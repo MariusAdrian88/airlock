@@ -165,7 +165,9 @@ selected profile. Keys present in a later layer win; keys absent fall through.
     "function_budget": 10000,       // per response of `function` (decompiled C)
     "detail": "brief",              // brief | full | evidence
     "decompile_timeout_s": 60,
-    "bulk_decompile": "lazy",       // lazy | background
+    "bulk_decompile": "background", // lazy | background
+    "decompile_cpu_min": 0.5,       // share of logical processors while other work runs
+    "decompile_cpu_max": 0.75,      // share of logical processors when idle
     "analysis_timeout_min": 60,
     "max_budget": 32000,            // cap for a per-call budget override
     "allow_writes": false,          // gate for every tool in "annotate"
@@ -238,10 +240,14 @@ tools. Revisit later.
 
 There is no tool to switch between the dirty and the clean role. A switch
 cannot remove what the agent context already holds, so dirty → clean would
-fake a clean session and clean → dirty would contaminate one. The role comes
-from the folder the client was started in (§9). `airlock serve` is registered
-once per MCP client, with no flags; `--profile` stays as an optional override
-for scripted use (it may not contradict the folder role).
+fake a clean session and clean → dirty would contaminate one. Every session
+starts unbound; `project_open(name, role)` (or a successful `project_create`)
+binds the process to one project and one role for the rest of its life, and
+any later call returns `error role_locked: ...`. A restart starts a new
+unbound session, so clean work must begin in a new conversation. `airlock
+serve` is registered once per MCP client, with no flags; `--profile` stays as
+an optional restriction for scripted use (a mismatching role returns
+`error wrong_role: this server was started with --profile X`).
 
 ---
 
@@ -639,12 +645,35 @@ not a project folder, goes through `project_create`:
 7. PE resources (server side, `pefile`): dialogs, menus, string tables,
    version info → `ui_element`.
 8. Decompilation:
-   - `lazy` (default): on first `function` request, then cached.
-   - `background`: Ghidra's parallel decompiler over all non-thunk functions,
-     lowest priority, interruptible by foreground requests. The package
-     `ghidra.app.decompiler.parallel` (`ParallelDecompiler`,
-     `ChunkingParallelDecompiler`) exists in 12.1.4 **[verified]**; how to make
-     it interruptible is **[verify]**.
+   - `background` (default): after a binary is `ready`, decompile all its
+     non-thunk, non-external, non-runtime functions in parallel and cache them,
+     so `function`, feature entry points and full-text search over C are
+     instant. Order: feature entry points first, then by call-graph
+     centrality, then the rest.
+   - `lazy`: only on first `function` request, then cached.
+   - **Threads.** N parallel decompilers, each its own `DecompInterface` (one
+     native decompiler process each), N between `decompile_cpu_min` and
+     `decompile_cpu_max` of `os.cpu_count()` (defaults ½ and ¾; 16 logical
+     processors → 8–12):
+     - ¾ while nothing else runs;
+     - ½ while Ghidra auto-analysis of another binary runs or a foreground
+       request (`function` on an uncached function, `extract`) is in
+       progress; the foreground request is served first by a reserved
+       decompiler, never queued behind the background pass;
+     - always at least 1, and at most what `jvm_max_memory` allows (each
+       decompiler process needs memory; the worker lowers N and logs it if
+       decompiles fail with out-of-memory).
+   - Implementation: a worker-side pool with per-thread `DecompInterface`
+     (or `ghidra.app.decompiler.parallel.ParallelDecompiler` /
+     `ChunkingParallelDecompiler`, which exist in 12.1.4 **[verified]**;
+     whether their thread count can change while running is **[verify]**).
+     Background work runs in chunks of ~50 functions so N can change between
+     chunks and a cancel takes effect quickly. Results are written to the
+     index in batches by the server. `index_status` shows decompiled/total,
+     rate (functions/s) and the current N.
+   - The worker request loop must not block on the pass: `status`, `hello`
+     and foreground `decompile` stay answerable (today the loop is
+     sequential, §8; this needs the request loop to dispatch to threads).
 9. Each decompile also produces `ast_node` rows from the decompiler's
    `ClangNode` markup tree, so every call or string reference in the C text
    maps to an instruction address.
@@ -779,7 +808,7 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 | Tool | Parameters | Returns |
 |---|---|---|
 | `program_scan` | `path` | light scan (§5.0): groups, options table with estimated analysis time per option, data files, recommendation. No Ghidra; allowed when unbound |
-| `project_create` | `path`, `name?`, `option` (`A`–`D`), `add?`, `remove?` | creates the project folder (§4), queues the selection; tells the user to reopen the client in `<project>\dirty`. Allowed only when unbound |
+| `project_create` | `path`, `name?`, `option` (`A`–`D`), `add?`, `remove?` | creates the project folder (§4), queues the selection and binds the session as dirty. Allowed only when unbound |
 | `program_add` | `option` or `files` | re-scan and queue more files of the same program |
 | `overview` | | the project map (§4 "Project map"): purpose, binaries, relations, features with coverage, knowledge, frontier; same content as `dirty\PROJECT.md` |
 | `project_describe` | `purpose` | sets the purpose paragraph of the map (dirty only) |
@@ -927,41 +956,40 @@ parameter names). No `outputSchema` is advertised.
 - **Dirty session:** reads code, decompiles, writes notes and specifications.
 - **Clean session:** sees only `spec_read`, `spec_list`, `spec_export`. Never
   sees code, addresses, bytes or notes.
-- **Unbound session:** started outside a project folder. Only `program_scan`,
-  `project_create` and `project_info` work; every other tool returns
-  `error unbound: ...`.
+- **Unbound session:** the state of every new session. Only `projects`,
+  `project_open`, `project_create`, `program_scan` and `project_info` work;
+  every other tool returns `error unbound: ...`.
 
-The role comes from the folder the MCP client runs in, not from a flag or a
-tool call. The server reads the client's workspace from, in order: (1) the
-first MCP root, requested after `notifications/initialized` when the client
-declares the capability and the connection allows server requests (legacy
-handshake; the 2026-07-28 protocol has no back-channel, and roots are deprecated
-there); (2) `CLAUDE_PROJECT_DIR`, which Claude Code sets (client-provided
-detection, not airlock configuration); (3) the working directory of the server
-process. `project_info` shows which source was used. Per client:
+The role is chosen by the agent, with the user, not detected from the client's
+folder, flags or environment. The server instructions tell the agent to start
+with `projects` and `project_open(name, role)` (reverse engineering and specs:
+dirty; implementation from specs: clean; ask the user when unclear). The
+role is fixed for the life of the process: a second `project_open` or
+`project_create` returns `error role_locked: ...`. Because a restart starts a
+new unbound session, the user starts clean work in a new conversation.
 
-| Client | Roots offered | Workspace source | Deny rules written into `clean\` | Shell blocked? |
-|---|---|---|---|---|
-| Claude Code | yes (launch dir first) **[verify]** | roots, else `CLAUDE_PROJECT_DIR` | `.claude\settings.json`: `permissions.deny` with `Read(//<abs>/dirty/**)` and `Edit(//<abs>/dirty/**)` (`//` = absolute from filesystem root, forward slashes; Windows drive form **[verify]**) | no: `cat`/`type` on the path still work; rules cover Read/Grep/Glob and @-mentions |
-| OpenCode | no **[verify]** | server cwd (per-server `cwd` configurable) | `opencode.json`: `permission.external_directory {"*": "deny"}` (blocks paths outside the launch folder, bash included) **[verify]** | yes, for paths outside the launch folder **[verify]** |
-| Codex | no **[verify]** | server cwd **[verify]** | `.codex\config.toml`: permission profile `airlock-clean` denying `<abs>/dirty/**`; exact TOML nesting **[verify]** | per profile **[verify]** |
+`projects` and `project_info` are allowed in every role and are role-aware
+(catalog flag `clean_safe`): in a clean session `projects` shows only name and
+published spec count, and `project_info` only role, project name, version and
+enabled tool names. No paths into `dirty\`, no binary names, no Ghidra paths.
+
+The folders still matter to the clients. `project_create` writes deny rules into
+`clean\` so that a client started there cannot read the sibling `dirty\`:
+
+| Client | Deny rules written into `clean\` | Shell blocked? |
+|---|---|---|
+| Claude Code | `.claude\settings.json`: `permissions.deny` with `Read(//<abs>/dirty/**)` and `Edit(//<abs>/dirty/**)` (`//` = absolute from filesystem root, forward slashes; Windows drive form **[verify]**) | no: `cat`/`type` on the path still work; rules cover Read/Grep/Glob and @-mentions |
+| OpenCode | `opencode.json`: `permission.external_directory {"*": "deny"}` (blocks paths outside the launch folder, bash included) **[verify]** | yes, for paths outside the launch folder **[verify]** |
+| Codex | `.codex\config.toml`: permission profile `airlock-clean` denying `<abs>/dirty/**`; exact TOML nesting **[verify]** | per profile **[verify]** |
 
 Existing user files in `clean\` are never overwritten: the JSON files are
 merged, the Codex TOML is skipped when present. Relative `..\dirty` rules are
 not used because their resolution is unconfirmed in all three clients.
 
-| Workspace | Role |
-|---|---|
-| `<project>\dirty` (or below), marker present | dirty, profile `dirty` |
-| `<project>\clean` (or below), marker present | clean, profile `clean` |
-| anything else | unbound |
-
 - One registration of `airlock serve` per client, with no flags; the server
   loads automatically and the user just states the task.
-- The role is fixed for the life of the process and cannot change. It does
-  not need to be remembered: the folder decides it again on every start.
-- If the workspace cannot be determined, the server is unbound; it never
-  guesses `clean`.
+- The server never guesses a role: an unbound session cannot reach any
+  analysis or spec tool.
 - The tool list is the same in every role (clients do not refresh tool lists
   reliably); tools outside the role return `error wrong_role: ...` and do
   nothing. Descriptions contain no program data.
@@ -1127,7 +1155,7 @@ formats is the primary use case of this project.
 |---|---|---|
 | M0 | Skeleton: config loading, `init`, `doctor`, MCP server with `project_info`, worker spawn in Job Object, PyGhidra start | `airlock doctor --start` passes on Ghidra 12.1.4; `project_info` callable from Claude Code. **Done 2026-11-04: Ghidra 12.1.4 + Java 25 on Windows, JVM start 4.7 s** |
 | M1 | `open_binary`, analysis, cheap pass, `outline`, `search`, `function`, `xrefs`, `callgraph`, `strings`, `index_status` | End-to-end on a 32-bit MSVC application: find a file-loading function by string and read its decompile within budget |
-| M1.5 | Project folders (`projects_root`, `dirty\`/`clean\`, role from folder), `program_scan` with options table and time estimates, `project_create`, analysis queue for many binaries, cross-binary import links, tools across all binaries | From an unbound session: scan a multi-file program, show the options table, create the project, analyse option B; in `dirty\` search across binaries and follow a call from the executable into a DLL; in `clean\` every non-spec tool returns `wrong_role`; `project_open` returns the project map; `feature("file-io")` lists the program's file-loading entry points across binaries |
+| M1.5 | Project folders (`projects_root`, `dirty\`/`clean\`, `projects` and `project_open` with a role locked per session), `program_scan` with options table and time estimates, `project_create`, analysis queue for many binaries, cross-binary import links, tools across all binaries | From an unbound session: scan a multi-file program, show the options table, create the project, analyse option B; in `dirty\` search across binaries and follow a call from the executable into a DLL; in `clean\` every non-spec tool returns `wrong_role`; `project_open` returns the project map; `feature("file-io")` lists the program's file-loading entry points across binaries |
 | M2 | `resources` set, `cpp` set (RTTI, vtables, MFC message maps) | MFC menu items and dialog buttons mapped to handler functions |
 | M3 | `annotate` set + invalidation, `frontier`, notes | Renaming a callee refreshes callers' cached decompiles |
 | M4 | `spec_write`/`spec_read`/`spec_export`, clean profile, audit | Clean session can read a spec and nothing else |
@@ -1143,8 +1171,8 @@ formats is the primary use case of this project.
 1. Mirror agent notes into Ghidra plate comments by default, or only on
    request? (Proposal: config flag `mirror_notes_to_ghidra`, default `true`
    so the GUI shows the agent's work.)
-2. Background decompile priority and CPU cap on large binaries (some targets have
-   very large executables): thread count config, default `cores / 2`.
+2. ~~Background decompile priority and CPU cap~~ Decided: ½ to ¾ of the
+   logical processors (`decompile_cpu_min`/`max`), §5 step 8.
 3. Similarity across versions: own masked hashes first, or go straight to
    Ghidra's BSim?
 4. Spec filter strictness: reject, or accept with a warning and mark the spec
