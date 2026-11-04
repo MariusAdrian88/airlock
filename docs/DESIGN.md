@@ -131,8 +131,12 @@ THIRD_PARTY_NOTICES.md
 | What | Path |
 |---|---|
 | Global config | `%APPDATA%\airlock\config.jsonc` |
-| Data (index, projects) | `%LOCALAPPDATA%\airlock\` unless `index_dir` is set |
-| Project overlay | `<project dir>\project.jsonc` |
+| Project folders | `projects_root` (default `%USERPROFILE%\airlock-projects`), one folder per program, §4 |
+| Machine data (logs, cursors, caches not tied to a project) | `%LOCALAPPDATA%\airlock\` unless `index_dir` is set |
+| Project overlay | `<project folder>\airlock-project.jsonc` (the `settings` key) |
+
+`projects_root` must be on a local disk (Ghidra projects on network drives
+are unreliable); `doctor` checks it with `win/drives.py`.
 
 `airlock init --ghidra <path>` writes the commented default config.
 `airlock doctor` checks every configured path (Ghidra, JDK, ilspycmd), the
@@ -230,24 +234,49 @@ Not in v1. Tool-list-changed notifications are not refreshed reliably by every
 MCP client, so the config file and profile are the supported way to choose
 tools. Revisit later.
 
+### No runtime role switching
+
+There is no tool to switch between the dirty and the clean role. A switch
+cannot remove what the agent context already holds, so dirty → clean would
+fake a clean session and clean → dirty would contaminate one. The role comes
+from the folder the client was started in (§9). `airlock serve` is registered
+once per MCP client, with no flags; `--profile` stays as an optional override
+for scripted use (it may not contradict the folder role).
+
 ---
 
 ## 4. Storage
 
 ### Layout
 
+A project is a **program** (an installation folder with executables, DLLs,
+plugins and data files), not a single file. Each project is one folder under
+`projects_root`, with one subfolder per clean-room role:
+
 ```
-%LOCALAPPDATA%\airlock\
-  projects\
-    <project>\
-      project.jsonc        # overlay config (optional)
-      project.json         # binaries, hashes, Ghidra version, analysis profile
-      ghidra\              # Ghidra project (.gpr + .rep)
-      artifacts\           # private copies of imported binaries, by sha256
-      index.sqlite         # derived index + agent notes + specs
+<projects_root>\<name>\
+  airlock-project.jsonc    # marker + manifest: name, source folder, scan
+                           #   result, selected option, file list with groups,
+                           #   per-project settings overlay
+  dirty\                   # start the MCP client here for analysis
+    .airlock\
+      ghidra\              # ONE Ghidra project holding every analysed binary
+      artifacts\           # private copies of the program's files, by sha256
+      index.sqlite         # derived index + agent notes + draft specs
       cache\               # ilspycmd output, extracted resources
       logs\
+  clean\                   # start the MCP client here for implementation
+    specs\                 # published specs (.md + specs.json), nothing else from dirty
+    .claude\settings.json  # deny rules for ..\dirty (and the equivalents of other clients)
 ```
+
+- The original program folder is never modified; files are copied into
+  `artifacts\` by SHA-256, so a later program version can join the same
+  project and be compared.
+- `airlock-project.jsonc` is the marker that makes a folder a project folder.
+  A folder named `dirty` without the marker is not a project.
+- Nothing under `dirty\.airlock\` is ever committed to git. `clean\` can be a
+  git repository of the new implementation.
 
 ### Roles
 
@@ -445,6 +474,76 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);  -- schema_version, etc.
 
 ## 5. Indexing pipeline
 
+### 5.0 Project creation: light scan, options, queue
+
+The first request to reverse engineer a program, made from any folder that is
+not a project folder, goes through `project_create`:
+
+1. **Name.** The server asks the user for the project name (MCP elicitation
+   if the client supports it **[verify]** per client; else the tool returns
+   `error need_name` and the agent asks the user). The name is slugged.
+2. **Light scan** (`program_scan`, server side, `pefile` only, no JVM;
+   seconds even for 100+ files). For every file under the given folder (or
+   the folder of a given executable):
+   - PE files: bitness, code size (sum of executable sections), imports,
+     export count, version info (`CompanyName`, `ProductName`), Rich
+     header, CLI header (.NET).
+   - Other files: counted and sized by extension (data-file candidates for
+     the `fileformat` set).
+3. **Groups**, decided in this order:
+   - `runtime`: known compiler/framework runtimes (`msvcr*`, `msvcp*`,
+     `mfc*`, `atl*`, `vcruntime*`, `ucrtbase`, `api-ms-*`, VB/.NET runtimes)
+     by name and vendor.
+   - `core`: the root executable(s) plus the transitive closure of DLLs they
+     import from inside the program folder, if the vendor matches.
+   - `own_plugin`: other DLLs/OCXs with the root executable's vendor
+     (`CompanyName`), e.g. in plugin folders. They are found only by the
+     folder scan, because they are loaded with `LoadLibrary`.
+   - `third_party`: DLLs/OCXs with a different vendor, including imported
+     ones.
+   - `separate_exe`: other executables, drivers and installers in the folder
+     (often separate programs; can be larger than the main executable).
+   - `system`: DLLs imported but not present in the folder (names only).
+   - `data`: non-PE files, by extension.
+   The root executable is the one the user named, else the largest non-DLL
+   executable in the top folder; the scan report says which and why.
+4. **Options table.** Cumulative options with code size and an analysis-time
+   estimate, shown to the user before any Ghidra work, for example:
+
+   | Option | Contents | Files | Code | Est. analysis |
+   |---|---|---|---|---|
+   | A. Core | `core` | 3 | 1.5 MB | ~2 min |
+   | B. Core + own plugins | A + `own_plugin` | 9 | 2.8 MB | ~4 min |
+   | C. + third party | B + `third_party` | 30 | 9 MB | ~12 min |
+   | D. Everything | C + `separate_exe` | 45 | 16 MB | ~21 min |
+   | (never by default) | `runtime` (Function ID covers them) | 8 | 2.5 MB | |
+
+   (Illustrative numbers.)
+
+   Each option row also names its largest files. The estimate is
+   `code MB × analysis_s_per_code_mb` (config, default 80, measured on a
+   32-bit MSVC application **[verified]**) and is refined from the project's
+   own measured analysis times as binaries finish. The table ends with the
+   data-file summary and a recommendation (default: B when own plugins
+   exist, else A). The user picks an option or adds/removes single files.
+5. **Create.** Write the folder structure (§4), the manifest, the deny rules
+   in `clean\`, copy the selected files into `artifacts\`, and queue them.
+   The response tells the user to open the client in `<project>\dirty` to
+   continue; the creating session is not a project session.
+6. **Queue.** Binaries are imported and analysed one at a time in priority
+   order (`core`, then `own_plugin`, then the rest by size). Each binary is
+   usable as soon as it is `ready`; `index_status` shows the queue, the
+   current binary, finished times and the remaining estimate. Options can be
+   extended later (`program_add`), which re-runs the light scan and queues
+   only the new files.
+7. **Cross-binary links.** All binaries live in one Ghidra project. After
+   import, each program's external library paths are set to the project's
+   programs (`ExternalManager.setExternalPath`) so imports resolve to the
+   exporting binary **[verify]**; the index adds `edge` rows from an import
+   slot to the export's function in the other binary.
+
+`open_binary` stays as the single-file path inside an existing project.
+
 `open_binary(project, path)`:
 
 1. Hash the file, copy to `artifacts\<sha256>`, register in `binary`.
@@ -602,7 +701,10 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `index_status` | `project?` | analysis/decompile progress, worker state, stale counts |
+| `program_scan` | `path` | light scan (§5.0): groups, options table with estimated analysis time per option, data files, recommendation. No Ghidra; allowed when unbound |
+| `project_create` | `path`, `name?`, `option` (`A`–`D`), `add?`, `remove?` | creates the project folder (§4), queues the selection; tells the user to reopen the client in `<project>\dirty`. Allowed only when unbound |
+| `program_add` | `option` or `files` | re-scan and queue more files of the same program |
+| `index_status` | `project?` | analysis queue (per binary: state, time, remaining estimate), decompile progress, worker state, stale counts |
 | `reindex` | `binary`, `scope=stale` (`stale`/`all`/`analyzers`) | job id |
 | `project_info` | | config in effect, enabled sets, profile, paths |
 | `frontier` | `limit=20` | unnamed functions ranked by call-graph centrality and how interesting their strings/imports/UI links are: "what to reverse next" |
@@ -740,20 +842,45 @@ parameter names). No `outputSchema` is advertised.
 
 ### Roles
 
-- **Dirty session:** profile `dirty`. Reads code, decompiles, writes notes and
-  specifications.
-- **Clean session:** profile `clean`. Sees only `spec_read`, `spec_list`,
-  `spec_export`. Never sees code, addresses, bytes or notes.
+- **Dirty session:** reads code, decompiles, writes notes and specifications.
+- **Clean session:** sees only `spec_read`, `spec_list`, `spec_export`. Never
+  sees code, addresses, bytes or notes.
+- **Unbound session:** started outside a project folder. Only `program_scan`,
+  `project_create` and `project_info` work; every other tool returns
+  `error unbound: ...`.
 
-They must be separate sessions with separate MCP registrations, e.g.:
+The role comes from the folder the MCP client runs in, not from a flag or a
+tool call. The server reads the client's workspace from MCP `roots`, else the
+working directory of the server process **[verify per client: Claude Code,
+OpenCode, Codex]**:
 
-```
-airlock serve --profile dirty
-airlock serve --profile clean
-```
+| Workspace | Role |
+|---|---|
+| `<project>\dirty` (or below), marker present | dirty, profile `dirty` |
+| `<project>\clean` (or below), marker present | clean, profile `clean` |
+| anything else | unbound |
 
-One agent session that both decompiles and implements is not clean room,
-whatever the tooling does.
+- One registration of `airlock serve` per client, with no flags; the server
+  loads automatically and the user just states the task.
+- The role is fixed for the life of the process and cannot change. It does
+  not need to be remembered: the folder decides it again on every start.
+- If the workspace cannot be determined, the server is unbound; it never
+  guesses `clean`.
+- The tool list is the same in every role (clients do not refresh tool lists
+  reliably); tools outside the role return `error wrong_role: ...` and do
+  nothing. Descriptions contain no program data.
+- One agent session that both decompiles and implements is not clean room,
+  whatever the tooling does. The two folders make the separation visible;
+  the deny rules in `clean\` stop the clean agent's own file tools from
+  reading `..\dirty` (not a guarantee).
+
+### Publishing specs
+
+Specs are written in the dirty session as `draft` into the project index,
+with provenance. "Publish" (`spec_export` in the dirty role) writes the
+`final` specs to `clean\specs\` as Markdown plus a `specs.json` index
+(topic, title, version, status), without provenance, addresses or notes.
+The clean role reads only `clean\specs\`; it never opens `dirty\.airlock\`.
 
 ### Enforcement
 
@@ -904,6 +1031,7 @@ formats is the primary use case of this project.
 |---|---|---|
 | M0 | Skeleton: config loading, `init`, `doctor`, MCP server with `project_info`, worker spawn in Job Object, PyGhidra start | `airlock doctor --start` passes on Ghidra 12.1.4; `project_info` callable from Claude Code. **Done 2026-11-04: Ghidra 12.1.4 + Java 25 on Windows, JVM start 4.7 s** |
 | M1 | `open_binary`, analysis, cheap pass, `outline`, `search`, `function`, `xrefs`, `callgraph`, `strings`, `index_status` | End-to-end on a 32-bit MSVC application: find a file-loading function by string and read its decompile within budget |
+| M1.5 | Project folders (`projects_root`, `dirty\`/`clean\`, role from folder), `program_scan` with options table and time estimates, `project_create`, analysis queue for many binaries, cross-binary import links, tools across all binaries | From an unbound session: scan a multi-file program, show the options table, create the project, analyse option B; in `dirty\` search across binaries and follow a call from the executable into a DLL; in `clean\` every non-spec tool returns `wrong_role` |
 | M2 | `resources` set, `cpp` set (RTTI, vtables, MFC message maps) | MFC menu items and dialog buttons mapped to handler functions |
 | M3 | `annotate` set + invalidation, `frontier`, notes | Renaming a callee refreshes callers' cached decompiles |
 | M4 | `spec_write`/`spec_read`/`spec_export`, clean profile, audit | Clean session can read a spec and nothing else |
