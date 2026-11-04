@@ -37,6 +37,7 @@ SKIP_GROUPS = ("runtime",)
 TERMINAL = ("done", "cancelled", "error", "interrupted")
 IDLE_POLL_S = 1.0
 EVENT_WAIT_S = 2.0
+BG_TIMEOUT = "bg_timeout"  # error prefix of a timeout row written by the background pass
 STALL_S = 180.0  # no event for this long while the worker lives: the pass is stuck
 
 
@@ -242,7 +243,7 @@ class BulkScheduler:
                 break
         res = ix.worker.request("bulk_decompile", {
             "program": program, "order": [int(r["entry"]) for r in rows],
-            "timeout": int(d.get("decompile_timeout_s") or 60),
+            "timeout": int(d.get("bulk_decompile_timeout_s") or 15),
             "cpu_min": d.get("decompile_cpu_min"), "cpu_max": d.get("decompile_cpu_max"),
         }, timeout=300)
         job = res.get("job")
@@ -306,10 +307,13 @@ class BulkScheduler:
                 continue
             fid, version = hit
             ok = r.get("status") == "ok"
+            err = None if ok else (r.get("error") or r.get("status"))
+            if r.get("status") == "timeout":   # marks a short-timeout row: `function` retries once
+                err = f"{BG_TIMEOUT}: {err}"
             items.append({
                 "function_id": fid, "fn_version": version, "status": r.get("status") or "error",
                 "c_text": r.get("c_text") if ok else None,
-                "error": None if ok else (r.get("error") or r.get("status")),
+                "error": err,
                 "ast": [dict(zip(cols, row)) for row in r.get("ast") or []] if ok else [],
             })
         return st.save_decomp_batch(profile, items, _now())

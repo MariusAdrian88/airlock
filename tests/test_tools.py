@@ -546,7 +546,7 @@ def test_function_views_and_errors(ctx):
     ctx.worker.decompile_reply = {"status": "timeout", "error": "took too long"}
     assert core.function(ctx, "FUN_00401200").startswith("error decompile_timeout:")
     ctx.worker.decompile_reply = {"status": "error", "error": "bad"}
-    assert core.function(ctx, "FUN_00401200").startswith("error decompile_failed:")
+    assert core.function(ctx, "FUN_00401200", retry=True).startswith("error decompile_failed:")
     ctx.worker.decompile_reply = WorkerError  # type: ignore[assignment]
 
 

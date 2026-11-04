@@ -36,7 +36,8 @@ def test_config_defaults_for_the_pass():
 @pytest.mark.parametrize("bad", [
     {"bulk_decompile": "eager"}, {"bulk_decompile": 1},
     {"decompile_cpu_min": 0}, {"decompile_cpu_min": -0.1}, {"decompile_cpu_max": 1.5},
-    {"decompile_cpu_max": "half"}, {"decompile_cpu_min": True},
+    {"decompile_cpu_max": "half"}, {"bulk_decompile_timeout_s": 0},
+    {"bulk_decompile_timeout_s": "15"}, {"decompile_cpu_min": True},
     {"decompile_cpu_min": 0.9, "decompile_cpu_max": 0.5},
 ])
 def test_config_rejects_bad_pass_settings(bad):
@@ -201,7 +202,7 @@ def test_pass_decompiles_all_functions_and_writes_the_index(pass_ctx):
     # one request, in call-graph order: most called first; thunk and external left out
     assert ctx.worker.orders == [[0x401200, 0x401000, 0x401100]]
     req = ctx.worker.calls[[c[0] for c in ctx.worker.calls].index("bulk_decompile")][1]
-    assert req["program"] == "app_exe" and req["timeout"] == 60
+    assert req["program"] == "app_exe" and req["timeout"] == 15
     assert (req["cpu_min"], req["cpu_max"]) == (0.5, 0.75)
     for e in (0x401000, 0x401100, 0x401200):
         fn = st.function_at(bid, e)
@@ -270,7 +271,7 @@ def test_failures_are_recorded_as_status_rows(pass_ctx):
     st = ctx.indexer.store("proj")
     fn = st.function_at(bid, 0x401100)
     d = st.get_decomp(fn, "prof1")
-    assert d.status == "timeout" and d.error == "timeout" and d.c_text is None
+    assert d.status == "timeout" and d.error == "bg_timeout: timeout" and d.c_text is None
     assert st.decomp_candidates(bid, "prof1") == []      # not retried by the pass
 
 
@@ -422,3 +423,73 @@ def test_a_binary_that_becomes_ready_starts_the_pass(tmp_path, monkeypatch):
     assert ix.bulk.wait_idle()
     assert ctx.worker.calls[-1][0] in ("bulk_decompile", "status", "open_project")
     assert st.decomp_current_count(b.id, "prof1") == 3
+
+
+# ── timeouts in the background pass ──────────────────────────────────────────
+
+def test_config_default_for_the_pass_timeout():
+    assert cfg().defaults["bulk_decompile_timeout_s"] == 15
+    assert cfg(bulk_decompile_timeout_s=5).defaults["bulk_decompile_timeout_s"] == 5
+
+
+def test_background_pass_uses_the_short_timeout(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    ctx.config.defaults["bulk_decompile_timeout_s"] = 7
+    ctx.indexer.bulk.schedule("proj", bid)
+    assert ctx.indexer.bulk.wait_idle()
+    req = next(a for o, a in ctx.worker.calls if o == "bulk_decompile")
+    assert req["timeout"] == 7 and ctx.config.defaults["decompile_timeout_s"] == 60
+
+
+def test_background_timeout_is_not_retried_by_the_next_pass(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    ctx.worker.timeouts = {0x401100}
+    ix = ctx.indexer
+    ix.bulk.schedule("proj", bid)
+    assert ix.bulk.wait_idle()
+    ctx.worker.orders.clear()
+    assert ix.bulk.resume("proj") == 0
+    ix.bulk.schedule("proj", bid)
+    assert ix.bulk.wait_idle()
+    assert ctx.worker.orders == []
+    assert "timeouts 1" in admin.index_status(ctx)
+
+
+def timed_out_in_background(ctx):
+    bid = fill(ctx)
+    ctx.worker.timeouts = {0x401100}
+    ctx.indexer.bulk.schedule("proj", bid)
+    assert ctx.indexer.bulk.wait_idle()
+    return bid, ctx.indexer.store("proj")
+
+
+def test_foreground_retries_a_background_timeout_with_the_full_timeout(pass_ctx):
+    ctx = pass_ctx
+    bid, st = timed_out_in_background(pass_ctx)
+    ctx.worker.decompile_reply = None
+    out = core.function(ctx, "0x401100")
+    assert "void main" in out or "(" in out and not out.startswith("error")
+    calls = [a for o, a in ctx.worker.calls if o == "decompile"]
+    assert len(calls) == 1 and calls[0]["timeout"] == 60
+    d = st.get_decomp(st.function_at(bid, 0x401100), "prof1")
+    assert d.status == "ok" and d.c_text
+    core.function(ctx, "0x401100")                       # now cached
+    assert ctx.worker.count("decompile") == 1
+    assert "timeouts" not in admin.index_status(ctx)
+
+
+def test_second_foreground_timeout_is_not_retried_without_the_flag(pass_ctx):
+    ctx = pass_ctx
+    bid, st = timed_out_in_background(pass_ctx)
+    ctx.worker.decompile_reply = {"status": "timeout", "error": "took too long"}
+    first = core.function(ctx, "0x401100")
+    assert first.startswith("error decompile_timeout:") and "took too long" in first
+    assert ctx.worker.count("decompile") == 1
+    again = core.function(ctx, "0x401100")
+    assert again.startswith("error decompile_timeout:") and "retry=true" in again
+    assert ctx.worker.count("decompile") == 1            # no new attempt
+    ctx.worker.decompile_reply = None
+    assert not core.function(ctx, "0x401100", retry=True).startswith("error")
+    assert ctx.worker.count("decompile") == 2

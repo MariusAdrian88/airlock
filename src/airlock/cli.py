@@ -1,4 +1,4 @@
-"""Command line: airlock serve | init | doctor."""
+"""Command line: airlock serve | init | config | doctor."""
 
 from __future__ import annotations
 
@@ -39,6 +39,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_config(args: argparse.Namespace) -> int:
+    from airlock.config.report import run
+
+    return run(args)
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from airlock.doctor import run
 
@@ -53,13 +59,24 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve", help="run the MCP server on stdio")
-    s.add_argument("--profile", default=None, help="profile from config.jsonc (default: default_profile)")
+    s.add_argument("--profile", default=None, choices=["dirty", "clean"],
+                   help="role of the tool list (default: dirty)")
     s.set_defaults(fn=_cmd_serve)
 
-    i = sub.add_parser("init", help="write a commented default config.jsonc")
+    i = sub.add_parser("init", help="write the documented default config.jsonc")
     i.add_argument("--ghidra", type=Path, default=None, help="Ghidra install directory")
     i.add_argument("--force", action="store_true", help="overwrite an existing config")
     i.set_defaults(fn=_cmd_init)
+
+    c = sub.add_parser("config", help="show, set, validate or upgrade the config file")
+    c.add_argument("action", nargs="?", choices=["show", "upgrade", "validate"],
+                   help="show (default): every key with value, default and source")
+    c.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="change one key")
+    c.add_argument("--unset", metavar="KEY", help="return one key to its default")
+    c.add_argument("--dry-run", action="store_true", help="upgrade: print the diff, write nothing")
+    c.add_argument("--overlay", type=Path, default=None, help="project overlay file to include")
+    c.add_argument("--profile", choices=["dirty", "clean"], default=None)
+    c.set_defaults(fn=_cmd_config)
 
     d = sub.add_parser("doctor", help="check the installation")
     d.add_argument("--profile", default=None)

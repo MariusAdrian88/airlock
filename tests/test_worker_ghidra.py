@@ -255,6 +255,9 @@ def test_decompile_errors_are_codes(world):
     assert e.value.code == "bad_args"
 
 
+BULK_TIMEOUT_S = 15  # defaults.bulk_decompile_timeout_s
+
+
 class BulkWatch:
     """Collects the events of one program's bulk passes."""
 
@@ -314,7 +317,7 @@ def test_bulk_pass_covers_all_functions_and_worker_stays_responsive(world):
     targets = fn_entries(c)
     assert len(targets) > 100
     t0 = time.monotonic()
-    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": 60})
+    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": BULK_TIMEOUT_S})
     job = r["job"]
     assert r["started"] and r["total"] == len(targets)
     assert r["processors"] >= 1 and 1 <= r["threads"] <= r["processors"]
@@ -370,7 +373,7 @@ def test_bulk_cancel_is_quick_and_leaves_the_worker_usable(world):
     c = world["client"]
     w = BulkWatch(c)
     targets = fn_entries(c)
-    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": 60})
+    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": BULK_TIMEOUT_S})
     job = r["job"]
     again = c.request("bulk_decompile", {"program": PROGRAM, "order": targets})
     assert again.get("already_running") is True and again["job"] == job

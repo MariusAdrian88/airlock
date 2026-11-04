@@ -340,9 +340,10 @@ def test_mermaid_flag_writes_three_kinds_of_files(proj):
 
 
 def test_mermaid_config_validation():
+    from airlock.config.keys import DEFAULTS
     base = parse_jsonc(default_config_text())
-    assert base["defaults"]["mermaid"] is False
-    bad = deep_merge(base, {"defaults": {"mermaid": "yes"}})
+    assert DEFAULTS["mermaid"] is False
+    bad = deep_merge(base, {"mermaid": "yes"})
     with pytest.raises(ConfigError):
         resolve(bad, "dirty", None)
 

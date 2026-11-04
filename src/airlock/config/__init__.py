@@ -1,3 +1,4 @@
+from airlock.config.keys import CONFIG_VERSION, KEYS
 from airlock.config.loader import (
     CLEAN_ROLE,
     DIRTY_ROLE,
@@ -10,7 +11,9 @@ from airlock.config.loader import (
 
 __all__ = [
     "CLEAN_ROLE",
+    "CONFIG_VERSION",
     "DIRTY_ROLE",
+    "KEYS",
     "Config",
     "ConfigError",
     "Issue",

@@ -210,6 +210,32 @@ def test_engine_uses_the_background_thread_count_and_one_context_per_thread():
     assert all(c["closed"] for c in fake.ctxs)  # every decompiler is disposed at the end
 
 
+def test_one_slow_function_does_not_idle_the_other_threads():
+    """Work is taken per function from one queue: while one thread sits in a timeout, the
+    others finish everything else (no fixed chunks)."""
+    fake, batches = Fake(delay=0.005), []
+    gate = threading.Event()
+    done_while_blocked: list[int] = []
+
+    def work(ctx, entry):
+        if entry == 0:
+            gate.wait(10)                      # the function that always times out
+            return {"entry": 0, "status": "timeout", "error": "t"}
+        r = fake.work(ctx, entry)
+        done_while_blocked.append(entry)
+        if len(done_while_blocked) == 59:
+            gate.set()
+        return r
+
+    e = Engine(list(range(60)), work, fake.make_ctx, fake.close_ctx, Pool(processors=8),
+               batches.append, batch_size=50)
+    t0 = time.monotonic()
+    assert e.run() == "done"
+    assert time.monotonic() - t0 < 5
+    assert len(done_while_blocked) == 59           # all others finished before the slow one
+    assert (e.done, e.ok, e.failed) == (60, 59, 1)
+
+
 def test_engine_applies_a_changed_n_between_functions():
     fake = Fake(delay=0.01)
     busy = [False]

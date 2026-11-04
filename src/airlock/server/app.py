@@ -40,6 +40,14 @@ def build_server(config: Config, profile_explicit: bool = False
     for issue in config.issues:
         if issue.level != "info":
             log.warning("%s", issue)
+    if config.source is not None:
+        from airlock.config.upgrade import stale_message
+        try:
+            stale = stale_message(config.source.read_text("utf-8-sig"))
+        except Exception:  # a broken file already failed in load_config
+            stale = None
+        if stale:
+            log.warning("config: %s", stale)
     return server, ctx
 
 

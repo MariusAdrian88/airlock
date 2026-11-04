@@ -1,27 +1,22 @@
 // airlock global configuration.
+// my own header comment.
 // JSONC: comments and trailing commas are allowed.
 // Comment out a tool in "sets" to remove it from the tool list.
 {
   // ── Locations. Only ghidra_dir is required. ──────────────────────────────
-  "ghidra_dir": null,        // e.g. "C:/Tools/ghidra_12.1.4_PUBLIC"
+  "ghidra_dir": "C:/Tools/ghidra_test",        // e.g. "C:/Tools/ghidra_12.1.4_PUBLIC"
   "jdk_dir": null,           // null: java on PATH, else Ghidra's LaunchSupport picks one
   "ilspycmd": null,          // e.g. "C:/Tools/ilspycmd/ilspycmd.exe" (optional, .NET)
   "index_dir": null,         // null: %LOCALAPPDATA%/airlock
-  "projects_root": null,     // null: %USERPROFILE%/airlock-projects (local disk)
 
   // ── Behaviour ─────────────────────────────────────────────────────────────
   "defaults": {
-    "token_budget": 2000,            // per response (list tools, outline, ...)
-    "function_budget": 10000,        // per response of `function` (decompiled C)
-    "max_budget": 32000,             // cap for a per-call budget override
+    "token_budget": 3000,            // MY NOTE: bigger answers please
+    "max_budget": 8000,              // cap for a per-call budget override
     "detail": "brief",               // brief | full | evidence
-    "decompile_timeout_s": 60,
-    "bulk_decompile": "background",  // lazy | background: decompile every function after analysis
-    "decompile_cpu_min": 0.5,        // share of the processors while analysis or a request runs
-    "decompile_cpu_max": 0.75,       // share of the processors while idle (0 < x <= 1)
+    "decompile_timeout_s": 120,
+    "bulk_decompile": "lazy",        // lazy | background
     "analysis_timeout_min": 60,
-    "mermaid": false,                // true: also write Mermaid charts to dirty\diagrams\ after each map update
-    "analysis_s_per_code_mb": 80,    // light-scan time estimate: seconds per MB of code
     "allow_writes": false,           // gate for every tool in "annotate"
     "mirror_notes_to_ghidra": true,  // agent notes also become plate comments
     "jvm_max_memory": null           // e.g. "8G"; null: Ghidra's default
@@ -33,14 +28,13 @@
     "dirty": {
       "role": "dirty",
       "enabled_sets": ["core", "cpp", "resources", "types", "annotate",
-                       "dataflow", "fileformat", "spec_write", "map", "admin"],
+                       "dataflow", "fileformat", "spec_write", "admin"],
       "allow_writes": true
     },
     "clean": {
-      // A clean profile may only contain clean-safe tools: the spec_read tools and
-      // the role-aware session tools.
+      // A clean profile may only contain spec_read, spec_list, spec_export.
       "role": "clean",
-      "enabled_sets": ["spec_read", "session"]
+      "enabled_sets": ["spec_read"]
     }
   },
 
@@ -60,14 +54,9 @@
     "dotnet": ["dotnet_types", "dotnet_decompile"],
     "resources": ["pe_resources", "dialogs", "string_tables", "version_info"],
     "dataflow": ["trace_values", "switch_tables", "constants"],
-    "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
+    "fileformat": ["ole_streams", /* "hexdump", */ "file_diff", "record_guess"],
     "spec_write": ["spec_write", "spec_list"],
     "spec_read": ["spec_read", "spec_list", "spec_export"],
-    "map": ["overview", "project_describe", "features", "feature", "feature_define",
-            "path", "graph_export"],
-    "session": ["projects", "project_open", "project_info"],
-    "admin": ["index_status", "reindex", "project_info", "frontier", "program_scan",
-              "projects", "project_open", "project_create", "program_add",
-              "function_map", "cluster_label"]
+    "admin": ["index_status", "reindex", "project_info", "frontier"]
   }
 }

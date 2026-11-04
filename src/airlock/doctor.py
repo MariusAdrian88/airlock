@@ -12,7 +12,6 @@ from pathlib import Path
 
 from airlock import ghidra_install
 from airlock.config import Config, ConfigError, load_config
-from airlock.config.catalog import CATALOG
 from airlock.win import drives
 
 RECOMMENDED_PY = ((3, 10), (3, 13))
@@ -94,10 +93,16 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
     for issue in cfg.issues:
         if issue.level != "info":
             add(Check("FAIL" if issue.level == "error" else "WARN", "config", issue.message))
-    typos = sorted({t for s, tools in cfg.sets.items() if s not in cfg.enabled_sets
-                    for t in tools if t not in CATALOG})
-    if typos:
-        add(Check("WARN", "config", f"unknown tools in disabled sets: {', '.join(typos)}"))
+    if cfg.source is not None:
+        from airlock.config.upgrade import stale_message, upgrade_file
+        stale = stale_message(cfg.source.read_text("utf-8-sig"))
+        if stale and fix:
+            plan, bak = upgrade_file(cfg.source)
+            add(Check("FIXED", "config", f"upgraded to version {plan.to_version}; "
+                                         f"backup {bak}; {plan.summary()}"))
+            cfg = load_config(config_path, profile)
+        elif stale:
+            add(Check("WARN", "config", stale))
 
     # Data dir
     data = cfg.data_dir

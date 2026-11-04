@@ -86,7 +86,7 @@ bridge (xrefs, vtables, RTTI, renames) is ported into the worker, with the
 ```
 airlock/
   cli.py                  # airlock serve | init | doctor (later: close, export-spec)
-  config/                 # jsonc loading, schema, overlays, profiles
+  config/                 # jsonc loading, keys (single source), generated template, overlays, upgrade
   server/
     app.py                # MCP server, tool registration from enabled sets
     budget.py             # token estimation, truncation, cursors
@@ -138,98 +138,101 @@ THIRD_PARTY_NOTICES.md
 `projects_root` must be on a local disk (Ghidra projects on network drives
 are unreliable); `doctor` checks it with `win/drives.py`.
 
-`airlock init --ghidra <path>` writes the commented default config.
+`airlock init --ghidra <path>` writes the documented default config.
 `airlock doctor` checks every configured path (Ghidra, JDK, ilspycmd), the
 Python version against the bundled JPype wheels, the PyGhidra install, and
 write access to the data directory. `--fix` installs PyGhidra from Ghidra's
-bundled wheels; `--start` also launches the worker and the JVM.
+bundled wheels and upgrades an old config file (see "Versions and upgrade");
+`--start` also launches the worker and the JVM.
 
 ### Resolution order
 
-Built-in defaults → global `config.jsonc` → project `project.jsonc` → the
-selected profile. Keys present in a later layer win; keys absent fall through.
+Built-in defaults (`config/keys.py`) -> global `config.jsonc` -> project
+overlay. Keys present in a later layer win; keys absent fall through. Every
+setting is a top-level key. Dicts merge key by key, lists and scalars replace,
+and `null` in a later layer removes the key, so the built-in default applies
+again (for the location keys, `null` means "not set").
 
-### Schema (default file)
+### Keys and the generated file
 
-```jsonc
-{
-  // ── Locations. Only ghidra_dir is required. ──────────────────────────
-  "ghidra_dir": "C:/Tools/ghidra_12.1.4_PUBLIC",
-  "jdk_dir": null,          // null: let Ghidra's launcher find the JDK
-  "ilspycmd": null,         // e.g. "C:/Tools/ilspycmd/ilspycmd.exe"
-  "index_dir": null,        // null: %LOCALAPPDATA%/airlock
+`config/keys.py` is the one source: for every key it holds the name, type,
+range or allowed values, default, group, what it does and when to change it.
+`config/template.py` generates the shipped file from it: a section header
+(`// === Locations ===`), then per key a comment block (what, `Allowed:`,
+`Default:`, `Change it:`) and the key line. Keys that most users never change
+ship commented out and show their default (`// "mermaid": false,`); remove the
+`//` to override. A few keys ship active: `config_version`, `ghidra_dir`,
+`disabled_sets`, `disabled_tools`. `airlock config` reads its descriptions
+back from the generated text, and tests check that the template documents
+every key, once, with the right default.
 
-  // ── Behaviour ─────────────────────────────────────────────────────────
-  "defaults": {
-    "token_budget": 2000,           // per response (list tools, outline, ...)
-    "function_budget": 10000,       // per response of `function` (decompiled C)
-    "detail": "brief",              // brief | full | evidence
-    "decompile_timeout_s": 60,
-    "bulk_decompile": "background", // lazy | background
-    "decompile_cpu_min": 0.5,       // share of logical processors while other work runs
-    "decompile_cpu_max": 0.75,      // share of logical processors when idle
-    "analysis_timeout_min": 60,
-    "mermaid": false,               // true: also write Mermaid charts to dirty\diagrams\
-    "max_budget": 32000,            // cap for a per-call budget override
-    "allow_writes": false,          // gate for every tool in "annotate"
-    "mirror_notes_to_ghidra": true, // agent notes also become plate comments
-    "jvm_max_memory": null          // e.g. "8G"; null: Ghidra's default
-  },
+Keys: `config_version`; locations `ghidra_dir`, `jdk_dir`, `ilspycmd`,
+`index_dir`, `projects_root`; response size `token_budget`, `function_budget`,
+`max_budget`, `detail`; decompiler `decompile_timeout_s`, `bulk_decompile`,
+`bulk_decompile_timeout_s`, `decompile_cpu_min`, `decompile_cpu_max`;
+analysis `analysis_timeout_min`, `analysis_s_per_code_mb`, `jvm_max_memory`;
+`mermaid`, `mirror_notes_to_ghidra`; tools `allow_writes`, `disabled_sets`,
+`disabled_tools`.
 
-  // ── Profiles: which sets each kind of session gets ───────────────────
-  // Select with `airlock serve --profile <name>` in the MCP registration.
-  "profiles": {
-    "dirty": {
-      "role": "dirty",
-      "enabled_sets": ["core", "cpp", "resources", "types", "annotate",
-                       "dataflow", "fileformat", "spec_write", "admin"],
-      "allow_writes": true
-    },
-    "clean": {
-      // Clean side sees specifications only. Do not add code sets here.
-      "role": "clean",
-      "enabled_sets": ["spec_read"]
-    }
-  },
-  "default_profile": "dirty",
+### Tool selection
 
-  // ── Tool sets. Comment a line to disable that tool. ──────────────────
-  "sets": {
-    "core": [
-      "open_binary", "list_binaries", "outline",
-      "search", "function", "xrefs", "callgraph", "strings"
-    ],
-    "types": ["type_inspect", "type_search"],
-    "annotate": [
-      "rename", "retype", "comment", "annotate", "struct_define"
-      // "patch_bytes"
-    ],
-    "cpp": ["rtti_classes", "vtable", "mfc_message_maps", "qt_metaobjects"],
-    "delphi": ["delphi_classes", "delphi_forms", "delphi_events"],
-    "dotnet": ["dotnet_types", "dotnet_decompile"],
-    "resources": ["pe_resources", "dialogs", "string_tables", "version_info"],
-    "dataflow": ["trace_values", "switch_tables", "constants"],
-    "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
-    "spec_write": ["spec_write", "spec_list"],
-    "spec_read": ["spec_read", "spec_list", "spec_export"],
-    "admin": ["index_status", "reindex", "project_info", "frontier"]
-  }
-}
-```
+Tools are chosen by a deny list. Every tool in the catalog (`config/catalog.py`,
+which also groups tools into sets) is shown unless it is named in
+`disabled_tools` or its set is named in `disabled_sets`. A tool added in a new
+version therefore appears without any change to the user's file. The template
+lists every tool and set, one per line with its description; a line that
+starts with `//` is shown, a line without it is hidden.
 
 Rules:
 
-- A tool appears in the MCP tool list only if it is in an enabled set and not
-  commented out.
-- A tool listed in a set that does not exist in code is a config error,
+- `disabled_sets` defaults to `delphi` and `dotnet`, `disabled_tools` to
+  `patch_bytes`.
+- `allow_writes: false` removes `annotate` tools even if the set is shown.
+  Writes are never silently refused at call time.
+- The role is code-enforced, not configured. `airlock serve --profile
+  dirty|clean` (default `dirty`) picks the role of the tool list. A clean role
+  only ever has catalog tools flagged `clean_safe`, never has write tools, and
+  `disabled_*` can only remove more (§9).
+- A name in `disabled_tools` or `disabled_sets` that is not in the catalog is
   reported by `doctor` and at startup (logged, not fatal).
-- `allow_writes: false` removes `annotate` tools from the list even if the set
-  is enabled. Writes are never silently refused at call time.
-- A profile with `"role": "clean"` refuses to start if any of its sets contains
-  a tool that returns code, addresses or bytes, or if it allows writes (§9).
-- Merging: dicts merge key by key, lists replace, `null` removes an inherited
-  key. A project overlay can therefore change one profile's `enabled_sets`
-  without restating the rest of the file.
+- Unknown keys are reported, not fatal: `unknown key 'token_budjet' (ignored);
+  did you mean 'token_budget'?` A wrong type or range is an error that names
+  the key and the allowed values.
+- A project overlay can change single keys, for example `disabled_sets`.
+
+### Versions and upgrade
+
+`config_version` (integer, missing means 0) says which layout the file has;
+the built-in version is `CONFIG_VERSION`. At server start, and in `airlock
+doctor`, a lower file version gives a warning:
+`config: version 0 < 1; N tools/keys missing (...) - run airlock config upgrade`.
+
+`airlock config upgrade [--dry-run]` edits the file in place and never deletes
+or reorders what the user wrote:
+
+- A key that is neither active nor commented out in the user's file is new:
+  it is added before the closing brace with its comment block, marked
+  `// added in config_version N`. Commented out means removed on purpose and
+  is never touched.
+- An old file with `defaults`, `profiles` or `sets` (allow lists) is migrated:
+  values that differ from the default become top-level keys; tools or sets
+  that the old file did not expose, although the old default file did, go into
+  `disabled_tools` and `disabled_sets`; the old blocks stay as comments behind
+  `// replaced by disabled_tools in config_version N`.
+- `config_version` is set, `config.jsonc.bak` is written first, and the result
+  must parse and resolve (otherwise nothing is written). `--dry-run` prints a
+  unified diff. `doctor --fix` runs the same upgrade.
+
+### The `airlock config` command
+
+| Command | Effect |
+|---|---|
+| `airlock config` | every key: value in effect, default, source (`built-in`, `global file`, `project overlay`), one line each |
+| `airlock config --set KEY VALUE` | validates and converts the value, writes it into the file keeping comments, re-reads the file and restores it if the result is invalid |
+| `airlock config --unset KEY` | comments the key out again with its default |
+| `airlock config validate` | types and ranges, unknown keys with a suggestion; exit code 1 on errors |
+| `airlock config upgrade [--dry-run]` | see "Versions and upgrade" |
+
 
 ### Runtime set switching
 
@@ -907,9 +910,8 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 | `project_info` | | config in effect, enabled sets, profile, paths |
 | `frontier` | `limit=20` | unnamed functions ranked by call-graph centrality and how interesting their strings/imports/UI links are: "what to reverse next" |
 
-Total with every set enabled: 44 tools. The default dirty profile enables
-36 (no `delphi`, `dotnet`, `spec_read`, and `patch_bytes` commented out); the
-clean profile 3.
+Total in the catalog: 58 tools. The default dirty tool list has 52 (without
+`delphi`, `dotnet` and `patch_bytes`); the clean role has the 6 `clean_safe` tools.
 
 ---
 

@@ -107,6 +107,8 @@ def _decomp_text(ix, p: str, st, b, counts) -> str:
     text = f"decompiled {done}/{st.decomp_target_count(b.id)}"
     if counts["decomp_stale"]:
         text += f" (stale {counts['decomp_stale']})"
+    if counts.get("timeouts"):
+        text += f", timeouts {counts['timeouts']}"
     bp = ix.bulk.progress(p, b.id)
     if bp is None:
         return text

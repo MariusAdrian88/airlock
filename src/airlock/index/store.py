@@ -882,6 +882,9 @@ class Store:
             "decompiled": q(
                 "SELECT COUNT(*) FROM decomp d JOIN function f ON f.id=d.function_id "
                 "WHERE f.binary_id=?"),
+            "timeouts": q(
+                "SELECT COUNT(*) FROM decomp d JOIN function f ON f.id=d.function_id "
+                "WHERE f.binary_id=? AND d.status='timeout' AND d.fn_version=f.version"),
             "decomp_stale": q(
                 "SELECT COUNT(*) FROM decomp d JOIN function f ON f.id=d.function_id "
                 "JOIN binary b ON b.id=f.binary_id WHERE f.binary_id=? AND "

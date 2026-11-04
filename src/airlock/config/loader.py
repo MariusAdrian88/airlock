@@ -1,18 +1,19 @@
 """Load and resolve configuration.
 
-Layers, later wins: built-in defaults -> global config.jsonc -> project
-overlay (project.jsonc) -> the selected profile.
+Layers, later wins: built-in defaults (keys.DEFAULTS) -> global config.jsonc ->
+project overlay. Every setting is a top-level key (see keys.py). Old files with
+`defaults`, `sets` and `profiles` blocks are still read as far as possible;
+`airlock config upgrade` migrates them.
 
-Merge rules: dicts merge key by key, lists and scalars replace, and an
-explicit null removes a key inherited from an earlier layer (for top-level
-locations, null simply means "not set").
+Merge rules: dicts merge key by key, lists and scalars replace, and an explicit
+null removes a key inherited from an earlier layer (the built-in default then
+applies again). For location keys, null simply means "not set".
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,18 @@ import json5
 
 from airlock import paths
 from airlock.config.catalog import CATALOG
+from airlock.config.keys import (
+    DEFAULTS,
+    KEY_BY_NAME,
+    LEGACY_KEYS,
+    suggestion,
+    validate_values,
+)
 
 CLEAN_ROLE = "clean"
 DIRTY_ROLE = "dirty"
 _LOCATION_KEYS = ("ghidra_dir", "jdk_dir", "ilspycmd", "index_dir", "projects_root")
+_NOT_DEFAULTS = set(_LOCATION_KEYS) | {"config_version", "disabled_tools", "disabled_sets"}
 
 
 class ConfigError(Exception):
@@ -51,11 +60,12 @@ class Config:
     projects_root: Path
     defaults: dict[str, Any]
     allow_writes: bool
-    enabled_sets: list[str]
-    sets: dict[str, list[str]]
+    disabled_tools: list[str]
+    disabled_sets: list[str]
     tools: list[str]
     issues: list[Issue] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    file_version: int | None = None   # config_version of the global file; None: no file
 
     @property
     def is_clean(self) -> bool:
@@ -65,7 +75,8 @@ class Config:
 # ── JSONC ──────────────────────────────────────────────────────────────────
 
 def default_config_text() -> str:
-    return resources.files("airlock.config").joinpath("default_config.jsonc").read_text("utf-8")
+    from airlock.config.template import generate_template
+    return generate_template()
 
 
 def parse_jsonc(text: str, origin: str = "<string>") -> dict[str, Any]:
@@ -115,111 +126,121 @@ def _projects_root(value: Any) -> Path:
     return p
 
 
+def effective_values(merged: dict[str, Any], role: str = DIRTY_ROLE) -> dict[str, Any]:
+    """Built-in defaults, then old `defaults` blocks, then the top-level keys."""
+    eff = dict(DEFAULTS)
+    legacy = merged.get("defaults")
+    if isinstance(legacy, dict):
+        eff.update({k: v for k, v in legacy.items() if k in KEY_BY_NAME})
+    profs = merged.get("profiles")
+    if isinstance(profs, dict) and isinstance(profs.get(role), dict):
+        p = profs[role]
+        if "allow_writes" in p:
+            eff["allow_writes"] = p["allow_writes"]
+        if isinstance(p.get("defaults"), dict):
+            eff.update({k: v for k, v in p["defaults"].items() if k in KEY_BY_NAME})
+    eff.update({k: v for k, v in merged.items() if k in KEY_BY_NAME})
+    return eff
+
+
+def check_unknown(data: dict[str, Any], origin: str) -> list[Issue]:
+    """Warnings for keys airlock does not know, with a did-you-mean."""
+    out: list[Issue] = []
+    for k, v in data.items():
+        if k in KEY_BY_NAME:
+            continue
+        if k in LEGACY_KEYS:
+            note = ("still read" if k == "defaults" else
+                    "ignored (tools are chosen with disabled_tools and disabled_sets)")
+            out.append(Issue("warning", f"{origin}: old key '{k}' is {note}; "
+                                        "run `airlock config upgrade`"))
+            if k == "defaults" and isinstance(v, dict):
+                for ik in v:
+                    if ik not in KEY_BY_NAME:
+                        out.append(Issue("warning", f"{origin}: unknown key 'defaults.{ik}' "
+                                                    f"(ignored){suggestion(ik)}"))
+        else:
+            out.append(Issue("warning", f"{origin}: unknown key '{k}' (ignored){suggestion(k)}"))
+    return out
+
+
 def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) -> Config:
     issues: list[Issue] = []
 
-    profiles = merged.get("profiles") or {}
-    name = profile or merged.get("default_profile") or DIRTY_ROLE
-    if name not in profiles:
-        known = ", ".join(sorted(profiles)) or "none"
-        raise ConfigError(f"profile '{name}' is not defined (known: {known})")
-    prof = profiles[name] or {}
-
-    role = prof.get("role", DIRTY_ROLE)
+    role = profile or DIRTY_ROLE
     if role not in (CLEAN_ROLE, DIRTY_ROLE):
-        raise ConfigError(f"profile '{name}': role must be 'clean' or 'dirty'")
+        raise ConfigError(f"profile '{role}' is not defined (use 'dirty' or 'clean')")
 
-    defaults = dict(merged.get("defaults") or {})
-    if isinstance(prof.get("defaults"), dict):
-        defaults = deep_merge(defaults, prof["defaults"])
-    allow_writes = bool(prof.get("allow_writes", defaults.get("allow_writes", False)))
+    eff = effective_values(merged, role)
+    errs = validate_values(eff)
+    if errs:
+        raise ConfigError("; ".join(errs))
 
-    for key in ("token_budget", "function_budget", "max_budget",
-                "decompile_timeout_s", "analysis_timeout_min"):
-        v = defaults.get(key)
-        if v is not None and (not isinstance(v, int) or v <= 0):
-            raise ConfigError(f"defaults.{key} must be a positive integer")
+    allow_writes = bool(eff["allow_writes"]) and role == DIRTY_ROLE
+    defaults = {k: v for k, v in eff.items() if k not in _NOT_DEFAULTS}
+    defaults["allow_writes"] = allow_writes
 
-    mer = defaults.get("mermaid")
-    if mer is not None and not isinstance(mer, bool):
-        raise ConfigError("defaults.mermaid must be true or false")
-
-    bulk = defaults.get("bulk_decompile")
-    if bulk is not None and bulk not in ("lazy", "background"):
-        raise ConfigError("defaults.bulk_decompile must be 'lazy' or 'background'")
-    shares: dict[str, float] = {}
-    for key, fallback in (("decompile_cpu_min", 0.5), ("decompile_cpu_max", 0.75)):
-        v = defaults.get(key, fallback)
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 < v <= 1):
-            raise ConfigError(f"defaults.{key} must be a number above 0 and at most 1")
-        shares[key] = float(v)
-    if shares["decompile_cpu_min"] > shares["decompile_cpu_max"]:
-        raise ConfigError("defaults.decompile_cpu_min must not exceed defaults.decompile_cpu_max")
-
-    spc = defaults.get("analysis_s_per_code_mb")
-    if spc is not None and (isinstance(spc, bool) or not isinstance(spc, (int, float)) or spc <= 0):
-        raise ConfigError("defaults.analysis_s_per_code_mb must be a positive number")
-
-    sets_raw = merged.get("sets") or {}
-    sets: dict[str, list[str]] = {}
-    for set_name, tools in sets_raw.items():
-        if tools is None:
-            continue
-        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
-            raise ConfigError(f"sets.{set_name} must be a list of tool names")
-        sets[set_name] = tools
-
-    enabled_sets = prof.get("enabled_sets", merged.get("enabled_sets", []))
-    if not isinstance(enabled_sets, list):
-        raise ConfigError(f"profile '{name}': enabled_sets must be a list")
+    disabled_tools = list(eff["disabled_tools"])
+    disabled_sets = list(eff["disabled_sets"])
+    set_names = {i.set for i in CATALOG.values()}
+    for t in disabled_tools:
+        if t not in CATALOG:
+            issues.append(Issue("warning", f"unknown tool '{t}' in disabled_tools (ignored)"))
+    for s in disabled_sets:
+        if s not in set_names:
+            issues.append(Issue("warning", f"unknown set '{s}' in disabled_sets (ignored)"))
 
     tools: list[str] = []
-    for set_name in enabled_sets:
-        if set_name not in sets:
-            issues.append(Issue("error", f"enabled set '{set_name}' is not defined in 'sets'"))
+    for name, info in CATALOG.items():
+        if role == CLEAN_ROLE and not info.clean_safe:
+            continue            # a clean session only ever gets clean-safe tools
+        if name in disabled_tools or info.set in disabled_sets:
             continue
-        for tool in sets[set_name]:
-            info = CATALOG.get(tool)
-            if info is None:
-                issues.append(Issue("warning", f"unknown tool '{tool}' in set '{set_name}' (ignored)"))
-                continue
-            if info.writes and not allow_writes:
-                issues.append(Issue("info", f"'{tool}' hidden: allow_writes is off"))
-                continue
-            if tool not in tools:
-                tools.append(tool)
+        if info.writes and not allow_writes:
+            issues.append(Issue("info", f"'{name}' hidden: allow_writes is off"))
+            continue
+        tools.append(name)
 
-    if role == CLEAN_ROLE:
-        leaking = [t for t in tools if not CATALOG[t].clean_safe]
-        if leaking:
-            raise ConfigError(
-                f"profile '{name}' is a clean profile but exposes tools that can return "
-                f"code, addresses or bytes: {', '.join(leaking)}"
-            )
-        if allow_writes:
-            raise ConfigError(f"profile '{name}' is a clean profile and cannot allow writes")
-
-    ghidra_dir = _opt_path(merged.get("ghidra_dir"), "ghidra_dir")
+    ghidra_dir = _opt_path(eff.get("ghidra_dir"), "ghidra_dir")
     if ghidra_dir is None and role == DIRTY_ROLE:
         issues.append(Issue("error", "ghidra_dir is not set"))
 
     return Config(
         source=source,
-        profile=name,
+        profile=role,
         role=role,
         ghidra_dir=ghidra_dir,
-        jdk_dir=_opt_path(merged.get("jdk_dir"), "jdk_dir"),
-        ilspycmd=_opt_path(merged.get("ilspycmd"), "ilspycmd"),
-        projects_root=_projects_root(merged.get("projects_root")),
-        data_dir=_opt_path(merged.get("index_dir"), "index_dir") or paths.default_data_dir(),
+        jdk_dir=_opt_path(eff.get("jdk_dir"), "jdk_dir"),
+        ilspycmd=_opt_path(eff.get("ilspycmd"), "ilspycmd"),
+        projects_root=_projects_root(eff.get("projects_root")),
+        data_dir=_opt_path(eff.get("index_dir"), "index_dir") or paths.default_data_dir(),
         defaults=defaults,
         allow_writes=allow_writes,
-        enabled_sets=list(enabled_sets),
-        sets=sets,
+        disabled_tools=disabled_tools,
+        disabled_sets=disabled_sets,
         tools=tools,
         issues=issues,
         raw=merged,
     )
+
+
+@dataclass
+class Layers:
+    source: Path | None
+    global_data: dict[str, Any] | None
+    overlay_data: dict[str, Any] | None
+    overlay_path: Path | None
+
+
+def load_layers(path: Path | None = None, project_overlay: Path | None = None) -> Layers:
+    source = path or paths.default_config_path()
+    gdata = load_jsonc(source) if source.exists() else None
+    if gdata is None:
+        source = None
+    odata = None
+    if project_overlay is not None and project_overlay.exists():
+        odata = load_jsonc(project_overlay)
+    return Layers(source, gdata, odata, project_overlay if odata is not None else None)
 
 
 def load_config(
@@ -227,20 +248,26 @@ def load_config(
     profile: str | None = None,
     project_overlay: Path | None = None,
 ) -> Config:
-    """Load built-in defaults, the global file (if present) and an optional overlay."""
-    merged = parse_jsonc(default_config_text(), "built-in defaults")
-    source = path or paths.default_config_path()
-    if source.exists():
-        merged = deep_merge(merged, load_jsonc(source))
-    else:
-        source = None
-    if project_overlay is not None and project_overlay.exists():
-        merged = deep_merge(merged, load_jsonc(project_overlay))
-    return resolve(merged, profile, source)
+    """Load the global file (if present) and an optional overlay over the built-in defaults."""
+    lay = load_layers(path, project_overlay)
+    merged: dict[str, Any] = {}
+    issues: list[Issue] = []
+    if lay.global_data is not None:
+        merged = deep_merge(merged, lay.global_data)
+        issues += check_unknown(lay.global_data, str(lay.source))
+    if lay.overlay_data is not None:
+        merged = deep_merge(merged, lay.overlay_data)
+        issues += check_unknown(lay.overlay_data, str(lay.overlay_path))
+    cfg = resolve(merged, profile, lay.source)
+    cfg.issues += issues
+    if lay.global_data is not None:
+        v = lay.global_data.get("config_version", 0)
+        cfg.file_version = v if isinstance(v, int) and not isinstance(v, bool) else 0
+    return cfg
 
 
 def write_default_config(path: Path, ghidra_dir: Path | None = None) -> Path:
-    """Write the commented default config, optionally with ghidra_dir filled in."""
+    """Write the verbose, documented default config, optionally with ghidra_dir filled in."""
     text = default_config_text()
     if ghidra_dir is not None:
         value = str(ghidra_dir).replace("\\", "/")

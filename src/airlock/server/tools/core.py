@@ -9,9 +9,11 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime, timezone
+from typing import Any
 
 from airlock.index.store import CrossRef, Function, StringHit
 from airlock.projects import read_manifest, read_sections
+from airlock.server.bulk import BG_TIMEOUT
 from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
 )
@@ -317,13 +319,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[str | None, str | None]:
-    """(c_text, error line). Uses the cache when fn_version and analysis_profile match."""
+def _timeout_error(fn: Function, what: Any) -> str:
+    return (f"error decompile_timeout: {fn.qualified_name}: {what}. "
+            "Try view=signature or xrefs, or raise defaults.decompile_timeout_s.")
+
+
+def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
+                    retry: bool = False) -> tuple[str | None, str | None]:
+    """(c_text, error line). Uses the cache when fn_version and analysis_profile match.
+    A timeout row from the background pass (short timeout) gets one decompile with the full
+    timeout; a timeout from a full-timeout attempt is not repeated unless retry is set."""
     st, b = bd.store, bd.binary
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
     if cached is not None and cached.status == "ok" and cached.c_text is not None:
         return cached.c_text, None
+    if (cached is not None and cached.status == "timeout" and not retry
+            and not (cached.error or "").startswith(BG_TIMEOUT)):
+        return None, _timeout_error(fn, cached.error or "timeout") + " Pass retry=true to try again."
     ix = ctx.indexer
     timeout = int(ctx.config.defaults.get("decompile_timeout_s") or 60)
     try:
@@ -337,8 +350,9 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[str | 
         st.upsert_decomp(fn.id, fn.version, profile, d.get("status") or "error",
                          error=d.get("error"), produced_at=_now())
         what = d.get("error") or d.get("status")
-        code = "decompile_timeout" if d.get("status") == "timeout" else "decompile_failed"
-        return None, (f"error {code}: {fn.qualified_name}: {what}. "
+        if d.get("status") == "timeout":
+            return None, _timeout_error(fn, what)
+        return None, (f"error decompile_failed: {fn.qualified_name}: {what}. "
                       "Try view=signature or xrefs, or raise defaults.decompile_timeout_s.")
     st.upsert_decomp(fn.id, fn.version, profile, "ok", c_text=d["c_text"], produced_at=_now())
     cols = d["ast_columns"]
@@ -359,7 +373,7 @@ def _parse_lines(spec: str) -> tuple[int, int] | None:
                   "(view=signature), by name or address.")
 def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
              lines: str = "", cursor: str = "", budget: int = 0, detail: str = "brief",
-             outline: bool = True) -> str:
+             outline: bool = True, retry: bool = False) -> str:
     bud = budget_for(ctx, budget, "function_budget")
     if not target.strip():
         return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
@@ -411,7 +425,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             offset = STORE.get(cursor, "function", args, identity).offset
         except CursorError as e:
             return e.message
-    c_text, err = _get_decompiled(ctx, bd, fn)
+    c_text, err = _get_decompiled(ctx, bd, fn, retry)
     if err:
         return err
     assert c_text is not None
