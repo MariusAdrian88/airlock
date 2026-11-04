@@ -44,8 +44,11 @@ def _step(g: gr.CallGraph, p: list[int], i: int) -> str:
         line = f"→ [{g.bin_name(g.nodes[v][0])}] {g.qname(v)} {g.addr(v)}"
     if i:
         s = g.site(p[i - 1], v)
+        ptr = (p[i - 1], v) in g.ptr_only
         if s is not None:
-            line += f"   call at {g.site_addr(p[i - 1], s)}"
+            line += f"   {'ref' if ptr else 'call'} at {g.site_addr(p[i - 1], s)}"
+        if ptr:
+            line += " (via pointer)"
     return line
 
 

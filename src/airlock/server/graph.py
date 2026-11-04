@@ -22,11 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
-from airlock.index.store import CODE_EDGES, CODE_SQL, Store
+from airlock.index.store import CODE_EDGES, CODE_SQL, GRAPH_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
 from airlock.server.selectors import fmt_addr, parse_address, split_binary_target
 
-CALL_KINDS = CODE_EDGES
+CALL_KINDS = GRAPH_EDGES   # call edges plus fnptr (call through a pointer)
 HUB_PERCENT = 0.01
 HUB_MIN_CALLERS = 20
 MAX_SITES = 8
@@ -124,6 +124,7 @@ class CallGraph:
     binaries: dict[int, tuple[str, int]] = field(default_factory=dict)      # id -> (name, pointer size)
     index: dict[tuple[int, str, int], int] = field(default_factory=dict)
     node_of_fid: dict[tuple[int, int], int] = field(default_factory=dict)
+    ptr_only: set[tuple[int, int]] = field(default_factory=set)             # hops that exist only via fnptr
     _adj: list[list[int]] | None = None
     _names: dict[str, list[int]] | None = None
 
@@ -224,6 +225,9 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
 
     cats: dict[int, Counter] = {}
     raw: list[tuple[int, int, int, int, int]] = []     # bid, src node, dst fid or -1, dst addr, site
+    ptr_keys: set[tuple[int, int, int]] = set()        # (bid, site, dst addr) of fnptr edges
+    ptr_pairs: set[tuple[int, int]] = set()
+    call_pairs: set[tuple[int, int]] = set()
     thunk_out: dict[tuple[int, int], list[tuple[int, int]]] = {}
     imp_by_addr: dict[int, dict[int, ImportKey]] = {}
     imp_by_name: dict[int, dict[str, ImportKey]] = {}
@@ -285,6 +289,8 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
                     for c in sc:
                         cats.setdefault(sn, Counter())[c] += 1
             if is_call:
+                if kind == "fnptr":
+                    ptr_keys.add((bid, r["src_addr"], da))
                 raw.append((bid, sn, -1 if df is None else df, da, r["src_addr"]))
 
     memo: dict[tuple[int, int], int | None] = {}
@@ -381,6 +387,7 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
             if dn != sn:
                 directed[(sn, dn)] = directed.get((sn, dn), 0) + 1
                 add_site((sn, dn), site)
+                (ptr_pairs if (bid, site, da) in ptr_keys else call_pairs).add((sn, dn))
             f2 = fns[bid].get(df) if df >= 0 else None
             if f2 is None or f2[2] or f2[3]:
                 k = import_of(bid, df, da)
@@ -408,6 +415,7 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
 
     g = CallGraph(nodes, info, directed, cats, sites, imports, imp_directed, import_resolved,
                   import_table)
+    g.ptr_only = ptr_pairs - call_pairs
     g.index = {(b, sp, en): i for i, (b, sp, en, _f) in enumerate(nodes)}
     g.node_of_fid = {(b, f): i for i, (b, _sp, _en, f) in enumerate(nodes)}
     for bid in bids:

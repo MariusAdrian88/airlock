@@ -11,7 +11,7 @@ crashes; on Windows the Job Object additionally guarantees it (win.jobobject).
 
 Requests run on two lanes so a long job never blocks the cheap ones (DESIGN.md section 8):
 - CONCURRENT_OPS (hello, status, cancel_*, decompile, decompile_batch, bulk_decompile,
-  external_paths) each get their own thread and answer while anything else runs;
+  external_paths, disassemble) each get their own thread and answer while anything else runs;
 - every other op runs one at a time on the main thread, in arrival order, as before
   (the JVM must be started from the main thread).
 Responses carry their request id and may arrive in any order. All protocol writes go
@@ -36,7 +36,7 @@ Handler = Callable[[dict[str, Any]], dict[str, Any]]
 OPS: dict[str, Handler] = {}
 CONCURRENT_OPS = frozenset({
     "hello", "status", "cancel_analysis", "cancel_bulk", "decompile", "decompile_batch",
-    "bulk_decompile", "external_paths",
+    "bulk_decompile", "external_paths", "disassemble",
 })
 
 

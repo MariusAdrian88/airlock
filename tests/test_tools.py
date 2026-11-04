@@ -49,6 +49,17 @@ DATA = {"functions": (FN_COLS, FUNCTIONS), "edges": (EDGE_COLS, EDGES),
         "strings": (STR_COLS, STRINGS), "imports": (IMP_COLS, IMPORTS),
         "exports": (EXP_COLS, EXPORTS)}
 
+ASM_ROWS = [
+    [0x401000, 1, "PUSH EBP", "", "", 1],
+    [0x401001, 2, "MOV EBP,ESP", "", "", 0],
+    [0x401003, 5, "CALL 0x00401100", "CMainFrame::OnFoo", "", 0],
+    [0x401008, 2, "TEST EAX,EAX", "", "", 0],
+    [0x40100a, 2, "JZ LAB_00401012", "", "", 0],
+    [0x40100c, 5, "PUSH 0x403000", '"Open file failed"', "", 1],
+    [0x401011, 1, "RET", "", "", 0],
+    [0x401012, 1, "POP EBP", "", "LAB_00401012", 1],
+]
+
 C_TEXT = "void main(void)\n{\n  OnFoo();\n  FUN_00401200();\n  return;\n}\n"
 
 
@@ -120,6 +131,9 @@ class FakeWorker:
             return {"status": "ok", "c_text": self.c_text, "error": None,
                     "ast_columns": ["kind", "start_off", "end_off", "address", "target", "text"],
                     "ast": _ast(self.c_text)}
+        if op == "disassemble":
+            return {"entry": args["entry"], "name": "main", "columns": [], "total": len(ASM_ROWS),
+                    "truncated": False, "rows": ASM_ROWS}
         raise AssertionError(op)
 
     project_path = ""
@@ -535,8 +549,6 @@ def test_function_views_and_errors(ctx):
     sig = core.function(ctx, "main", view="signature")
     assert sig == "0x00401000 int main(void) [__cdecl, 64 bytes, user] callers 1"
     assert ctx.worker.count("decompile") == 0
-    assert core.function(ctx, "main", view="asm").startswith("error not_implemented:")
-    assert core.function(ctx, "main", view="both").startswith("error not_implemented:")
     assert core.function(ctx, "main", view="zz").startswith("error bad_args:")
     assert core.function(ctx, "").startswith("error bad_target:")
     assert core.function(ctx, "nosuch").startswith("error not_found:")

@@ -419,6 +419,10 @@ class Indexer:
             if (paths.artifacts / b.sha256).is_file():
                 n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
         try:
+            self.refresh_fixups(slug, store)  # older post-analysis fixups: no re-analysis
+        except Exception as e:  # noqa: BLE001  an extra; the binaries stay usable
+            log.warning("cannot refresh the fixups of %s: %s", slug, e)
+        try:
             if linking.needs_relink(store):  # links built by an older version: no re-analysis
                 ready = linking.ready_ids(store)
                 linking.relink_project(store, paths.artifacts,
@@ -429,6 +433,41 @@ class Indexer:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
             log.warning("cannot resume the decompile pass of %s: %s", slug, e)
+        return n
+
+    def refresh_fixups(self, project: str, store: Store) -> int:
+        """Ready binaries whose stored collector version (meta ``collector:<id>``) is not the
+        worker's: run the worker's ``apply_fixups`` (no re-analysis), re-read the function rows
+        (calling conventions) and store the new analysis profile, which invalidates the old
+        decompiles. Returns the number of binaries refreshed."""
+        n = 0
+        for b in store.list_binaries():
+            if self.get_status(store, b.id)[0] != "ready" or self.job_for(project, b.id) is not None:
+                continue
+            have = store.get_meta(f"collector:{b.id}")
+            program = store.get_meta(f"program:{b.id}")
+            if not program:
+                continue
+            self.ensure_open(project)
+            res = self.worker.request("apply_fixups", {
+                "program": program, "have_collector": int(have) if have else None,
+                "parameter_id": bool(self.config.defaults.get("decompiler_parameter_id", True)),
+            }, timeout=3600)
+            if res.get("skipped"):
+                continue
+            offset = 0
+            while True:  # functions only: the upsert bumps the version of changed rows
+                r = self.worker.request("extract", {"program": program, "kind": "functions",
+                                                    "offset": offset, "limit": PAGE_SIZE["functions"]},
+                                        timeout=900)
+                store.insert_functions(b.id, map_function_rows(r["columns"], r["rows"]))
+                if r.get("done") or r.get("next_offset") is None:
+                    break
+                offset = r["next_offset"]
+            store.rebuild_fts(b.id)
+            store.upsert_binary(b.sha256, b.name, analysis_profile=res.get("analysis_profile"))
+            store.set_meta(f"collector:{b.id}", str(res.get("collector")))
+            n += 1
         return n
 
     def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
@@ -680,6 +719,7 @@ class Indexer:
             res = w.request("analyze", {
                 "program": job.program,
                 "timeout_min": self.config.defaults.get("analysis_timeout_min"),
+                "parameter_id": bool(self.config.defaults.get("decompiler_parameter_id", True)),
             }, timeout=300)
             if res.get("already_analysed") or res.get("state") == "ready":
                 job.already_analysed = bool(res.get("already_analysed"))
@@ -732,10 +772,11 @@ class Indexer:
             res = run_extraction(self.worker, st, bid, job.program)
             job.timings = {**{f"extract_{k}": v for k, v in res["secs"].items()},
                            "extract_total": round(time.monotonic() - t0, 2)}
-            profile = None
+            profile = collector = None
             try:
                 s = self.worker.request("status", {"program": job.program}, timeout=30)
                 profile = (s.get("programs") or [{}])[0].get("analysis_profile")
+                collector = (s.get("programs") or [{}])[0].get("collector")
             except WorkerError:
                 pass
             b = st.get_binary_by_id(bid)
@@ -743,6 +784,8 @@ class Indexer:
             st.upsert_binary(b.sha256, b.name, pointer_size=res["pointer_size"],
                              image_base=res["image_base"], analysis_profile=profile,
                              analysed_at=_now())
+            if collector is not None:
+                st.set_meta(f"collector:{bid}", str(collector))
             extra: dict[str, Any] = {"code_size": job.code_size,
                                      "extract_s": job.timings["extract_total"]}
             if analysis_s is not None:

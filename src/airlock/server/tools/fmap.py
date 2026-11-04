@@ -10,8 +10,8 @@ from airlock.server import clusters as cl
 from airlock.server.budget import CursorError, estimate_tokens, fit_lines, footer, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
-from airlock.server.selectors import resolve_function
-from airlock.server.tools.common import bind_target, budget_for
+from airlock.server import targets as tg
+from airlock.server.tools.common import budget_for
 
 MAX_MEMBER_LINES = 500
 
@@ -41,6 +41,22 @@ def _have(cs: cl.ClusterSet) -> str:
     return ", ".join(ids[:12]) + (f", … {len(ids) - 12} more" if len(ids) > 12 else "")
 
 
+def _import_scope(cs: cl.ClusterSet, tr: tg.ImportTarget):
+    """Scope of an import: the clusters that contain its callers."""
+    near: dict[str, int] = {}
+    for _bd, f in tg.import_callers(tr, 2000):
+        c = cs.of((f.binary_id, f.space, f.entry))
+        if c is not None:
+            near[c.id] = near.get(c.id, 0) + 1
+    if not near:
+        return None, None, [], tg.err(
+            "not_clustered", f"no clustered function calls {tr.label}",
+            "Use xrefs on it, or pass a function")
+    head = [f"{tr.label} is called from " + ", ".join(
+        f"{k} ({v} callers)" for k, v in sorted(near.items(), key=lambda kv: (-kv[1], kv[0])))]
+    return (lambda c: c.id in near), None, head, None
+
+
 def _scope_filter(ctx: ServerContext, pp: ProjectPaths, cs: cl.ClusterSet, scope: str):
     """(predicate on Cluster | None, member-binary id | None, header lines, error | None)."""
     st = ctx.indexer.store(pp.name)
@@ -58,14 +74,13 @@ def _scope_filter(ctx: ServerContext, pp: ProjectPaths, cs: cl.ClusterSet, scope
     if bins:
         bid = bins[0].id
         return (lambda c: any(m.key[0] == bid for m in c.members)), bid, [], None
-    bd = bind_target(ctx, "", scope)
-    if isinstance(bd, str):
-        return None, None, [], bd
-    bound, bare, _note = bd
-    r = resolve_function(bound.store, bound.binary.id, bare)
-    if r.function is None:
-        return None, None, [], r.error
-    fn = r.function
+    tr = tg.resolve_target(ctx, "", scope, (tg.FUNCTION, tg.IMPORT))
+    if isinstance(tr, str):
+        return None, None, [], tr
+    if isinstance(tr, tg.ImportTarget):
+        return _import_scope(cs, tr)
+    assert isinstance(tr, tg.FunctionTarget)
+    bound, fn = tr.bound, tr.fn
     key = (fn.binary_id, fn.space, fn.entry)
     own = cs.of(key)
     if own is None:
@@ -85,11 +100,12 @@ def _scope_filter(ctx: ServerContext, pp: ProjectPaths, cs: cl.ClusterSet, scope
 
 
 @tool("function_map", "List the subsystem clusters of the program (scope narrows by feature, binary "
-                      "or function) or, with cluster=C3, the functions of one subsystem.")
+                      "or function; runtime library clusters need include_runtime) or, with cluster=C3, "
+                      "the functions of one subsystem.")
 def function_map(ctx: ServerContext, scope: str = "", cluster: str = "", limit: int = 30,
-                 cursor: str = "", budget: int = 0) -> str:
+                 cursor: str = "", budget: int = 0, include_runtime: bool = False) -> str:
     bud = budget_for(ctx, budget)
-    args = {"scope": scope, "cluster": cluster}
+    args = {"scope": scope, "cluster": cluster, "include_runtime": include_runtime}
     if cursor:
         try:
             return resume_lines(cursor, bud, "prose", tool="function_map", args=args)[0]
@@ -128,7 +144,14 @@ def function_map(ctx: ServerContext, scope: str = "", cluster: str = "", limit: 
     rows = [c for c in cl.ordered(cs) if pred is None or pred(c)]
     if not rows:
         return "no subsystem matches the scope. Call function_map without scope."
+    hidden = [] if include_runtime else [c for c in rows if c.runtime]
+    if hidden:
+        rows = [c for c in rows if not c.runtime]
     lines = head + [cl.cluster_line(cs, c) for c in rows]
+    if hidden:
+        lines.append(f"{len(hidden)} runtime clusters ({sum(c.total for c in hidden)} fns) hidden: "
+                     + ", ".join(c.id for c in hidden[:8]) + (", …" if len(hidden) > 8 else "")
+                     + ". function_map(include_runtime=true) shows them.")
     return _page(lines, len(head), int(limit), bud, args)
 
 

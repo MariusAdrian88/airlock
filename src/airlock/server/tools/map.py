@@ -13,12 +13,13 @@ from airlock.index.store import Store
 from airlock.projects import ProjectPaths
 from airlock.server import features as fx
 from airlock.server import projectmap as pm
+from airlock.server import targets as tg
 from airlock.server.budget import (
     CursorError, estimate_tokens, fit_lines, footer, resume_lines,
 )
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
-from airlock.server.selectors import fmt_addr, resolve_function, split_binary_target
+from airlock.server.selectors import fmt_addr
 from airlock.server.tools.common import budget_for
 
 _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9:_.-]{0,47}$")
@@ -193,31 +194,15 @@ def feature(ctx: ServerContext, key: str = "", depth: int = 0, binary: str = "",
     return _limited(lines, len(head), int(limit), bud, "feature", args)
 
 
-def _resolve_targets(st: Store, tokens: list[str]) -> tuple[list[tuple[int, str, int, str]], str | None]:
+def _resolve_targets(ctx: ServerContext, tokens: list[str]) -> tuple[list[tuple[int, str, int, str]], str | None]:
     """[(binary id, space, entry, label)] for the function tokens, or a one-line error."""
-    ready = [b for b in st.list_binaries() if st.get_meta(f"status:{b.id}") == "ready"]
     out: list[tuple[int, str, int, str]] = []
     for tok in tokens:
-        bname, bare = split_binary_target(st, tok)
-        pool = [b for b in ready if not bname or b.name.lower() == bname.lower()]
-        if not pool:
-            return [], f"error not_ready: no ready binary for '{tok}'. Call list_binaries."
-        found = []
-        errs = []
-        for b in pool:
-            r = resolve_function(st, b.id, bare)
-            if r.function is not None:
-                found.append((b, r.function))
-            elif r.error:
-                errs.append(r.error)
-        if not found:
-            return [], errs[0] if errs else f"error not_found: no function '{tok}'. Use search."
-        if len(found) > 1:
-            where = ", ".join(b.name for b, _ in found)
-            return [], (f"error ambiguous_binary: '{tok}' exists in {where}. "
-                        "Write it as binary!function.")
-        b, fn = found[0]
-        out.append((b.id, fn.space, fn.entry, fn.qualified_name))
+        tr = tg.resolve_target(ctx, "", tok, (tg.FUNCTION,))
+        if isinstance(tr, str):
+            return [], tr
+        assert isinstance(tr, tg.FunctionTarget)
+        out.append((tr.fn.binary_id, tr.fn.space, tr.fn.entry, tr.fn.qualified_name))
     return out, None
 
 
@@ -238,7 +223,7 @@ def feature_define(ctx: ServerContext, key: str, title: str = "", functions: str
     if not title:
         return f"error need_title: new feature '{key}' needs a title. Pass title=."
     toks = [t.strip() for t in functions.replace("\n", ",").split(",") if t.strip()]
-    targets, err = _resolve_targets(st, toks)
+    targets, err = _resolve_targets(ctx, toks)
     if err:
         return err
     tp = ", ".join(t.strip() for t in topics.split(",") if t.strip()) if topics else \

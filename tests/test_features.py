@@ -87,9 +87,13 @@ def entries(st, key):
     ("InternetOpenA", "network"), ("WinHttpOpen", "network"), ("DeviceIoControl", "hardware"),
     ("SetupDiGetClassDevsW", "hardware"), ("HidD_GetAttributes", "hardware"),
     ("LoadLibraryA", "plugins"), ("GetProcAddress", "plugins"), ("CoCreateInstance", "plugins"),
-    ("CreateWindowExW", "ui"), ("DialogBoxParamA", "ui"), ("CreateDialogIndirectParamW", "ui"),
-    ("LoadMenuA", "ui"), ("wglCreateContext", "graphics"), ("glBegin", "graphics"),
-    ("BitBlt", "graphics"), ("StretchBlt", "graphics"), ("CryptAcquireContextA", "licensing"),
+    ("CreateWindowExW", "ui-window"), ("DialogBoxParamA", "ui-dialog"),
+    ("CreateDialogIndirectParamW", "ui-dialog"), ("MessageBoxA", "ui-dialog"),
+    ("LoadMenuA", "ui-menu"), ("TrackPopupMenu", "ui-menu"), ("wglCreateContext", "graphics"),
+    ("glBegin", "graphics"), ("BitBlt", "ui-draw"), ("StretchBlt", "ui-draw"), ("TextOutA", "ui-draw"),
+    ("GetKeyState", "ui-input"), ("SetTimer", "ui-input"), ("CDC::TextOut", "ui-draw"),
+    ("CWnd::OnPaint", "ui-window"), ("CMenu::LoadMenu", "ui-menu"), ("GdiplusStartup", "graphics"),
+    ("Direct3DCreate9", "graphics"), ("ChooseColorA", "ui-dialog"), ("CryptAcquireContextA", "licensing"),
     ("BCryptOpenAlgorithmProvider", "licensing"), ("GetSystemTime", "licensing"),
     ("CreateObject", "scripting"), ("_RegOpenKeyExA@20", "config"),
 ])
@@ -166,7 +170,7 @@ def test_coverage_counts_named_functions(st):
     assert row["named"] == 0 and row["n"] >= 5
     with st.db:
         st.db.execute("UPDATE function SET name='read_cfg', name_state='user' WHERE name='FUN_a'")
-        st.db.execute("UPDATE function SET name_state='library' WHERE name='FUN_b'")
+        st.db.execute("UPDATE function SET name_state='user' WHERE name='FUN_b'")
     row2 = next(r for r in fx.stats(st) if r["key"] == "file-io")
     assert row2["named"] == 2 and row2["n"] == row["n"]
     assert fx.coverage(row2["n"], row2["named"]).startswith("named 2 of ")
@@ -241,3 +245,51 @@ def test_migration_v2_to_v3(tmp_path):
     assert s.feature_stats()[0]["n"] == 1
     assert s.get_binary_by_id(b).name == "app.exe"
     s.close()
+
+
+# -- ui split, library functions are not seeds ----------------------------------------------------------
+
+def build_ui(st: Store):
+    """app.dll: one caller per UI API family, an MFC-named caller and a function only the MFC one calls."""
+    b = st.upsert_binary("aa" * 32, "app.dll", pointer_size=4)
+    apis = [("CreateWindowExA", "ui-window"), ("DialogBoxParamA", "ui-dialog"), ("LoadMenuA", "ui-menu"),
+            ("BitBlt", "ui-draw"), ("GetKeyState", "ui-input"), ("MessageBoxA", "ui-dialog"),
+            ("glBegin", "graphics")]
+    st.insert_functions(b, [fn(0x1000 + i * 0x100, f"user_{k}") for i, (_a, k) in enumerate(apis)]
+                        + [fn(0x3000, "OnPaint", ns="CWnd"), fn(0x3100, "helper"), fn(0x3200, "_crt_x")])
+    st.insert_imports(b, [("USER32.DLL", a, None, 0x8000 + i * 0x10) for i, (a, _k) in enumerate(apis)])
+    st.insert_edges(b, [(0x1000 + i * 0x100 + 4, 0x8000 + i * 0x10, "call_ind") for i in range(len(apis))]
+                    + [(0x3004, 0x8000, "call_ind"),      # MFC-named OnPaint calls CreateWindowEx
+                       (0x3104, 0x8010, "call_ind"),      # helper calls DialogBoxParam ...
+                       (0x3204, 0x3100, "call"),          # ... and is only called from a CRT function
+                       (0x3008, 0x3100, "call")])         # ... and from the MFC function
+    st.link_edges(b)
+    return b
+
+
+def test_ui_split_seeds_and_library_not_seeds(st, capsys):
+    b = build_ui(st)
+    counts = fx.derive(st, runtime_ids=set())
+    assert "ui" not in counts
+    got = {k: {n for (_b, n) in entries(st, k)} for k in counts}
+    assert got["ui-window"] == {"user_ui-window"}              # OnPaint (MFC name) is not a seed
+    assert got["ui-dialog"] == {"user_ui-dialog"}              # helper: only library callers -> library
+    assert got["ui-menu"] == {"user_ui-menu"} and got["ui-draw"] == {"user_ui-draw"}
+    assert got["ui-input"] == {"user_ui-input"} and got["graphics"] == {"user_graphics"}
+    assert all(r[1] == 0 for k in ("ui-window", "ui-dialog") for r in entries(st, k).values())
+    for k in ("ui-window", "ui-dialog", "ui-menu", "ui-draw", "ui-input", "graphics"):
+        assert fx.feature_title(k) and k in fx.FEATURES
+    with capsys.disabled():
+        print("\n[features] " + ", ".join(f"{k}={counts[k]}" for k in sorted(counts)))
+    assert fx.dropped(st) == {}
+
+
+def test_cap_still_applies_per_split_feature(st, monkeypatch):
+    monkeypatch.setattr(fx, "MAX_ENTRIES", 3)
+    b = st.upsert_binary("aa" * 32, "big.dll", pointer_size=4)
+    st.insert_functions(b, [fn(0x1000 + i * 0x100, f"f{i}") for i in range(6)])
+    st.insert_imports(b, [("USER32.DLL", "SetTimer", None, 0x8000)])
+    st.insert_edges(b, [(0x1000 + i * 0x100 + 4, 0x8000, "call_ind") for i in range(6)])
+    st.link_edges(b)
+    assert fx.derive(st, runtime_ids=set())["ui-input"] == 3
+    assert fx.dropped(st) == {"ui-input": 3}

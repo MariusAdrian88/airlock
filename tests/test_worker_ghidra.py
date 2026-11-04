@@ -149,6 +149,27 @@ def test_extract_functions(world):
     assert r["next_offset"] == 1 and r["done"] is False
 
 
+def test_calling_conventions_are_set_on_x86_32(world):
+    """After analysis (Parameter ID + instruction fixups) few functions have no convention,
+    and apply_fixups is skipped when current and stable when forced again."""
+    c = world["client"]
+    if world["import"]["pointer_size"] != 4:
+        pytest.skip("32-bit x86 only")
+    cols, rows = extract_all(c, "functions")
+    code = [f for f in as_dicts(cols, rows) if not f["is_external"] and not f["is_thunk"]]
+    unset = [f for f in code if f["calling_conv"] in (None, "", "unknown", "default")]
+    assert len(unset) <= 0.10 * len(code), f"{len(unset)} of {len(code)} functions without convention"
+    convs = {f["calling_conv"] for f in code}
+    assert convs & {"__thiscall", "__stdcall", "__cdecl", "__fastcall"}
+    status = c.request("status", {"program": PROGRAM})["programs"][0]
+    cur = status["collector"]
+    assert c.request("apply_fixups", {"program": PROGRAM, "have_collector": cur})["skipped"] is True
+    res = c.request("apply_fixups", {"program": PROGRAM, "have_collector": None}, timeout=1800)
+    assert res["collector"] == cur and len(res["analysis_profile"]) == 16
+    assert not res.get("parameter_id"), "Parameter ID must not rerun when conventions are set"
+    assert sum(res["conventions"].values()) <= 0.02 * len(code)
+
+
 def test_extract_batches_are_resumable_and_random_access(world):
     c = world["client"]
     _, all_rows = extract_all(c, "functions", limit=50)
@@ -443,3 +464,26 @@ def test_report_timings(world, capsys):
         print("TIMINGS " + ", ".join(f"{k}={v:.2f}" for k, v in sorted(TIMINGS.items())))
         print("COUNTS", {k: len(extract_all(world["client"], k)[1])
                          for k in ("functions", "imports", "strings", "edges")})
+
+
+def test_disassemble(world):
+    c = world["client"]
+    cols, rows = extract_all(c, "functions", limit=300)
+    fns = [f for f in as_dicts(cols, rows) if not f["is_external"] and not f["is_thunk"]]
+    f = max((x for x in fns if x["size"] < 3000), key=lambda x: x["size"])
+    d = c.request("disassemble", {"program": PROGRAM, "entry": f["entry"]}, timeout=120)
+    assert d["entry"] == f["entry"] and d["columns"] == ["addr", "length", "text", "note", "label", "block"]
+    r = [dict(zip(d["columns"], x)) for x in d["rows"]]
+    assert r and d["total"] == len(r) and not d["truncated"]
+    assert r[0]["addr"] == f["entry"] and r[0]["block"] == 1
+    addrs = [x["addr"] for x in r]
+    assert addrs == sorted(addrs) and len(set(addrs)) == len(addrs)
+    assert all(x["length"] > 0 and x["text"] for x in r)
+    labels = [x for x in r if x["label"]]
+    assert labels and all(x["block"] == 1 for x in labels)
+    assert any(x["label"] in y["text"] for x in labels for y in r)  # jumps use the label
+    assert any(x["note"] for x in r)  # at least one resolved call / global reference
+    cut = c.request("disassemble", {"program": PROGRAM, "entry": f["entry"], "max_instructions": 5})
+    assert len(cut["rows"]) == 5 and cut["truncated"] and cut["total"] == d["total"]
+    with pytest.raises(WorkerError):
+        c.request("disassemble", {"program": PROGRAM, "entry": 0})

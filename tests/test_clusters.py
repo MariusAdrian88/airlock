@@ -67,6 +67,9 @@ def proj(tmp_path):
                     {"path": "lib.dll", "group": "own_plugin", "sha256": "bb" * 32},
                     {"path": "crt_rt.dll", "group": "runtime", "sha256": "cc" * 32}]
     P.write_manifest(pp.manifest, man)
+    # set_status('ready') queues a background map refresh that computes (and caches) clusters;
+    # let it finish so it cannot race the test's own edits and cache writes
+    assert ctx.wait_maps()
     return ctx, pp, st, (app, lib, rt)
 
 
@@ -177,6 +180,7 @@ def test_cache_and_fingerprint_invalidation(proj):
 def test_label_survives_recomputation(proj):
     ctx, pp, st, (app, lib, rt) = proj
     assert ctx.bind_session("dirty", pp) is None
+    assert ctx.wait_maps()
     out = fmap.cluster_label(ctx, "C1", "Alpha  engine")
     assert out.startswith('C1 labeled "Alpha engine"')
     cs = cl.get_clusters(ctx, "proj")
@@ -260,7 +264,8 @@ def test_function_map_scopes(proj):
     assert out.splitlines()[0].startswith("beta0 (0x00009000) is in ")
     assert f"is in {beta.id}" in out.splitlines()[0] and f"neighbours: {alpha.id} " in out.splitlines()[0]
     assert {ln.split()[0] for ln in out.splitlines()[1:]} == {alpha.id, beta.id}
-    assert fmap.function_map(ctx, scope="app.exe!LibFn").startswith("error not_clustered")
+    imp = fmap.function_map(ctx, scope="app.exe!LibFn").splitlines()      # import-like: clusters of its callers
+    assert " is called from " in imp[0] and imp[0].endswith(" callers)") and len(imp) > 1
     assert fmap.function_map(ctx, scope="nosuchthing").startswith("error")
     # feature scope
     st.define_feature("cfg", "Config", "", "now")
@@ -335,3 +340,125 @@ def test_performance_20k_functions_200k_edges(tmp_path, capsys):
     assert dt < 10
     assert 50 <= len(regular) <= 400
     st.close()
+
+
+# -- library recognition, runtime clusters ------------------------------------------------------
+
+from airlock.server import features as fx  # noqa: E402
+
+
+@pytest.mark.parametrize("name,ns,state,want", [
+    ("OnPaint", "CWnd", "auto", "MFC"), ("CString", "CString", "auto", "MFC"),
+    ("Serialize", "CArchive", "auto", "MFC"), ("AfxThrowMemoryException", None, "auto", "MFC"),
+    ("Open", "CFile", "auto", "MFC"), ("CObject", "CObject", "auto", "MFC"),
+    ("Foo", "CMyDocument", "auto", None),                      # own C-class is not MFC
+    ("insert", "std", "auto", "ATL/STL"), ("Release", "ATL", "auto", "ATL/STL"),
+    ("__crt_debugger", None, "auto", "CRT"), ("_malloc", None, "auto", "CRT"),
+    ("__security_check_cookie", None, "auto", "CRT"), ("_EH_prolog", None, "auto", "CRT"),
+    ("__SEH_prolog", None, "auto", "CRT"), ("memcpy", None, "auto", "CRT"),
+    ("operator_new", None, "auto", "ATL/STL"),
+    ("FUN_00401000", None, "auto", None), ("Parse", None, "auto", None),
+    ("Whatever", None, "library", "lib"), ("OnPaint", "CWnd", "user", None),
+])
+def test_lib_family(name, ns, state, want):
+    assert fx.lib_family(name, ns, state) == want
+
+
+def test_propagate_library_fixpoint_and_rounds():
+    # 1 and 3 are library; 2 (caller 1, callee 3) joins; 4 (only called by 3) joins; 6 also has the
+    # non-library caller 9 and 7 calls the non-library 6
+    callers = {2: {1}, 3: {2}, 4: {3}, 6: {1, 9}, 7: {1}}
+    callees = {1: {2, 6, 7}, 2: {3}, 3: {4}, 7: {6}, 9: {6}}
+    base = {1: "CRT", 3: "CRT"}
+    out = fx.propagate_library(base, [1, 2, 3, 4, 6, 7, 9], callers, callees, rounds=3)
+    assert set(out) == {1, 2, 3, 4} and out[2] == "prop" and out[1] == "CRT"
+    assert set(fx.propagate_library(base, [1, 2, 3, 4], callers, callees, rounds=0)) == {1, 3}
+    # a node without callers (an entry point) is never library by propagation
+    assert fx.propagate_library({}, [1, 2], {}, {}) == {}
+    # a chain below a library node does not resolve: its members have non-library neighbours
+    assert set(fx.propagate_library({1: "CRT"}, [1, 2, 3], {2: {1}, 3: {2}}, {1: {2}, 2: {3}})) == {1}
+
+
+def lib_community(st, bid, base, n, prefix, ns=None, state="auto"):
+    st.insert_functions(bid, [fn(base + i * 0x100, f"{prefix}{i}", state, ns=ns) for i in range(n)])
+    st.insert_edges(bid, [(base + i * 0x100 + 4 + 4 * j, base + j * 0x100, "call")
+                          for i in range(n) for j in range(n) if i < j])
+
+
+@pytest.fixture
+def rtproj(tmp_path):
+    """plug.dll: an MFC-like runtime community, a mixed community (3 CRT + 7 own functions that call
+    ReadFile), and a named community with no imports (plugin interface)."""
+    ctx = make_ctx(tmp_path)
+    pp = ctx.indexer.paths("proj", create=True)
+    st = ctx.indexer.store("proj")
+    b = st.upsert_binary("aa" * 32, "plug.dll", pointer_size=4, analysis_profile="p1")
+    lib_community(st, b, 0x1000, 8, "OnThing", ns="CWnd")                 # runtime: MFC
+    lib_community(st, b, 0x9000, 10, "mixed")                             # mixed
+    for i in range(3):                                                   # first 3 become CRT names
+        st.db.execute("UPDATE function SET name=?, namespace=NULL WHERE binary_id=? AND entry=?",
+                      (f"_crtfn{i}", b, 0x9000 + i * 0x100))
+    st.insert_functions(b, [fn(0x30000, "ReadFile", "library", thunk=1)])
+    st.insert_imports(b, [("KERNEL32.DLL", "ReadFile", None, 0x40000)])
+    st.insert_edges(b, [(0x30004, 0x40000, "jump")]
+                    + [(0x9000 + i * 0x100 + 0x70, 0x30000, "call") for i in range(3, 10)])
+    names = ["PluginInitControl", "PluginNotify", "PluginConfigure", "Reset", "Flush", "Update"]
+    st.insert_functions(b, [fn(0x50000 + i * 0x100, nm, "user") for i, nm in enumerate(names)])
+    st.insert_edges(b, [(0x50000 + i * 0x100 + 4 + 4 * j, 0x50000 + j * 0x100, "call")
+                        for i in range(6) for j in range(6) if i < j])
+    st.link_edges(b)
+    ctx.indexer.set_status(st, b, "ready")
+    return ctx, pp, st, b
+
+
+def test_runtime_label_mixed_label_and_name_rules(rtproj):
+    ctx, pp, st, b = rtproj
+    cs = cl.get_clusters(ctx, "proj")
+    rt = cs.of((b, "ram", 0x1000))
+    assert rt.auto_label == "runtime: MFC" and rt.runtime
+    mixed = cs.of((b, "ram", 0x9000 + 5 * 0x100))
+    assert not mixed.runtime and "file-io" in mixed.auto_label      # label from the 7 own members
+    assert mixed.total == 10
+    plug = cs.of((b, "ram", 0x50000))
+    assert plug.auto_label == "plugin interface"
+    assert cs.of((b, "ram", 0x1000)).id != mixed.id
+
+
+def test_runtime_share_threshold_and_plain_runtime():
+    assert cl.runtime_label(["CRT", "prop", "MFC", "CRT"]) == "runtime: CRT"
+    assert cl.runtime_label(["prop", "lib"]) == "runtime"
+    assert cl.runtime_label(["ATL/STL", "MFC"]) == "runtime: ATL/STL" or "runtime: MFC"
+    assert cl.name_label(["PluginA", "Other"]) == ""             # one hit is not enough
+    assert cl.name_label(["ParseHeader", "ParseBody", "x"]) == "parsing"
+
+
+def test_propagated_library_cluster(tmp_path):
+    ctx = make_ctx(tmp_path)
+    st = ctx.indexer.store("proj")
+    b = st.upsert_binary("aa" * 32, "p.dll", pointer_size=4, analysis_profile="p1")
+    st.insert_functions(b, [fn(0x1000, "owner", "library"), fn(0x1300, "_crtx")]
+                        + [fn(0x2000 + i * 0x100, f"plain{i}") for i in range(5)])
+    st.insert_edges(b, [(0x1004 + 4 * i, 0x2000 + i * 0x100, "call") for i in range(5)]
+                    + [(0x2004 + i * 0x100, 0x1300, "call") for i in range(5)])
+    st.link_edges(b)
+    ctx.indexer.set_status(st, b, "ready")
+    cs = cl.get_clusters(ctx, "proj")
+    c = cs.of((b, "ram", 0x2000))
+    # 2 of 7 are library by name (29%); the five plain functions sit between library functions
+    assert c.total == 7 and c.runtime and c.auto_label == "runtime: CRT"
+
+
+def test_function_map_hides_runtime_by_default(rtproj):
+    ctx, pp, st, b = rtproj
+    assert ctx.bind_session("dirty", pp) is None
+    out = fmap.function_map(ctx)
+    assert "runtime: MFC" not in out and "plugin interface" in out
+    assert "1 runtime clusters (8 fns) hidden" in out and "include_runtime=true" in out
+    full = fmap.function_map(ctx, include_runtime=True)
+    assert "runtime: MFC" in full and "hidden" not in full
+    cid = cl.get_clusters(ctx, "proj").of((b, "ram", 0x1000)).id
+    assert "runtime: MFC" in fmap.function_map(ctx, cluster=cid)          # explicit cluster still works
+    lines = cl.cluster_summary_lines(cl.get_clusters(ctx, "proj"), 8)
+    assert not any(ln.startswith(cid + " ") for ln in lines)
+    assert any(ln.startswith("runtime: 1 clusters, 8 fns (MFC 1)") for ln in lines)
+    print("\n" + out)

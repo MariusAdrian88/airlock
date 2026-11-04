@@ -75,12 +75,12 @@ def test_outline_structure():
     assert out[0] == "// H" and out[1] == "int f(int a)"
     ctl = out[out.index("control:") + 1: out.index("calls:")]
     first_if = ls.index(next(x for x in ls if x.startswith("  if (a ==")))
-    assert ctl[0].startswith(f"  L{first_if + 1}-L{first_if + 9} if (a == ") and ctl[0].endswith("...")
+    assert ctl[0].startswith(f"  L{first_if + 1}-L{first_if + 9} if (a == ") and ctl[0].endswith("... (9 lines)")
     assert any("while (x < 3)" in x and x.startswith(f"  L{first_if + 3}-") for x in ctl)
-    assert not any("Deeper" in x or "if (x)" in x for x in ctl)           # level 2 hidden
+    assert any("if (x)" in x for x in ctl) and not any("Deeper" in x for x in ctl)  # levels 0-2
     assert any("case 0..32,0x100,0x200,default (37 cases)" in x or "case 0..0x20,0x100,0x200,default" in x
                for x in ctl)
-    assert any("do {" in x or x.strip().endswith("do") for x in ctl)
+    assert any("do … while (x < 9) (3 lines)" in x for x in ctl)
     calls = out[out.index("calls:") + 1: out.index("strings:")]
     assert calls[0] == f"  Log x3 L{first_if + 2}"
     strs = out[out.index("strings:") + 1:]
@@ -90,3 +90,51 @@ def test_outline_structure():
 def test_compress_cases():
     assert compress_cases(["0", "1", "2", "3", "5", "0x20", "default"]) == "0..3,5,0x20,default"
     assert compress_cases(["A", "B"]) == "A,B"
+
+
+NESTED = [
+    "int g(int a)", "", "{", "  int x;", "",
+    "  if (a == 1) {",                    # 6  level 0
+    "    if (a == 2) {",                  # 7  level 1
+    "      if (a == 3) {",                # 8  level 2
+    "        if (a == 4) {",              # 9  level 3
+    "          Deep();",
+    "        }",
+    "      }",
+    "    }",
+    "  }",
+    "  if (a == 9) goto LAB_00401050;",   # 15 brace-less
+    "  if (x < 0) return;",
+    "  do {",                             # 17
+    "    x = x + 1;",
+    "  } while (x < GetLimit(a));",
+    "LAB_00401050:",                      # 20
+    "  return x;", "}"]
+
+
+def _ctl(depth=None):
+    out = outline_lines(NESTED, "// H") if depth is None else outline_lines(NESTED, "// H", depth)
+    return out[out.index("control:") + 1: out.index("calls:")]
+
+
+def test_outline_depth_levels():
+    assert not any("a == 4" in x for x in _ctl())                 # default depth 2 hides level 3
+    assert any("a == 3" in x for x in _ctl())
+    assert not any("a == 3" in x for x in _ctl(1))
+    assert len([x for x in _ctl(0) if "if (a ==" in x]) == 2      # top-level ifs only
+    assert any("a == 4" in x for x in _ctl(3))
+
+
+def test_outline_braceless_dowhile_labels():
+    c = _ctl()
+    assert "  L15 if (a == 9) goto LAB_00401050" in c
+    assert "  L16 if (x < 0) return" in c
+    assert "  L17-L19 do … while (x < GetLimit(a)) (3 lines)" in c
+    assert "  L20 LAB_00401050: (1 goto)" in c
+    assert "  L6-L14 if (a == 1) (9 lines)" in c
+
+
+def test_outline_case_and_default_are_not_labels():
+    t = ["void f(int a)", "{", "  switch (a) {", "  case 1:", "  default:", "    break;", "  }", "}"]
+    c = outline_lines(t, "// H")
+    assert not any(x.rstrip().endswith("default:") or x.rstrip().endswith("case 1:") for x in c)

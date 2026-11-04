@@ -22,6 +22,14 @@ FTS_KINDS = ("function", "string", "import")
 # xrefs ``kind=call`` includes it; ``kind=read`` no longer lists slot calls.
 CODE_EDGES = ("call", "call_ind", "call_imp", "jump")
 CODE_SQL = ",".join(f"'{k}'" for k in CODE_EDGES)
+# ``fnptr``: function F may call G through a pointer (G's entry is referenced as data by F, or F
+# references a table of function pointers). Not a call in xrefs kind=call semantics; the call graph,
+# clusters and path add it (``GRAPH_EDGES``).
+GRAPH_EDGES = CODE_EDGES + ("fnptr",)
+GRAPH_SQL = ",".join(f"'{k}'" for k in GRAPH_EDGES)
+FNPTR_TABLE_MIN = 3        # consecutive function pointers that make a table
+FNPTR_TABLE_CAP = 256      # entries used per table
+FNPTR_TABLE_REFS = 64      # referencing functions used per table
 
 
 @dataclass(frozen=True)
@@ -362,6 +370,84 @@ class Store:
                 [(find(r["src_addr"]), find(r["dst_addr"]), r["rowid"]) for r in rows],
             )
         self.normalise_import_edges(binary_id)
+        self.link_fnptr(binary_id)
+
+    def link_fnptr(self, binary_id: int) -> int:
+        """Rebuild the ``fnptr`` edges of a binary (needs src_fn / dst_fn: run after ``link_edges``):
+        a read/data/write reference from function F to the entry of a non-thunk function G, and
+        references from F to the start of a table of function pointers (>= FNPTR_TABLE_MIN pointers,
+        stride = pointer size, no function around the table) to every function in the table.
+        Returns the number of rows."""
+        b = self.get_binary_by_id(binary_id)
+        ptr = (b.pointer_size if b else 4) or 4
+        q = self.db.execute
+        with self.db:
+            q("DELETE FROM edge WHERE binary_id=? AND kind='fnptr'", (binary_id,))
+        rows: dict[tuple[int, int], tuple[int, int, int, int]] = {}   # (F, G) -> src_addr, dst_addr
+        for r in q(
+                "SELECT e.src_fn, e.src_addr, e.dst_fn, e.dst_addr FROM edge e "
+                "JOIN function g ON g.id=e.dst_fn WHERE e.binary_id=? AND e.src_fn IS NOT NULL "
+                "AND e.kind IN ('read','data','write') AND g.space='ram' AND g.entry=e.dst_addr "
+                "AND g.is_thunk=0 AND g.is_external=0 AND e.src_fn<>e.dst_fn "
+                "ORDER BY e.src_addr", (binary_id,)):
+            rows.setdefault((r["src_fn"], r["dst_fn"]), (r["src_addr"], r["dst_addr"], r["src_fn"], r["dst_fn"]))
+        # tables: data edges from addresses outside every function to function entries
+        ptrs: list[tuple[int, int, int]] = []     # src_addr, dst_addr, dst_fn
+        last = None
+        for r in q(
+                "SELECT e.src_addr, e.dst_addr, e.dst_fn FROM edge e JOIN function g ON g.id=e.dst_fn "
+                "WHERE e.binary_id=? AND e.src_fn IS NULL AND e.kind IN ('data','read','write') "
+                "AND g.space='ram' AND g.entry=e.dst_addr AND g.is_thunk=0 AND g.is_external=0 "
+                "ORDER BY e.src_addr", (binary_id,)):
+            if r["src_addr"] != last:
+                ptrs.append((r["src_addr"], r["dst_addr"], r["dst_fn"]))
+                last = r["src_addr"]
+        tables: dict[int, list[tuple[int, int]]] = {}    # start -> [(entry, fn id)]
+        run: list[tuple[int, int, int]] = []
+        for p in [*ptrs, None]:
+            if run and (p is None or p[0] != run[-1][0] + ptr):
+                if len(run) >= FNPTR_TABLE_MIN:
+                    tables[run[0][0]] = [(x[1], x[2]) for x in run[:FNPTR_TABLE_CAP]]
+                run = []
+            if p is not None:
+                run.append(p)
+        if tables:
+            seen_refs: dict[int, int] = {}
+            for r in q(
+                    "SELECT src_fn, src_addr, dst_addr FROM edge WHERE binary_id=? AND src_fn IS NOT NULL "
+                    "AND kind IN ('read','data','write') ORDER BY src_addr", (binary_id,)):
+                tab = tables.get(r["dst_addr"])
+                if tab is None:
+                    continue
+                n = seen_refs.get(r["dst_addr"], 0)
+                if n >= FNPTR_TABLE_REFS:
+                    continue
+                seen_refs[r["dst_addr"]] = n + 1
+                for entry, gid in tab:
+                    if gid != r["src_fn"]:
+                        rows.setdefault((r["src_fn"], gid), (r["src_addr"], entry, r["src_fn"], gid))
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) "
+                "VALUES (?,?,?,?,?,'fnptr')",
+                [(binary_id, sf, sa, df, da) for sa, da, sf, df in rows.values()])
+        return len(rows)
+
+    def ptr_callees(self, fn: Function, limit: int = 200) -> list[Function]:
+        """Distinct functions G with a ``fnptr`` edge from fn."""
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.dst_fn "
+            "WHERE e.src_fn=? AND e.kind='fnptr' AND f.id<>? ORDER BY f.entry LIMIT ?",
+            (fn.id, fn.id, limit)).fetchall()
+        return [_function(r) for r in rows]
+
+    def ptr_callers(self, fn: Function, limit: int = 200) -> list[Function]:
+        """Distinct functions with a ``fnptr`` edge to fn."""
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.src_fn "
+            "WHERE e.dst_fn=? AND e.kind='fnptr' AND f.id<>? ORDER BY f.entry LIMIT ?",
+            (fn.id, fn.id, limit)).fetchall()
+        return [_function(r) for r in rows]
 
     def insert_strings(self, binary_id: int, rows: Iterable[tuple[int, str, str]]) -> None:
         """Rows: (address, encoding, value)."""

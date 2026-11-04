@@ -6,24 +6,26 @@ cut to the token budget with a cursor; errors are one line `error <code>: ...`.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import datetime, timezone
 from typing import Any
 
-from airlock.index.store import CODE_EDGES, CrossRef, Function, StringHit
+from airlock.index.store import CODE_EDGES, CrossRef, Function, StringHit, Xref
 from airlock.projects import read_manifest, read_sections
 from airlock.server.bulk import BG_TIMEOUT
 from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
 )
 from airlock.server.context import ServerContext
-from airlock.server.cview import outline_lines, reduce_c
+from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, format_asm, outline_lines, reduce_c
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
-from airlock.server.selectors import fmt_addr, parse_address, resolve_function
+from airlock.server.selectors import fmt_addr
+from airlock.server import targets as tg
 from airlock.server.tools.common import (
-    Bound, bind_binary, bind_many, bind_target, bound_of, budget_for, fn_desc, preview,
+    Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
 )
 from airlock.worker.protocol import WorkerError
 
@@ -369,19 +371,82 @@ def _parse_lines(spec: str) -> tuple[int, int] | None:
     return (max(a, 1), max(b, a))
 
 
-@tool("function", "Show a function's decompiled C with call addresses (view=c) or its signature "
-                  "(view=signature), by name or address.")
+def _asm_cache_file(ctx: ServerContext, bd: Bound, fn: Function):
+    return ctx.indexer.paths(bd.project, create=True).data / "cache" / "asm" / f"{bd.binary.id}_{fn.entry:x}.json"
+
+
+def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | None, str | None]:
+    """(asm lines, error line). JSON file cache keyed by fn_version and analysis_profile
+    (derived data, safe to delete)."""
+    st, b = bd.store, bd.binary
+    profile = b.analysis_profile or "unknown"
+    path = _asm_cache_file(ctx, bd, fn)
+    try:
+        d = json.loads(path.read_text(encoding="utf8"))
+        if d.get("version") == fn.version and d.get("profile") == profile and isinstance(d.get("lines"), list):
+            return d["lines"], None
+    except (OSError, ValueError):
+        pass
+    ix = ctx.indexer
+    try:
+        ix.ensure_open(bd.project)
+        r = ctx.worker.request("disassemble", {"program": ix.program_of(st, b), "entry": fn.entry}, timeout=300)
+    except WorkerError as e:
+        return None, worker_error(e, "Call index_status to check the worker")
+    total = r.get("total") if r.get("truncated") else None
+    lines = format_asm(r["rows"], bd.psize, total)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": fn.version, "profile": profile, "lines": lines},
+                                   separators=(",", ":")), encoding="utf8")
+    except OSError:
+        pass  # the cache is an optimisation
+    return lines, None
+
+
+def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None, view: str,
+                  span: tuple[int, int] | None, lines: str, detail: str, retry: bool,
+                  bud: int, args: dict) -> str:
+    """view=asm: header + instruction lines. view=both: C section, then asm section, one
+    paged line list (no outline). `lines=a-b` selects asm lines (asm only)."""
+    asm, err = _get_asm(ctx, bd, fn)
+    if err:
+        return err
+    assert asm is not None
+    body: list[str] = []
+    if view == "both":
+        c_text, err = _get_decompiled(ctx, bd, fn, retry)
+        if err:
+            return err
+        assert c_text is not None
+        c = reduce_c(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize).rstrip(chr(10)), detail)
+        body = ["// C"] + c.split(chr(10)) + [f"// asm ({len(asm)} lines)"]
+    first = 1
+    if span:
+        asm = asm[span[0] - 1: span[1]]
+        first = span[0]
+        if not asm:
+            return f"error bad_args: lines {lines} is past the end of the function. Use a smaller range."
+    head = f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)} asm: lines {first}-{first + len(asm) - 1}"
+    out = ([f"// {note}"] if note else []) + ([head] if view == "asm" else []) + body + asm
+    return fit_lines(out, bud, "code", tool="function", args=args)[0]
+
+
+@tool("function", "Show a function's decompiled C with call addresses (view=c), its assembly (view=asm), "
+                  "both (view=both) or its signature (view=signature), by name or address.")
 def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
              lines: str = "", cursor: str = "", budget: int = 0, detail: str = "brief",
-             outline: bool = True, retry: bool = False) -> str:
+             outline: bool = True, retry: bool = False,
+             outline_depth: int = OUTLINE_DEFAULT_DEPTH) -> str:
     bud = budget_for(ctx, budget, "function_budget")
     if not target.strip():
         return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
-    if view in ("asm", "both"):
-        return (f"error not_implemented: view={view} is not available yet. "
-                "Use view=c or view=signature.")
-    if view not in ("c", "signature"):
-        return f"error bad_args: unknown view '{view}'. Use c or signature."
+    if view not in ("c", "asm", "both", "signature"):
+        return f"error bad_args: unknown view '{view}'. Use c, asm, both or signature."
+    if not 0 <= outline_depth <= OUTLINE_MAX_DEPTH:
+        return f"error bad_args: outline_depth must be 0 to {OUTLINE_MAX_DEPTH}. Fix and retry."
+    if view == "both" and lines:
+        return "error bad_args: lines applies to view=c or view=asm. Drop lines or choose one view."
     if detail not in ("brief", "full"):
         return f"error bad_args: unknown detail '{detail}'. Use brief or full."
     span = None
@@ -389,17 +454,12 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         span = _parse_lines(lines)
         if span is None:
             return "error bad_args: lines must look like 40-80. Fix and retry."
-    bt = bind_target(ctx, binary, target)
-    if isinstance(bt, str):
-        return bt
-    bd, bare, bnote = bt
+    ft = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT_FN))
+    if isinstance(ft, str):
+        return ft
+    assert isinstance(ft, tg.FunctionTarget)
+    bd, fn, note = ft.bound, ft.fn, ft.any_note
     st, b = bd.store, bd.binary
-    r = resolve_function(st, b.id, bare)
-    if not r.ok:
-        return r.error or "error not_found: no such function. Use search."
-    fn = r.function
-    assert fn is not None
-    note = r.note or (f"binary {b.name}" if bnote else None)
     if view == "signature":
         callers = len(st.callers(fn, 200))
         sig = fn.signature or fn.qualified_name
@@ -413,7 +473,14 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         return (f"error external: {fn.qualified_name} is an imported function with no code. "
                 "Use xrefs on it to see its callers.")
     args = {"binary": binary, "target": target, "view": view, "lines": lines, "detail": detail}
-    oargs = {**args, "outline": 1}
+    if view in ("asm", "both"):
+        if cursor:
+            try:
+                return resume_lines(cursor, bud, "code", tool="function", args=args)[0]
+            except CursorError as e:
+                return e.message
+        return _asm_response(ctx, bd, fn, note, view, span, lines, detail, retry, bud, args)
+    oargs = {**args, "outline": 1, "depth": outline_depth}
     identity = (b.id, fn.entry, fn.version, b.analysis_profile)
     offset = 0
     if cursor:
@@ -436,7 +503,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         head = (f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)}: {len(all_lines)} lines, "
                 f"~{estimate_tokens(full, 'code')} tokens (budget {bud}). "
                 "Read with lines=a-b, or outline=false to page.")
-        olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head)
+        olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head, outline_depth)
         return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
     return _function_page(full, bud, span, lines, offset, note, args, identity)
 
@@ -481,29 +548,7 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
 # ── xrefs ──────────────────────────────────────────────────────────────────────
 
 _KIND_MAP = {"call": ("call", "call_ind", "call_imp"), "jump": ("jump",), "read": ("read",),
-             "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",)}
-
-
-def _resolve_ref_target(bd: Bound, target: str):
-    """('fn', Function, note) | ('addr', (space, value)) | ('err', message)."""
-    st, b = bd.store, bd.binary
-    addr = parse_address(target)
-    if addr is None and not st.functions_by_name(b.id, target.strip()) \
-            and _HEX.match(target.strip()):
-        addr = ("ram", int(target.strip(), 16))
-    if addr is None:
-        r = resolve_function(st, b.id, target)
-        return ("fn", r.function, r.note) if r.ok else ("err", r.error)
-    fn = st.function_at(b.id, addr[1], addr[0])
-    if fn is not None:
-        return ("fn", fn, None)
-    has_refs = (st.xrefs_to_address(b.id, addr[1], None, 1) or
-                st.xrefs_from_address(b.id, addr[1], None, 1))
-    if not has_refs:  # nothing at the address itself: an interior address means its function
-        r = resolve_function(st, b.id, target)
-        if r.ok:
-            return ("fn", r.function, r.note)
-    return ("addr", addr)
+             "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",), "fnptr": ("fnptr",)}
 
 
 def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
@@ -538,23 +583,39 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         if kinds is None:
             return (f"error bad_args: unknown kind '{kind}'. "
                     "Use call, jump, read, write, data, import or dynamic.")
-    bt = bind_target(ctx, binary, target)
-    if isinstance(bt, str):
-        return bt
-    bd, bare, bnote = bt
-    st, b = bd.store, bd.binary
     limit = max(1, min(int(limit), 1000))
-    res = _resolve_ref_target(bd, bare)
-    if res[0] == "err":
-        return res[1]
-    notes: list[str] = [bnote] if bnote else []
+    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
+    if isinstance(tr, str):
+        return tr
+    if isinstance(tr, tg.ImportTarget) and direction == "from":
+        ft = tg.function_of_import(tr)   # only library code or a thunk has outgoing references
+        if isinstance(ft, str) or ft.fn.is_external:
+            return tg.err("external", f"{tr.label} is an imported function with no code",
+                          "Use direction=to to see its callers")
+        tr = ft
+    assert not isinstance(tr, (tg.StringTarget, tg.FeatureTarget, tg.ClusterTarget))
+    notes: list[str] = [tr.binary_note] if tr.binary_note else []
     entries: list[tuple[str, str]] = []   # (kind, line)
+    refs: list[tuple[Bound, Xref]] = []
     cross: list[CrossRef] = []            # callers from other binaries (direction=to)
-    links: list[CrossRef] = []            # where an import slot or thunk here resolves to
-    if res[0] == "fn":
-        fn: Function = res[1]
-        if res[2]:
-            notes.append(res[2])
+    links: list[tuple[Bound, CrossRef]] = []   # where an import slot or thunk here resolves to
+    multi = False
+    if isinstance(tr, tg.ImportTarget):
+        bd = tr.bindings[0].bound
+        multi = tr.multi
+        b0 = tr.bindings[0]
+        stub = (b0.thunks or b0.externals or (None,))[0]
+        label = (f"{tr.label} (import, {tr.nbinaries} binaries)" if multi
+                 else fn_desc(bd, stub) if stub is not None else tr.label)
+        refs = tg.import_refs(tr, kinds, limit + 1)
+        for ib in tr.bindings:
+            for a in [f.entry for f in ib.thunks] + list(ib.slots):
+                links += [(ib.bound, x) for x in ib.bound.store.cross_from_address(ib.bound.binary.id, a, 5)]
+    elif isinstance(tr, tg.FunctionTarget):
+        bd, fn = tr.bound, tr.fn
+        st, b = bd.store, bd.binary
+        if tr.note:
+            notes.append(tr.note)
         label = fn_desc(bd, fn)
         if fn.space != "ram":  # imported function: callers reach it through its IAT slot
             slots = [i["address"] for i in st.imports_by_name(b.id, fn.name)
@@ -563,33 +624,40 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
             slots = []
         if direction == "to":
             if fn.space != "ram":
-                refs = []
+                xs: list[Xref] = []
                 for a in slots:
-                    refs += st.xrefs_to_address(b.id, a, kinds, limit + 1)
+                    xs += st.xrefs_to_address(b.id, a, kinds, limit + 1)
             else:
-                refs = st.xrefs_to_function(fn, kinds, limit + 1)
+                xs = st.xrefs_to_function(fn, kinds, limit + 1)
                 cross = st.cross_to_function(fn, limit + 1)
         else:
-            refs = st.xrefs_from_function(fn, kinds, limit + 1)
+            xs = st.xrefs_from_function(fn, kinds, limit + 1)
+        refs = [(bd, x) for x in xs]
         for a in ([fn.entry] if fn.space == "ram" else []) + slots:
-            links += st.cross_from_address(b.id, a, 5)
+            links += [(bd, x) for x in st.cross_from_address(b.id, a, 5)]
     else:
-        space, value = res[1]
+        bd = tr.bound
+        st, b = bd.store, bd.binary
+        space, value = tr.space, tr.value
         s = st.string_at(b.id, value)
         label = bd.addr(value, space) + (f" {preview(s.value, 40)}" if s else "")
         notes.append("no function starts here; showing raw references")
-        refs = (st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
+        xs = (st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
             b.id, value, kinds, limit + 1)
-        links = st.cross_from_address(b.id, value, 5)
-    for x in links[:5]:
-        notes.append(_cross_target(bd, x))
-    for x in refs:
+        refs = [(bd, x) for x in xs]
+        links = [(bd, x) for x in st.cross_from_address(b.id, value, 5)]
+    for lb, x in links[:5]:
+        n = _cross_target(lb, x)
+        if n not in notes:
+            notes.append(n)
+    for rb, x in refs:
+        pfx = f"[{rb.binary.name}] " if multi else ""
         if direction == "to":
             who = x.src_fn.qualified_name if x.src_fn else "-"
-            entries.append((x.kind, f"  {bd.addr(x.src_addr)}  {who:<36} {x.kind}"))
+            entries.append((x.kind, f"  {pfx}{rb.addr(x.src_addr)}  {who:<36} {x.kind}"))
         else:
-            what = _describe_addr(bd, x.dst_addr, x.dst_fn)
-            entries.append((x.kind, f"  {bd.addr(x.src_addr)}  -> {bd.addr(x.dst_addr)} {what:<30} "
+            what = _describe_addr(rb, x.dst_addr, x.dst_fn)
+            entries.append((x.kind, f"  {rb.addr(x.src_addr)}  -> {rb.addr(x.dst_addr)} {what:<30} "
                                     f"{x.kind}"))
     for x in cross:
         if kinds is not None and x.kind not in kinds:
@@ -633,7 +701,7 @@ def _cross_target(bd: Bound, x: CrossRef) -> str:
 @tool("callgraph", "Show the call tree below (callees) or above (callers) a function as an "
                    "indented list; cycles are marked.")
 def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction: str = "callees",
-              depth: int = 2, cursor: str = "", budget: int = 0) -> str:
+              depth: int = 2, cursor: str = "", budget: int = 0, pointers: bool = True) -> str:
     bud = budget_for(ctx, budget)
     if cursor:
         return _cursor_page(cursor, "callgraph", bud)
@@ -642,25 +710,41 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     if direction not in ("callees", "callers"):
         return "error bad_args: direction must be callees or callers. Fix and retry."
     depth = max(1, min(int(depth), MAX_DEPTH))
-    bt = bind_target(ctx, binary, target)
-    if isinstance(bt, str):
-        return bt
-    bd, bare, bnote = bt
-    st, b = bd.store, bd.binary
-    r = resolve_function(st, b.id, bare)
-    if not r.ok:
-        return r.error or "error not_found: no such function. Use search."
-    root = r.function
-    assert root is not None
-    out = [f"{direction} of {fn_desc(bd, root)}, depth {depth}"]
-    if bnote:
-        out.append(bnote)
-    if r.note:
-        out.append(r.note)
+    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT))
+    if isinstance(tr, str):
+        return tr
+    assert isinstance(tr, (tg.FunctionTarget, tg.ImportTarget))
+    imp: tg.ImportTarget | None = None
+    if isinstance(tr, tg.ImportTarget):
+        ft = tg.function_of_import(tr) if direction == "callees" else None
+        if isinstance(ft, tg.FunctionTarget):    # the thunk or library code has callees
+            tr = ft
+        else:
+            imp = tr
+    if imp is not None:
+        b0 = imp.bindings[0]
+        stub = (b0.thunks or b0.externals or (None,))[0]
+        bd = b0.bound
+        root = None
+        head = (f"{imp.label} (import, {imp.nbinaries} binaries)" if imp.multi
+                else fn_desc(bd, stub) if stub is not None else imp.label)
+        out = [f"{direction} of {head}, depth {depth}"]
+        if imp.binary_note:
+            out.append(imp.binary_note)
+        expanded: set[int] = set()
+    else:
+        assert isinstance(tr, tg.FunctionTarget)
+        bd, root = tr.bound, tr.fn
+        out = [f"{direction} of {fn_desc(bd, root)}, depth {depth}"]
+        if tr.binary_note:
+            out.append(tr.binary_note)
+        if tr.note:
+            out.append(tr.note)
+        expanded = {root.id}
     base = len(out)
-    expanded = {root.id}
     state = {"truncated": False}
     dyn: set[tuple[int, int]] = set()   # (binary id, entry) of hops that are run-time loaded
+    ptr: set[tuple[int, int]] = set()   # (binary id, entry) of hops through a function pointer
 
     def children(cb: Bound, fn: Function) -> list[tuple[Bound, Function | None, str, int | None]]:
         """(bound, function, hop mark, raw address): local edges first, then links into
@@ -670,6 +754,14 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
         step = s_.callees if direction == "callees" else s_.callers
         kids: list[tuple[Bound, Function | None, str, int | None]] = [
             (cb, c, "", None) for c in step(fn, CALLGRAPH_FANOUT + 1)]
+        if pointers:
+            seen_p = {c.id for _, c, _, _ in kids if c is not None}
+            pstep = s_.ptr_callees if direction == "callees" else s_.ptr_callers
+            for c in pstep(fn, CALLGRAPH_FANOUT + 1):
+                if c.id not in seen_p:
+                    seen_p.add(c.id)
+                    ptr.add((cb.binary.id, c.entry))
+                    kids.append((cb, c, "", None))
         if direction == "callees":
             hops: set[tuple[int, int]] = set()
             for x in s_.cross_from_function(fn, CALLGRAPH_FANOUT + 1):
@@ -702,12 +794,17 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
         suffix = ""
         if mark and (cb.binary.id, f.entry if f is not None else raw) in dyn:
             suffix = " (dynamic)"
+        elif f is not None and not mark and (cb.binary.id, f.entry) in ptr:
+            suffix = " (ptr)"
         if f is None:
             return mark + cb.addr(raw or 0) + suffix
         return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "") + suffix
 
     def walk(cb: Bound, fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
-        kids = children(cb, fn)
+        walk_kids(children(cb, fn), left, indent, path)
+
+    def walk_kids(kids: list[tuple[Bound, Function | None, str, int | None]], left: int,
+                  indent: int, path: frozenset[int]) -> None:
         for kb, c, mark, raw in kids[:CALLGRAPH_FANOUT]:
             if len(out) >= CALLGRAPH_MAX_LINES:
                 state["truncated"] = True
@@ -728,7 +825,14 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
         if len(kids) > CALLGRAPH_FANOUT:
             out.append(f"{'  ' * indent}… more than {CALLGRAPH_FANOUT} {direction} not shown")
 
-    walk(bd, root, depth, 1, frozenset({root.id}))
+    if imp is not None:   # callers of an import: its calling functions in every binary that has it
+        mark = "[{}] "
+        callers = tg.import_callers(imp, CALLGRAPH_FANOUT + 1) if direction == "callers" else []
+        walk_kids([(cb, f, mark.format(cb.binary.name) if imp.multi else "", None)
+                   for cb, f in callers], depth, 1, frozenset())
+    else:
+        assert root is not None
+        walk(bd, root, depth, 1, frozenset({root.id}))
     if len(out) == base:
         out.append("  (none)")
     if state["truncated"]:

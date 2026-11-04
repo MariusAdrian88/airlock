@@ -25,10 +25,14 @@ from airlock.index.store import CODE_EDGES, Binary, Store
 
 log = logging.getLogger(__name__)
 
-LINK_VERSION = 3   # 3: import-slot reads rewritten to call_imp edges (Store.normalise_import_edges)
+LINK_VERSION = 4   # 3: import-slot reads rewritten to call_imp edges; 4: plugin-interface links + fnptr edges
 CODE_KINDS = CODE_EDGES
 _LOAD_RE = re.compile(r"^(?:LoadLibrary(?:Ex)?[AW]?|LdrLoadDll)$")
 _GPA_RE = re.compile(r"^(?:GetProcAddress|LdrGetProcedureAddress)$")
+_FIND_RE = re.compile(r"^FindFirstFile(?:Ex)?[AW]?$")
+_FOLDER_RE = re.compile(r"\*\.dll|[\\/]plug-?ins?[\\/]|^plug-?ins?[\\/]", re.I)
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$")
+MIN_IFACE_NAMES = 2
 MAX_EVIDENCE = 200
 
 
@@ -125,6 +129,8 @@ class _Src:
     str_refs: dict[int, set[int]] = field(default_factory=lambda: defaultdict(set))
     ll_fns: set[int] = field(default_factory=set)
     gpa_fns: set[int] = field(default_factory=set)
+    find_fns: set[int] = field(default_factory=set)
+    iface: tuple | None = None
     out: dict[int, set[int]] = field(default_factory=lambda: defaultdict(set))
     inn: dict[int, set[int]] = field(default_factory=lambda: defaultdict(set))
     entry_of: dict[int, int] = field(default_factory=dict)
@@ -139,16 +145,19 @@ def _src_info(store: Store, binary_id: int) -> _Src:
         info.entry_of[r["id"]] = r["entry"]
     ll: set[int] = set()      # slot addresses and thunk entries of the loader APIs
     gpa: set[int] = set()
+    find: set[int] = set()
     thunks: set[int] = set()
     for r in q("SELECT name, address FROM import WHERE binary_id=? AND address IS NOT NULL", (binary_id,)):
         n = _clean(r["name"])
-        (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else set()).add(r["address"])
+        (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else find if _FIND_RE.match(n) else set()
+         ).add(r["address"])
     for r in q("SELECT id, name, entry, is_thunk FROM function WHERE binary_id=? AND space='ram' "
                "AND (is_thunk=1 OR is_external=1)", (binary_id,)):
         if r["is_thunk"]:
             thunks.add(r["id"])
         n = _clean(r["name"])
-        (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else set()).add(r["entry"])
+        (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else find if _FIND_RE.match(n) else set()
+         ).add(r["entry"])
     for r in q("SELECT src_fn, dst_addr, dst_fn, kind FROM edge WHERE binary_id=? AND src_fn IS NOT NULL",
                (binary_id,)):
         k = r["kind"]
@@ -159,6 +168,8 @@ def _src_info(store: Store, binary_id: int) -> _Src:
                 info.ll_fns.add(r["src_fn"])
             if r["dst_addr"] in gpa and r["src_fn"] not in thunks:
                 info.gpa_fns.add(r["src_fn"])
+            if r["dst_addr"] in find and r["src_fn"] not in thunks:
+                info.find_fns.add(r["src_fn"])
         if k in CODE_KINDS:
             if r["dst_fn"] is not None and r["dst_fn"] != r["src_fn"]:
                 info.out[r["src_fn"]].add(r["dst_fn"])
@@ -174,14 +185,101 @@ def _basename(v: str) -> str:
 
 def link_dynamic(store: Store, src_id: int, dst_id: int, info: _Src | None = None) -> int:
     """Rebuild the ``dynamic``/``dynlib`` xedges from ``src_id`` to ``dst_id``; returns the
-    number of rows."""
+    number of rows. Without a literal LoadLibrary name, the plugin-interface rule applies."""
+    info = info or _src_info(store, src_id)
+    n = _link_literal(store, src_id, dst_id, info)
+    if n == 0 and src_id != dst_id:
+        n = link_interface(store, src_id, dst_id, info)
+    return n
+
+
+def _iface_names(store: Store, info: _Src) -> tuple[dict[str, list[int]], bool, str]:
+    """GetProcAddress name strings of a host: (name -> site functions, folder-scan evidence, the
+    plugin-folder text). Names that are imports of any project binary or known API names are not
+    interface names."""
+    if info.iface is not None:
+        return info.iface
+    from airlock.server.graph import api_category   # late: graph imports the store
+    imported = {r["name"] for r in store.db.execute(
+        "SELECT DISTINCT name FROM import WHERE name IS NOT NULL")}
+    names: dict[str, list[int]] = {}
+    for g in sorted(info.gpa_fns):
+        for f in sorted({g} | info.out.get(g, set()) | info.inn.get(g, set())):
+            for a in sorted(info.str_refs.get(f, ())):
+                v = info.strings[a].strip()
+                if (not _IDENT_RE.match(v) or v in imported or _clean(v) in imported
+                        or api_category(v)):
+                    continue
+                sites = names.setdefault(v, [])
+                if g not in sites:
+                    sites.append(g)
+    scan, text = False, ""
+    for f in sorted(info.str_refs):
+        for a in sorted(info.str_refs[f]):
+            if _FOLDER_RE.search(info.strings[a]):
+                scan, text = True, info.strings[a][:MAX_EVIDENCE]
+                break
+        if scan:
+            break
+    if not scan and info.find_fns & info.ll_fns:
+        scan, text = True, "FindFirstFile + LoadLibrary"
+    info.iface = (names, scan, text)
+    return info.iface
+
+
+def link_interface(store: Store, src_id: int, dst_id: int, info: _Src | None = None) -> int:
+    """Plugin-interface links: ``dst`` exports at least MIN_IFACE_NAMES of the names the host
+    resolves with GetProcAddress (one name when the host scans a plugin folder) and the host
+    calls LoadLibrary*. Rows: ``dynamic`` from each GetProcAddress site to each matching export,
+    one ``dynlib`` per binary pair. Returns the number of rows added."""
+    dst = store.get_binary_by_id(dst_id)
+    if dst is None or src_id == dst_id:
+        return 0
+    info = info or _src_info(store, src_id)
+    if not info.ll_fns or not info.gpa_fns:
+        return 0
+    names, scan, scan_text = _iface_names(store, info)
+    if not names:
+        return 0
+    exports: dict[str, int] = {}
+    for e in store.exports_of(dst_id):
+        if e["name"] and not e["name"].startswith("Ordinal_"):
+            exports.setdefault(e["name"], e["address"])
+    hit = sorted(n for n in names if n in exports)
+    if len(hit) < (1 if scan else MIN_IFACE_NAMES):
+        return 0
+    how = "folder scan" if scan else "run-time path"
+    rows: list[tuple[int, int, int, int, str, str]] = []
+    lib_fn = sorted(info.find_fns & info.ll_fns or info.ll_fns)[0]
+    if info.entry_of.get(lib_fn) is not None:
+        rows.append((src_id, info.entry_of[lib_fn], dst_id, -1, "dynlib",
+                     f"LoadLibrary by {how}" + (f' "{scan_text}"' if scan_text else "")))
+    n_dyn = 0
+    for name in hit:
+        fnd = store.function_containing(dst_id, exports[name])
+        entry = fnd.entry if fnd is not None else exports[name]
+        for g in names[name]:
+            gentry = info.entry_of.get(g)
+            if gentry is not None:
+                n_dyn += 1
+                rows.append((src_id, gentry, dst_id, entry, "dynamic",
+                             f"interface name {name}; loaded by {how}"))
+    if not n_dyn:
+        return 0
+    with store.db:
+        store.db.executemany(
+            "INSERT INTO xedge(src_binary, src_addr, dst_binary, dst_entry, kind, evidence) "
+            "VALUES (?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def _link_literal(store: Store, src_id: int, dst_id: int, info: _Src) -> int:
     dst = store.get_binary_by_id(dst_id)
     with store.db:
         store.db.execute("DELETE FROM xedge WHERE src_binary=? AND dst_binary=? "
                          "AND kind IN ('dynamic','dynlib')", (src_id, dst_id))
     if dst is None or src_id == dst_id:
         return 0
-    info = info or _src_info(store, src_id)
     if not info.ll_fns:
         return 0
     full = dst.name.lower()
@@ -281,6 +379,11 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
     for k, i in enumerate(ids):
         store.link_cross_binary(i, ids[k + 1:])
         link_dynamic_for(store, i, ids[k + 1:])
+    for i in ids:
+        try:
+            store.link_fnptr(i)
+        except Exception as e:  # noqa: BLE001
+            log.warning("function-pointer edges of binary %s: %s", i, e)
     with store.db:
         store.set_meta("link_version", str(LINK_VERSION))
     if after is not None:

@@ -16,7 +16,7 @@ from . import fixups
 from . import session as S
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 2  # bump when extract/decompile row semantics change
+COLLECTOR_VERSION = 3  # bump when extract/decompile row semantics or post-analysis fixups change
 PROGRESS_INTERVAL_S = 1.0
 
 
@@ -173,7 +173,9 @@ def analysis_profile(program: Any) -> str:
 @op("analyze")
 @guarded
 def analyze(args: dict[str, Any]) -> dict[str, Any]:
-    """analyze(program, timeout_min=None, force=False): start auto-analysis in the background."""
+    """analyze(program, timeout_min=None, force=False, parameter_id=True): start auto-analysis in
+    the background; `parameter_id` (config decompiler_parameter_id) allows the post-analysis
+    Decompiler Parameter ID pass."""
     e = S.get_entry(args.get("program"))
     force = bool(args.get("force"))
     timeout_min = args.get("timeout_min")
@@ -190,14 +192,15 @@ def analyze(args: dict[str, Any]) -> dict[str, Any]:
         e.started_at = time.monotonic()
         e.progress = {"job": "analysis", "program": e.name, "state": "running", "pct": None,
                       "message": "starting", "elapsed_s": 0.0}
-        t = threading.Thread(target=_analysis_thread, args=(e, timeout_min),
+        t = threading.Thread(target=_analysis_thread,
+                             args=(e, timeout_min, args.get("parameter_id") is not False),
                              name=f"airlock-analysis-{e.name}", daemon=True)
         e.thread = t
         t.start()
     return {"program": e.name, "state": ANALYSING, "started": True}
 
 
-def _analysis_thread(e: Entry, timeout_min: Any) -> None:
+def _analysis_thread(e: Entry, timeout_min: Any, parameter_id: bool = True) -> None:
     from ghidra.app.plugin.core.analysis import AutoAnalysisManager  # type: ignore
     from ghidra.app.script import GhidraScriptUtil  # type: ignore
     from ghidra.program.util import GhidraProgramUtilities  # type: ignore
@@ -248,7 +251,7 @@ def _analysis_thread(e: Entry, timeout_min: Any) -> None:
                     mgr.reAnalyzeAll(None)
                     mgr.startAnalysis(monitor, True)
                     if not monitor.isCancelled():
-                        fixups.apply_call_fixups(program)
+                        fixups.apply_all(program, monitor, parameter_id)
                 finally:
                     GhidraScriptUtil.releaseBundleHostReference()
                 ok = True
@@ -289,6 +292,46 @@ def _analysis_thread(e: Entry, timeout_min: Any) -> None:
         else:
             report("done", "analysis finished", functions=final["functions"],
                    analysis_profile=e.analysis_profile)
+
+
+@op("apply_fixups")
+@guarded
+def apply_fixups(args: dict[str, Any]) -> dict[str, Any]:
+    """apply_fixups(program, parameter_id=True, have_collector=None): run the post-analysis fixups (prolog helpers,
+    calling conventions) on an analysed program without re-analysing it, save, and return the
+    new analysis_profile. Takes minutes on large binaries."""
+    from ghidra.app.script import GhidraScriptUtil  # type: ignore
+    from ghidra.util.task import TaskMonitorAdapter  # type: ignore
+
+    gp = S.require_project()
+    if args.get("have_collector") == COLLECTOR_VERSION:  # already current: nothing to load
+        return {"program": args.get("program"), "skipped": True, "collector": COLLECTOR_VERSION}
+    e = S.get_entry(args.get("program"))
+    if e.state == ANALYSING:
+        raise WorkerError("busy", f"'{e.name}' is being analysed. Wait for it to finish.")
+    if e.state != READY:
+        raise WorkerError("not_analysed", f"'{e.name}' has not been analysed. Call analyze first.")
+    from . import bulk
+    bulk.cancel(e.name, join=True)  # fixups take the write lock; stop the readers first
+    t0 = time.monotonic()
+    monitor = TaskMonitorAdapter()
+    with e.lock:
+        program = e.program
+        tx = program.startTransaction("airlock fixups")
+        ok = False
+        try:
+            GhidraScriptUtil.acquireBundleHostReference()
+            try:
+                stats = fixups.apply_all(program, monitor, args.get("parameter_id") is not False)
+            finally:
+                GhidraScriptUtil.releaseBundleHostReference()
+            ok = True
+        finally:
+            program.endTransaction(tx, ok)
+        e.analysis_profile = analysis_profile(program)
+        gp.save(program)
+    return {"program": e.name, "collector": COLLECTOR_VERSION, "fixups_s": round(time.monotonic() - t0, 1),
+            "analysis_profile": e.analysis_profile, **stats}
 
 
 @op("link_externals")
@@ -378,7 +421,8 @@ def save(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _status_of(e: Entry) -> dict[str, Any]:
-    d: dict[str, Any] = {"program": e.name, "state": e.state, "analysed": e.state == READY}
+    d: dict[str, Any] = {"program": e.name, "state": e.state, "analysed": e.state == READY,
+                         "collector": COLLECTOR_VERSION}
     if e.error:
         d["error"] = e.error
     if e.state == ANALYSING and e.started_at is not None:

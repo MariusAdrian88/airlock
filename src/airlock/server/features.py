@@ -3,7 +3,7 @@
 A fixed table maps API names to feature keys; string patterns add more. Functions that call
 those imports or reference matching strings are the seeds of a feature; its entry points are
 the seeds plus their callers up to depth 2 inside the project's own binaries (runtime
-libraries excluded). Rows live in the index (``feature``, ``feature_entry``); features defined
+libraries and library functions excluded: they are evidence, not entry points). Rows live in the index (``feature``, ``feature_entry``); features defined
 by the agent (source 'agent') survive every re-derivation. Feature keys never change.
 """
 
@@ -26,7 +26,11 @@ log = logging.getLogger("airlock")
 FEATURES: dict[str, str] = {
     "file-io": "File input/output",
     "config": "Configuration and settings",
-    "ui": "User interface",
+    "ui-window": "User interface: windows and messages",
+    "ui-dialog": "User interface: dialogs and message boxes",
+    "ui-menu": "User interface: menus and accelerators",
+    "ui-draw": "User interface: 2D drawing (GDI)",
+    "ui-input": "User interface: keyboard, mouse, cursor and timers",
     "network": "Network and serial communication",
     "hardware": "Hardware and drivers",
     "plugins": "Plugins and dynamic loading",
@@ -67,19 +71,45 @@ _API: dict[str, tuple[str, ...]] = {
         "SetEnvironmentVariable ExpandEnvironmentStrings GetModuleFileName GetUserName GetComputerName "
         "CoCreateInstance_MSXML"
     ).split(),
-    "ui": (
-        "CreateWindow CreateWindowEx RegisterClass RegisterClassEx DefWindowProc DialogBox DialogBoxParam "
-        "DialogBoxIndirect DialogBoxIndirectParam CreateDialog CreateDialogParam CreateDialogIndirect "
-        "CreateDialogIndirectParam EndDialog GetMessage PeekMessage DispatchMessage TranslateMessage "
-        "PostQuitMessage SendMessage PostMessage SendDlgItemMessage GetDlgItem SetDlgItemText "
-        "GetDlgItemText LoadMenu LoadMenuIndirect CreateMenu CreatePopupMenu TrackPopupMenu TrackPopupMenuEx "
-        "AppendMenu InsertMenu ModifyMenu EnableMenuItem CheckMenuItem SetMenu GetMenu DestroyMenu "
-        "LoadAccelerators TranslateAccelerator LoadIcon LoadCursor LoadString LoadImage MessageBox "
-        "MessageBoxEx MessageBoxIndirect ShowWindow UpdateWindow SetWindowText GetWindowText "
-        "SetWindowLong SetWindowLongPtr GetWindowLong GetWindowLongPtr CreateToolbarEx InitCommonControls "
-        "InitCommonControlsEx CreateStatusWindow SetTimer KillTimer DrawText DrawTextEx TextOut "
-        "BeginPaint EndPaint InvalidateRect RedrawWindow SetFocus SetCapture ReleaseCapture "
-        "GetCursorPos SetCursorPos ChooseColor ChooseFont PropertySheet CreatePropertySheetPage"
+    "ui-window": (
+        "CreateWindow CreateWindowEx RegisterClass RegisterClassEx UnregisterClass DefWindowProc "
+        "DefMDIChildProc DefFrameProc CallWindowProc DestroyWindow MoveWindow SetWindowPos FindWindow "
+        "FindWindowEx EnableWindow GetClientRect GetWindowRect SetParent GetParent GetMessage PeekMessage "
+        "DispatchMessage TranslateMessage PostQuitMessage SendMessage PostMessage ShowWindow UpdateWindow "
+        "SetWindowText GetWindowText SetWindowLong SetWindowLongPtr GetWindowLong GetWindowLongPtr "
+        "CreateToolbarEx InitCommonControls InitCommonControlsEx CreateStatusWindow SetFocus "
+        "InvalidateRect RedrawWindow PropertySheet CreatePropertySheetPage LoadString LoadIcon LoadImage "
+        "SetForegroundWindow SetActiveWindow BringWindowToTop"
+    ).split(),
+    "ui-dialog": (
+        "DialogBox DialogBoxParam DialogBoxIndirect DialogBoxIndirectParam CreateDialog CreateDialogParam "
+        "CreateDialogIndirect CreateDialogIndirectParam EndDialog IsDialogMessage DefDlgProc GetDlgItem "
+        "SetDlgItemText GetDlgItemText GetDlgItemInt SetDlgItemInt SendDlgItemMessage CheckDlgButton "
+        "IsDlgButtonChecked CheckRadioButton MessageBox MessageBoxEx MessageBoxIndirect ChooseColor "
+        "ChooseFont PrintDlg PageSetupDlg FindText ReplaceText"
+    ).split(),
+    "ui-menu": (
+        "LoadMenu LoadMenuIndirect CreateMenu CreatePopupMenu TrackPopupMenu TrackPopupMenuEx AppendMenu "
+        "InsertMenu ModifyMenu DeleteMenu RemoveMenu EnableMenuItem CheckMenuItem CheckMenuRadioItem "
+        "SetMenu GetMenu GetSubMenu GetMenuItemCount GetMenuItemInfo SetMenuItemInfo InsertMenuItem "
+        "DestroyMenu LoadAccelerators TranslateAccelerator CreateAcceleratorTable"
+    ).split(),
+    "ui-draw": (
+        "DrawText DrawTextEx TextOut ExtTextOut BeginPaint EndPaint BitBlt StretchBlt StretchDIBits "
+        "CreateCompatibleDC CreateCompatibleBitmap CreateBitmap CreateBitmapIndirect SelectObject "
+        "DeleteObject DeleteDC GetDC GetWindowDC ReleaseDC CreateDC CreateFontIndirect CreateFont "
+        "CreatePen CreatePenIndirect CreateSolidBrush CreateHatchBrush CreatePatternBrush SetBkMode "
+        "SetBkColor SetTextColor SetStretchBltMode AlphaBlend TransparentBlt MaskBlt PlgBlt PatBlt "
+        "LineTo MoveToEx Polyline Polygon Rectangle RoundRect Ellipse Arc Pie FillRect FrameRect "
+        "InvertRect SetPixel GetPixel SetROP2 SetMapMode GetTextExtentPoint GetTextExtentPoint32 "
+        "GetTextMetrics GetStockObject GdiFlush"
+    ).split(),
+    "ui-input": (
+        "SetTimer KillTimer GetCursorPos SetCursorPos SetCursor LoadCursor ShowCursor ClipCursor "
+        "SetCapture ReleaseCapture GetCapture GetKeyState GetAsyncKeyState GetKeyboardState "
+        "SetKeyboardState MapVirtualKey MapVirtualKeyEx VkKeyScan ToAscii ToUnicode keybd_event "
+        "mouse_event SendInput RegisterHotKey UnregisterHotKey TrackMouseEvent GetDoubleClickTime "
+        "GetKeyboardLayout GetKeyNameText"
     ).split(),
     "network": (
         "socket connect bind listen accept send recv sendto recvfrom select closesocket shutdown "
@@ -122,12 +152,8 @@ _API: dict[str, tuple[str, ...]] = {
         "luaL_openlibs lua_pcall lua_pcallk JS_NewRuntime JS_NewContext duk_create_heap_default"
     ).split(),
     "graphics": (
-        "BitBlt StretchBlt StretchDIBits SetDIBitsToDevice SetDIBits GetDIBits CreateCompatibleDC "
-        "CreateCompatibleBitmap CreateDIBSection CreateBitmap CreateBitmapIndirect CreatePalette "
-        "RealizePalette SelectPalette SelectObject DeleteObject DeleteDC GetDC ReleaseDC CreateDC "
-        "CreateFontIndirect CreateFont CreatePen CreateSolidBrush SetBkMode SetStretchBltMode "
-        "AlphaBlend TransparentBlt MaskBlt PlgBlt PatBlt LineTo MoveToEx Polyline Polygon Rectangle "
-        "Ellipse FillRect GdiFlush SwapBuffers ChoosePixelFormat SetPixelFormat DescribePixelFormat "
+        "SetDIBitsToDevice SetDIBits GetDIBits CreateDIBSection CreatePalette RealizePalette "
+        "SelectPalette SwapBuffers ChoosePixelFormat SetPixelFormat DescribePixelFormat "
         "Direct3DCreate9 Direct3DCreate8 D3D11CreateDevice D3D11CreateDeviceAndSwapChain "
         "CreateDXGIFactory CreateDXGIFactory1 DirectDrawCreate DirectDrawCreateEx DirectDrawCreateClipper "
         "GdiplusStartup GdipCreateBitmapFromFile GdipLoadImageFromFile GdipDrawImageI GdipDrawImageRectI "
@@ -169,11 +195,12 @@ API_PREFIX: tuple[tuple[str, str], ...] = (
     ("CArchive::", "file-io"), ("CFileDialog::", "file-io"), ("CFileFind::", "file-io"),
     ("CRecentFileList::", "file-io"), ("CRegKey::", "config"), ("CWinApp::GetProfile", "config"),
     ("CWinApp::WriteProfile", "config"), ("CWinApp::SetRegistryKey", "config"),
-    ("CWnd::", "ui"), ("CDialog::", "ui"), ("CFrameWnd::", "ui"), ("CMenu::", "ui"),
-    ("CView::", "ui"), ("CDocument::", "ui"), ("CPropertySheet::", "ui"), ("CPropertyPage::", "ui"),
+    ("CWnd::", "ui-window"), ("CFrameWnd::", "ui-window"), ("CView::", "ui-window"),
+    ("CDocument::", "ui-window"), ("CDialog::", "ui-dialog"), ("CPropertySheet::", "ui-dialog"),
+    ("CPropertyPage::", "ui-dialog"), ("CMenu::", "ui-menu"),
     ("CSocket::", "network"), ("CAsyncSocket::", "network"), ("CInternetSession::", "network"),
-    ("CHttpFile::", "network"), ("CDC::", "graphics"), ("CBitmap::", "graphics"),
-    ("CBrush::", "graphics"), ("CPen::", "graphics"),
+    ("CHttpFile::", "network"), ("CDC::", "ui-draw"), ("CBitmap::", "ui-draw"),
+    ("CBrush::", "ui-draw"), ("CPen::", "ui-draw"), ("CFont::", "ui-draw"),
 )
 # gl*/glu*/glut* only when followed by an uppercase letter (glBegin, not global).
 _GL_RE = re.compile(r"^(?:wgl|glu|glut|gl)[A-Z]")
@@ -214,6 +241,91 @@ def api_feature(name: str | None) -> str | None:
                 continue
             return feat
     return None
+
+
+# -- library (runtime) code recognition ---------------------------------------------------------
+# A function is library code when its name_state is 'library', its name/namespace matches a known
+# runtime family, or (propagation) it is only called from library code and calls only library code.
+# Names the user or agent set (name_state 'user') are never matched by pattern.
+
+MFC_CLASSES = frozenset(
+    "CObject CCmdTarget CWnd CFrameWnd CMDIFrameWnd CMDIChildWnd CView CScrollView CFormView CEditView "
+    "CListView CTreeView CRichEditView CDocument CDocTemplate CSingleDocTemplate CMultiDocTemplate "
+    "CWinApp CWinThread CDialog CPropertySheet CPropertyPage CCommonDialog CFileDialog CColorDialog "
+    "CFontDialog CString CStringArray CStringList CByteArray CDWordArray CPtrArray CPtrList CObArray "
+    "CObList CMapStringToPtr CMapStringToString CMapPtrToPtr CMapWordToPtr CArchive CFile CStdioFile "
+    "CMemFile CFileFind CException CFileException CMemoryException CArchiveException CUserException "
+    "CNotSupportedException CResourceException COleException CDC CClientDC CPaintDC CWindowDC CMetaFileDC "
+    "CGdiObject CBitmap CBrush CPen CFont CPalette CRgn CMenu CImageList CToolBar CStatusBar CDialogBar "
+    "CControlBar CReBar CButton CEdit CListBox CComboBox CStatic CScrollBar CListCtrl CTreeCtrl "
+    "CTabCtrl CSliderCtrl CSpinButtonCtrl CProgressCtrl CToolTipCtrl CHeaderCtrl CRichEditCtrl "
+    "CAnimateCtrl CDateTimeCtrl CMonthCalCtrl CComboBoxEx CSplitterWnd CTime CTimeSpan CPoint CSize "
+    "CRect CCriticalSection CMutex CEvent CSemaphore CSingleLock CMultiLock CSyncObject CRuntimeClass "
+    "CCmdUI CDataExchange CDocManager CRecentFileList CSocket CAsyncSocket CSocketFile "
+    "CInternetSession CHttpFile CInternetFile CFtpConnection CHttpConnection CDatabase CRecordset "
+    "CDaoDatabase CDaoRecordset COleDispatchDriver COleControl COleDataObject COleDataSource "
+    "COleVariant COleSafeArray COleDocument COleServerDoc COleClientItem CDockState CHandleMap "
+    "CPlex CDumpContext CMemoryState CWaitCursor CTypedPtrList CTypedPtrArray CTypedPtrMap "
+    "CRegKey CBitmapButton CHotKeyCtrl CIPAddressCtrl CDialogEx".split())
+_CRT_PLAIN = frozenset(
+    "malloc free calloc realloc memcpy memmove memset memcmp memchr strlen strcpy strncpy strcat strncat "
+    "strcmp strncmp strchr strrchr strstr strtok strtol strtoul strtod atoi atol atof sprintf snprintf "
+    "vsprintf printf vprintf sscanf scanf puts putchar getchar qsort bsearch abs labs exit abort atexit "
+    "toupper tolower isalpha isdigit isspace isalnum isupper islower isxdigit ispunct sin cos tan atan "
+    "atan2 sqrt pow exp log log10 floor ceil fabs fmod rand srand setjmp longjmp signal raise getenv "
+    "wcslen wcscpy wcscmp wcscat wcsncpy wcschr wcsstr swprintf vswprintf".split())
+_CRT_RE = re.compile(r"^(?:__crt|__security_|__SEH_|__except|__CxxFrame|__CxxThrow|__local_unwind|"
+                     r"__global_unwind|__alloca|__chkstk|__aullrem|__aulldiv|__allmul|__alldiv|__allrem|"
+                     r"__ftol|__CIpow|__CI[a-z]|__unwind|__NLG|__EH|__amsg|__cinit|__initterm|"
+                     r"__onexit|__dllonexit|__setargv|__mtinit|__heap|__sbh|__lock|__unlock|"
+                     r"_EH|_CxxThrow|_SEH|_except_|_unwind|_security_|_purecall|_RTC_|_encode|_decode)")
+_CRT_UNDERSCORE_RE = re.compile(r"^__?[a-z]\w*$")      # _malloc, _free, __strlen_sse2, __ftol2
+_STL_NS = ("std", "stdext", "__gnu_cxx", "_STL")
+_ATL_NS = ("ATL", "ATLSafe", "ATL7")
+_MFC_CLS_RE = re.compile(r"^(C[A-Z]\w*)")
+
+
+def lib_family(name: str, namespace: str | None, state: str) -> str | None:
+    """'MFC' | 'CRT' | 'ATL/STL' | 'lib' (name_state=library, family unknown) | None (not library)."""
+    if state == "user":
+        return None
+    ns = namespace or ""
+    top = ns.split("::", 1)[0] if ns else ""
+    if top in _ATL_NS or top in _STL_NS or name.startswith("operator_"):
+        return "ATL/STL"
+    if top.startswith(("Afx", "afx", "_Afx", "AFX")) or name.startswith(("Afx", "afx", "_Afx", "AFX_")):
+        return "MFC"
+    if top:
+        m = _MFC_CLS_RE.match(top)
+        if m and m.group(1) in MFC_CLASSES:
+            return "MFC"
+    elif name in MFC_CLASSES:
+        return "MFC"
+    if name.startswith(("operator new", "operator delete", "operator_")) or (not ns and name in _CRT_PLAIN):
+        return "CRT"
+    if not ns and (_CRT_RE.match(name) or _CRT_UNDERSCORE_RE.match(name)):
+        return "CRT"
+    return "lib" if state == "library" else None
+
+
+def propagate_library(base: dict[int, str], nodes: Iterable[int], callers: dict[int, set[int]],
+                      callees: dict[int, set[int]], rounds: int = 3) -> dict[int, str]:
+    """Extend {node: family} with nodes that have at least one caller, all of them library, and call
+    only library nodes (max ``rounds`` rounds). Propagated nodes get the family 'prop'."""
+    lib = dict(base)
+    order = sorted(nodes)
+    for _ in range(rounds):
+        new: dict[int, str] = {}
+        for v in order:
+            if v in lib:
+                continue
+            cs = callers.get(v)
+            if cs and all(c in lib for c in cs) and all(c in lib for c in callees.get(v, ())):
+                new[v] = "prop"
+        if not new:
+            break
+        lib.update(new)
+    return lib
 
 
 # -- strings ---------------------------------------------------------------------
@@ -321,16 +433,29 @@ class _Bin:
     def __init__(self, store: Store, binary_id: int) -> None:
         self.id = binary_id
         self.fn: dict[int, tuple[str, int, str, bool]] = {}      # id -> (space, entry, qname, skip)
+        self.lib: dict[int, str] = {}                             # library function id -> family
         self.at: dict[tuple[str, int], int] = {}
         self.names: dict[int, str] = {}
         for r in store.db.execute(
-                "SELECT id, space, entry, name, namespace, is_thunk, is_external FROM function "
+                "SELECT id, space, entry, name, name_state, namespace, is_thunk, is_external FROM function "
                 "WHERE binary_id=?", (binary_id,)):
             q = f"{r['namespace']}::{r['name']}" if r["namespace"] else r["name"]
             self.fn[r["id"]] = (r["space"], r["entry"], q, bool(r["is_thunk"] or r["is_external"]))
             self.at[(r["space"], r["entry"])] = r["id"]
+            if not (r["is_thunk"] or r["is_external"]):
+                fam = lib_family(r["name"], r["namespace"], r["name_state"])
+                if fam:
+                    self.lib[r["id"]] = fam
         self.callers = store.callers_of_ids(binary_id)
         self.thunk_ids = {i for i, v in self.fn.items() if v[3]}
+        callees: dict[int, set[int]] = {}
+        for callee, srcs in self.callers.items():
+            if callee in self.thunk_ids:
+                continue
+            for c in srcs:
+                callees.setdefault(c, set()).add(callee)
+        self.lib = propagate_library(self.lib, [i for i in self.fn if i not in self.thunk_ids],
+                                     self.callers, callees)
 
 
 def _edge_sources(store: Store, binary_id: int, addrs: Iterable[int],
@@ -399,7 +524,7 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
         for addr, srcs in _edge_sources(store, bid, targets, CODE_EDGES).items():
             key, api = targets[addr]
             for fid in srcs:
-                if fid not in bn.thunk_ids:
+                if fid not in bn.thunk_ids and fid not in bn.lib:
                     seed(key, bid, fid, f"calls {api}", api)
         # string seeds
         hits: dict[int, list[tuple[str, str]]] = {}
@@ -409,7 +534,7 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
         for addr, srcs in _edge_sources(store, bid, hits, ("read", "write", "data")).items():
             for k, lab in hits[addr]:
                 for fid in srcs:
-                    if fid not in bn.thunk_ids:
+                    if fid not in bn.thunk_ids and fid not in bn.lib:
                         seed(k, bid, fid, f"refs {lab}", lab)
         # a data-format extension that appears in strings is a feature even when no code refs it
         for addr, lst in hits.items():
@@ -441,7 +566,7 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
                     continue
                 inherited = got[(bid, fid)][1][:MAX_EVIDENCE]
                 for cb, cf in sorted(cs):
-                    if (cb, cf) in got or cf in bins[cb].thunk_ids:
+                    if (cb, cf) in got or cf in bins[cb].thunk_ids or cf in bins[cb].lib:
                         continue
                     if len(got) >= MAX_ENTRIES:
                         dropped_refs.add((cb, cf))

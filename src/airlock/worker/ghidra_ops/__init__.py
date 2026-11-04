@@ -4,4 +4,4 @@ No module here imports Ghidra or JPype at import time (the JVM is not running
 yet); Java classes are imported inside functions after `start_ghidra`.
 """
 
-from airlock.worker.ghidra_ops import bulk, decompile, extract, project  # noqa: F401
+from airlock.worker.ghidra_ops import bulk, decompile, disasm, extract, project  # noqa: F401

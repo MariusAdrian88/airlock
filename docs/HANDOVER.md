@@ -81,16 +81,17 @@ disabled. The user's global config was upgraded to `config_version` 1
    plugins). Recognise library functions and label those clusters.
 2. The `ui` feature hits the 1500 cap; its count is not faithful. Split
    `ui` (windows, dialogs, menus, drawing) or rank harder.
-3. `xrefs`/`callgraph` do not accept `KERNEL32!ReadFile`; only `path` does.
-   Use the same endpoint resolver everywhere.
+3. (Fixed) `xrefs`/`callgraph`/`function`/`function_map`/`feature_define` use
+   `server/targets.py` (DESIGN 7.3 rule 7). `path` still has its own
+   graph-based resolver with the same import name rules; merge later.
 4. Plugins loaded through run-time paths (no string names the DLL) get no
    dynamic link. Calls through function pointers are not in the graph.
 5. Calling convention `unknown` for most functions; `__thiscall` not
    detected (`in_ECX[...]` in MFC methods).
-6. Outline control section shows nesting levels 0–1 only.
+6. (fixed) Outline shows levels 0-2 (`outline_depth`, max 4), brace-less items, do-while, labels.
 7. Named strings with no references (dispatch/automation tables): M2
    (MFC/OLE analysers).
-8. `view=asm`/`both` return `not_implemented`.
+8. (fixed) `view=asm`/`both` implemented (worker `disassemble`, JSON cache under `.airlock\cache\asm`).
 9. Spec tools (M4) and annotate tools (M3) are not implemented.
 10. The new time estimate is not yet measured on a fresh analysis.
 

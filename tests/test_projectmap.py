@@ -207,7 +207,7 @@ def test_ambiguous_function_across_binaries(proj):
     app = proj[3][0]
     st.insert_functions(app, [{"entry": 0x430000, "name": "Impl", "name_state": "auto", "size": 8}])
     out = mt.feature_define(ctx, "dup", "Dup", functions="Impl")
-    assert out.startswith("error ambiguous_binary:") and "app.exe, lib.dll" in out
+    assert out.startswith("error ambiguous:") and "app.exe!Impl" in out and "lib.dll!Impl" in out
     assert mt.feature_define(ctx, "dup", "Dup", functions="lib.dll!Impl").startswith("feature dup defined")
 
 

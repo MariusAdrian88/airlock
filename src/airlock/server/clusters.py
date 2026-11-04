@@ -28,10 +28,13 @@ from airlock.server import graph as gr
 from airlock.server.graph import (  # noqa: F401  re-exported: tests and callers use them from here
     CALL_KINDS, HUB_MIN_CALLERS, HUB_PERCENT, CallGraph, _fx, api_category, build_graph, string_categories,
 )
+from airlock.server.features import lib_family, propagate_library
 from airlock.server.selectors import fmt_addr
 
 MIN_CLUSTER = 3
-ALGO_VERSION = 2   # 2: call_imp edges (import-slot calls)
+ALGO_VERSION = 3   # 2: call_imp edges (import-slot calls); 3: library recognition and runtime labels
+RUNTIME_SHARE = 0.6     # a cluster with at least this share of library members is a runtime cluster
+RUNTIME_PREFIX = "runtime"
 LABEL_JACCARD = 0.5
 LABELS_FILE = "cluster_labels.json"
 CACHE_FILE = "clusters.json"
@@ -77,6 +80,11 @@ class Cluster:
     @property
     def label(self) -> str:
         return self.agent_label or self.auto_label
+
+    @property
+    def runtime(self) -> bool:
+        """Mostly library code (the automatic label starts with ``runtime``)."""
+        return self.kind == "c" and self.auto_label.startswith(RUNTIME_PREFIX)
 
     @property
     def total(self) -> int:
@@ -234,11 +242,62 @@ def _auto_label(cnt: Counter, size: int) -> str:
     return "+".join(top) if top else "unclassified"
 
 
+# Name-token rules for clusters without feature evidence: label -> lowercase substrings of member
+# names. A rule needs at least two named (non-library) members that hit it; the best rule wins.
+NAME_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("plugin interface", ("plugin", "initcontrol", "notify", "getinterface")),
+    ("rendering", ("render", "paint", "draw", "redraw")),
+    ("parsing", ("parse", "token", "lexer", "scan")),
+    ("networking", ("socket", "connect", "packet", "protocol")),
+    ("file handling", ("loadfile", "savefile", "readfile", "writefile", "openfile", "serializ")),
+    ("settings", ("config", "setting", "option", "preference", "profile")),
+    ("string utilities", ("string", "strcmp", "trim", "format")),
+    ("memory management", ("alloc", "pool", "heap")),
+    ("threading", ("thread", "mutex", "lock", "queue")),
+)
+
+
+def name_label(names: list[str]) -> str:
+    """Label from the names of the named non-library members (small rule table), or ''."""
+    best, best_n = "", 1
+    for label, keys in NAME_RULES:
+        n = sum(1 for nm in names if any(k in nm.lower() for k in keys))
+        if n > best_n:
+            best, best_n = label, n
+    return best
+
+
+def runtime_label(fams: list[str]) -> str:
+    """``runtime: MFC`` by the majority of the identified families, else plain ``runtime``."""
+    cnt = Counter(f for f in fams if f in ("MFC", "CRT", "ATL/STL"))
+    if not cnt:
+        return RUNTIME_PREFIX
+    top = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return f"{RUNTIME_PREFIX}: {top}"
+
+
+def library_nodes(g: CallGraph) -> dict[int, str]:
+    """{node: family} for library functions: by name_state/name/namespace, then propagated to a
+    fixpoint (max 3 rounds) over functions only called from, and only calling, library functions."""
+    base: dict[int, str] = {}
+    for i, (nm, state, ns) in enumerate(g.info):
+        fam = lib_family(nm, ns, state)
+        if fam:
+            base[i] = fam
+    callers: dict[int, set[int]] = {}
+    callees: dict[int, set[int]] = {}
+    for (a, b) in g.directed:
+        callees.setdefault(a, set()).add(b)
+        callers.setdefault(b, set()).add(a)
+    return propagate_library(base, range(len(g.nodes)), callers, callees)
+
+
 def compute(st: Store, bids: list[int], names: dict[int, tuple[str, int]], project: str,
             fingerprint: str) -> ClusterSet:
     g = build_graph(st, bids)
     n = len(g.nodes)
     comms, hubs = partition(g)
+    lib = library_nodes(g)
     callers = [0] * n
     callees = [0] * n
     for (a, b) in g.directed:
@@ -277,14 +336,19 @@ def compute(st: Store, bids: list[int], names: dict[int, tuple[str, int]], proje
     clusters: list[Cluster] = []
     for gid, kind, mem, bid in groups:
         cnt: Counter = Counter()
-        for i in mem:
+        own = [i for i in mem if i not in lib]
+        for i in own:
             cnt.update(g.cats.get(i, ()))
         if kind == "util":
             label = ""
         elif kind == "misc":
             label = f"misc {names.get(bid, ('?', 4))[0]}"
+        elif len(mem) - len(own) >= RUNTIME_SHARE * len(mem):
+            label = runtime_label([lib[i] for i in mem if i in lib])
         else:
-            label = _auto_label(cnt, len(mem))
+            label = _auto_label(cnt, len(own))
+            if label == "unclassified":
+                label = name_label([g.info[i][0] for i in own if g.info[i][1] != "auto"]) or label
         members = [Member((g.nodes[i][0], g.nodes[i][1], g.nodes[i][2]), g.info[i][0], g.info[i][1],
                           g.info[i][2], g.nodes[i][3], internal[i], callers[i], callees[i]) for i in mem]
         clusters.append(Cluster(gid, kind, label, members,
@@ -554,10 +618,16 @@ def ordered(cs: ClusterSet) -> list[Cluster]:
 
 def cluster_summary_lines(cs: ClusterSet, limit: int = 8) -> list[str]:
     """Lines for the project map section "Subsystems": top clusters by size, then util/misc."""
-    regular = [c for c in ordered(cs) if c.kind == "c"]
+    regular = [c for c in ordered(cs) if c.kind == "c" and not c.runtime]
     lines = [cluster_line(cs, c, key_limit=MAP_KEY_FUNCTIONS) for c in regular[:max(0, limit)]]
     if len(regular) > limit:
         lines.append(f"… {len(regular) - limit} more subsystems. function_map() lists them.")
+    rt = [c for c in ordered(cs) if c.runtime]
+    if rt:
+        fams = Counter(c.auto_label.partition(": ")[2] or "other" for c in rt)
+        lines.append(f"runtime: {len(rt)} clusters, {sum(c.total for c in rt)} fns ("
+                     + ", ".join(f"{k} {v}" for k, v in sorted(fams.items(), key=lambda kv: (-kv[1], kv[0])))
+                     + '). function_map(include_runtime=true) lists them.')
     for c in ordered(cs):
         if c.kind != "c":
             lines.append(cluster_line(cs, c, link_limit=3, key_limit=MAP_KEY_FUNCTIONS))

@@ -142,6 +142,48 @@ def bind_target(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, st
             "Retry with binary!name or binary!address.")
 
 
+@dataclass(frozen=True)
+class Scope:
+    """Where a target is looked up: the binaries, the target text without a binary prefix, and
+    whether the binary was named (prefix, ``binary=``, or a single-binary project)."""
+
+    project: str
+    store: Store
+    bounds: tuple[Bound, ...]
+    bare: str
+    explicit: bool
+    skipped: int = 0
+
+
+def bind_scope(ctx: ServerContext, binary: str, target: str) -> Scope | str:
+    """Like ``bind_target`` but without resolving the name: one binary when it is named (DESIGN
+    7.3 rule 6) or the only one, else every ready binary. Returns a Scope or an error line."""
+    ix = ctx.indexer
+    try:
+        proj = ix.resolve_project(None)
+    except IndexerError as e:
+        return e.message
+    st = ix.store(proj)
+    t = target.strip()
+    if len(t) > 3 and t[0] == "<" and ">!" in t:          # <main.exe>!name
+        t = t[1:].replace(">!", "!", 1)
+    pre, bare = split_binary_target(st, t)
+    if pre:
+        if binary and not any(b.name.lower() == pre.lower() for b in st.find_binaries(binary)):
+            return (f"error bad_args: target names binary '{pre}' but binary='{binary}'. "
+                    "Pass one of them.")
+        bd = bind_binary(ctx, pre)
+        return bd if isinstance(bd, str) else Scope(proj, st, (bd,), bare, True)
+    if binary or len(st.list_binaries()) <= 1:
+        bd = bind_binary(ctx, binary)
+        return bd if isinstance(bd, str) else Scope(proj, st, (bd,), t, True)
+    many = bind_many(ctx, "")
+    if isinstance(many, str):
+        return many
+    bounds, skipped = many
+    return Scope(proj, st, tuple(bounds), t, False, skipped)
+
+
 FALLBACK_BUDGETS = {"token_budget": 2000, "function_budget": 10000, "max_budget": 32000}
 
 

@@ -172,7 +172,9 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
             "SELECT src_binary, dst_binary, "
             "COUNT(DISTINCT CASE WHEN kind='dynlib' THEN src_addr END) AS nl, "
             "COUNT(DISTINCT CASE WHEN kind='dynamic' THEN src_addr END) AS ng FROM xedge "
-            "WHERE kind IN ('dynamic','dynlib') GROUP BY src_binary, dst_binary "
+            "WHERE kind IN ('dynamic','dynlib') AND COALESCE(evidence,'') NOT LIKE '%interface name%' "
+            "AND COALESCE(evidence,'') NOT LIKE 'LoadLibrary by %' "
+            "GROUP BY src_binary, dst_binary "
             "ORDER BY nl DESC, ng DESC, src_binary, dst_binary"):
         s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
         if s and d:
@@ -180,6 +182,16 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
             if r["ng"]:
                 via.append(f"{r['ng']} via GetProcAddress")
             out.append(f"{s.name} -> {d.name}: {', '.join(via)} (dynamic). "
+                       f"xrefs(binary={d.name}, kind=\"dynamic\") shows the callers.")
+    for r in store.db.execute(
+            "SELECT src_binary, dst_binary, COUNT(DISTINCT evidence) AS n, "
+            "MAX(CASE WHEN evidence LIKE '%folder scan%' THEN 1 ELSE 0 END) AS scan FROM xedge "
+            "WHERE kind='dynamic' AND evidence LIKE '%interface name%' "
+            "GROUP BY src_binary, dst_binary ORDER BY n DESC, src_binary, dst_binary"):
+        s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
+        if s and d:
+            out.append(f"{s.name} -> {d.name}: {r['n']} interface names via GetProcAddress "
+                       f"({'folder scan' if r['scan'] else 'run-time path'}, plugin interface). "
                        f"xrefs(binary={d.name}, kind=\"dynamic\") shows the callers.")
     for r in store.db.execute(
             "SELECT e.binary_id AS b, COUNT(*) AS n FROM feature_entry e WHERE e.feature_key='plugins' "

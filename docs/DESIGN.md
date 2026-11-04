@@ -979,6 +979,35 @@ restart.
    `bin!name 0x…`, none gives `error not_found`. Applies to `function`,
    `xrefs` and `callgraph`.
 
+7. **Imports and typed targets.** One resolver (`server/targets.py`) serves
+   every tool. A name is first looked up as a function; stubs of an import
+   (thunk, EXTERNAL row, import-table row) form an *import*, not a function.
+   Accepted import spellings (case-insensitive, `__imp_`/`@N` decoration
+   ignored): `ReadFile`, `KERNEL32!ReadFile`, `KERNEL32.DLL!ReadFile`,
+   `KERNEL32.DLL::ReadFile`, `<KERNEL32>!ReadFile`; without an exact match the
+   `A`/`W` forms are tried together (`CreateFile` = `CreateFileA` +
+   `CreateFileW`). `DLL!` is read as a DLL only when the project imports from
+   it, else the whole text is a name. A bare name that is an import in
+   several binaries and a function in none is the import across all of them
+   (not ambiguous); a function in one binary plus an import elsewhere is
+   `error ambiguous`. `binary!name`/`binary=` limits the import to one binary.
+   A statically linked library function (a real function of that name) is the
+   import's *library function*.
+
+   | form | function | xrefs | callgraph | function_map scope | feature_define functions | path |
+   |---|---|---|---|---|---|---|
+   | `name`, `ns::name`, `bin!name` | yes | yes | yes | yes | yes | yes |
+   | `0x…`, `SPACE:0x…`, bare hex, interior address | yes | yes | yes | yes | yes | yes |
+   | raw address that starts no function | no | yes (raw refs) | no | no | no | no |
+   | import, any spelling above | its library function, else its one thunk, else `error external` (use xrefs) | callers in all binaries, merged, `[bin]` prefixed | callers tree rooted at the import; callees only via its thunk/library code | clusters of its callers | no (`error bad_target`) | yes (import node) |
+   | quoted or plain string | no | no | no | no | no | yes |
+   | feature key, cluster id | no | no | no | feature key, binary name | no | yes |
+
+   Errors have one wording everywhere: `error not_found: no function or import
+   named 'X' [in N ready binaries]. Use search …`, `error ambiguous: 'X' matches
+   N functions: bin!name 0x…, …. Retry with binary!name or binary!address.`,
+   `error bad_target: 'X' is <kind>, but this tool takes <kinds>. <next step>.`
+
 ### 7.4 Format
 
 Plain text with a fixed, compact line layout, not JSON. JSON costs more
@@ -1037,11 +1066,28 @@ fetches more candidates than `limit`); paging uses the usual cursor footer.
 `function` over budget: when the reduced C does not fit the budget and no
 `cursor` or `lines` is given, the response is an outline instead of page 1
 (`outline=false` pages as usual): a header with line count, estimated tokens and
-how to read on, the signature, the control skeleton (top two nesting levels of
-`if`/`switch`/loops with line ranges; switch case labels compressed into
-ranges), callees with call count and first line, and referenced strings with
+how to read on, the signature, the control skeleton (nesting levels 0 to `outline_depth`,
+default 2, max 4, of `if`/`switch`/loops: blocks as `La-Lb text (N lines)`,
+brace-less statements as one `Ln if (c) goto X` line, `do … while (c)` with its
+condition, `LAB_x:` labels with their line and goto count; switch case labels
+compressed into ranges), callees with call count and first line, and referenced strings with
 line numbers. It is built by a line/brace scanner, not a C parser, and is cut
 to the budget with the usual cursor footer.
+
+`function view=asm` / `view=both`: the worker op `disassemble` (read lock,
+concurrent lane) returns the function body in address order; Ghidra prints the
+instruction (names resolved), a note lists resolved call/string/global targets,
+jump targets inside the function become `LAB_x` labels. Output lines:
+`0x00401000  PUSH EBP  ; → Name`, a `LAB_x:` line before each jump target, a
+header `// name addr asm: lines a-b`, budget + cursor as for C (`lines=a-b`
+selects asm lines). Basic-block starts without a label are not marked. The
+formatted text is cached per function in
+`<project>\dirty\.airlock\cache\asm\<binary id>_<entry hex>.json`, keyed by
+fn_version and analysis_profile (derived data, deletable; no schema change). More
+than 4000 instructions are cut with a `; … truncated at N of M` line. `view=both`
+is the C section (`// C`, brace/call annotated, `detail` honoured, no outline)
+followed by `// asm (N lines)` and the asm lines, one paged list; `lines` is
+rejected for it.
 
 ### 7.5 Errors
 
@@ -1257,9 +1303,36 @@ formats is the primary use case of this project.
   With it, `unaff_EBP` drops from 335 to 0 over 20 sampled callers **[verified]**.
 - airlock therefore runs `ghidra_ops/fixups.py` after auto-analysis: it matches
   helpers by exact entry bytes, names them and sets the fixup. It is part of
-  the collector version, so existing projects need `analyze(force)` to benefit.
+  the collector version; existing projects get it through `apply_fixups` on resume.
 - The `unknown` calling convention on most functions is Ghidra's default before
   parameter analysis and is not what causes the frame-access noise **[verified]**.
+
+### x86 calling conventions (`__thiscall` detection)
+
+- Ghidra 12.1.4 lists "Decompiler Parameter ID" and "Call Convention ID" as enabled in
+  the analysis options, but on a large static-MFC 32-bit binary (about 14,400
+  functions) 82% of the functions kept the convention `unknown` and the DEFAULT
+  signature source after airlock's auto-analysis **[verified]**. The reason is not
+  established; on a 3,500-function 32-bit exe the same analysis set every convention.
+- Running the Decompiler Parameter ID analyzer once afterwards
+  (`AutoAnalysisManager.scheduleOneTimeAnalysis` over the loaded memory, then
+  `startAnalysis`) took 86 s on the 14,400 functions (about 6 ms each) and set every
+  convention plus parameter types **[verified]**. It tries `__fastcall` first, so plain
+  this-calls (ECX only) come out as `__fastcall` with `param_1` in ECX: 2,372 of
+  14,400 functions, about 2,300 of them wrong **[verified]**.
+- airlock's post-analysis step (`fixups.apply_all`, run after auto-analysis and by the
+  worker op `apply_fixups` on existing projects) therefore does, in order: prolog helper
+  fixups; Decompiler Parameter ID when more than 5% of functions have no convention
+  (config `decompiler_parameter_id`, default true); `__fastcall` functions whose
+  instructions read only ECX are relabelled `__thiscall` through `Function.updateFunction`
+  with the ECX parameter dropped, so the decompiler shows `this` instead of a stale
+  `param_1` **[verified]**; then an instruction-only classifier (entry path reads ECX
+  before writing it, callers load ECX before the CALL, `RET n` / caller `ADD ESP`) for
+  functions still without a convention (13 s over 14,400 functions).
+- `Function.updateFunction` lives on a nested enum: `Function.FunctionUpdateType`.
+- `COLLECTOR_VERSION` is part of `analysis_profile`. The server stores the collector
+  version per binary (meta `collector:<id>`) and `resume_project` runs `apply_fixups`
+  for binaries with an older one: no re-analysis, 1.3 s when nothing is left to do.
 
 ### MSVC RTTI and vtables
 
