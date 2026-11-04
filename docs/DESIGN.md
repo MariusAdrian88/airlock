@@ -798,6 +798,25 @@ formats is the primary use case of this project.
 
 ## 11. Toolchain analyzers
 
+### MSVC exception-frame prolog helpers
+
+- 32-bit static-CRT MSVC code starts most functions with a call to a tiny
+  helper that builds the exception frame (`__EH_prolog`: `push -1; push eax;
+  mov eax,fs:[0]; ...; ret`). Without a fixup the decompiler shows
+  `unaff_EBP + -0x18` frame accesses and `extraout_ECX` in every caller **[verified]**.
+- Ghidra 12.1.4 ships Function ID databases for VS2012 to VS2019 and
+  `vsOlder` (x86 and x64), and the Function ID analyzer runs by default. It
+  names and fixes up the larger helpers (`__SEH_prolog`, `__SEH_epilog`) but
+  left the 30-byte `__EH_prolog` unnamed in the sample binary **[verified]**.
+- `x86win.cspec` has a call fixup (`EH_prolog`, inline p-code) for it. Renaming
+  the function is not enough; `Function.setCallFixup("EH_prolog")` is required.
+  With it, `unaff_EBP` drops from 335 to 0 over 20 sampled callers **[verified]**.
+- airlock therefore runs `ghidra_ops/fixups.py` after auto-analysis: it matches
+  helpers by exact entry bytes, names them and sets the fixup. It is part of
+  the collector version, so existing projects need `analyze(force)` to benefit.
+- The `unknown` calling convention on most functions is Ghidra's default before
+  parameter analysis and is not what causes the frame-access noise **[verified]**.
+
 ### MSVC RTTI and vtables
 
 - 32-bit: Complete Object Locator holds absolute pointers (signature 0).

@@ -12,10 +12,11 @@ from typing import Any
 from airlock.worker.main import STATE, emit, op
 from airlock.worker.protocol import WorkerError
 
+from . import fixups
 from . import session as S
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 1  # bump when extract/decompile row semantics change
+COLLECTOR_VERSION = 2  # bump when extract/decompile row semantics change
 PROGRESS_INTERVAL_S = 1.0
 
 
@@ -238,6 +239,8 @@ def _analysis_thread(e: Entry, timeout_min: Any) -> None:
                     mgr.initializeOptions()
                     mgr.reAnalyzeAll(None)
                     mgr.startAnalysis(monitor, True)
+                    if not monitor.isCancelled():
+                        fixups.apply_call_fixups(program)
                 finally:
                     GhidraScriptUtil.releaseBundleHostReference()
                 ok = True
