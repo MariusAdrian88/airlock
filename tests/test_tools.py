@@ -422,13 +422,83 @@ def test_function_lines_and_cursor(ctx):
     assert lines[-1].startswith("… ") and "more lines. cursor=c_" in lines[-1]
     cid = lines[-1].split("cursor=")[1]
     second = core.function(ctx, "main", cursor=cid, budget=100)
-    assert second.splitlines()[0].startswith("  x") and second.splitlines()[0] != lines[0]
+    assert second.splitlines()[0].startswith("// lines 12-") and second.splitlines()[1].startswith("  x11 =")
     assert core.function(ctx, "main", cursor="c_dead").startswith("error bad_cursor:")
     assert core.function(ctx, "OnFoo", cursor=cid, budget=100).startswith("error bad_cursor:")
     part = core.function(ctx, "main", lines="2-3").splitlines()
-    assert len(part) == 2 and part[0].startswith("  x1 =")
+    assert len(part) == 3 and part[0].startswith("// lines 2-3 of 200,")
+    assert part[1].startswith("  x1 =")
     assert core.function(ctx, "main", lines="999-1000").startswith("error bad_args:")
     assert core.function(ctx, "main", lines="abc").startswith("error bad_args:")
+
+
+def _hdr(text: str) -> tuple[int, int, int]:
+    import re
+    m = re.match(r"// lines (\d+)-(\d+) of (\d+),", text)
+    assert m, text[:80]
+    return int(m[1]), int(m[2]), int(m[3])
+
+
+def _cursor(text: str) -> str | None:
+    last = text.splitlines()[-1]
+    return last.split("cursor=")[1] if "cursor=" in last else None
+
+
+def test_function_small_has_no_header(ctx):
+    out = core.function(ctx, "main")
+    assert not out.startswith("// lines") and "of 6" not in out
+    note = core.function(ctx, "0x00401104")
+    assert note.startswith("// resolved from interior address")
+    assert "// lines" not in note
+
+
+def test_function_header_paging(ctx):
+    from airlock.server.budget import estimate_tokens
+    n = 300
+    ctx.worker.c_text = "\n".join(f"  x{i} = {i};" for i in range(n)) + "\n"
+    pages, cid, budget = [], None, 120
+    while True:
+        out = (core.function(ctx, "main", budget=budget) if cid is None
+               else core.function(ctx, "main", cursor=cid, budget=budget))
+        assert estimate_tokens(out, "code") <= budget
+        pages.append(out)
+        cid = _cursor(out)
+        if cid is None:
+            break
+    assert len(pages) > 2
+    nxt = 1
+    for p in pages:
+        s, e, tot = _hdr(p)
+        assert tot == n and s == nxt and e >= s
+        body = [ln for ln in p.splitlines()[1:] if not ln.startswith("… ")]
+        assert len(body) == e - s + 1
+        assert body[0] == f"  x{s - 1} = {s - 1};" and body[-1] == f"  x{e - 1} = {e - 1};"
+        nxt = e + 1
+    assert nxt - 1 == n                       # last page E == N
+    assert "more lines" not in pages[-1]
+    assert "(budget 120)" in pages[0] and "~" in pages[0]
+
+
+def test_function_header_with_note_and_lines(ctx):
+    from airlock.server.budget import estimate_tokens
+    ctx.worker.c_text = "\n".join(f"  x{i} = {i};" for i in range(300)) + "\n"
+    out = core.function(ctx, "0x00401104", budget=150)
+    ls = out.splitlines()
+    assert ls[0].startswith("// resolved from interior address") and ls[1].startswith("// lines 1-")
+    assert estimate_tokens(out, "code") <= 150
+    s, e, tot = _hdr(ls[1])
+    assert (s, tot) == (1, 300) and ls[2] == "  x0 = 0;"   # note does not shift numbering
+    sel = core.function(ctx, "0x00401104", lines="10-12").splitlines()
+    assert sel[1].startswith("// lines 10-12 of 300,") and sel[2] == "  x9 = 9;"
+    assert len(sel) == 5
+    tail = core.function(ctx, "main", lines="299-999").splitlines()
+    assert _hdr(tail[0]) == (299, 300, 300) and len(tail) == 3
+    # lines= span larger than the budget pages with a cursor and continues the range
+    big = core.function(ctx, "main", lines="50-250", budget=100)
+    s, e, _ = _hdr(big)
+    assert s == 50 and e < 250
+    nxt = core.function(ctx, "main", lines="50-250", cursor=_cursor(big), budget=100)
+    assert _hdr(nxt)[0] == e + 1
 
 
 def test_list_tool_cursor_resume(ctx):

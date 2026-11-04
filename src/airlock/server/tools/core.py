@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 
 from airlock.index.store import Function
 from airlock.projects import read_sections
-from airlock.server.budget import STORE, CursorError, fit_lines, fit_text, resume_lines
+from airlock.server.budget import (
+    STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
+)
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
@@ -297,15 +299,45 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if err:
         return err
     assert c_text is not None
-    text = annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize).rstrip("\n")
-    if r.note:
-        text = f"// {r.note}\n{text}"
+    full = annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize).rstrip("\n")
+    return _function_page(full, bud, span, lines, offset, r.note, args, identity)
+
+
+def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str,
+                   offset: int, note: str | None, args: dict, identity: tuple) -> str:
+    """One page of decompiled C. Line numbers count C lines only (not the note).
+
+    If the page does not hold the whole function, a header line gives the page's
+    line range plus the function's total lines and tokens, so the agent can decide
+    to page on, ask for `lines=`, or raise `budget`.
+    """
+    all_lines = full.split("\n")
+    n_total = len(all_lines)
+    first = 1
+    body = full
     if span:
-        text = "\n".join(text.split("\n")[span[0] - 1: span[1]])
-        if not text:
+        first = span[0]
+        body = "\n".join(all_lines[span[0] - 1: span[1]])
+        if not body:
             return f"error bad_args: lines {lines} is past the end of the function. Use a smaller range."
-    return fit_text(text, bud, "code", offset=offset, tool="function", args=args,
-                    identity=identity)[0]
+    prefix = [f"// {note}"] if note else []
+    total_tok = estimate_tokens(full, "code")
+    if not span and offset == 0 and estimate_tokens("\n".join(prefix + [body]), "code") <= bud:
+        return "\n".join(prefix + [body])
+
+    def make_header(start: int, end: int) -> str:
+        return (f"// lines {start}-{end} of {n_total}, function ~{total_tok} tokens "
+                f"(budget {bud}). More: cursor, lines=a-b or budget=<n>.")
+
+    # Reserve note + header (worst-case digit width) before cutting the body.
+    reserved = sum(estimate_tokens(ln + "\n", "code")
+                   for ln in prefix + [make_header(n_total, n_total)])
+    page, remaining = fit_text(body, max(1, bud - reserved), "code", offset=offset,
+                               tool="function", args=args, identity=identity)
+    start = first + body[:offset].count("\n")
+    shown = body[offset:].count("\n") + 1 - remaining
+    end = start + shown - 1
+    return "\n".join(prefix + [make_header(start, end), page])
 
 
 # ── xrefs ──────────────────────────────────────────────────────────────────────
