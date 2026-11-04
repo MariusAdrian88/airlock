@@ -42,6 +42,7 @@ CATALOG: dict[str, ToolInfo] = {
         *_set("fileformat", ["ole_streams", "hexdump", "file_diff", "record_guess"]),
         *_set("spec_write", ["spec_write"]),
         *_set("spec_read", ["spec_read", "spec_list", "spec_export"], clean_safe=True),
-        *_set("admin", ["index_status", "reindex", "project_info", "frontier"]),
+        *_set("admin", ["index_status", "reindex", "project_info", "frontier",
+                       "program_scan", "project_create"]),
     ]
 }

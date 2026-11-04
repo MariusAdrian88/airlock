@@ -267,7 +267,8 @@ plugins and data files), not a single file. Each project is one folder under
       logs\
   clean\                   # start the MCP client here for implementation
     specs\                 # published specs (.md + specs.json), nothing else from dirty
-    .claude\settings.json  # deny rules for ..\dirty (and the equivalents of other clients)
+    .claude\settings.json  # deny rules for the sibling dirty folder; opencode.json and
+                           #   .codex\config.toml are the equivalents for other clients (§9)
 ```
 
 - The original program folder is never modified; files are copied into
@@ -850,9 +851,23 @@ parameter names). No `outputSchema` is advertised.
   `error unbound: ...`.
 
 The role comes from the folder the MCP client runs in, not from a flag or a
-tool call. The server reads the client's workspace from MCP `roots`, else the
-working directory of the server process **[verify per client: Claude Code,
-OpenCode, Codex]**:
+tool call. The server reads the client's workspace from, in order: (1) the
+first MCP root, requested after `notifications/initialized` when the client
+declares the capability and the connection allows server requests (legacy
+handshake; the 2026-07-28 protocol has no back-channel, and roots are deprecated
+there); (2) `CLAUDE_PROJECT_DIR`, which Claude Code sets (client-provided
+detection, not airlock configuration); (3) the working directory of the server
+process. `project_info` shows which source was used. Per client:
+
+| Client | Roots offered | Workspace source | Deny rules written into `clean\` | Shell blocked? |
+|---|---|---|---|---|
+| Claude Code | yes (launch dir first) **[verify]** | roots, else `CLAUDE_PROJECT_DIR` | `.claude\settings.json`: `permissions.deny` with `Read(//<abs>/dirty/**)` and `Edit(//<abs>/dirty/**)` (`//` = absolute from filesystem root, forward slashes; Windows drive form **[verify]**) | no: `cat`/`type` on the path still work; rules cover Read/Grep/Glob and @-mentions |
+| OpenCode | no **[verify]** | server cwd (per-server `cwd` configurable) | `opencode.json`: `permission.external_directory {"*": "deny"}` (blocks paths outside the launch folder, bash included) **[verify]** | yes, for paths outside the launch folder **[verify]** |
+| Codex | no **[verify]** | server cwd **[verify]** | `.codex\config.toml`: permission profile `airlock-clean` denying `<abs>/dirty/**`; exact TOML nesting **[verify]** | per profile **[verify]** |
+
+Existing user files in `clean\` are never overwritten: the JSON files are
+merged, the Codex TOML is skipped when present. Relative `..\dirty` rules are
+not used because their resolution is unconfirmed in all three clients.
 
 | Workspace | Role |
 |---|---|

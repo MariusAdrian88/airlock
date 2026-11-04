@@ -7,6 +7,7 @@
   "jdk_dir": null,           // null: java on PATH, else Ghidra's LaunchSupport picks one
   "ilspycmd": null,          // e.g. "C:/Tools/ilspycmd/ilspycmd.exe" (optional, .NET)
   "index_dir": null,         // null: %LOCALAPPDATA%/airlock
+  "projects_root": null,     // null: %USERPROFILE%/airlock-projects (local disk)
 
   // ── Behaviour ─────────────────────────────────────────────────────────────
   "defaults": {
@@ -17,6 +18,7 @@
     "decompile_timeout_s": 60,
     "bulk_decompile": "lazy",        // lazy | background
     "analysis_timeout_min": 60,
+    "analysis_s_per_code_mb": 80,    // light-scan time estimate: seconds per MB of code
     "allow_writes": false,           // gate for every tool in "annotate"
     "mirror_notes_to_ghidra": true,  // agent notes also become plate comments
     "jvm_max_memory": null           // e.g. "8G"; null: Ghidra's default
@@ -57,6 +59,7 @@
     "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
     "spec_write": ["spec_write", "spec_list"],
     "spec_read": ["spec_read", "spec_list", "spec_export"],
-    "admin": ["index_status", "reindex", "project_info", "frontier"]
+    "admin": ["index_status", "reindex", "project_info", "frontier", "program_scan",
+              "project_create"]
   }
 }

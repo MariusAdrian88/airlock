@@ -39,9 +39,13 @@ def test_slugify():
 
 def test_layout(tmp_path):
     pp = P.project_paths(tmp_path, "a b")
-    assert pp.root == tmp_path / "projects" / "a_b"
-    for d in (pp.ghidra, pp.artifacts, pp.cache, pp.logs):
+    assert pp.root == tmp_path / "a_b"
+    assert pp.data == pp.root / "dirty" / ".airlock"
+    assert pp.ghidra == pp.data / "ghidra" and pp.index_db == pp.data / "index.sqlite"
+    assert pp.specs == pp.root / "clean" / "specs"
+    for d in (pp.ghidra, pp.artifacts, pp.cache, pp.logs, pp.specs):
         assert d.is_dir()
+    assert pp.manifest.is_file() and P.read_manifest(pp.manifest)["name"] == "a_b"
     assert P.list_projects(tmp_path) == ["a_b"]
     assert not P.project_paths(tmp_path, "zz", create=False).root.exists()
 

@@ -1,0 +1,294 @@
+"""Role from workspace, tool gating, project_create, manifest and deny rules (no Ghidra)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import anyio
+import pytest
+from mcp import types
+from mcp.client import Client
+
+from airlock import projects as P
+from airlock.config.loader import deep_merge, default_config_text, parse_jsonc, resolve
+from airlock.server import roles
+from airlock.server.app import build_server
+from airlock.server.scan import ScanOption, ScannedFile, ScanResult
+from airlock.server.tools import project_create as pc
+from test_tools import make_ctx
+
+
+def _cfg(tmp_path, profile="dirty"):
+    merged = deep_merge(parse_jsonc(default_config_text()),
+                        {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path / "d"),
+                         "projects_root": str(tmp_path / "projects")})
+    return resolve(merged, profile, None)
+
+
+def make_project(root: Path, name="demo") -> P.ProjectPaths:
+    return P.project_paths(root, name, create=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_env(monkeypatch):
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+
+# -- config / layout / manifest ------------------------------------------------
+
+def test_projects_root_config(tmp_path):
+    assert _cfg(tmp_path).projects_root == tmp_path / "projects"
+    merged = deep_merge(parse_jsonc(default_config_text()), {"ghidra_dir": "x"})
+    assert resolve(merged, "dirty", None).projects_root.name == "airlock-projects"
+    with pytest.raises(Exception, match="absolute"):
+        resolve(deep_merge(merged, {"projects_root": "rel/dir"}), "dirty", None)
+
+
+def test_manifest_round_trip(tmp_path):
+    f = tmp_path / "m" / P.MANIFEST_NAME
+    data = {"name": "x", "files": [{"path": "a b.exe", "sha256": "ab"}]}
+    P.write_manifest(f, data)
+    assert f.read_text("utf-8").startswith("//")
+    assert P.read_manifest(f) == data
+
+
+# -- role resolution -------------------------------------------------------------
+
+def test_role_table(tmp_path):
+    pp = make_project(tmp_path)
+    (pp.dirty / "sub" / "deep").mkdir(parents=True)
+    cases = [
+        (pp.dirty, "dirty"), (pp.dirty / "sub" / "deep", "dirty"),
+        (pp.clean, "clean"), (pp.specs, "clean"),
+        (pp.root, "unbound"), (tmp_path, "unbound"),
+    ]
+    for ws, role in cases:
+        s = roles.resolve_session(ws, "cwd")
+        assert s.role == role, ws
+        assert (s.project.name if s.project else None) == (None if role == "unbound" else "demo")
+
+
+def test_folder_named_dirty_without_marker_is_unbound(tmp_path):
+    (tmp_path / "x" / "dirty").mkdir(parents=True)
+    assert roles.resolve_session(tmp_path / "x" / "dirty", "cwd").role == "unbound"
+
+
+def test_profile_override(tmp_path):
+    pp = make_project(tmp_path)
+    assert roles.resolve_session(pp.dirty, "cwd", "dirty").role == "dirty"
+    with pytest.raises(roles.RoleConflict, match="clean"):
+        roles.resolve_session(pp.dirty, "cwd", "clean")
+    s = roles.resolve_session(tmp_path, "cwd", "clean")  # unbound folder: profile applies
+    assert (s.role, s.project, s.source) == ("clean", None, "profile")
+
+
+def test_workspace_detection_order(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert roles.detect_workspace()[1] == "cwd"
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "env"))
+    assert roles.detect_workspace() == (tmp_path / "env", "env CLAUDE_PROJECT_DIR")
+    ws, src = roles.detect_workspace([(tmp_path / "r").as_uri()])
+    assert src == "roots" and ws.name == "r"
+
+
+def test_build_server_start_role_and_conflict(tmp_path, monkeypatch):
+    pp = make_project(tmp_path / "projects")
+    monkeypatch.chdir(pp.clean)
+    _, ctx = build_server(_cfg(tmp_path))
+    assert ctx.session.role == "clean" and ctx.session.source == "cwd"
+    with pytest.raises(roles.RoleConflict):
+        build_server(_cfg(tmp_path, "dirty"), profile_explicit=True)
+    build_server(_cfg(tmp_path, "clean"), profile_explicit=True)
+
+
+# -- gating -----------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool", ["open_binary", "function", "index_status", "spec_write"])
+def test_unbound_blocks_other_tools(tool):
+    assert roles.gate(roles.SessionState(), tool).startswith("error unbound:")
+
+
+@pytest.mark.parametrize("tool", ["program_scan", "project_create", "project_info"])
+def test_unbound_allows(tool):
+    assert roles.gate(roles.SessionState(), tool) is None
+
+
+def test_clean_only_clean_safe(tmp_path):
+    s = roles.resolve_session(make_project(tmp_path).clean, "cwd")
+    for t in ("spec_read", "spec_list", "spec_export"):
+        assert roles.gate(s, t) is None
+    for t in ("function", "project_info", "project_create", "spec_write"):
+        assert roles.gate(s, t).startswith("error wrong_role:")
+
+
+def test_dirty_blocks_project_create_only(tmp_path):
+    s = roles.resolve_session(make_project(tmp_path).dirty, "cwd")
+    assert roles.gate(s, "project_create").startswith("error wrong_role: already in project demo")
+    assert roles.gate(s, "function") is None and roles.gate(s, "program_scan") is None
+
+
+def _call(server, name, args=None):
+    async def go():
+        return (await server.call_tool(name, args or {})).content[0].text
+    return anyio.run(go)
+
+
+def test_gate_applies_through_server_and_clean_never_opens_index(tmp_path, monkeypatch):
+    pp = make_project(tmp_path / "projects")
+    monkeypatch.chdir(pp.clean)
+    server, ctx = build_server(_cfg(tmp_path))
+    assert _call(server, "index_status").startswith("error wrong_role:")
+    assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
+    assert not pp.index_db.exists()
+    monkeypatch.chdir(tmp_path)
+    server, _ = build_server(_cfg(tmp_path))
+    assert _call(server, "index_status").startswith("error unbound:")
+    info = _call(server, "project_info")
+    assert "session role unbound" in info and "(from cwd)" in info
+
+
+def test_roots_decide_role_over_cwd(tmp_path, monkeypatch):
+    pp = make_project(tmp_path / "projects")
+    monkeypatch.chdir(tmp_path)  # cwd unbound
+    server, ctx = build_server(_cfg(tmp_path))
+
+    async def cb(context):
+        return types.ListRootsResult(roots=[types.Root(uri=pp.clean.as_uri())])
+
+    async def go():
+        # legacy handshake (what stdio clients use): the server may call roots/list
+        async with Client(server, list_roots_callback=cb, mode="legacy") as c:
+            with anyio.fail_after(10):
+                while not ctx.roots_done:  # resolved by notifications/initialized
+                    await anyio.sleep(0.01)
+            assert ctx.session.source == "roots"
+            r = await c.call_tool("index_status", {})
+            return r.content[0].text
+
+    assert anyio.run(go).startswith("error wrong_role:")
+    assert ctx.session.role == "clean" and ctx.session.source == "roots"
+
+
+def test_client_without_roots_keeps_cwd(tmp_path, monkeypatch):
+    pp = make_project(tmp_path / "projects")
+    monkeypatch.chdir(pp.dirty)
+    server, ctx = build_server(_cfg(tmp_path))
+
+    async def go():
+        async with Client(server) as c:
+            with anyio.fail_after(10):
+                r = await c.call_tool("project_create", {"path": str(tmp_path), "name": "z"})
+            return r.content[0].text
+
+    assert "already in project demo" in anyio.run(go)
+    assert ctx.session.role == "dirty" and ctx.session.source == "cwd"
+
+
+# -- project_create ------------------------------------------------------------------
+
+def _sf(rel, group, kind="pe", code=1 << 20, dll=False):
+    pe = kind == "pe"
+    return ScannedFile(rel, kind, group, 2 << 20 if pe else 10, code if pe else 0,
+                       32 if pe else None, dll, False, False, None, None, (), 0)
+
+
+@pytest.fixture
+def fake_scan(tmp_path, monkeypatch):
+    src = tmp_path / "prog"
+    (src / "plug").mkdir(parents=True)
+    for rel, body in {"app.exe": b"A" * 100, "core.dll": b"B" * 100, "plug/p1.dll": b"C" * 100,
+                      "data.bin": b"D" * 10}.items():
+        (src / rel).write_bytes(body)
+    app, core = _sf("app.exe", "core"), _sf("core.dll", "core", dll=True)
+    plug, data = _sf("plug/p1.dll", "own_plugin", dll=True), _sf("data.bin", "data", kind="data")
+    a = ScanOption("A", "Core", ("core",), (app, core), 2 << 20, 160.0)
+    b = ScanOption("B", "Core + own plugins", ("core", "own_plugin"), (app, core, plug),
+                   3 << 20, 240.0)
+    res = ScanResult(src, "app.exe", "largest executable", (app, core, plug, data), (), (),
+                     (a, b), "B")
+    monkeypatch.setattr(pc, "scan_program", lambda path, root_exe=None, s_per_code_mb=80.0: res)
+    monkeypatch.setattr(pc, "render_scan", lambda r: ["SCANTABLE"])
+    return src
+
+
+def test_project_create_need_name(tmp_path, fake_scan):
+    ctx = make_ctx(tmp_path)
+    out = pc.project_create(ctx, str(fake_scan))
+    assert out.startswith("error need_name:") and "name=" in out
+
+
+def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
+    ctx = make_ctx(tmp_path)
+    out = pc.project_create(ctx, str(fake_scan), name="My Prog")
+    assert out.splitlines()[0] == "SCANTABLE"
+    assert "Choose option=A..B (recommended B)" in out
+    assert not (tmp_path / "projects" / "My_Prog").exists()
+
+    out = pc.project_create(ctx, str(fake_scan), name="My Prog", option="b", remove="core.dll",
+                            add="data.bin")
+    root = tmp_path / "projects" / "My_Prog"
+    assert out.splitlines()[-1] == f"Open the MCP client in {root / 'dirty'} to continue."
+    man = P.read_manifest(root / P.MANIFEST_NAME)
+    assert man["selected_option"] == "B" and man["source"]["root_exe"] == "app.exe"
+    paths = {f["path"]: f for f in man["files"]}
+    assert set(paths) == {"app.exe", "plug/p1.dll", "data.bin"}
+    assert paths["plug/p1.dll"]["group"] == "own_plugin" and len(paths["app.exe"]["sha256"]) == 64
+    assert paths["plug/p1.dll"]["state"] == "queued"
+    assert paths["app.exe"]["state"] == "error"  # fake file is not a PE: indexer refuses it
+    for f in man["files"]:
+        assert (root / "dirty" / ".airlock" / "artifacts" / f["sha256"]).is_file()
+    assert (root / "clean" / "specs").is_dir()
+    assert roles.resolve_session(root / "dirty", "cwd").role == "dirty"
+    assert pc.project_create(ctx, str(fake_scan), name="my prog!", option="A").startswith("error exists:")
+    assert pc.project_create(ctx, str(fake_scan), name="q", option="Z").startswith("error bad_option:")
+    assert pc.project_create(ctx, str(fake_scan), name="q", option="A",
+                             add="nope.dll").startswith("error bad_file:")
+
+
+def test_project_create_calls_indexer_for_root_only(tmp_path, fake_scan, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    calls = []
+
+    class R:
+        status = "importing"
+
+    def fake_open(p, path, wait_s=0):
+        calls.append((p, path))
+        return R()
+
+    monkeypatch.setattr(ctx.indexer, "open_binary", fake_open)
+    pc.project_create(ctx, str(fake_scan), name="q", option="B")
+    assert calls == [("q", str(fake_scan / "app.exe"))]
+    man = P.read_manifest(tmp_path / "projects" / "q" / P.MANIFEST_NAME)
+    assert {f["path"]: f["state"] for f in man["files"]} == {
+        "app.exe": "importing", "core.dll": "queued", "plug/p1.dll": "queued"}
+
+
+def test_deny_rules(tmp_path):
+    pp = make_project(tmp_path)
+    P.write_clean_deny_rules(pp)
+    rule = "//" + str(pp.dirty.resolve()).replace("\\", "/")
+    cs = json.loads((pp.clean / ".claude" / "settings.json").read_text("utf-8"))
+    assert cs == {"permissions": {"deny": [f"Read({rule}/**)", f"Edit({rule}/**)"]}}
+    assert json.loads((pp.clean / "opencode.json").read_text("utf-8")) == {
+        "permission": {"external_directory": {"*": "deny"}}}
+    toml = (pp.clean / ".codex" / "config.toml").read_text("utf-8")
+    assert 'default_permissions = "airlock-clean"' in toml and "dirty/**" in toml
+
+
+def test_deny_rules_merge_and_keep_existing(tmp_path):
+    pp = make_project(tmp_path)
+    cj = pp.clean / ".claude" / "settings.json"
+    cj.parent.mkdir(parents=True)
+    cj.write_text(json.dumps({"permissions": {"deny": ["Read(secret)"], "allow": ["Bash(ls)"]},
+                              "x": 1}))
+    (pp.clean / ".codex").mkdir()
+    (pp.clean / ".codex" / "config.toml").write_text("mine = true\n")
+    P.write_clean_deny_rules(pp)
+    cs = json.loads(cj.read_text("utf-8"))
+    assert cs["x"] == 1 and cs["permissions"]["allow"] == ["Bash(ls)"]
+    assert cs["permissions"]["deny"][0] == "Read(secret)" and len(cs["permissions"]["deny"]) == 3
+    P.write_clean_deny_rules(pp)  # idempotent
+    assert len(json.loads(cj.read_text("utf-8"))["permissions"]["deny"]) == 3
+    assert (pp.clean / ".codex" / "config.toml").read_text() == "mine = true\n"

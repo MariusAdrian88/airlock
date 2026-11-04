@@ -6,7 +6,8 @@ from airlock.server.app import build_server
 
 def _cfg(tmp_path, profile="dirty"):
     merged = deep_merge(parse_jsonc(default_config_text()),
-                        {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path)})
+                        {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path),
+                         "projects_root": str(tmp_path / "projects")})
     return resolve(merged, profile, None)
 
 
@@ -15,13 +16,14 @@ def test_only_implemented_configured_tools_are_listed(tmp_path):
     tools = anyio.run(server.list_tools)
     names = [t.name for t in tools]
     assert set(names) == {"project_info", "index_status", "open_binary", "list_binaries",
-                          "outline", "search", "function", "xrefs", "callgraph", "strings"}
+                          "outline", "search", "function", "xrefs", "callgraph", "strings",
+                          "program_scan", "project_create"}
     assert "rename" in ctx.not_implemented
     pi = next(t for t in tools if t.name == "project_info")
     dumped = pi.model_dump(exclude_none=True)
     assert all("output_schema" not in t.model_dump(exclude_none=True) for t in tools)
     assert set(dumped["input_schema"]["properties"]) == {"check_ghidra"}
-    assert len(ctx.config.tools) == 36
+    assert len(ctx.config.tools) == 38
 
 
 def test_clean_profile_lists_no_code_tools(tmp_path):

@@ -124,7 +124,8 @@ class FakeWorker:
 
 def make_ctx(tmp_path) -> ServerContext:
     merged = deep_merge(parse_jsonc(default_config_text()),
-                        {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path / "data")})
+                        {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path / "data"),
+                         "projects_root": str(tmp_path / "projects")})
     fake = FakeWorker()
     ctx = ServerContext(config=resolve(merged, "dirty", None), worker=fake)
     fake.project_path = str(ctx.indexer.paths("proj", create=True).ghidra)

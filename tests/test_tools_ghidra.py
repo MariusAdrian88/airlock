@@ -28,7 +28,8 @@ SAMPLES: dict[str, str] = {}
 
 @pytest.fixture(scope="module")
 def world(binary_path, tmp_path_factory):
-    cfg = dataclasses.replace(load_config(), data_dir=tmp_path_factory.mktemp("data"))
+    cfg = dataclasses.replace(load_config(), data_dir=tmp_path_factory.mktemp("data"),
+                              projects_root=tmp_path_factory.mktemp("projects"))
     ctx = ServerContext(config=cfg, worker=WorkerClient(cfg))
     try:
         t0 = time.monotonic()

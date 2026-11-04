@@ -13,6 +13,7 @@ from airlock import __version__, paths
 def _cmd_serve(args: argparse.Namespace) -> int:
     from airlock.config import ConfigError, load_config
     from airlock.server.app import serve
+    from airlock.server.roles import RoleConflict
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="[airlock] %(levelname)s %(message)s")
@@ -21,7 +22,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     except ConfigError as e:
         print(f"airlock: {e}", file=sys.stderr)
         return 2
-    serve(cfg)
+    try:
+        serve(cfg, profile_explicit=args.profile is not None)
+    except RoleConflict as e:
+        print(f"airlock: {e}", file=sys.stderr)
+        return 2
     return 0
 
 

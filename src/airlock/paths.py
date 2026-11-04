@@ -32,6 +32,10 @@ def default_config_path() -> Path:
     return config_dir() / "config.jsonc"
 
 
+def default_projects_root() -> Path:
+    return Path.home() / "airlock-projects"
+
+
 def default_data_dir() -> Path:
     if is_windows():
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")

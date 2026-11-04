@@ -113,6 +113,20 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
     except OSError as e:
         add(Check("FAIL", "data dir", f"{data}: {e}"))
 
+    # Projects root
+    root = cfg.projects_root
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=root, delete=True):
+            pass
+        if drives.is_network_path(root):
+            add(Check("WARN", "projects root",
+                      f"{root} is on a network drive; Ghidra projects need a local disk"))
+        else:
+            add(Check("OK", "projects root", str(root)))
+    except OSError as e:
+        add(Check("FAIL", "projects root", f"{root}: {e}"))
+
     if cfg.is_clean:
         _print(checks)
         return 0 if all(c.status != "FAIL" for c in checks) else 1

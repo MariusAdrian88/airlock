@@ -10,6 +10,7 @@ locations, null simply means "not set").
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -22,7 +23,7 @@ from airlock.config.catalog import CATALOG
 
 CLEAN_ROLE = "clean"
 DIRTY_ROLE = "dirty"
-_LOCATION_KEYS = ("ghidra_dir", "jdk_dir", "ilspycmd", "index_dir")
+_LOCATION_KEYS = ("ghidra_dir", "jdk_dir", "ilspycmd", "index_dir", "projects_root")
 
 
 class ConfigError(Exception):
@@ -47,6 +48,7 @@ class Config:
     jdk_dir: Path | None
     ilspycmd: Path | None
     data_dir: Path
+    projects_root: Path
     defaults: dict[str, Any]
     allow_writes: bool
     enabled_sets: list[str]
@@ -102,6 +104,17 @@ def _opt_path(value: Any, key: str) -> Path | None:
     return Path(value).expanduser()
 
 
+def _projects_root(value: Any) -> Path:
+    if value is None or value == "":
+        return paths.default_projects_root()
+    if not isinstance(value, str):
+        raise ConfigError("'projects_root' must be a path string or null")
+    p = Path(os.path.expandvars(os.path.expanduser(value)))
+    if not p.is_absolute():
+        raise ConfigError(f"'projects_root' must be an absolute path (got '{value}')")
+    return p
+
+
 def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) -> Config:
     issues: list[Issue] = []
 
@@ -126,6 +139,10 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         v = defaults.get(key)
         if v is not None and (not isinstance(v, int) or v <= 0):
             raise ConfigError(f"defaults.{key} must be a positive integer")
+
+    spc = defaults.get("analysis_s_per_code_mb")
+    if spc is not None and (isinstance(spc, bool) or not isinstance(spc, (int, float)) or spc <= 0):
+        raise ConfigError("defaults.analysis_s_per_code_mb must be a positive number")
 
     sets_raw = merged.get("sets") or {}
     sets: dict[str, list[str]] = {}
@@ -177,6 +194,7 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         ghidra_dir=ghidra_dir,
         jdk_dir=_opt_path(merged.get("jdk_dir"), "jdk_dir"),
         ilspycmd=_opt_path(merged.get("ilspycmd"), "ilspycmd"),
+        projects_root=_projects_root(merged.get("projects_root")),
         data_dir=_opt_path(merged.get("index_dir"), "index_dir") or paths.default_data_dir(),
         defaults=defaults,
         allow_writes=allow_writes,

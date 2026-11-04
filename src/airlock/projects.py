@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+import json5
 import pefile
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -32,60 +35,183 @@ def slugify(name: str) -> str:
     return s or "project"
 
 
+MANIFEST_NAME = "airlock-project.jsonc"
+MANIFEST_VERSION = 1
+MANIFEST_HEADER = (
+    "// airlock project manifest. Marker for the project folder and record of what was\n"
+    "// scanned, selected and queued. Written by airlock; the \"settings\" key is a\n"
+    "// per-project config overlay you may edit.\n"
+)
+
+
 @dataclass(frozen=True)
 class ProjectPaths:
+    """<projects_root>/<name>/{airlock-project.jsonc, dirty/.airlock/..., clean/specs}."""
+
     root: Path
     name: str
 
     @property
+    def manifest(self) -> Path:
+        return self.root / MANIFEST_NAME
+
+    @property
+    def dirty(self) -> Path:
+        return self.root / "dirty"
+
+    @property
+    def clean(self) -> Path:
+        return self.root / "clean"
+
+    @property
+    def data(self) -> Path:
+        return self.dirty / ".airlock"
+
+    @property
     def ghidra(self) -> Path:
-        return self.root / "ghidra"
+        return self.data / "ghidra"
 
     @property
     def artifacts(self) -> Path:
-        return self.root / "artifacts"
+        return self.data / "artifacts"
 
     @property
     def index_db(self) -> Path:
-        return self.root / "index.sqlite"
+        return self.data / "index.sqlite"
 
     @property
     def cache(self) -> Path:
-        return self.root / "cache"
+        return self.data / "cache"
 
     @property
     def logs(self) -> Path:
-        return self.root / "logs"
+        return self.data / "logs"
 
     @property
-    def project_json(self) -> Path:
-        return self.root / "project.json"
-
-    @property
-    def project_jsonc(self) -> Path:
-        return self.root / "project.jsonc"
+    def specs(self) -> Path:
+        return self.clean / "specs"
 
     def ensure(self) -> "ProjectPaths":
-        for d in (self.ghidra, self.artifacts, self.cache, self.logs):
+        for d in (self.ghidra, self.artifacts, self.cache, self.logs, self.specs):
             d.mkdir(parents=True, exist_ok=True)
         return self
 
 
-def projects_root(data_dir: Path) -> Path:
-    return Path(data_dir) / "projects"
+def read_manifest(path: Path) -> dict:
+    data = json5.loads(Path(path).read_text("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: manifest must be an object")
+    return data
 
 
-def project_paths(data_dir: Path, name: str, create: bool = True) -> ProjectPaths:
+def write_manifest(path: Path, data: dict) -> None:
+    """JSONC with a header comment; atomic replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(MANIFEST_HEADER + json.dumps(data, indent=2, ensure_ascii=False) + "\n", "utf-8")
+    tmp.replace(path)
+
+
+def new_manifest(name: str) -> dict:
+    return {"version": MANIFEST_VERSION, "name": name, "settings": {}}
+
+
+def project_paths(root: Path, name: str, create: bool = True) -> ProjectPaths:
+    """Paths of project ``name`` under the projects root. With create, make the folders
+    and a minimal manifest if none exists (the manifest is what makes it a project)."""
     slug = slugify(name)
-    p = ProjectPaths(projects_root(data_dir) / slug, slug)
-    return p.ensure() if create else p
+    p = ProjectPaths(Path(root) / slug, slug)
+    if create:
+        p.ensure()
+        if not p.manifest.exists():
+            write_manifest(p.manifest, new_manifest(slug))
+    return p
 
 
-def list_projects(data_dir: Path) -> list[str]:
-    root = projects_root(data_dir)
+def list_projects(root: Path) -> list[str]:
+    root = Path(root)
     if not root.is_dir():
         return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+    return sorted(p.name for p in root.iterdir() if (p / MANIFEST_NAME).is_file())
+
+
+def _norm(p: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def locate_project(workspace: Path) -> tuple[str, ProjectPaths] | None:
+    """(role, project) when the workspace is the dirty or clean folder of a project, or
+    below it. Walks up looking for the marker; the marker's folder must have a dirty or
+    clean child that contains the workspace. Otherwise None."""
+    try:
+        ws = Path(workspace).resolve()
+    except OSError:
+        return None
+    for cand in (ws, *ws.parents):
+        if not (cand / MANIFEST_NAME).is_file():
+            continue
+        pp = ProjectPaths(cand, cand.name)
+        for role, folder in (("dirty", pp.dirty), ("clean", pp.clean)):
+            f, w = _norm(folder), _norm(ws)
+            if w == f or w.startswith(f + os.sep):
+                return role, pp
+    return None
+
+
+def _claude_rule_path(p: Path) -> str:
+    return "//" + str(p.resolve()).replace("\\", "/")
+
+
+def _merge_json(path: Path, patch: dict) -> None:
+    cur: dict = {}
+    if path.exists():
+        try:
+            cur = json5.loads(path.read_text("utf-8-sig"))
+        except ValueError:
+            cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(cur.get(k), dict):
+            for k2, v2 in v.items():
+                if isinstance(v2, list) and isinstance(cur[k].get(k2), list):
+                    cur[k][k2] = cur[k][k2] + [x for x in v2 if x not in cur[k][k2]]
+                elif isinstance(v2, dict) and isinstance(cur[k].get(k2), dict):
+                    cur[k][k2] = {**v2, **cur[k][k2]}  # the user's entries win
+                else:
+                    cur[k].setdefault(k2, v2)
+        else:
+            cur.setdefault(k, v)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cur, indent=2) + "\n", "utf-8")
+
+
+def write_clean_deny_rules(pp: ProjectPaths) -> list[str]:
+    """Deny rules in clean/ that keep the clean agent's own file tools out of ../dirty,
+    using the absolute path of the sibling folder. Existing user files are merged
+    (JSON) or left alone (Codex TOML). Returns the files written."""
+    pp.clean.mkdir(parents=True, exist_ok=True)
+    rule = _claude_rule_path(pp.dirty)
+    written = []
+    f = pp.clean / ".claude" / "settings.json"
+    _merge_json(f, {"permissions": {"deny": [f"Read({rule}/**)", f"Edit({rule}/**)"]}})
+    written.append(str(f))
+    f = pp.clean / "opencode.json"
+    _merge_json(f, {"permission": {"external_directory": {"*": "deny"}}})
+    written.append(str(f))
+    f = pp.clean / ".codex" / "config.toml"
+    if not f.exists():
+        d = str(pp.dirty.resolve()).replace("\\", "/")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            "# airlock: keep the clean session out of the sibling dirty folder. [verify] schema\n"
+            'default_permissions = "airlock-clean"\n\n'
+            "[permissions.airlock-clean.filesystem]\n"
+            f'":workspace_roots" = {{ "." = "write" }}\n"{d}/**" = "deny"\n',
+            "utf-8")
+        written.append(str(f))
+    return written
 
 
 def hash_file(path: Path, chunk: int = 1 << 20) -> str:

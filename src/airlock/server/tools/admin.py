@@ -28,7 +28,11 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
         f"writes {'on' if cfg.allow_writes else 'off'}",
         f"config  {cfg.source or '(built-in defaults only)'}",
         f"data    {cfg.data_dir}",
+        f"projects {cfg.projects_root}",
     ]
+    se = ctx.session
+    out.append(f"session role {se.role} | project {se.project.name if se.project else '-'} | "
+               f"workspace {se.workspace or '?'} (from {se.source})")
     if not cfg.is_clean:
         g = "not set"
         if cfg.ghidra_dir:
