@@ -63,17 +63,18 @@ def test_migration_hook(tmp_path, monkeypatch):
         calls.append(1)
         db.execute("CREATE TABLE extra(x)")
 
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 4)
-    monkeypatch.setitem(store_mod.MIGRATIONS, 4, mig)
+    nxt = store_mod.SCHEMA_VERSION + 1
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", nxt)
+    monkeypatch.setitem(store_mod.MIGRATIONS, nxt, mig)
     s = Store(p)
-    assert calls == [1] and s.schema_version == 4
+    assert calls == [1] and s.schema_version == nxt
     s.close()
 
 
 def test_missing_migration_and_newer_schema(tmp_path, monkeypatch):
     p = tmp_path / "i.sqlite"
     Store(p).close()
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 4)
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", store_mod.SCHEMA_VERSION + 1)
     with pytest.raises(RuntimeError):
         Store(p)
     monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 0)

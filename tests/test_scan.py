@@ -209,8 +209,11 @@ def test_option_math_and_cumulation(prog):
     assert {f.rel_path for f in c.files} == {"main.exe", "lib.dll", "plugins/p.dll"}
     assert c.code_size == 0x6000 + 0x1000 + 0x600
     assert {f.rel_path for f in d.files} == {"main.exe", "lib.dll", "plugins/p.dll", "helper.exe"}
-    assert a.est_seconds == pytest.approx(0x6000 / (1024 * 1024) * 100.0)
-    assert d.est_seconds == pytest.approx(d.code_size / (1024 * 1024) * 100.0)
+    n_pe = lambda o: sum(1 for f in o.files if f.kind == "pe")   # noqa: E731
+    assert a.est_seconds == pytest.approx(20.0 + 0x6000 / (1024 * 1024) * 100.0)
+    assert d.est_seconds == pytest.approx(n_pe(d) * 20.0 + d.code_size / (1024 * 1024) * 100.0)
+    r2 = scan_program(prog, root_exe="main.exe", s_per_code_mb=100.0, overhead_s=0.0)
+    assert r2.options[0].est_seconds == pytest.approx(0x6000 / (1024 * 1024) * 100.0)
     assert not any(f.group == "runtime" for o in r.options for f in o.files)
 
 

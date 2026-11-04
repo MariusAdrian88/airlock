@@ -84,7 +84,8 @@ CREATE TABLE import (
   dll           TEXT,
   name          TEXT,
   ordinal       INTEGER,
-  address       INTEGER
+  address       INTEGER,
+  resolved      TEXT
 );
 CREATE INDEX import_by_binary ON import(binary_id, dll);
 
@@ -103,7 +104,8 @@ CREATE TABLE xedge (
   src_addr      INTEGER NOT NULL,
   dst_binary    INTEGER NOT NULL REFERENCES binary(id),
   dst_entry     INTEGER NOT NULL,
-  kind          TEXT NOT NULL DEFAULT 'import'
+  kind          TEXT NOT NULL DEFAULT 'import',
+  evidence      TEXT
 );
 CREATE INDEX xedge_src ON xedge(src_binary, src_addr);
 CREATE INDEX xedge_dst ON xedge(dst_binary, dst_entry);

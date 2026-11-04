@@ -61,7 +61,7 @@ def test_dirty_map_sections_and_identifiers(proj):
     assert "app.exe -> lib.dll: " in text and " imports" in text
     # features with coverage and the drill-in call; data-format from the manifest extension
     assert 'file-io | File input/output |' in text and 'feature(key="file-io")' in text
-    assert "coverage 0/" in text and 'feature(key="data-format:blg")' in text
+    assert "named 0 of " in text and "seeds " in text and 'feature(key="data-format:blg")' in text
     # knowledge with zero counts, frontier with address and the next call, where to write
     assert "notes 0 | specs 0 | published specs 0" in text
     front = text.split("## Frontier")[1].split("## Where to write")[0]
@@ -114,7 +114,7 @@ def test_hook_regenerates_project_md_after_ready(proj):
     ctx.indexer.ready_hooks[0]("proj", app)
     assert ctx.wait_maps(20)
     first = (pp.dirty / "PROJECT.md").read_text("utf-8")
-    assert "coverage 0/" in first and (pp.clean / "PROJECT.md").exists()
+    assert "named 0 of " in first and (pp.clean / "PROJECT.md").exists()
     with st.db:
         st.db.execute("UPDATE function SET name='read_it', name_state='user' WHERE name='FUN_a'")
     ctx.indexer.ready_hooks[0]("proj", lib)
@@ -157,7 +157,7 @@ def test_features_and_feature_tools(proj):
     ctx, pp, st = bound(proj)
     out = mt.features(ctx)
     assert "file-io | File input/output | " in out and 'feature(key="config")' in out
-    f = mt.feature(ctx, "file-io")
+    f = mt.feature(ctx, "file-io", depth=2)
     lines = f.splitlines()
     assert lines[0].startswith("feature file-io: File input/output |")
     assert "app.exe | FUN_a (0x00401100) | auto | calls ReadFile" in f
@@ -170,10 +170,10 @@ def test_features_and_feature_tools(proj):
 
 def test_feature_limit_and_cursor(proj):
     ctx, pp, st = bound(proj)
-    full = mt.feature(ctx, "file-io", limit=100)
+    full = mt.feature(ctx, "file-io", depth=2, limit=100)
     n_entries = sum(1 for ln in full.splitlines() if " | auto | " in ln)
     assert n_entries >= 5
-    page = mt.feature(ctx, "file-io", limit=2)
+    page = mt.feature(ctx, "file-io", depth=2, limit=2)
     assert sum(1 for ln in page.splitlines() if " | auto | " in ln) == 2
     assert f"… {n_entries - 2} more lines. cursor=" in page
     cid = page.rsplit("cursor=", 1)[1].strip()
@@ -196,7 +196,7 @@ def test_feature_define_and_survival(proj):
     assert "[agent]" in mt.features(ctx)
     mt.features(ctx, refresh=True)                      # re-derive: the agent feature stays
     assert "WinMain (0x00401000)" in mt.feature(ctx, "open-project-file")
-    assert 'open-project-file [agent] | Open a project file | 2 entry points' in mt.overview(ctx)
+    assert 'open-project-file [agent] | Open a project file | seeds 2, total 2' in mt.overview(ctx)
     # refine: add one more function, keep the title
     assert "updated" in mt.feature_define(ctx, "open-project-file", "", functions="FUN_cfg", topics="io")
     assert "3 entry points" in mt.feature_define(ctx, "open-project-file", "", functions="FUN_cfg")
@@ -262,3 +262,60 @@ def test_bind_session_resumes_project(proj, monkeypatch):
     monkeypatch.setattr(ctx.indexer, "resume_project", lambda name: seen.append(name) or 0)
     assert ctx.bind_session("dirty", pp) is None
     assert seen == ["proj"]
+
+
+# -- feature ranking, depth and binary filters, summary counts ----------------------------------
+
+def _ranked_feature(st, ids):
+    app, lib, _rt = ids
+    st.define_feature("rank-demo", "Rank demo", "", "2026-01-01T00:00:00Z")
+    rows = [(app, 0x401100, 0, "calls A", "calls A ; calls B"),     # FUN_a: two evidence items
+            (app, 0x401200, 0, "calls A", "calls A"),               # FUN_b
+            (app, 0x401500, 0, "calls A", "calls A"),               # FUN_cfg
+            (lib, 0x1000, 0, "calls A", "calls A"),                 # FUN_lr
+            (lib, 0x1100, 1, "caller of FUN_lr", "calls A"),        # Impl
+            (app, 0x401300, 2, "caller of FUN_b", "calls A")]       # FUN_c
+    with st.db:
+        st.db.executemany("INSERT INTO feature_entry(feature_key, binary_id, space, entry, reason, evidence, "
+                          "depth, source) VALUES ('rank-demo', ?, 'ram', ?, ?, ?, ?, 'auto')",
+                          [(b, e, r, ev, d) for b, e, d, r, ev in rows])
+
+
+def _fn_names(out):
+    return [ln.split(" | ")[1].split(" (")[0] for ln in out.splitlines() if " | auto | " in ln]
+
+
+def test_feature_seed_first_ranking_and_filters(proj):
+    ctx, pp, st = bound(proj)
+    ids = proj[3]
+    _ranked_feature(st, ids)
+    out = mt.feature(ctx, "rank-demo")
+    assert out.splitlines()[0] == ("feature rank-demo [agent]: Rank demo | 6 entry points (seeds 4, callers 2) "
+                                   "in 2 binaries; named 0 of 6 (0%)")
+    assert "by binary: app.exe 4 (seeds 3), lib.dll 2 (seeds 1)" in out
+    assert "showing depth 0 only: 4 seeds; depth=1 adds callers (2 more)" in out
+    assert _fn_names(out) == ["FUN_a", "FUN_b", "FUN_lr", "FUN_cfg"]      # strength, then binary interleave
+    assert _fn_names(mt.feature(ctx, "rank-demo", depth=1)) == ["FUN_a", "FUN_b", "FUN_lr", "FUN_cfg", "Impl"]
+    assert _fn_names(mt.feature(ctx, "rank-demo", depth=2))[-1] == "FUN_c"
+    lib_only = mt.feature(ctx, "rank-demo", depth=2, binary="LIB.dll")
+    assert _fn_names(lib_only) == ["FUN_lr", "Impl"] and "in lib.dll" in lib_only
+    assert mt.feature(ctx, "rank-demo", binary="nope.exe").startswith("error not_found: no binary")
+    listing = mt.features(ctx)
+    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 in 2 binaries | named 0 of 6 (0%) | " in listing
+    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 | named 0 of 6 (0%) | " in mt.overview(ctx)
+
+
+def test_derive_cap_counts_dropped(proj, monkeypatch):
+    ctx, pp, st = bound(proj)
+    ids = proj[3]
+    from airlock.server import features as fx
+    full = fx.derive_project(pp, st)["file-io"]
+    monkeypatch.setattr(fx, "MAX_ENTRIES", 4)
+    capped = fx.derive_project(pp, st)["file-io"]
+    assert capped == 4 and full > 4
+    assert fx.dropped(st)["file-io"] == full - 4
+    out = mt.feature(ctx, "file-io", depth=2)
+    assert f"{full - 4} more dropped by the 4 cap" in out.splitlines()[0]
+    assert f"(+{full - 4} dropped by the 4 cap)" in mt.features(ctx)
+    seeds = [r for r in fx.stats(st) if r["key"] == "file-io"][0]["seeds"]
+    assert seeds == 3                                                    # seeds are kept before callers

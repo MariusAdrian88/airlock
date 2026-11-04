@@ -100,9 +100,10 @@ def features(ctx: ServerContext, refresh: bool = False, cursor: str = "", budget
     rows = fx.stats(st)
     if not rows:
         return "no features yet. They are derived when a binary is ready; feature_define adds one."
+    drop = fx.dropped(st)
     lines = [f"{r['key']}{' [agent]' if r['source'] == 'agent' else ''} | {r['title']} | "
-             f"{pm.plural(r['n'], 'entry point')} | coverage {fx.coverage(r['n'], r['named'])} | "
-             f"feature(key=\"{r['key']}\")" for r in rows]
+             f"{fx.size_text(r, drop.get(r['key'], 0), binaries=True)} | "
+             f"{fx.coverage(r['n'], r['named'])} | feature(key=\"{r['key']}\")" for r in rows]
     return _page(lines, bud, "features")
 
 
@@ -132,9 +133,9 @@ def _limited(lines: list[str], head: int, limit: int, budget: int, tool_name: st
 
 
 @tool("feature", "List the entry points of one feature (binary, function, address, reason, "
-                 "evidence) so it can be reverse engineered alone.")
-def feature(ctx: ServerContext, key: str = "", limit: int = 40, cursor: str = "",
-            budget: int = 0) -> str:
+                 "evidence), seeds first; depth=1 or 2 adds callers, binary= filters.")
+def feature(ctx: ServerContext, key: str = "", depth: int = 0, binary: str = "", limit: int = 40,
+            cursor: str = "", budget: int = 0) -> str:
     bud = budget_for(ctx, budget)
     key = key.strip().lower()
     args = {"key": key}
@@ -148,17 +149,47 @@ def feature(ctx: ServerContext, key: str = "", limit: int = 40, cursor: str = ""
     if row is None:
         have = ", ".join(r["key"] for r in fx.stats(st)) or "none"
         return f"error not_found: no feature '{key}' (have: {have}). Call features."
-    names = {b.id: (b.name, b.pointer_size or 4) for b in st.list_binaries()}
+    bins = st.list_binaries()
+    names = {b.id: (b.name, b.pointer_size or 4) for b in bins}
+    only: int | None = None
+    if binary.strip():
+        only = next((b.id for b in bins if b.name.lower() == binary.strip().lower()), None)
+        if only is None:
+            return f"error not_found: no binary '{binary.strip()}'. Call list_binaries."
+    depth = max(0, min(int(depth), fx.MAX_DEPTH))
     ents = st.feature_entries(key)
+    seeds = sum(1 for r in ents if r["depth"] == 0)
     named = sum(1 for r in ents if (r["name_state"] or "auto") != "auto")
+    per_bin: dict[int, list[int]] = {}
+    for r in ents:
+        c = per_bin.setdefault(r["binary_id"], [0, 0])
+        c[0] += 1
+        c[1] += r["depth"] == 0
+    drop = fx.dropped(st).get(key, 0)
     head = [f"feature {key}{' [agent]' if row['source'] == 'agent' else ''}: {row['title']} | "
-            f"{pm.plural(len(ents), 'entry point')}, coverage {fx.coverage(len(ents), named)}"]
+            f"{pm.plural(len(ents), 'entry point')} (seeds {seeds}, callers {len(ents) - seeds}) in "
+            f"{pm.plural(len(per_bin), 'binary').replace('binarys', 'binaries')}; "
+            f"{fx.coverage(len(ents), named)}" + (f"; {drop} more dropped by the {fx.MAX_ENTRIES} cap" if drop else "")]
+    if len(per_bin) > 1 or only is not None:
+        top = sorted(per_bin.items(), key=lambda kv: (-kv[1][0], names.get(kv[0], ("?",))[0]))
+        head.append("by binary: " + ", ".join(
+            f"{names.get(b, ('?',))[0]} {c[0]} (seeds {c[1]})" for b, c in top[:8])
+            + (f", +{len(top) - 8} more" if len(top) > 8 else ""))
+    view = [r for r in ents if r["depth"] <= depth and (only is None or r["binary_id"] == only)]
+    shown = (f"showing depth 0 only: {len(view)} seeds" if depth == 0 else
+             f"showing depth 0-{depth}: {len(view)} entry points")
+    if only is not None:
+        shown += f" in {names[only][0]}"
+    hidden = sum(1 for r in ents if r["depth"] > depth and (only is None or r["binary_id"] == only))
+    if hidden:
+        shown += f"; depth={min(depth + 1, fx.MAX_DEPTH)} adds callers ({hidden} more)"
+    head.append(shown)
     if row["evidence"]:
         head.append(f"evidence: {row['evidence']}")
     head.append(f"topics: {key}" + (f", {row['topics']}" if row["topics"] else "")
-                + " | notes 0 | specs 0 | unnamed first. Next: function(binary, target), rename/annotate, "
-                  "spec_write(topic)")
-    lines = head + [_entry_line(st, names, r) for r in ents]
+                + " | notes 0 | specs 0 | ranked by depth, evidence, binary. Next: function(binary, "
+                  "target), rename/annotate, spec_write(topic)")
+    lines = head + [_entry_line(st, names, r) for r in fx.rank_entries(view)]
     return _limited(lines, len(head), int(limit), bud, "feature", args)
 
 

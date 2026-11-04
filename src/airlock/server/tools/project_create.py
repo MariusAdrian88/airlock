@@ -16,6 +16,7 @@ from airlock.projects import (
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
 from airlock.server.registry import tool
+from airlock.server.estimate import priors
 from airlock.server.scan import render_scan, scan_program
 from airlock.server.tools.session import dirty_lines
 
@@ -50,9 +51,9 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
     pp = project_paths(cfg.projects_root, slug, create=False)
     if pp.root.exists():
         return f"error exists: project '{slug}' already exists at {pp.root}. Choose another name."
-    spc = float(cfg.defaults.get("analysis_s_per_code_mb") or 80.0)
+    oh, spc = priors(cfg.defaults)
     try:
-        scan = scan_program(Path(path).expanduser(), None, spc)
+        scan = scan_program(Path(path).expanduser(), None, spc, oh)
     except FileNotFoundError:
         return f"error not_found: {path} does not exist. Give an existing folder or executable."
     keys = [o.key for o in scan.options]

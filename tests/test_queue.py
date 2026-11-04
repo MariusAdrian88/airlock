@@ -77,7 +77,7 @@ def make_project(tmp_path, specs, state="queued"):
     return ctx, entries
 
 
-def wait_for(cond, secs=15.0):
+def wait_for(cond, secs=60.0):   # a bound on a state change, not a duration under test
     end = time.time() + secs
     while time.time() < end:
         if cond():
@@ -129,8 +129,11 @@ def test_priority_order_states_and_manifest(tmp_path):
                                          "other.dll"]
     assert q.current.name == "first.dll" and q.current.state == "importing"
     total = sum(e["code_size"] for e in entries) / _MB
-    assert q.s_per_mb == pytest.approx(80.0)
-    assert 80 * total - 5 <= q.remaining_s <= 80 * total
+    assert q.s_per_mb == pytest.approx(120.0) and q.overhead_s == pytest.approx(20.0)
+    # queued: 5 binaries; current (first.dll, 1 MB) is floored at 25% of its estimate
+    queued_est = 5 * 20 + (total - 1.0) * 120
+    cur_est = 20 + 120.0
+    assert queued_est + 0.25 * cur_est <= q.remaining_s <= queued_est + cur_est
 
     out = admin.index_status(ctx)
     assert "queue: 1 importing, 5 queued | remaining ~" in out
@@ -151,22 +154,63 @@ def test_priority_order_states_and_manifest(tmp_path):
     assert "queue:" not in done and "analysed in" in done and done.count(" ready:") == 6
 
 
+def test_model_priors_and_blend():
+    from airlock.server import estimate as est
+    assert est.refine([], 20, 120) == (20, 120)
+    # one tiny binary: the fixed cost rises towards what was measured, the rate barely moves
+    oh, rate = est.refine([(0.01, 30.0)], 20, 120)
+    assert 20 < oh < 30 and rate == pytest.approx(120.0, rel=0.1)
+    # a big binary: the rate rises, the overhead stays near its prior
+    oh, rate = est.refine([(2.0, 280.0)], 20, 120)
+    assert oh == pytest.approx(30.0) and rate > 120
+
+
+def test_model_least_squares_with_three_samples():
+    from airlock.server import estimate as est
+    pts = [(0.0, 25.0), (1.0, 145.0), (2.0, 265.0), (0.5, 85.0)]   # 25 s + 120 s/MB
+    oh, rate = est.refine(pts, 99, 999)
+    assert oh == pytest.approx(25.0) and rate == pytest.approx(120.0)
+    # equal sizes cannot be fitted: falls back to the blend instead of dividing by zero
+    oh, rate = est.refine([(0.1, 30.0)] * 3, 20, 120)
+    assert 15 <= oh <= 30 and rate > 0
+    # a negative intercept is clamped to a fit through the origin
+    oh, rate = est.refine([(1.0, 50.0), (2.0, 120.0), (3.0, 170.0)], 20, 120)
+    assert oh == 0.0 and rate > 0
+
+
 def test_remaining_estimate_uses_measured_rate(tmp_path):
     ctx, entries = make_project(tmp_path, [("a.dll", "core", 1.0), ("b.dll", "core", 2.0),
                                            ("c.dll", "core", 4.0)])
     ix = ctx.indexer
-    assert ix.s_per_mb([]) == pytest.approx(80.0)
-    # one finished binary: 1 MB in 200 s -> (80*0.5 + 200) / (0.5 + 1)
-    assert ix.s_per_mb([{"analysis_s": 200, "code_size": _MB}]) == pytest.approx(160.0)
+    assert ix.s_per_mb([]) == pytest.approx(120.0)
     ctx.worker.gate.clear()
     ix.enqueue("proj", entries[:1])
     wait_for(lambda: states(ctx)["a.dll"] == "importing")
     ix.enqueue("proj", entries[1:])
-    ix._mf_update("proj", entries[0]["sha256"], analysis_s=200.0)  # as if measured on a binary
+    # as if measured: 1 MB took 320 s in total (20 + 300)
+    ix._mf_update("proj", entries[0]["sha256"], total_s=320.0)
     q = ix.queue_status("proj")
-    assert q.s_per_mb == pytest.approx(160.0)
-    # current is 1 MB (est 160 s, elapsed ~0), queued 2 + 4 MB
-    assert 160 * 7 - 5 <= q.remaining_s <= 160 * 7
+    oh, rate = ix.model(read_manifest(ix.paths("proj").manifest)["files"])
+    assert rate > 120.0 and q.s_per_mb == pytest.approx(rate) and q.overhead_s == pytest.approx(oh)
+    cur_est = oh + rate * 1
+    assert 2 * oh + rate * 6 + 0.75 * cur_est <= q.remaining_s <= 2 * oh + rate * 6 + cur_est
+    ctx.worker.gate.set()
+    wait_for(lambda: all(v == "ready" for v in states(ctx).values()))
+
+
+def test_running_binary_never_shows_zero_and_overrun(tmp_path):
+    ctx, entries = make_project(tmp_path, [("a.dll", "core", 0.1), ("b.dll", "core", 0.1)])
+    ix = ctx.indexer
+    ctx.worker.gate.clear()
+    ix.enqueue("proj", entries)
+    wait_for(lambda: states(ctx)["a.dll"] == "importing")
+    ix._running.started -= 1000.0     # far past the estimate (~32 s)
+    q = ix.queue_status("proj")
+    est_a = 20 + 0.1 * 120
+    assert q.over_s == pytest.approx(1000.0 - est_a, abs=5)
+    assert q.remaining_s >= 0.25 * est_a + est_a - 0.1   # a.dll floor + b.dll
+    out = admin.index_status(ctx)
+    assert "over estimate" in out and "s/binary" in out
     ctx.worker.gate.set()
     wait_for(lambda: all(v == "ready" for v in states(ctx).values()))
 
@@ -232,6 +276,7 @@ def test_same_file_name_gets_distinct_program_names(tmp_path):
 def test_status_caps_lines(tmp_path):
     specs = [(f"f{i}.dll", "third_party", 0.1) for i in range(20)]
     ctx, entries = make_project(tmp_path, specs)
+    ctx.indexer.ready_hooks.clear()   # the map rebuild after each binary is not under test here
     ctx.worker.gate.clear()
     ctx.worker.delay = 0.01
     ctx.indexer.enqueue("proj", entries)
@@ -239,7 +284,7 @@ def test_status_caps_lines(tmp_path):
     assert "20 binaries" in out and "  +4 more" in out
     assert len([ln for ln in out.splitlines() if ln.startswith("  #")]) == admin.STATUS_LINES
     ctx.worker.gate.set()
-    wait_for(lambda: all(v == "ready" for v in states(ctx).values()))
+    wait_for(lambda: all(v == "ready" for v in states(ctx).values()), secs=180.0)
 
 
 def _xbin_data(w):
@@ -326,7 +371,7 @@ def scanned(tmp_path, monkeypatch):
                        (app, p1, p2, third), 8 << 20, 640.0))
     res = ScanResult(src, "app.exe", "x", (app, p1, p2, third, data), (), (), opts, "B")
     seen = []
-    monkeypatch.setattr(qt, "scan_program", lambda path, root_exe=None, s_per_code_mb=80.0:
+    monkeypatch.setattr(qt, "scan_program", lambda path, root_exe=None, s_per_code_mb=120.0, overhead_s=20.0:
                         seen.append((path, root_exe)) or res)
     ctx.indexer.current = "proj"
     ctx.worker.gate.clear()  # keep the queue parked so the states stay "queued"

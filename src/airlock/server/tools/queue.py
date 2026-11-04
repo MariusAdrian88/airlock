@@ -8,6 +8,7 @@ from airlock.projects import copy_artifact, hash_file, read_manifest, write_mani
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
 from airlock.server.registry import tool
+from airlock.server.estimate import priors
 from airlock.server.scan import ScannedFile, ScanResult, scan_program
 
 _MB = 1 << 20
@@ -51,8 +52,8 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
     if not folder or not Path(folder).is_dir():
         return (f"error no_source: the program folder {folder or '(unknown)'} is not available. "
                 "Use open_binary with a file path instead.")
-    spc = float(ctx.config.defaults.get("analysis_s_per_code_mb") or 80.0)
-    scan = scan_program(Path(folder), src.get("root_exe") or None, spc)
+    oh, spc = priors(ctx.config.defaults)
+    scan = scan_program(Path(folder), src.get("root_exe") or None, spc, oh)
     have = {f.get("path") for f in man.get("files") or []}
 
     if not option.strip() and not files.strip():
@@ -96,8 +97,8 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
         write_manifest(pp.manifest, man)
     ix.enqueue(project, entries)
     code = sum(e["code_size"] for e in entries)
-    rate = ix.queue_status(project).s_per_mb
-    est = code / _MB * rate
+    q = ix.queue_status(project)
+    est = len(entries) * q.overhead_s + code / _MB * q.s_per_mb
     names = ", ".join(Path(e["path"]).name for e in entries[:6])
     more = f", +{len(entries) - 6} more" if len(entries) > 6 else ""
     return (f"queued {len(entries)} files, {code / _MB:.1f} MB code, ~{max(1, round(est / 60))} min: "

@@ -9,6 +9,7 @@ by the agent (source 'agent') survive every re-derivation. Feature keys never ch
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import Counter
@@ -36,7 +37,8 @@ FEATURES: dict[str, str] = {
 DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
-MAX_ENTRIES = 3000    # per feature
+MAX_ENTRIES = 1500    # per feature; seeds first (strongest evidence), then callers by depth
+DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
 _CHUNK = 400
 
@@ -419,9 +421,12 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
     rows: list[tuple[str, int, str, int, str, str, int]] = []
     feats: list[tuple[str, str, str]] = []
     counts: dict[str, int] = {}
+    dropped: dict[str, int] = {}
     for key in sorted(seeds, key=feature_order):
+        ranked = sorted(seeds[key].items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        dropped_refs: set[tuple[int, int]] = {ref for ref, _ev in ranked[MAX_ENTRIES:]}
         got: dict[tuple[int, int], tuple[str, list[str], int]] = {
-            ref: (ev[0], ev, 0) for ref, ev in seeds[key].items()}
+            ref: (ev[0], ev, 0) for ref, ev in ranked[:MAX_ENTRIES]}
         frontier = list(got)
         for depth in range(1, MAX_DEPTH + 1):
             nxt: list[tuple[int, int]] = []
@@ -436,7 +441,10 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
                     continue
                 inherited = got[(bid, fid)][1][:MAX_EVIDENCE]
                 for cb, cf in sorted(cs):
-                    if (cb, cf) in got or cf in bins[cb].thunk_ids or len(got) >= MAX_ENTRIES:
+                    if (cb, cf) in got or cf in bins[cb].thunk_ids:
+                        continue
+                    if len(got) >= MAX_ENTRIES:
+                        dropped_refs.add((cb, cf))
                         continue
                     got[(cb, cf)] = (f"caller of {qn}", inherited, depth)
                     nxt.append((cb, cf))
@@ -445,10 +453,15 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
             space, entry, _q, _s = bins[bid].fn[fid]
             rows.append((key, bid, space, entry, reason, " ; ".join(ev[:MAX_EVIDENCE]), depth))
         counts[key] = len(got)
+        dropped_refs -= set(got)
+        if dropped_refs:
+            dropped[key] = len(dropped_refs)
         top = ", ".join(f"{lab} x{n}" if n > 1 else lab
                         for lab, n in summary.get(key, Counter()).most_common(6))
         feats.append((key, feature_title(key), top))
     store.replace_auto_features(feats, rows, now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    with store.db:
+        store.set_meta(DROPPED_META, json.dumps(dropped, separators=(",", ":")))
     return counts
 
 
@@ -460,11 +473,52 @@ def derive_project(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = 
 # -- coverage ---------------------------------------------------------------------------
 
 def coverage(n: int, named: int) -> str:
-    return f"{named}/{n}" + (f" ({100 * named // n}%)" if n else "")
+    return f"named {named} of {n}" + (f" ({100 * named // n}%)" if n else "")
 
 
 def stats(store: Store) -> list[dict[str, Any]]:
-    """Features in display order: key, title, source, topics, n, named."""
+    """Features in display order: key, title, source, topics, n, named, seeds, binaries."""
     rows = [dict(r) for r in store.feature_stats()]
+    extra = {r["feature_key"]: (r["seeds"], r["bins"]) for r in store.db.execute(
+        "SELECT feature_key, COALESCE(SUM(depth=0), 0) AS seeds, COUNT(DISTINCT binary_id) AS bins "
+        "FROM feature_entry GROUP BY feature_key")}
+    for r in rows:
+        r["seeds"], r["binaries"] = extra.get(r["key"], (0, 0))
     rows.sort(key=lambda r: feature_order(r["key"]))
     return rows
+
+
+def dropped(store: Store) -> dict[str, int]:
+    """{feature key: entry points cut by MAX_ENTRIES at the last derivation}."""
+    try:
+        return {k: int(v) for k, v in json.loads(store.get_meta(DROPPED_META) or "{}").items()}
+    except (ValueError, TypeError):
+        return {}
+
+
+def size_text(r: dict[str, Any], drop: int = 0, binaries: bool = False) -> str:
+    """``seeds 41, total 688`` (+ `` in 6 binaries``, `` (+N dropped by the cap)``)."""
+    out = f"seeds {r['seeds']}, total {r['n']}"
+    if binaries and r.get("binaries"):
+        out += f" in {r['binaries']} binar{'y' if r['binaries'] == 1 else 'ies'}"
+    if drop:
+        out += f" (+{drop} dropped by the {MAX_ENTRIES} cap)"
+    return out
+
+
+def rank_entries(rows: Iterable[Any]) -> list[Any]:
+    """Entry-point rows ordered by depth, then evidence strength (distinct evidence items), with the
+    binaries interleaved inside each (depth, strength) group so the first page spans binaries."""
+    def strength(r: Any) -> int:
+        ev = r["evidence"] or ""
+        return len({x.strip() for x in ev.split(" ; ") if x.strip()})
+
+    base = sorted(rows, key=lambda r: (r["depth"], -strength(r), r["binary_id"], r["space"], r["entry"]))
+    seen: Counter[tuple[int, int, int]] = Counter()
+    keyed = []
+    for i, r in enumerate(base):
+        grp = (r["depth"], strength(r), r["binary_id"])
+        keyed.append(((r["depth"], -strength(r), seen[grp], r["binary_id"], i), r))
+        seen[grp] += 1
+    keyed.sort(key=lambda t: t[0])
+    return [r for _k, r in keyed]

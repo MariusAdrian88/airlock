@@ -30,6 +30,11 @@ def role_locked(session: SessionState) -> str:
             "Start a new session for other work.")
 
 
+def usable(session: SessionState, names: list[str]) -> list[str]:
+    """The names a call in this session would not refuse (role gate only)."""
+    return [n for n in names if gate(session, n) is None]
+
+
 def gate(session: SessionState, tool: str) -> str | None:
     """None if the call may proceed, else the one-line error."""
     if session.role == UNBOUND:

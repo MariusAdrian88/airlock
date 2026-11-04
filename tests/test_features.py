@@ -169,8 +169,8 @@ def test_coverage_counts_named_functions(st):
         st.db.execute("UPDATE function SET name_state='library' WHERE name='FUN_b'")
     row2 = next(r for r in fx.stats(st) if r["key"] == "file-io")
     assert row2["named"] == 2 and row2["n"] == row["n"]
-    assert fx.coverage(row2["n"], row2["named"]).startswith("2/")
-    assert fx.coverage(0, 0) == "0/0"
+    assert fx.coverage(row2["n"], row2["named"]).startswith("named 2 of ")
+    assert fx.coverage(0, 0) == "named 0 of 0"
     # a rename never changes the entry points: re-deriving gives the same keys and names resolve live
     fx.derive(st, runtime_ids={rt})
     assert entries(st, "file-io")[("app.exe", "read_cfg")][0] == "calls ReadFile"
@@ -235,7 +235,7 @@ def test_migration_v2_to_v3(tmp_path):
         s.set_meta("schema_version", "2")
     s.close()
     s = Store(p)
-    assert s.schema_version == store_mod.SCHEMA_VERSION == 3
+    assert s.schema_version == store_mod.SCHEMA_VERSION
     s.define_feature("k", "T", "", "t")
     s.add_feature_entries("k", b, [("ram", 0x10, "r")])
     assert s.feature_stats()[0]["n"] == 1

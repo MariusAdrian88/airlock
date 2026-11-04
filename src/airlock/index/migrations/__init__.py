@@ -44,3 +44,21 @@ def _v3(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[3] = _v3
+
+
+def _v4(db: sqlite3.Connection) -> None:
+    """Reserved (no change)."""
+
+
+MIGRATIONS.setdefault(4, _v4)
+
+
+def _v5(db: sqlite3.Connection) -> None:
+    """Dynamic links and ordinal imports: xedge.evidence and import.resolved."""
+    for table, col in (("xedge", "evidence"), ("import", "resolved")):
+        cols = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+
+
+MIGRATIONS[5] = _v5

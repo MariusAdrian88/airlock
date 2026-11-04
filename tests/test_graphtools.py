@@ -209,7 +209,7 @@ def test_path_errors(proj):
     out = gt.path(ctx, "Boot", "Read", max_depth=2)
     assert out.startswith("error no_path:") and "within 2 hops" in out and "Raise max_depth to 3" in out
     out = gt.path(ctx, "dup_fn", "Read")
-    assert out.startswith("error ambiguous:") and "app.exe!dup_fn" in out and "plug.dll!dup_fn" in out
+    assert lines(out)[0] == "path dup_fn (2 functions in 2 binaries) → Read, 1 hops"
     assert lines(gt.path(ctx, "app.exe!dup_fn", "Read"))[0].startswith("path app.exe!dup_fn → Read, 1 hops")
     assert gt.path(ctx, "nothing_named_so", "Read").startswith("error not_found:")
     assert gt.path(ctx, "Boot", "plug.dll!nothing").startswith("error not_found:")
@@ -367,3 +367,84 @@ def test_project_open_keeps_first_sections(proj):
     text = sess.dirty_open_text(ctx, pp)
     assert "Subsystems" not in text and "## Purpose" in text and "## Features" in text
     assert estimate_tokens(text) <= 1500 + 200                    # map budget plus the session line
+
+
+# -- endpoint forms: imports, A/W, strings, ambiguous names -------------------------------------
+
+def extend(proj):
+    """plug.dll gets: Opener (calls import CreateFileW, CFile::OpenEx), ThunkCaller (calls a thunk
+    named like the import ReadFile), an import DeleteFileW nobody calls; app.exe gets CFile::OpenEx."""
+    ctx, pp, st, (app, plug), b = proj
+    st.insert_functions(plug, [fn(0x1300, "Opener"), fn(0x1400, "ThunkCaller"), fn(0x1500, "ReadFile", thunk=1),
+                               dict(fn(0x1600, "OpenEx"), namespace="CFile")])
+    st.insert_functions(app, [dict(fn(0x60000, "OpenEx"), namespace="CFile")])
+    st.insert_imports(plug, [("KERNEL32.DLL", "CreateFileW", None, 0x30020),
+                             ("KERNEL32.DLL", "ReadFile", None, 0x30030),
+                             ("KERNEL32.DLL", "DeleteFileW", None, 0x30040)])
+    st.insert_edges(plug, [call(0x1300, 0x1600), (0x1300 + 0x20, 0x30020, "call_ind"),
+                           call(0x1400, 0x1500), (0x1504, 0x30030, "jump")])
+    st.insert_edges(app, [call(b["Boot"], 0x60000)])
+    st.link_edges(plug)
+    st.link_edges(app)
+    return ctx
+
+
+def head(out):
+    return lines(out)[0]
+
+
+@pytest.mark.parametrize("form", ["ReadFile", "readfile", "KERNEL32!ReadFile", "KERNEL32.DLL!ReadFile",
+                                  "kernel32.dll!readfile", "app.exe!ReadFile", "<app.exe>!ReadFile",
+                                  "plug.dll!ReadFile", "ReadFileA", "ReadFileW"])
+def test_path_import_endpoint_forms(proj, form):
+    ctx = extend(proj)
+    out = gt.path(ctx, "Boot", form)
+    assert head(out).startswith(f"path Boot → {form}"), out
+    assert lines(out)[-1].startswith("→ import KERNEL32!ReadFile")
+
+
+def test_path_import_aw_variant_and_thunk(proj):
+    ctx = extend(proj)
+    out = gt.path(ctx, "Opener", "CreateFileA")           # only CreateFileW is imported
+    assert head(out) == "path Opener → CreateFileA (import KERNEL32!CreateFileW, 1 node), 1 hops"
+    assert lines(out)[-1].startswith("→ import KERNEL32!CreateFileW")
+    out = gt.path(ctx, "ThunkCaller", "ReadFile")         # call goes through a thunk named like the import
+    assert head(out) == "path ThunkCaller → ReadFile, 1 hops"
+    assert lines(out)[-1].startswith("→ import KERNEL32!ReadFile")
+    out = gt.path(ctx, "Boot", "DeleteFile")
+    assert out.startswith("error not_found: import KERNEL32!DeleteFileW exists but no analysed function calls it")
+    assert gt.path(ctx, "Boot", "plug.dll!NoSuchApi").startswith("error not_found:")
+
+
+def test_path_string_fallback_kinds(proj):
+    ctx, pp, st, _, b = proj
+    for text, how in (('"brew.cfg"', "exact"), ("brew.cfg", "exact"), ("brew", "substring"),
+                      ('"rew.c"', "substring"), ("*.cfg", "glob")):
+        out = gt.path(ctx, "Boot", text)
+        assert head(out) == f"path Boot → {text} (string, {how} match, 1 function), 1 hops", out
+        assert lines(out)[-1].startswith("→ [app.exe] Load")
+    assert gt.path(ctx, "Boot", "no such text anywhere").startswith("error not_found: no function, import")
+    assert gt.path(ctx, "Boot", '"no such text"').startswith("error not_found: no function references")
+    assert head(gt.path(ctx, "Boot", "file-io")).startswith("path Boot → file-io, 3 hops")   # feature still wins
+
+
+def test_path_ambiguous_name_is_multi_target(proj):
+    ctx = extend(proj)
+    out = gt.path(ctx, "Boot", "CFile::OpenEx")
+    assert head(out) == "path Boot → CFile::OpenEx (2 functions in 2 binaries), 1 hops", out
+    assert lines(out)[-1].startswith("→ [app.exe] CFile::OpenEx")
+    out = gt.path(ctx, "CFile::OpenEx", "Boot")
+    assert head(out).startswith("error no_path:")                       # not an error about ambiguity
+    out = gt.path(ctx, "Opener", "CFile::OpenEx")
+    assert "(2 functions in 2 binaries)" in head(out) and "[plug.dll] CFile::OpenEx" in out
+    assert gt.path(ctx, "Boot", "app.exe!CFile::OpenEx").startswith("path Boot → app.exe!CFile::OpenEx, 1 hops")
+
+
+def test_graph_export_path_with_ambiguous_names(proj):
+    ctx = extend(proj)
+    pp = proj[1]
+    out = gt.graph_export(ctx, "path:Boot->CFile::OpenEx")
+    assert out.startswith("wrote ") and "2 nodes" in out
+    out = gt.graph_export(ctx, "path:dup_fn->Read")
+    assert out.startswith("wrote ") and "ambiguous" not in out
+    assert gt.graph_export(ctx, "path:Boot->nothing_like_this_zz").startswith("error not_found:")

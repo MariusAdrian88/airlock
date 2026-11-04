@@ -28,7 +28,9 @@ from typing import Any, Callable
 
 from airlock.config import Config
 from airlock.index.store import Binary, Store
-from airlock.server.bulk import BulkScheduler
+from airlock.server import estimate as est
+from airlock.server import linking
+from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
     read_sections, slugify, write_manifest,
@@ -40,7 +42,7 @@ EXTRACT_KINDS = ("functions", "imports", "exports", "strings", "edges")
 PAGE_SIZE = {"functions": 5000, "imports": 5000, "exports": 5000, "strings": 5000, "edges": 10000}
 GROUP_RANK = {"core": 0, "own_plugin": 1}  # every other group ranks 2
 ACTIVE = ("importing", "analysing", "extracting")
-RATE_PRIOR_MB = 0.5  # weight of the configured s/MB prior, in MB of code, against measurements
+DECOMPILE_FN_PER_S = 200.0  # prior of the background pass, until a rate has been measured
 _MB = 1 << 20
 log = logging.getLogger("airlock")
 FINAL = ("ready", "error")
@@ -195,6 +197,10 @@ class QueueStatus:
     remaining_s: float
     s_per_mb: float
     current: QueueRow | None
+    overhead_s: float = 0.0          # fixed seconds per binary
+    over_s: float = 0.0              # seconds the current binary is past its estimate
+    decompile_fns: int = 0           # functions the background pass still has to decompile
+    decompile_s: float = 0.0         # ... and its estimate
 
 
 @dataclass(frozen=True)
@@ -413,6 +419,11 @@ class Indexer:
             if (paths.artifacts / b.sha256).is_file():
                 n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
         try:
+            if linking.needs_relink(store):  # links built by an older version: no re-analysis
+                linking.relink_project(store, paths.artifacts)
+        except Exception as e:  # noqa: BLE001  links are an extra
+            log.warning("cannot relink %s: %s", slug, e)
+        try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
             log.warning("cannot resume the decompile pass of %s: %s", slug, e)
@@ -528,16 +539,47 @@ class Indexer:
         self.set_status(self.store(job.project), job.binary_id, status, error)
         self._mf_update(job.project, job.sha256, state=status, error=error or None, **manifest)
 
-    def s_per_mb(self, files: list[dict[str, Any]]) -> float:
-        """Seconds of analysis per MB of code: the configured prior, refined by the measured
-        entries (prior counts as RATE_PRIOR_MB of code)."""
-        prior = float(self.config.defaults.get("analysis_s_per_code_mb") or 80.0)
-        secs = mb = 0.0
+    def model(self, files: list[dict[str, Any]]) -> tuple[float, float]:
+        """(overhead_s, s_per_mb): the configured priors refined by the measured entries."""
+        prior_oh, prior_rate = est.priors(self.config.defaults)
+        samples = []
         for f in files:
-            if f.get("analysis_s") and f.get("code_size"):
-                secs += float(f["analysis_s"])
-                mb += float(f["code_size"]) / _MB
-        return (prior * RATE_PRIOR_MB + secs) / (RATE_PRIOR_MB + mb)
+            secs = f.get("total_s")
+            if secs is None and f.get("analysis_s"):
+                secs = float(f["analysis_s"]) + float(f.get("extract_s") or 0.0)
+            if secs and f.get("code_size") is not None:
+                samples.append((float(f["code_size"]) / _MB, float(secs)))
+        return est.refine(samples, prior_oh, prior_rate)
+
+    def s_per_mb(self, files: list[dict[str, Any]]) -> float:
+        return self.model(files)[1]
+
+    def decompile_estimate(self, project: str, files: list[dict[str, Any]],
+                           pending_code: float) -> tuple[int, float]:
+        """(functions still to decompile in the background pass, seconds at the measured rate).
+        Binaries not extracted yet count with the project's functions per code MB."""
+        if not self.bulk.enabled:
+            return 0, 0.0
+        st = self.store(project)
+        by_sha = {f.get("sha256"): f for f in files}
+        fns = 0
+        known_fns = known_mb = 0.0
+        rate = 0.0
+        for b in st.list_binaries():
+            f = by_sha.get(b.sha256, {})
+            if f.get("group") in SKIP_GROUPS or self.get_status(st, b.id)[0] != "ready":
+                continue
+            target = st.decomp_target_count(b.id)
+            known_fns += target
+            known_mb += float(f.get("code_size") or 0) / _MB
+            fns += max(target - st.decomp_current_count(b.id, b.analysis_profile or "unknown"), 0)
+            bp = self.bulk.progress(project, b.id)
+            if bp is not None and bp.rate > 0:
+                rate = bp.rate
+        if known_mb > 0 and pending_code > 0:
+            fns += int(known_fns / known_mb * pending_code / _MB)
+        rate = rate or DECOMPILE_FN_PER_S
+        return fns, fns / rate
 
     def queue_status(self, project: str) -> QueueStatus:
         """Rows for every binary of the project and the refined remaining-time estimate."""
@@ -548,7 +590,7 @@ class Indexer:
             man = {}
         files = man.get("files") or []
         by_sha = {f.get("sha256"): f for f in files}
-        rate = self.s_per_mb(files)
+        overhead, rate = self.model(files)
         with self._lock:
             waiting = sorted((j for j in self._queue if j.project == project),
                              key=lambda j: j.priority)
@@ -556,24 +598,27 @@ class Indexer:
         order = {j.binary_id: i for i, j in enumerate(waiting)}
         now = time.monotonic()
         rows: list[QueueRow] = []
-        remaining = 0.0
+        remaining = over = pending_code = 0.0
         for b in store.list_binaries():
             status, _ = self.get_status(store, b.id)
             f = by_sha.get(b.sha256, {})
             job = self.job_for(project, b.id)
             code = int(f.get("code_size") or (job.code_size if job else 0) or 0)
-            est = code / _MB * rate
+            est_s = est.binary_seconds(code, overhead, rate)
             secs: float | None = None
-            e: float | None = est
+            e: float | None = est_s
             if status == "ready":
                 secs, e = f.get("analysis_s"), None
             elif status == "error":
                 e = None
             elif job is not None and job is running:
                 secs = now - job.started
-                remaining += max(est - secs, 0.0)
+                remaining += max(est_s - secs, est.RUNNING_FLOOR * est_s)
+                over = max(secs - est_s, 0.0)
+                pending_code += code
             elif b.id in order or status == "queued":
-                remaining += est
+                remaining += est_s
+                pending_code += code
             rows.append(QueueRow(b.id, b.name, status, secs, e, code))
 
         def key(r: QueueRow) -> tuple:
@@ -585,7 +630,8 @@ class Indexer:
 
         rows.sort(key=key)
         cur = next((r for r in rows if running is not None and r.binary_id == running.binary_id), None)
-        return QueueStatus(tuple(rows), remaining, rate, cur)
+        fns, dec_s = self.decompile_estimate(project, files, pending_code)
+        return QueueStatus(tuple(rows), remaining, rate, cur, overhead, over, fns, dec_s)
 
     # -- job: import -> analyse -> extract ------------------------------------
 
@@ -699,6 +745,8 @@ class Indexer:
                                      "extract_s": job.timings["extract_total"]}
             if analysis_s is not None:
                 extra["analysis_s"] = analysis_s
+                if job.started is not None:
+                    extra["total_s"] = round(time.monotonic() - job.started, 1)
             self._state(job, "ready", **extra)
         except WorkerError as e:
             self._fail(job, worker_error(e))
@@ -729,13 +777,22 @@ class Indexer:
             except (OSError, ValueError):
                 man = None
             if man is not None and man.get("files"):
-                man["queue"] = {"s_per_mb": round(self.s_per_mb(man["files"]), 1)}
+                oh, rate = self.model(man["files"])
+                man["queue"] = {"s_per_mb": round(rate, 1), "overhead_s": round(oh, 1)}
                 write_manifest(self.paths(job.project).manifest, man)
         me = st.get_binary_by_id(bid)
         assert me is not None
         others = [b for b in st.list_binaries()
                   if b.id != bid and self.get_status(st, b.id)[0] == "ready"]
+        try:
+            linking.fix_export_ordinals(st, me, self.paths(job.project).artifacts / me.sha256)
+        except Exception as e:  # noqa: BLE001  ordinals are an extra
+            log.warning("export ordinals of %s: %s", me.name, e)
         st.link_cross_binary(bid, [b.id for b in others])
+        try:
+            linking.link_dynamic_for(st, bid, [b.id for b in others])
+        except Exception as e:  # noqa: BLE001  dynamic links are an extra
+            log.warning("dynamic links of %s: %s", me.name, e)
         links = []
         for o in others:
             if any(True for _ in st.db.execute(

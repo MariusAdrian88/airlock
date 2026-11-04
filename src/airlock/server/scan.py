@@ -333,19 +333,22 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
     return [(r, sc, w) for r, sc, w, _ in out]
 
 
-def _build_options(files: list[ScannedFile], s_per_code_mb: float) -> tuple[ScanOption, ...]:
+def _build_options(files: list[ScannedFile], s_per_code_mb: float,
+                   overhead_s: float = 20.0) -> tuple[ScanOption, ...]:
     out = []
     for key, label, groups in _OPTION_DEFS:
         if not any(f.group == _ADDED_GROUP[key] for f in files):
             continue
         sel = tuple(f for f in files if f.group in groups)
         code = sum(f.code_size for f in sel)
-        out.append(ScanOption(key, label, groups, sel, code, code / _MB * s_per_code_mb))
+        n_pe = sum(1 for f in sel if f.kind == "pe")
+        out.append(ScanOption(key, label, groups, sel, code,
+                              n_pe * overhead_s + code / _MB * s_per_code_mb))
     return tuple(out)
 
 
 def scan_program(path: Path, root_exe: str | None = None,
-                 s_per_code_mb: float = 80.0) -> ScanResult:
+                 s_per_code_mb: float = 120.0, overhead_s: float = 20.0) -> ScanResult:
     path = Path(path)
     if path.is_file():
         base, root_exe = path.parent, path.name
@@ -389,7 +392,7 @@ def scan_program(path: Path, root_exe: str | None = None,
     data_summary = tuple(sorted(((e, c, b) for e, (c, b) in ext.items()),
                                 key=lambda t: (-t[1], -t[2], t[0])))
 
-    options = _build_options(files, s_per_code_mb) if root_rel else ()
+    options = _build_options(files, s_per_code_mb, overhead_s) if root_rel else ()
     keys = [o.key for o in options]
     recommended = "B" if "B" in keys else ("A" if "A" in keys else (keys[0] if keys else ""))
     return ScanResult(base, root_rel, reason, tuple(files), tuple(system), data_summary,

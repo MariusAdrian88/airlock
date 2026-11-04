@@ -162,11 +162,25 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
     out = []
     for r in store.db.execute(
             "SELECT src_binary, dst_binary, COUNT(DISTINCT src_addr) AS n FROM xedge "
+            "WHERE kind='import' "
             "GROUP BY src_binary, dst_binary ORDER BY n DESC, src_binary, dst_binary"):
         s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
         if s and d:
             out.append(f"{s.name} -> {d.name}: {r['n']} imports. "
                        f"xrefs(binary={d.name}, ...) shows the callers on the other side.")
+    for r in store.db.execute(
+            "SELECT src_binary, dst_binary, "
+            "COUNT(DISTINCT CASE WHEN kind='dynlib' THEN src_addr END) AS nl, "
+            "COUNT(DISTINCT CASE WHEN kind='dynamic' THEN src_addr END) AS ng FROM xedge "
+            "WHERE kind IN ('dynamic','dynlib') GROUP BY src_binary, dst_binary "
+            "ORDER BY nl DESC, ng DESC, src_binary, dst_binary"):
+        s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
+        if s and d:
+            via = [f"{r['nl']} via LoadLibrary"] if r["nl"] else []
+            if r["ng"]:
+                via.append(f"{r['ng']} via GetProcAddress")
+            out.append(f"{s.name} -> {d.name}: {', '.join(via)} (dynamic). "
+                       f"xrefs(binary={d.name}, kind=\"dynamic\") shows the callers.")
     for r in store.db.execute(
             "SELECT e.binary_id AS b, COUNT(*) AS n FROM feature_entry e WHERE e.feature_key='plugins' "
             "AND e.depth=0 AND e.reason LIKE 'calls LoadLibrary%' GROUP BY e.binary_id"):
@@ -190,9 +204,10 @@ def features_lines(store: Store) -> list[str]:
         return ["(no features derived yet. They appear when a binary is ready; "
                 "feature_define adds one by hand.)"]
     out = []
+    drop = fx.dropped(store)
     for r in rows:
         tag = " [agent]" if r["source"] == "agent" else ""
-        out.append(f"{r['key']}{tag} | {r['title']} | {plural(r['n'], 'entry point')} | coverage "
+        out.append(f"{r['key']}{tag} | {r['title']} | {fx.size_text(r, drop.get(r['key'], 0))} | "
                    f"{fx.coverage(r['n'], r['named'])} | feature(key=\"{r['key']}\")")
     return out
 

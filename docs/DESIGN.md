@@ -668,8 +668,9 @@ not a project folder, goes through `project_create`:
    (Illustrative numbers.)
 
    Each option row also names its largest files. The estimate is
-   `code MB × analysis_s_per_code_mb` (config, default 80, measured on a
-   32-bit MSVC application **[verified]**) and is refined from the project's
+   per binary `analysis_overhead_s` (config, default 20: import, extraction,
+   linking) plus `code MB × analysis_s_per_code_mb` (config, default 120;
+   acceptance run: 20-35 s for tiny DLLs, 90-120 s/MB) and is refined from the project's
    own measured analysis times as binaries finish. The table ends with the
    data-file summary and a recommendation (default: B when own plugins
    exist, else A). The user picks an option or adds/removes single files.

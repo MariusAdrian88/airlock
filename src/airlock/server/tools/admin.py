@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 from airlock import __version__, ghidra_install
+from airlock.server import roles
 from airlock.config.catalog import CATALOG
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
 from airlock.worker.protocol import WorkerError
 
 
-def _wrap_list(label: str, items: list[str], width: int = 78) -> list[str]:
+def _wrap_list(label: str, items: list[str], width: int = 78, more: str = "") -> list[str]:
     lines, cur = [], f"{label} ({len(items)}):"
     for item in items:
         if len(cur) + len(item) + 1 > width:
             lines.append(cur)
             cur = "  "
         cur += " " + item
+    if more:
+        cur += " " + more
     lines.append(cur)
     return lines
 
@@ -26,11 +29,16 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
     cfg = ctx.config
     se = ctx.session
     exposed = [t for t in cfg.tools if t not in ctx.not_implemented]
-    if se.role == "clean" or cfg.is_clean:
+    clean = se.role == "clean" or cfg.is_clean
+    if clean:
+        exposed = [t for t in exposed if CATALOG[t].clean_safe]
+    usable = roles.usable(se, exposed)
+    more = (f"(+{len(exposed) - len(usable)} more after project_open)"
+            if se.role == roles.UNBOUND and len(exposed) > len(usable) else "")
+    if clean:
         out = [f"airlock {__version__} | role clean | "
                f"project {se.project.name if se.project else '-'}"]
-        safe = [t for t in exposed if CATALOG[t].clean_safe]
-        return "\n".join(out + _wrap_list("tools", safe))
+        return "\n".join(out + _wrap_list("tools", usable, more=more))
     out = [
         f"airlock {__version__} | profile {cfg.profile} (role {cfg.role}) | "
         f"writes {'on' if cfg.allow_writes else 'off'}",
@@ -48,9 +56,7 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
             g = f"{cfg.ghidra_dir} (invalid: {e})"
     out.append(f"ghidra  {g}")
     out.append(f"jdk     {cfg.jdk_dir or 'auto'}")
-    out += _wrap_list("tools", exposed)
-    if ctx.not_implemented:
-        out += _wrap_list("configured, not implemented yet", ctx.not_implemented)
+    out += _wrap_list("tools", usable, more=more)
     for issue in cfg.issues:
         if issue.level != "info":
             out.append(str(issue))
@@ -131,12 +137,20 @@ def _project_lines(ix, p: str, st) -> list[str]:
     if open_:
         parts = [f"{counts[s]} {s}" for s in ("ready", "importing", "analysing", "extracting",
                                               "queued", "error") if counts.get(s)]
-        out.append(f"  queue: {', '.join(parts)} | remaining ~{_dur(q.remaining_s)} "
-                   f"({q.s_per_mb:.0f} s/MB)")
+        line = (f"  queue: {', '.join(parts)} | remaining ~{_dur(q.remaining_s)} "
+                f"({q.overhead_s:.0f} s/binary + {q.s_per_mb:.0f} s/MB)")
+        if q.decompile_fns:
+            line += f", then decompile ~{_dur(q.decompile_s)} ({q.decompile_fns} fn)"
+        out.append(line)
         c = q.current
         if c is not None:
-            out.append(f"  current: {c.name} {c.state} {_dur(c.seconds)}"
-                       + (f" of ~{_dur(c.est_seconds)}" if c.est_seconds else ""))
+            if q.over_s > 0:
+                tail = f", ~{_dur(q.over_s)} over estimate"
+            else:
+                tail = f" of ~{_dur(c.est_seconds)}" if c.est_seconds else ""
+            out.append(f"  current: {c.name} {c.state} {_dur(c.seconds)}{tail}")
+    elif q.decompile_fns:
+        out.append(f"  decompile remaining ~{_dur(q.decompile_s)} ({q.decompile_fns} fn)")
     by_id = {r.binary_id: r for r in q.rows}
     shown = 0
     for r in q.rows:  # current, waiting in run order, then finished/failed

@@ -97,7 +97,9 @@ def path(ctx: ServerContext, from_: Annotated[str, Field(alias="from")] = "", to
     total = len(blocks)
     shown = min(k, total)
     first = len(res.paths[0]) - 1
-    head = f"path {frm} → {dst}, {first} hops" + (" [via util]" if res.via_util[0] else "")
+    fd = f" ({a.desc})" if a.desc else ""
+    td = f" ({b.desc})" if b.desc else ""
+    head = f"path {frm}{fd} → {dst}{td}, {first} hops" + (" [via util]" if res.via_util[0] else "")
     lines = [head] + [ln for blk in blocks for ln in blk]
     upto = 1 + sum(len(blk) for blk in blocks[:shown])
     need = (sum(_cost(x) for x in lines[:upto]) + _cost(footer(99999, "c_0000")))

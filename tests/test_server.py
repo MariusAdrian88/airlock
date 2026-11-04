@@ -44,5 +44,34 @@ def test_project_info_call(tmp_path):
     result = anyio.run(call)
     text = result.content[0].text
     assert "profile dirty" in text
-    assert "not implemented yet" in text
+    assert "not implemented yet" not in text
+    assert "more after project_open" in text
+    ctx.worker.stop()
+
+
+def test_project_info_lists_only_usable_tools_when_unbound(tmp_path):
+    from airlock.server.tools import admin
+    server, ctx = build_server(_cfg(tmp_path))
+    text = admin.project_info(ctx)
+    tools = text.split("tools (", 1)[1]
+    assert "index_status" not in tools and "function" not in tools.split("(+")[0].split()
+    assert "project_open" in tools and "program_scan" in tools
+    assert "more after project_open)" in tools
+    assert "not implemented" not in text and "rename" not in text
+    ctx.worker.stop()
+
+
+def test_unimplemented_tools_return_one_line_error(tmp_path):
+    from airlock.server import registry
+    server, ctx = build_server(_cfg(tmp_path, "clean"))
+    ctx.session = __import__("airlock.server.roles", fromlist=["x"]).SessionState("clean", None)
+    for name, ms in (("spec_list", "M4"), ("spec_read", "M4"), ("spec_export", "M4")):
+        out = registry.call(ctx, name)
+        assert out == f"error not_implemented: {name} is planned for {ms} and not available yet."
+    assert registry.call(ctx, "function").startswith("error wrong_role:")
+    # the catalog-only spec_write in a dirty session
+    ctx.session = __import__("airlock.server.roles", fromlist=["x"]).SessionState("dirty", None)
+    assert registry.call(ctx, "spec_write") == (
+        "error not_implemented: spec_write is planned for M4 and not available yet.")
+    assert registry.call(ctx, "nope").startswith("error unknown_tool:")
     ctx.worker.stop()

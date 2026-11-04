@@ -134,7 +134,7 @@ def test_project_open_clean_and_redaction(tmp_path):
     assert "role clean | project demo" in info
     for leak in (str(tmp_path), "app.exe", "ghidra", "jdk", "config"):
         assert leak not in info
-    assert "function" not in info and "project_open" in info
+    assert "function" not in info and "spec_read" not in info
     assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
     assert _call(server, "project_open", {"name": "demo", "role": "dirty"}).startswith(
         "error role_locked:")
@@ -190,7 +190,7 @@ def fake_scan(tmp_path, monkeypatch):
                    3 << 20, 240.0)
     res = ScanResult(src, "app.exe", "largest executable", (app, core, plug, data), (), (),
                      (a, b), "B")
-    monkeypatch.setattr(pc, "scan_program", lambda path, root_exe=None, s_per_code_mb=80.0: res)
+    monkeypatch.setattr(pc, "scan_program", lambda path, root_exe=None, s_per_code_mb=120.0, overhead_s=20.0: res)
     monkeypatch.setattr(pc, "render_scan", lambda r: ["SCANTABLE"])
     return src
 

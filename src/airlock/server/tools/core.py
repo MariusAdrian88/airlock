@@ -481,7 +481,7 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
 # ── xrefs ──────────────────────────────────────────────────────────────────────
 
 _KIND_MAP = {"call": ("call", "call_ind"), "jump": ("jump",), "read": ("read",),
-             "write": ("write",), "data": ("data",)}
+             "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",)}
 
 
 def _resolve_ref_target(bd: Bound, target: str):
@@ -515,7 +515,7 @@ def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
         return preview(s.value, 40)
     imp = st.import_at(b.id, addr)
     if imp is not None:
-        return f"{imp['dll']}!{imp['name'] or '#' + str(imp['ordinal'])}"
+        return st.import_label(imp)
     if fn is not None:
         return f"{fn.qualified_name}+0x{addr - fn.entry:x}"
     return "-"
@@ -536,7 +536,8 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     if kind:
         kinds = _KIND_MAP.get(kind)
         if kinds is None:
-            return f"error bad_args: unknown kind '{kind}'. Use call, jump, read, write or data."
+            return (f"error bad_args: unknown kind '{kind}'. "
+                    "Use call, jump, read, write, data, import or dynamic.")
     bt = bind_target(ctx, binary, target)
     if isinstance(bt, str):
         return bt
@@ -590,13 +591,14 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
             what = _describe_addr(bd, x.dst_addr, x.dst_fn)
             entries.append((x.kind, f"  {bd.addr(x.src_addr)}  -> {bd.addr(x.dst_addr)} {what:<30} "
                                     f"{x.kind}"))
-    if kinds is None or "import" in kinds:
-        for x in cross:
-            sb = bound_of(bd, x.src_binary)
-            imp = sb.store.import_at(x.src_binary, x.src_addr)
-            who = (x.src_fn.qualified_name if x.src_fn else
-                   f"{imp['dll']}!{imp['name'] or '#' + str(imp['ordinal'])}" if imp else "-")
-            entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
+    for x in cross:
+        if kinds is not None and x.kind not in kinds:
+            continue
+        sb = bound_of(bd, x.src_binary)
+        imp = sb.store.import_at(x.src_binary, x.src_addr)
+        who = (x.src_fn.qualified_name if x.src_fn else
+               sb.store.import_label(imp) if imp else "-")
+        entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
     over = len(entries) > limit
     entries = entries[:limit]
     counts: dict[str, int] = {}
@@ -622,7 +624,8 @@ def _cross_target(bd: Bound, x: CrossRef) -> str:
     """``→ engine.dll!Foo 0x10001000``: where an import slot or thunk resolves to."""
     db = bound_of(bd, x.dst_binary)
     name = x.dst_fn.qualified_name if x.dst_fn else None
-    return (f"→ {db.binary.name}!{name} " if name else f"→ {db.binary.name}!") + db.addr(x.dst_entry)
+    return ((f"→ {db.binary.name}!{name} " if name else f"→ {db.binary.name}!") + db.addr(x.dst_entry)
+            + (" (dynamic)" if x.kind == "dynamic" else ""))
 
 
 # ── callgraph ──────────────────────────────────────────────────────────────────
@@ -657,6 +660,7 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     base = len(out)
     expanded = {root.id}
     state = {"truncated": False}
+    dyn: set[tuple[int, int]] = set()   # (binary id, entry) of hops that are run-time loaded
 
     def children(cb: Bound, fn: Function) -> list[tuple[Bound, Function | None, str, int | None]]:
         """(bound, function, hop mark, raw address): local edges first, then links into
@@ -672,6 +676,8 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                 if (x.dst_binary, x.dst_entry) in hops:   # thunk and its slot: one hop
                     continue
                 hops.add((x.dst_binary, x.dst_entry))
+                if x.kind == "dynamic":
+                    dyn.add((x.dst_binary, x.dst_entry))
                 db = bound_of(cb, x.dst_binary)
                 kids.append((db, x.dst_fn, f"→ [{db.binary.name}] ", x.dst_entry))
         else:
@@ -687,13 +693,18 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                 for f_ in srcs:
                     if f_.id not in seen:
                         seen.add(f_.id)
+                        if x.kind == "dynamic":
+                            dyn.add((x.src_binary, f_.entry))
                         kids.append((sb, f_, f"← [{sb.binary.name}] ", None))
         return kids
 
     def label(cb: Bound, f: Function | None, mark: str, raw: int | None) -> str:
+        suffix = ""
+        if mark and (cb.binary.id, f.entry if f is not None else raw) in dyn:
+            suffix = " (dynamic)"
         if f is None:
-            return mark + cb.addr(raw or 0)
-        return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "")
+            return mark + cb.addr(raw or 0) + suffix
+        return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "") + suffix
 
     def walk(cb: Bound, fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
         kids = children(cb, fn)

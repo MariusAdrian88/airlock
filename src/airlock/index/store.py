@@ -13,7 +13,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 FTS_KINDS = ("function", "string", "import")
 CODE_EDGES = ("call", "call_ind", "jump")
@@ -650,7 +650,7 @@ class Store:
     def list_imports(
         self, binary_id: int, dll: str | None = None, limit: int = 200
     ) -> list[sqlite3.Row]:
-        sql = "SELECT dll, name, ordinal, address FROM import WHERE binary_id=?"
+        sql = "SELECT dll, name, ordinal, address, resolved FROM import WHERE binary_id=?"
         args: list[Any] = [binary_id]
         if dll:
             sql += " AND lower(dll)=lower(?)"
@@ -672,28 +672,38 @@ class Store:
         at the import slot and at each thunk function named like the import."""
         dst = self.get_binary_by_id(dst_id)
         with self.db:
-            self.db.execute("DELETE FROM xedge WHERE src_binary=? AND dst_binary=?",
-                            (src_id, dst_id))
+            self.db.execute("DELETE FROM xedge WHERE src_binary=? AND dst_binary=? "
+                            "AND kind='import'", (src_id, dst_id))
+            self.db.execute("UPDATE import SET resolved=NULL WHERE binary_id=? AND lower(dll)=? "
+                            "AND resolved IS NOT NULL", (src_id, dst.name.lower() if dst else ""))
             if dst is None or src_id == dst_id:
                 return 0
             imps = self.db.execute(
-                "SELECT name, ordinal, address FROM import WHERE binary_id=? AND lower(dll)=?",
-                (src_id, dst.name.lower())).fetchall()
+                "SELECT rowid AS rid, dll, name, ordinal, address FROM import "
+                "WHERE binary_id=? AND lower(dll)=?", (src_id, dst.name.lower())).fetchall()
             if not imps:
                 return 0
             by_name: dict[str, int] = {}
             by_ord: dict[int, int] = {}
+            ord_name: dict[int, str] = {}
             for e in self.exports_of(dst_id):
-                if e["name"] and not e["name"].startswith("Ordinal_"):
+                named = bool(e["name"]) and not e["name"].startswith("Ordinal_")
+                if named:
                     by_name.setdefault(e["name"], e["address"])
                 if e["ordinal"] is not None:
                     by_ord.setdefault(e["ordinal"], e["address"])
+                    if named:
+                        ord_name.setdefault(e["ordinal"], e["name"])
             rows: list[tuple[int, int, int, int, str]] = []
             bound = 0
             for i in imps:
                 addr = by_name.get(i["name"]) if i["name"] else None
                 if addr is None and i["ordinal"] is not None:
                     addr = by_ord.get(i["ordinal"])
+                    nm = ord_name.get(i["ordinal"])
+                    if addr is not None and nm:
+                        self.db.execute("UPDATE import SET resolved=? WHERE rowid=?",
+                                        (f"{i['dll']}!{nm} (ordinal {i['ordinal']})", i["rid"]))
                 if addr is None:
                     continue
                 fn = self.function_containing(dst_id, addr)
@@ -721,6 +731,17 @@ class Store:
             n += self._link_pair(binary_id, o) + self._link_pair(o, binary_id)
         return n
 
+    @staticmethod
+    def import_label(imp: sqlite3.Row) -> str:
+        """``dll!Name``; an ordinal import whose exporter is in the project reads
+        ``dll!ExportName (ordinal N)``."""
+        try:
+            if imp["resolved"]:
+                return str(imp["resolved"])
+        except (IndexError, KeyError):
+            pass
+        return f"{imp['dll']}!{imp['name'] or '#' + str(imp['ordinal'])}"
+
     def _crossrefs(self, where: str, args: list[Any], limit: int) -> list[CrossRef]:
         rows = self.db.execute(
             "SELECT src_binary, src_addr, dst_binary, dst_entry, kind FROM xedge "
@@ -732,11 +753,11 @@ class Store:
 
     def cross_to_function(self, fn: Function, limit: int = 200) -> list[CrossRef]:
         """Import slots/thunks of other binaries bound to this function (an exported one)."""
-        return self._crossrefs("dst_binary=? AND dst_entry=?", [fn.binary_id, fn.entry], limit)
+        return self._crossrefs("dst_binary=? AND dst_entry=? AND kind<>'dynlib'", [fn.binary_id, fn.entry], limit)
 
     def cross_from_address(self, binary_id: int, addr: int, limit: int = 20) -> list[CrossRef]:
         """The exporting function(s) an import slot or thunk address of this binary resolves to."""
-        return self._crossrefs("src_binary=? AND src_addr=?", [binary_id, addr], limit)
+        return self._crossrefs("src_binary=? AND src_addr=? AND kind<>'dynlib'", [binary_id, addr], limit)
 
     def cross_from_binary(self, binary_id: int, limit: int = 1000) -> list[CrossRef]:
         return self._crossrefs("src_binary=?", [binary_id], limit)
@@ -745,7 +766,7 @@ class Store:
         """Cross-binary links reached from ``fn``: its own entry (a thunk) or an import slot
         it has an edge to."""
         return self._crossrefs(
-            "src_binary=? AND (src_addr=? OR src_addr IN (SELECT dst_addr FROM edge WHERE src_fn=? AND dst_fn IS NULL))",
+            "src_binary=? AND kind<>'dynlib' AND (src_addr=? OR src_addr IN (SELECT dst_addr FROM edge WHERE src_fn=? AND dst_fn IS NULL))",
             [fn.binary_id, fn.entry, fn.id], limit)
 
     def cross_counts(self, binary_id: int) -> tuple[int, int]:
@@ -860,12 +881,12 @@ class Store:
 
     def imports_by_name(self, binary_id: int, name: str) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT dll, name, ordinal, address FROM import WHERE binary_id=? AND name=?",
+            "SELECT dll, name, ordinal, address, resolved FROM import WHERE binary_id=? AND name=?",
             (binary_id, name)).fetchall()
 
     def import_at(self, binary_id: int, addr: int) -> sqlite3.Row | None:
         return self.db.execute(
-            "SELECT dll, name, ordinal, address FROM import WHERE binary_id=? AND address=? "
+            "SELECT dll, name, ordinal, address, resolved FROM import WHERE binary_id=? AND address=? "
             "LIMIT 1", (binary_id, addr)).fetchone()
 
     def counts(self, binary_id: int) -> dict[str, int]:

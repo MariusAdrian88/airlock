@@ -45,6 +45,33 @@ def tool(name: str, description: str) -> Callable[[Impl], Impl]:
     return deco
 
 
+# Planned milestone per catalog set (docs/DESIGN.md milestones); a few tools differ.
+_SET_MILESTONE = {"types": "M2", "cpp": "M2", "resources": "M2", "annotate": "M3", "admin": "M3",
+                  "spec_write": "M4", "spec_read": "M4", "fileformat": "M5", "delphi": "M6",
+                  "dotnet": "M7", "dataflow": "M8"}
+_TOOL_MILESTONE = {"qt_metaobjects": "M8"}
+
+
+def not_implemented_error(name: str) -> str:
+    info = CATALOG.get(name)
+    if info is None:
+        return f"error unknown_tool: {name} is not a tool of this server. Call project_info for the list."
+    ms = _TOOL_MILESTONE.get(name) or _SET_MILESTONE.get(info.set, "a later milestone")
+    return f"error not_implemented: {name} is planned for {ms} and not available yet."
+
+
+def call(ctx: Any, name: str, *args: Any, **kwargs: Any) -> str:
+    """Direct (non-MCP) call with the same gate as the MCP path; never raises for a tool that
+    exists in the catalog but has no implementation yet."""
+    refusal = roles.gate(ctx.session, name)
+    if refusal is not None:
+        return refusal
+    impl = IMPLEMENTED.get(name)
+    if impl is None:
+        return not_implemented_error(name)
+    return impl.fn(ctx, *args, **kwargs)
+
+
 def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
     """Return an async function without the ctx parameter, keeping the rest of the
     signature so the MCP SDK derives the input schema from it. The implementation
