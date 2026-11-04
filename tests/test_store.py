@@ -63,17 +63,17 @@ def test_migration_hook(tmp_path, monkeypatch):
         calls.append(1)
         db.execute("CREATE TABLE extra(x)")
 
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 3)
-    monkeypatch.setitem(store_mod.MIGRATIONS, 3, mig)
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 4)
+    monkeypatch.setitem(store_mod.MIGRATIONS, 4, mig)
     s = Store(p)
-    assert calls == [1] and s.schema_version == 3
+    assert calls == [1] and s.schema_version == 4
     s.close()
 
 
 def test_missing_migration_and_newer_schema(tmp_path, monkeypatch):
     p = tmp_path / "i.sqlite"
     Store(p).close()
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 4)
     with pytest.raises(RuntimeError):
         Store(p)
     monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 0)
@@ -247,7 +247,7 @@ def test_migration_v1_to_v2(tmp_path):
         s.set_meta("schema_version", "1")
     s.close()
     s = Store(p)
-    assert s.schema_version == 2
+    assert s.schema_version == store_mod.SCHEMA_VERSION
     s.insert_exports(b, [("Foo", 1, 0x1000)])
     assert [tuple(r) for r in s.exports_of(b)] == [("Foo", 1, 0x1000)]
     assert s.cross_counts(b) == (0, 0)

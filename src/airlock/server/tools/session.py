@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from airlock.projects import ProjectPaths, count_specs, find_project, list_projects, summarize
-from airlock.server import roles
+from airlock.server import projectmap, roles
+from airlock.server.budget import fit_lines
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
 
@@ -18,6 +19,28 @@ def dirty_lines(pp: ProjectPaths) -> list[str]:
     state = f"binaries: {s.ready} ready, {s.queued} queued" + (f", {s.errors} failed" if s.errors else "")
     return [f"session dirty for {pp.name}: write notes and scratch files only under {pp.dirty}",
             state]
+
+
+OPEN_MAP_BUDGET = 1500   # tokens of the map that project_open adds
+
+
+def dirty_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
+    """Session line + the first map sections (Purpose, Binaries, Features)."""
+    head = dirty_lines(pp)
+    try:
+        st = ctx.indexer.store(pp.name)
+        man = projectmap.load_manifest(pp)
+        projectmap.write_maps(pp, st, man, mermaid=bool(ctx.config.defaults.get("mermaid")))
+        body = projectmap.render_dirty(pp, st, only=projectmap.FIRST_SECTIONS, heading=False, man=man)
+    except Exception as e:  # noqa: BLE001  the map is an extra; the session line is enough
+        return "\n".join(head + [f"(project map unavailable: {e})"])
+    text = fit_lines(body, OPEN_MAP_BUDGET, "prose", tool="overview", args={})[0]
+    return "\n".join(head) + "\n" + text + "\nMore: overview() (relations, knowledge, frontier)."
+
+
+def clean_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
+    st = ctx.indexer.store(pp.name) if pp.index_db.exists() else None
+    return clean_line(pp) + "\n" + "\n".join(projectmap.render_clean(pp, st))
 
 
 def clean_line(pp: ProjectPaths) -> str:
@@ -62,5 +85,5 @@ def project_open(ctx: ServerContext, name: str, role: str) -> str:
     if err:
         return err
     if role == roles.CLEAN:
-        return clean_line(pp)
-    return "\n".join(dirty_lines(pp))
+        return clean_open_text(ctx, pp)
+    return dirty_open_text(ctx, pp)

@@ -9,6 +9,7 @@ first run); the individual tests then read the results.
 from __future__ import annotations
 
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -252,6 +253,159 @@ def test_decompile_errors_are_codes(world):
     with pytest.raises(WorkerError) as e:
         c.request("extract", {"program": PROGRAM, "kind": "bogus"})
     assert e.value.code == "bad_args"
+
+
+class BulkWatch:
+    """Collects the events of one program's bulk passes."""
+
+    def __init__(self, client: WorkerClient) -> None:
+        self.lock = threading.Lock()
+        self.results: dict[int, dict[str, Any]] = {}
+        self.sizes: list[int] = []
+        self.progress: list[dict[str, Any]] = []
+        client.on_event(self.on)
+
+    def on(self, m: dict[str, Any]) -> None:
+        if m.get("program") != PROGRAM:
+            return
+        with self.lock:
+            if m.get("event") == "decompile_results":
+                self.sizes.append(len(m["results"]))
+                for r in m["results"]:
+                    self.results[r["entry"]] = r
+            elif m.get("event") == "decompile_progress":
+                self.progress.append(m)
+
+    def terminal(self, job: int) -> dict[str, Any] | None:
+        with self.lock:
+            return next((p for p in self.progress
+                         if p["job"] == job and p["state"] in {"done", "cancelled", "error"}), None)
+
+    def max_active(self, job: int) -> int:
+        with self.lock:
+            return max([p.get("active", 0) for p in self.progress if p["job"] == job] or [0])
+
+
+def fn_entries(c: WorkerClient) -> list[int]:
+    cols, rows = extract_all(c, "functions", limit=500)
+    return [f["entry"] for f in as_dicts(cols, rows)
+            if f["space"] == "ram" and not f["is_thunk"] and not f["is_external"]]
+
+
+def wait_terminal(w: BulkWatch, job: int, secs: float = 600) -> dict[str, Any]:
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
+        t = w.terminal(job)
+        if t:
+            return t
+        time.sleep(0.2)
+    raise AssertionError("bulk pass did not finish")
+
+
+def timed(c: WorkerClient, op: str, args: dict[str, Any] | None = None) -> tuple[float, Any]:
+    t0 = time.monotonic()
+    r = c.request(op, args or {}, timeout=120)
+    return time.monotonic() - t0, r
+
+
+def test_bulk_pass_covers_all_functions_and_worker_stays_responsive(world):
+    c = world["client"]
+    w = BulkWatch(c)
+    targets = fn_entries(c)
+    assert len(targets) > 100
+    t0 = time.monotonic()
+    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": 60})
+    job = r["job"]
+    assert r["started"] and r["total"] == len(targets)
+    assert r["processors"] >= 1 and 1 <= r["threads"] <= r["processors"]
+    assert r["threads"] == max(1, int(r["processors"] * 0.75 + 1e-9))   # idle: the max share
+
+    lat: dict[str, list[float]] = {"hello": [], "status": [], "decompile": [], "extract": []}
+    fg_ok = 0
+    saw_bulk_status = False
+    while w.terminal(job) is None:
+        lat["hello"].append(timed(c, "hello")[0])
+        dt, st = timed(c, "status", {"program": PROGRAM})
+        lat["status"].append(dt)
+        b = st["programs"][0].get("bulk")
+        saw_bulk_status = saw_bulk_status or (b is not None and b["job"] == job)
+        dt, d = timed(c, "decompile", {"program": PROGRAM, "entry": targets[fg_ok % 40],
+                                       "timeout": 60})
+        lat["decompile"].append(dt)
+        fg_ok += d["status"] == "ok"
+        lat["extract"].append(timed(c, "extract", {"program": PROGRAM, "kind": "functions",
+                                                   "limit": 5})[0])
+        time.sleep(0.3)
+    fin = wait_terminal(w, job)
+    bulk_s = time.monotonic() - t0
+    TIMINGS["bulk_s"] = bulk_s
+    TIMINGS["bulk_fn_per_s"] = len(targets) / bulk_s
+    TIMINGS["bulk_threads"] = r["threads"]
+    assert fin["state"] == "done" and fin["done"] == fin["total"] == len(targets)
+    assert saw_bulk_status and fg_ok > 0
+    # the request loop never waited for the pass: every cheap request answered quickly
+    for op, xs in lat.items():
+        assert xs and max(xs) < 15, (op, max(xs))
+    assert max(lat["hello"]) < 2 and max(lat["status"]) < 2
+
+    assert set(w.results) == set(targets)
+    assert {x["status"] for x in w.results.values()} <= {"ok", "timeout", "error"}
+    ok = [x for x in w.results.values() if x["status"] == "ok"]
+    assert len(ok) >= 0.95 * len(targets)
+    assert all(x["c_text"] and isinstance(x["ast"], list) for x in ok)
+    assert max(w.sizes) <= 50 and sum(w.sizes) == len(targets)
+    if r["processors"] >= 4:
+        assert w.max_active(job) >= 2          # decompiled on several threads at once
+    # parallel output equals single-decompiler output (thread-safety of the shared program)
+    for entry in [x["entry"] for x in ok][:: max(1, len(ok) // 12)][:12]:
+        d = c.request("decompile", {"program": PROGRAM, "entry": entry, "timeout": 60})
+        assert d["status"] == "ok"
+        assert d["c_text"] == w.results[entry]["c_text"], hex(entry)
+        assert d["ast"] == w.results[entry]["ast"], hex(entry)
+    s = c.request("status", {"program": PROGRAM})["programs"][0]["bulk"]
+    assert s["state"] == "done" and s["done"] == len(targets)
+
+
+def test_bulk_cancel_is_quick_and_leaves_the_worker_usable(world):
+    c = world["client"]
+    w = BulkWatch(c)
+    targets = fn_entries(c)
+    r = c.request("bulk_decompile", {"program": PROGRAM, "order": targets, "timeout": 60})
+    job = r["job"]
+    again = c.request("bulk_decompile", {"program": PROGRAM, "order": targets})
+    assert again.get("already_running") is True and again["job"] == job
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and len(w.results) < 20:
+        time.sleep(0.05)
+    t0 = time.monotonic()
+    assert c.request("cancel_bulk", {"program": PROGRAM})["cancelling"] is True
+    fin = wait_terminal(w, job, 60)
+    TIMINGS["cancel_s"] = time.monotonic() - t0
+    assert fin["state"] == "cancelled" and fin["done"] < len(targets)
+    assert time.monotonic() - t0 < 30
+    assert c.request("cancel_bulk", {"program": PROGRAM})["cancelling"] is False
+    d = c.request("decompile", {"program": PROGRAM, "entry": targets[0]})
+    assert d["status"] == "ok"
+    assert c.request("status", {"program": PROGRAM})["programs"][0]["bulk"]["state"] == "cancelled"
+
+
+def test_decompile_batch_matches_decompile(world):
+    c = world["client"]
+    targets = fn_entries(c)[:15]
+    entries = targets[:-1] + [targets[-1] + 1]            # the last one is an interior address
+    b = c.request("decompile_batch", {"program": PROGRAM, "entries": entries, "timeout": 60},
+                  timeout=300)
+    assert [r["req"] for r in b["results"]] == entries
+    assert b["ast_columns"] == ["kind", "start_off", "end_off", "address", "target", "text"]
+    assert b["results"][-1]["entry"] == targets[-1]
+    assert all(r["status"] in {"ok", "timeout", "error"} for r in b["results"])
+    one = c.request("decompile", {"program": PROGRAM, "entry": targets[3]})
+    assert b["results"][3]["c_text"] == one["c_text"] and b["results"][3]["ast"] == one["ast"]
+    assert "version_inputs" in b["results"][0]
+    for bad in ([], "x", list(range(501))):
+        with pytest.raises(WorkerError) as e:
+            c.request("decompile_batch", {"program": PROGRAM, "entries": bad})
+        assert e.value.code == "bad_args"
 
 
 def test_save_close_reopen_keeps_analysis(world):

@@ -248,7 +248,9 @@ def extract(args: dict[str, Any]) -> dict[str, Any]:
         limit = min(MAX_LIMIT, max(1, int(args.get("limit") or DEFAULT_LIMIT)))
     except (TypeError, ValueError) as ex:
         raise WorkerError("bad_args", f"offset/limit must be integers ({ex})") from ex
-    with e.lock:
+    # Read side: a background decompile pass and foreground decompiles continue meanwhile.
+    # Only one extract per program runs at a time (the server pages sequentially).
+    with S.POOL.foreground(), e.lock.read(), e.cursor_lock:
         cur = _cursor_for(e, kind, offset)
         rows = cur.take(limit)
         done = cur.exhausted()

@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from airlock.config import Config
 from airlock.index.store import Binary, Store
+from airlock.server.bulk import BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
     read_sections, slugify, write_manifest,
@@ -222,7 +223,15 @@ class Indexer:
         self._seq = itertools.count()
         self._mf_lock = threading.RLock()
         self._resumed: set[str] = set()
+        # callbacks(project, binary_id) run after a binary became ready and was linked
+        self.ready_hooks: list[Callable[[str, int], None]] = []
         worker.on_event(self._on_event)
+        self.bulk = BulkScheduler(self)  # background decompile pass (server/bulk.py)
+
+    def queue_idle(self) -> bool:
+        """True when no binary is being analysed or waiting for analysis."""
+        with self._lock:
+            return self._running is None and not self._queue
 
     # -- stores / projects -------------------------------------------------
 
@@ -403,6 +412,10 @@ class Indexer:
                 continue
             if (paths.artifacts / b.sha256).is_file():
                 n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
+        try:
+            self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
+        except Exception as e:
+            log.warning("cannot resume the decompile pass of %s: %s", slug, e)
         return n
 
     def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
@@ -698,6 +711,10 @@ class Indexer:
             self._after_ready(job)
         except Exception as e:  # links are an extra; the binary stays ready
             log.warning("cross-binary linking failed for %s: %s", job.program, e)
+        try:
+            self.bulk.schedule(job.project, job.binary_id, job.group)
+        except Exception as e:  # the pass is an extra; the binary stays ready
+            log.warning("cannot schedule the decompile pass for %s: %s", job.program, e)
         job.finished.set()
 
     def _after_ready(self, job: Job) -> None:
@@ -726,6 +743,11 @@ class Indexer:
                     (o.id, me.name.lower()))):
                 links.append({"program": self.program_of(st, o), "libs": {me.name.lower(): job.program}})
         self._link_externals(links)
+        for hook in list(self.ready_hooks):
+            try:
+                hook(job.project, bid)
+            except Exception as e:  # a hook is an extra; the binary stays ready
+                log.warning("ready hook failed for %s: %s", job.program, e)
 
     # -- worker session for decompile --------------------------------------
 

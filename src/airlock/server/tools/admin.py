@@ -101,6 +101,24 @@ def _dur(sec: float | None) -> str:
     return f"{round(sec / 60)} min"
 
 
+def _decomp_text(ix, p: str, st, b, counts) -> str:
+    """`decompiled X/Y`, plus rate and threads while the background pass runs."""
+    done = st.decomp_current_count(b.id, b.analysis_profile or "unknown")
+    text = f"decompiled {done}/{st.decomp_target_count(b.id)}"
+    if counts["decomp_stale"]:
+        text += f" (stale {counts['decomp_stale']})"
+    bp = ix.bulk.progress(p, b.id)
+    if bp is None:
+        return text
+    if bp.state == "running":
+        text += f", {bp.rate:.1f} fn/s, threads {bp.threads} of {bp.processors}"
+    elif bp.state in ("waiting", "planning"):
+        text += ", background pass waiting for analysis"
+    elif bp.state in ("error", "interrupted"):
+        text += f", background pass {bp.state}: {bp.message}"
+    return text
+
+
 def _project_lines(ix, p: str, st) -> list[str]:
     q = ix.queue_status(p)
     counts: dict[str, int] = {}
@@ -127,8 +145,7 @@ def _project_lines(ix, p: str, st) -> list[str]:
         if status == "ready":
             c = st.counts(b.id)
             line = (f"  #{b.id} {b.name} ready: {c['functions']} functions, {c['strings']} strings, "
-                    f"{c['imports']} imports, {c['edges']} edges; decompiled {c['decompiled']} "
-                    f"(stale {c['decomp_stale']})")
+                    f"{c['imports']} imports, {c['edges']} edges; {_decomp_text(ix, p, st, b, c)}")
             links = st.cross_counts(b.id)
             if links[0] or links[1]:
                 line += f"; links out {links[0]} in {links[1]}"

@@ -25,3 +25,22 @@ def _v2(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[2] = _v2
+
+
+def _v3(db: sqlite3.Connection) -> None:
+    """Feature index: features and their entry points (auto rows are derived, agent rows kept)."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS feature (key TEXT PRIMARY KEY, title TEXT NOT NULL, "
+        "source TEXT NOT NULL DEFAULT 'auto', topics TEXT NOT NULL DEFAULT '', "
+        "evidence TEXT NOT NULL DEFAULT '', updated TEXT)",
+        "CREATE TABLE IF NOT EXISTS feature_entry (feature_key TEXT NOT NULL "
+        "REFERENCES feature(key) ON DELETE CASCADE, binary_id INTEGER NOT NULL "
+        "REFERENCES binary(id), space TEXT NOT NULL DEFAULT 'ram', entry INTEGER NOT NULL, "
+        "reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', depth INTEGER NOT NULL DEFAULT 0, "
+        "source TEXT NOT NULL DEFAULT 'auto', PRIMARY KEY (feature_key, binary_id, space, entry))",
+        "CREATE INDEX IF NOT EXISTS feature_entry_by_fn ON feature_entry(binary_id, space, entry)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[3] = _v3

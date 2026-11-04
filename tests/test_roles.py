@@ -126,8 +126,9 @@ def test_project_open_dirty_then_locked(tmp_path):
 def test_project_open_clean_and_redaction(tmp_path):
     server, ctx, pp = _server(tmp_path)
     out = _call(server, "project_open", {"name": "demo", "role": "clean"})
-    assert out == (f"session clean for demo: write the implementation under {pp.clean}; "
-                   f"never read {pp.dirty}. Specs: 1 published in {pp.specs}")
+    assert out.splitlines()[0] == (f"session clean for demo: write the implementation under {pp.clean}; "
+                                   f"never read {pp.dirty}. Specs: 1 published in {pp.specs}")
+    assert "# demo (clean map)" in out and "one" in out and "app.exe" not in out
     assert _call(server, "projects") == "demo | specs 1"
     info = _call(server, "project_info")
     assert "role clean | project demo" in info
@@ -219,7 +220,7 @@ def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
     paths = {f["path"]: f for f in man["files"]}
     assert set(paths) == {"app.exe", "plug/p1.dll", "data.bin"}
     assert paths["plug/p1.dll"]["group"] == "own_plugin" and len(paths["app.exe"]["sha256"]) == 64
-    assert paths["plug/p1.dll"]["state"] == "queued"
+    assert paths["plug/p1.dll"]["state"] == "error"  # every PE is enqueued; the fake file is no PE
     assert paths["app.exe"]["state"] == "error"  # fake file is not a PE: indexer refuses it
     for f in man["files"]:
         assert (root / "dirty" / ".airlock" / "artifacts" / f["sha256"]).is_file()
@@ -230,23 +231,19 @@ def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
                              add="nope.dll").startswith("error bad_file:")
 
 
-def test_project_create_calls_indexer_for_root_only(tmp_path, fake_scan, monkeypatch):
+def test_project_create_enqueues_all_pe_files(tmp_path, fake_scan, monkeypatch):
     ctx = make_ctx(tmp_path)
     calls = []
-
-    class R:
-        status = "importing"
-
-    def fake_open(p, path, wait_s=0):
-        calls.append((p, path))
-        return R()
-
-    monkeypatch.setattr(ctx.indexer, "open_binary", fake_open)
+    monkeypatch.setattr(ctx.indexer, "enqueue", lambda slug, files: calls.append((slug, files)) or [])
+    monkeypatch.setattr(ctx.indexer, "open_binary", lambda *a, **k: pytest.fail("open_binary used"))
     pc.project_create(ctx, str(fake_scan), name="q", option="B")
-    assert calls == [("q", str(fake_scan / "app.exe"))]
+    assert calls and calls[0][0] == "q"  # later calls are resume_project at bind
+    assert [f["path"] for f in calls[0][1] if f["kind"] == "pe"] == [
+        "app.exe", "core.dll", "plug/p1.dll"]
+    assert all(len(f["sha256"]) == 64 for f in calls[0][1])
     man = P.read_manifest(tmp_path / "projects" / "q" / P.MANIFEST_NAME)
     assert {f["path"]: f["state"] for f in man["files"]} == {
-        "app.exe": "importing", "core.dll": "queued", "plug/p1.dll": "queued"}
+        "app.exe": "queued", "core.dll": "queued", "plug/p1.dll": "queued"}
 
 
 def test_deny_rules(tmp_path):

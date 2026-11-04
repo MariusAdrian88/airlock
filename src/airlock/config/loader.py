@@ -140,6 +140,22 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         if v is not None and (not isinstance(v, int) or v <= 0):
             raise ConfigError(f"defaults.{key} must be a positive integer")
 
+    mer = defaults.get("mermaid")
+    if mer is not None and not isinstance(mer, bool):
+        raise ConfigError("defaults.mermaid must be true or false")
+
+    bulk = defaults.get("bulk_decompile")
+    if bulk is not None and bulk not in ("lazy", "background"):
+        raise ConfigError("defaults.bulk_decompile must be 'lazy' or 'background'")
+    shares: dict[str, float] = {}
+    for key, fallback in (("decompile_cpu_min", 0.5), ("decompile_cpu_max", 0.75)):
+        v = defaults.get(key, fallback)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 < v <= 1):
+            raise ConfigError(f"defaults.{key} must be a number above 0 and at most 1")
+        shares[key] = float(v)
+    if shares["decompile_cpu_min"] > shares["decompile_cpu_max"]:
+        raise ConfigError("defaults.decompile_cpu_min must not exceed defaults.decompile_cpu_max")
+
     spc = defaults.get("analysis_s_per_code_mb")
     if spc is not None and (isinstance(spc, bool) or not isinstance(spc, (int, float)) or spc <= 0):
         raise ConfigError("defaults.analysis_s_per_code_mb must be a positive number")

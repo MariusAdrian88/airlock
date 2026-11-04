@@ -128,7 +128,8 @@ class FakeWorker:
 def make_ctx(tmp_path) -> ServerContext:
     merged = deep_merge(parse_jsonc(default_config_text()),
                         {"ghidra_dir": str(tmp_path / "g"), "index_dir": str(tmp_path / "data"),
-                         "projects_root": str(tmp_path / "projects")})
+                         "projects_root": str(tmp_path / "projects"),
+                         "defaults": {"bulk_decompile": "lazy"}})  # tests opt in to the pass
     fake = FakeWorker()
     ctx = ServerContext(config=resolve(merged, "dirty", None), worker=fake)
     fake.project_path = str(ctx.indexer.paths("proj", create=True).ghidra)
@@ -259,7 +260,8 @@ def test_not_ready_and_binary_selection(ctx):
     st = ctx.indexer.store("proj")
     b2 = st.upsert_binary("cd" * 32, "other.dll", pointer_size=4)
     ctx.indexer.set_status(st, b2, "analysing")
-    assert core.strings(ctx, "open").startswith("error ambiguous_binary:")
+    out = core.strings(ctx, "open")  # no binary given: every ready binary, the other is skipped
+    assert out.startswith("strings matching") and "1 binaries not ready, skipped" in out
     assert core.strings(ctx, "open", binary="app.exe").startswith("strings matching")
     out = core.strings(ctx, "open", binary="other.dll")
     assert out.startswith("error not_analysed:") and "analysing" in out and "index_status" in out
@@ -280,7 +282,7 @@ def test_no_project_errors(tmp_path):
 
 def test_list_binaries_and_index_status(ctx):
     out = core.list_binaries(ctx)
-    assert out == "proj/#1 app.exe pe32 x86 msvc sha256:" + "ab" * 6 + " ready"
+    assert out == "proj/#1 app.exe pe32 x86 msvc sha256:" + "ab" * 6 + " ready fns=5 links=0/0"
     st = admin.index_status(ctx)
     assert "worker running" in st and "#1 app.exe ready: 5 functions, 2 strings, 1 imports, 7 edges" in st
     assert core.list_binaries(ctx, "nope").startswith("error no_project:")

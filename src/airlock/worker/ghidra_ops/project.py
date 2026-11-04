@@ -73,6 +73,8 @@ def _project_info(created: bool, already_open: bool = False) -> dict[str, Any]:
 def _stop_analyses(force: bool) -> None:
     """Refuse (or with force, cancel and join) running analyses. Call WITHOUT SESSION.mutex:
     the analysis thread takes it when it finishes."""
+    from . import bulk
+    bulk.cancel_all(join=True)  # outside SESSION.mutex, so status keeps answering
     running = [e for e in list(SESSION.programs.values()) if e.state == ANALYSING]
     if running and not force:
         raise WorkerError("busy", f"analysis is running on {', '.join(e.name for e in running)}. "
@@ -85,8 +87,11 @@ def _stop_analyses(force: bool) -> None:
 
 
 def _close_project() -> None:
+    from . import bulk
+    bulk.cancel_all(join=True)  # background decompiles read the programs we are about to close
     for e in list(SESSION.programs.values()):
         with e.lock:
+            e.closed = True
             dispose_decomp(e)
     if SESSION.gp is not None:
         SESSION.gp.close()  # releases every opened program and the project lock
@@ -172,6 +177,9 @@ def analyze(args: dict[str, Any]) -> dict[str, Any]:
     e = S.get_entry(args.get("program"))
     force = bool(args.get("force"))
     timeout_min = args.get("timeout_min")
+    if force or e.state != READY:
+        from . import bulk
+        bulk.cancel(e.name, join=True)  # analysis takes the write lock; stop readers first
     with SESSION.mutex:
         if e.state == ANALYSING:
             return {"program": e.name, "state": ANALYSING, "already_running": True}
@@ -379,6 +387,8 @@ def _status_of(e: Entry) -> dict[str, Any]:
         d["progress"] = dict(e.progress)
     if e.analysis_profile:
         d["analysis_profile"] = e.analysis_profile
+    if e.bulk:
+        d["bulk"] = dict(e.bulk)
     return d
 
 

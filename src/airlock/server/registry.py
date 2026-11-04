@@ -59,6 +59,8 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
         refusal = roles.gate(ctx.session, impl.name)
         if refusal is not None:
             return refusal
+        if "from" in kwargs:      # `from` is a Python keyword: tools name the parameter `from_`
+            kwargs["from_"] = kwargs.pop("from")
         return await anyio.to_thread.run_sync(functools.partial(impl.fn, ctx, *args, **kwargs))
 
     bound.__name__ = impl.name
@@ -70,4 +72,6 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
 
 def load_tool_modules() -> None:
     """Import every module that defines tools (each registers on import)."""
-    from airlock.server.tools import admin, core, project, project_create, queue, session  # noqa: F401
+    from airlock.server.tools import (  # noqa: F401
+        admin, core, fmap, graphtools, map, project, project_create, queue, session,
+    )

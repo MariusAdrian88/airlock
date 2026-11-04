@@ -10,8 +10,8 @@ import math
 import re
 from datetime import datetime, timezone
 
-from airlock.index.store import Function, StringHit
-from airlock.projects import read_sections
+from airlock.index.store import CrossRef, Function, StringHit
+from airlock.projects import read_manifest, read_sections
 from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
 )
@@ -21,7 +21,7 @@ from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr, parse_address, resolve_function
 from airlock.server.tools.common import (
-    Bound, bind_binary, budget_for, fn_desc, preview,
+    Bound, bind_binary, bind_many, bind_target, bound_of, budget_for, fn_desc, preview,
 )
 from airlock.worker.protocol import WorkerError
 
@@ -72,7 +72,7 @@ def open_binary(ctx: ServerContext, project: str, path: str) -> str:
 
 
 @tool("list_binaries", "List the binaries of a project (all projects when none is given) with "
-                       "their status.")
+                       "status, group, code size, functions and cross-binary links out/in.")
 def list_binaries(ctx: ServerContext, project: str = "") -> str:
     ix = ctx.indexer
     try:
@@ -82,9 +82,26 @@ def list_binaries(ctx: ServerContext, project: str = "") -> str:
     out = []
     for p in names:
         st = ix.store(p)
+        try:
+            files = {f.get("sha256"): f for f in read_manifest(ix.paths(p).manifest).get("files") or []
+                     if isinstance(f, dict)}
+        except (OSError, ValueError):
+            files = {}
         for b in st.list_binaries():
-            out.append(_binary_line(b, ix.describe(p, st, b)[0], p))
+            line = _binary_line(b, ix.describe(p, st, b)[0], p)
+            mf = files.get(b.sha256) or {}
+            if mf.get("group"):
+                line += f" group={mf['group']}"
+            if mf.get("code_size"):
+                line += f" code={_size(int(mf['code_size']))}"
+            out_n, in_n = st.cross_counts(b.id)
+            line += f" fns={st.counts(b.id)['functions']} links={out_n}/{in_n}"
+            out.append(line)
     return "\n".join(out) if out else "no binaries. Call open_binary with a project and a file path."
+
+
+def _size(n: int) -> str:
+    return f"{n / (1 << 20):.1f}MB" if n >= 1 << 20 else f"{max(1, round(n / 1024))}KB"
 
 
 # ── outline ────────────────────────────────────────────────────────────────────
@@ -117,6 +134,11 @@ def outline(ctx: ServerContext, binary: str = "") -> str:
     shown = ", ".join(f"{d} {n}" for d, n in dlls[:10])
     more = f", +{len(dlls) - 10} more DLLs" if len(dlls) > 10 else ""
     out.append(f"imports {c['imports']} from {len(dlls)} DLLs: {shown}{more}")
+    out.append(f"exports {len(st.exports_of(b.id))}")
+    others = {o.name.lower() for o in st.list_binaries() if o.id != b.id}
+    mine = [(d, n) for d, n in dlls if d.lower() in others]
+    if mine:
+        out.append("imports from project binaries: " + ", ".join(f"{d} {n}" for d, n in mine))
     out.append(f"strings {c['strings']}, edges {c['edges']}, decompiled {c['decompiled']}")
     return "\n".join(out)
 
@@ -141,15 +163,40 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
                 "Use function, string, import or any.")
     if kind not in _SEARCH_KINDS:
         return f"error bad_args: unknown kind '{kind}'. Use function, string, import or any."
-    bd = bind_binary(ctx, binary)
-    if isinstance(bd, str):
-        return bd
-    st, b = bd.store, bd.binary
+    many = bind_many(ctx, binary)
+    if isinstance(many, str):
+        return many
+    bounds, skipped = many
+    multi = len(bounds) > 1
     limit = max(1, min(int(limit), 200))
     # Fetch more than `limit` per kind: dedup drops rows, and ranking needs candidates.
     fetch = limit * 5 + 20
     groups: dict[str, list[tuple[tuple[int, ...], str]]] = {}
     seq = 0
+    for bd in bounds:
+        seq = _search_binary(bd, query, kind, fetch, groups, seq,
+                             f"[{bd.binary.name}] " if multi else "")
+    for g in groups.values():
+        g.sort(key=lambda x: x[0])
+    if kind == "any":
+        merged = _balance(groups, limit)
+    else:
+        merged = [ln for _, ln in groups.get(kind, [])[:limit]]
+    if not merged:
+        return f"no hits for '{query}'"
+    args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
+    head = f"search '{query}': {len(merged)} hits"
+    if skipped:
+        head += f" ({skipped} binaries not ready, skipped)"
+    return _page([head, *merged], "search", args, bud)
+
+
+def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
+                   groups: dict[str, list[tuple[tuple[int, ...], str]]], seq: int,
+                   pfx: str) -> int:
+    """Add one binary's hits to `groups` (lines get the `[binary] ` prefix `pfx`); returns
+    the running sequence number, so FTS order stays stable across binaries."""
+    st, b = bd.store, bd.binary
     strings: dict[str, tuple[tuple[int, ...], StringHit]] = {}
     for k in _SEARCH_KINDS[kind]:
         for h in st.fts_search(b.id, query, k, fetch):
@@ -166,23 +213,14 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
             item = _search_item(bd, h, query)
             if item:
                 key, line = item
-                groups.setdefault(k, []).append(((*key, seq), line))
+                groups.setdefault(k, []).append(((*key, seq), pfx + line))
     for value, (key, s) in strings.items():
         total = st.string_copies(b.id, value)
         enc = "" if s.encoding == "ascii" else f" {s.encoding}"
         extra = f" (+{total - 1} copies)" if total > 1 else ""
         groups.setdefault("string", []).append(
-            (key, f"string {bd.addr(s.address)}{enc} {preview(s.value)}{extra}"))
-    for g in groups.values():
-        g.sort(key=lambda x: x[0])
-    if kind == "any":
-        merged = _balance(groups, limit)
-    else:
-        merged = [ln for _, ln in groups.get(kind, [])[:limit]]
-    if not merged:
-        return f"no hits for '{query}'"
-    args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
-    return _page([f"search '{query}': {len(merged)} hits", *merged], "search", args, bud)
+            (key, f"{pfx}string {bd.addr(s.address)}{enc} {preview(s.value)}{extra}"))
+    return seq
 
 
 _QUOTA = (("function", 0.4), ("import", 0.2), ("string", 0.2))
@@ -337,22 +375,24 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         span = _parse_lines(lines)
         if span is None:
             return "error bad_args: lines must look like 40-80. Fix and retry."
-    bd = bind_binary(ctx, binary)
-    if isinstance(bd, str):
-        return bd
+    bt = bind_target(ctx, binary, target)
+    if isinstance(bt, str):
+        return bt
+    bd, bare, bnote = bt
     st, b = bd.store, bd.binary
-    r = resolve_function(st, b.id, target)
+    r = resolve_function(st, b.id, bare)
     if not r.ok:
         return r.error or "error not_found: no such function. Use search."
     fn = r.function
     assert fn is not None
+    note = r.note or (f"binary {b.name}" if bnote else None)
     if view == "signature":
         callers = len(st.callers(fn, 200)) if not fn.is_external else 0
         sig = fn.signature or fn.qualified_name
         flags = ", ".join(x for x in (fn.calling_conv, f"{fn.size} bytes" if fn.size else None,
                                       fn.name_state, "thunk" if fn.is_thunk else None,
                                       "external" if fn.is_external else None) if x)
-        out = ([r.note] if r.note else []) + [
+        out = ([note] if note else []) + [
             f"{bd.addr(fn.entry, fn.space)} {sig} [{flags}] callers {callers}"]
         return "\n".join(out)
     if fn.is_external:
@@ -382,9 +422,9 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         head = (f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)}: {len(all_lines)} lines, "
                 f"~{estimate_tokens(full, 'code')} tokens (budget {bud}). "
                 "Read with lines=a-b, or outline=false to page.")
-        olines = ([f"// {r.note}"] if r.note else []) + outline_lines(all_lines, head)
+        olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head)
         return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
-    return _function_page(full, bud, span, lines, offset, r.note, args, identity)
+    return _function_page(full, bud, span, lines, offset, note, args, identity)
 
 
 def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str,
@@ -483,30 +523,41 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         kinds = _KIND_MAP.get(kind)
         if kinds is None:
             return f"error bad_args: unknown kind '{kind}'. Use call, jump, read, write or data."
-    bd = bind_binary(ctx, binary)
-    if isinstance(bd, str):
-        return bd
+    bt = bind_target(ctx, binary, target)
+    if isinstance(bt, str):
+        return bt
+    bd, bare, bnote = bt
     st, b = bd.store, bd.binary
     limit = max(1, min(int(limit), 1000))
-    res = _resolve_ref_target(bd, target)
+    res = _resolve_ref_target(bd, bare)
     if res[0] == "err":
         return res[1]
-    notes: list[str] = []
+    notes: list[str] = [bnote] if bnote else []
+    entries: list[tuple[str, str]] = []   # (kind, line)
+    cross: list[CrossRef] = []            # callers from other binaries (direction=to)
+    links: list[CrossRef] = []            # where an import slot or thunk here resolves to
     if res[0] == "fn":
         fn: Function = res[1]
         if res[2]:
             notes.append(res[2])
         label = fn_desc(bd, fn)
+        if fn.space != "ram":  # imported function: callers reach it through its IAT slot
+            slots = [i["address"] for i in st.imports_by_name(b.id, fn.name)
+                     if i["address"] is not None]
+        else:
+            slots = []
         if direction == "to":
-            if fn.space != "ram":  # imported function: callers reach it through its IAT slot
+            if fn.space != "ram":
                 refs = []
-                for imp in st.imports_by_name(b.id, fn.name):
-                    if imp["address"] is not None:
-                        refs += st.xrefs_to_address(b.id, imp["address"], kinds, limit + 1)
+                for a in slots:
+                    refs += st.xrefs_to_address(b.id, a, kinds, limit + 1)
             else:
                 refs = st.xrefs_to_function(fn, kinds, limit + 1)
+                cross = st.cross_to_function(fn, limit + 1)
         else:
             refs = st.xrefs_from_function(fn, kinds, limit + 1)
+        for a in ([fn.entry] if fn.space == "ram" else []) + slots:
+            links += st.cross_from_address(b.id, a, 5)
     else:
         space, value = res[1]
         s = st.string_at(b.id, value)
@@ -514,31 +565,50 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         notes.append("no function starts here; showing raw references")
         refs = (st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
             b.id, value, kinds, limit + 1)
-    over = len(refs) > limit
-    refs = refs[:limit]
-    counts: dict[str, int] = {}
+        links = st.cross_from_address(b.id, value, 5)
+    for x in links[:5]:
+        notes.append(_cross_target(bd, x))
     for x in refs:
-        counts[x.kind] = counts.get(x.kind, 0) + 1
+        if direction == "to":
+            who = x.src_fn.qualified_name if x.src_fn else "-"
+            entries.append((x.kind, f"  {bd.addr(x.src_addr)}  {who:<36} {x.kind}"))
+        else:
+            what = _describe_addr(bd, x.dst_addr, x.dst_fn)
+            entries.append((x.kind, f"  {bd.addr(x.src_addr)}  -> {bd.addr(x.dst_addr)} {what:<30} "
+                                    f"{x.kind}"))
+    if kinds is None or "import" in kinds:
+        for x in cross:
+            sb = bound_of(bd, x.src_binary)
+            imp = sb.store.import_at(x.src_binary, x.src_addr)
+            who = (x.src_fn.qualified_name if x.src_fn else
+                   f"{imp['dll']}!{imp['name'] or '#' + str(imp['ordinal'])}" if imp else "-")
+            entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
+    over = len(entries) > limit
+    entries = entries[:limit]
+    counts: dict[str, int] = {}
+    for k, _ in entries:
+        counts[k] = counts.get(k, 0) + 1
     if len(counts) == 1:
         (k, n), = counts.items()
         summary = f"{n} {k}{'s' if n != 1 else ''}"
     else:
-        summary = f"{len(refs)} refs: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
-    if not refs:
+        summary = f"{len(entries)} refs: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+    if not entries:
         summary = "no references"
     out = [f"xrefs {direction} {label}, {summary}{'+' if over else ''}", *notes]
-    for x in refs:
-        if direction == "to":
-            who = x.src_fn.qualified_name if x.src_fn else "-"
-            out.append(f"  {bd.addr(x.src_addr)}  {who:<36} {x.kind}")
-        else:
-            what = _describe_addr(bd, x.dst_addr, x.dst_fn)
-            out.append(f"  {bd.addr(x.src_addr)}  -> {bd.addr(x.dst_addr)} {what:<30} {x.kind}")
+    out += [ln for _, ln in entries]
     if over:
         out.append(f"… limit {limit} reached. Raise limit or filter with kind.")
     args = {"binary": binary, "target": target, "direction": direction, "kind": kind,
             "limit": limit}
     return _page(out, "xrefs", args, bud)
+
+
+def _cross_target(bd: Bound, x: CrossRef) -> str:
+    """``→ engine.dll!Foo 0x10001000``: where an import slot or thunk resolves to."""
+    db = bound_of(bd, x.dst_binary)
+    name = x.dst_fn.qualified_name if x.dst_fn else None
+    return (f"→ {db.binary.name}!{name} " if name else f"→ {db.binary.name}!") + db.addr(x.dst_entry)
 
 
 # ── callgraph ──────────────────────────────────────────────────────────────────
@@ -555,46 +625,86 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     if direction not in ("callees", "callers"):
         return "error bad_args: direction must be callees or callers. Fix and retry."
     depth = max(1, min(int(depth), MAX_DEPTH))
-    bd = bind_binary(ctx, binary)
-    if isinstance(bd, str):
-        return bd
+    bt = bind_target(ctx, binary, target)
+    if isinstance(bt, str):
+        return bt
+    bd, bare, bnote = bt
     st, b = bd.store, bd.binary
-    r = resolve_function(st, b.id, target)
+    r = resolve_function(st, b.id, bare)
     if not r.ok:
         return r.error or "error not_found: no such function. Use search."
     root = r.function
     assert root is not None
-    step = st.callees if direction == "callees" else st.callers
     out = [f"{direction} of {fn_desc(bd, root)}, depth {depth}"]
+    if bnote:
+        out.append(bnote)
     if r.note:
         out.append(r.note)
+    base = len(out)
     expanded = {root.id}
     state = {"truncated": False}
 
-    def label(f: Function) -> str:
-        return fn_desc(bd, f) + (" [thunk]" if f.is_thunk else "")
+    def children(cb: Bound, fn: Function) -> list[tuple[Bound, Function | None, str, int | None]]:
+        """(bound, function, hop mark, raw address): local edges first, then links into
+        other binaries (callees: an import slot or thunk to the exporting function; callers:
+        importing thunks and the callers of their import slots)."""
+        s_ = cb.store
+        step = s_.callees if direction == "callees" else s_.callers
+        kids: list[tuple[Bound, Function | None, str, int | None]] = [
+            (cb, c, "", None) for c in step(fn, CALLGRAPH_FANOUT + 1)]
+        if direction == "callees":
+            hops: set[tuple[int, int]] = set()
+            for x in s_.cross_from_function(fn, CALLGRAPH_FANOUT + 1):
+                if (x.dst_binary, x.dst_entry) in hops:   # thunk and its slot: one hop
+                    continue
+                hops.add((x.dst_binary, x.dst_entry))
+                db = bound_of(cb, x.dst_binary)
+                kids.append((db, x.dst_fn, f"→ [{db.binary.name}] ", x.dst_entry))
+        else:
+            seen = {c.id for _, c, _, _ in kids if c is not None}
+            for x in s_.cross_to_function(fn, CALLGRAPH_FANOUT + 1):
+                sb = bound_of(cb, x.src_binary)
+                if x.src_fn is not None and x.src_fn.entry == x.src_addr:
+                    srcs = [x.src_fn]   # a thunk: its own callers come with expanding it
+                else:                   # an import slot: the functions that call through it
+                    srcs = [r_.src_fn for r_ in sb.store.xrefs_to_address(
+                        x.src_binary, x.src_addr, ("call", "call_ind", "jump"),
+                        CALLGRAPH_FANOUT + 1) if r_.src_fn]
+                for f_ in srcs:
+                    if f_.id not in seen:
+                        seen.add(f_.id)
+                        kids.append((sb, f_, f"← [{sb.binary.name}] ", None))
+        return kids
 
-    def walk(fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
-        kids = step(fn, CALLGRAPH_FANOUT + 1)
-        for c in kids[:CALLGRAPH_FANOUT]:
+    def label(cb: Bound, f: Function | None, mark: str, raw: int | None) -> str:
+        if f is None:
+            return mark + cb.addr(raw or 0)
+        return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "")
+
+    def walk(cb: Bound, fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
+        kids = children(cb, fn)
+        for kb, c, mark, raw in kids[:CALLGRAPH_FANOUT]:
             if len(out) >= CALLGRAPH_MAX_LINES:
                 state["truncated"] = True
                 return
             pad = "  " * indent
-            if c.id in path:
-                out.append(f"{pad}{label(c)} [cycle]")
+            lab = label(kb, c, mark, raw)
+            if c is None:
+                out.append(f"{pad}{lab}")
+            elif c.id in path:
+                out.append(f"{pad}{lab} [cycle]")
             elif c.id in expanded:
-                out.append(f"{pad}{label(c)} [seen]")
+                out.append(f"{pad}{lab} [seen]")
             else:
-                out.append(f"{pad}{label(c)}")
+                out.append(f"{pad}{lab}")
                 if left > 1:
                     expanded.add(c.id)
-                    walk(c, left - 1, indent + 1, path | {c.id})
+                    walk(kb, c, left - 1, indent + 1, path | {c.id})
         if len(kids) > CALLGRAPH_FANOUT:
             out.append(f"{'  ' * indent}… more than {CALLGRAPH_FANOUT} {direction} not shown")
 
-    walk(root, depth, 1, frozenset({root.id}))
-    if len(out) == 1 + (1 if r.note else 0):
+    walk(bd, root, depth, 1, frozenset({root.id}))
+    if len(out) == base:
         out.append("  (none)")
     if state["truncated"]:
         out.append(f"… stopped at {CALLGRAPH_MAX_LINES} lines. Lower depth.")
@@ -618,26 +728,43 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
             re.compile(pattern)
         except re.error as e:
             return f"error bad_regex: {e}. Fix the pattern and retry."
-    bd = bind_binary(ctx, binary)
-    if isinstance(bd, str):
-        return bd
-    st, b = bd.store, bd.binary
+    many = bind_many(ctx, binary)
+    if isinstance(many, str):
+        return many
+    bounds, skipped = many
+    multi = len(bounds) > 1
     limit = max(1, min(int(limit), 500))
-    hits = st.search_strings(b.id, pattern, regex=regex, limit=limit, with_refs=with_refs)
-    if not hits:
+    per_binary: list[list[str]] = []
+    capped = False
+    for bd in bounds:
+        hits = bd.store.search_strings(bd.binary.id, pattern, regex=regex, limit=limit,
+                                       with_refs=with_refs)
+        capped = capped or len(hits) == limit
+        lines_b = []
+        for h in hits:
+            enc = "" if h.encoding == "ascii" else f" {h.encoding}"
+            line = f"{'[' + bd.binary.name + '] ' if multi else ''}{bd.addr(h.address)}{enc} "                    f"{preview(h.value)}"
+            if with_refs:
+                if h.refs:
+                    names = " ".join(f.qualified_name for f in h.refs[:4])
+                    extra = f" +{len(h.refs) - 4}" if len(h.refs) > 4 else ""
+                    line += f"  <- {names}{extra}"
+                else:
+                    line += "  <- (no refs)"
+            lines_b.append(line)
+        per_binary.append(lines_b)
+    # Round-robin over the binaries, so one chatty binary cannot crowd out the others.
+    merged: list[str] = []
+    for i in range(max((len(x) for x in per_binary), default=0)):
+        merged += [x[i] for x in per_binary if i < len(x)]
+    capped = capped or len(merged) > limit
+    merged = merged[:limit]
+    if not merged:
         return f"no strings match '{pattern}'"
-    out = [f"strings matching '{pattern}': {len(hits)}{'+' if len(hits) == limit else ''}"]
-    for h in hits:
-        enc = "" if h.encoding == "ascii" else f" {h.encoding}"
-        line = f"{bd.addr(h.address)}{enc} {preview(h.value)}"
-        if with_refs:
-            if h.refs:
-                names = " ".join(f.qualified_name for f in h.refs[:4])
-                extra = f" +{len(h.refs) - 4}" if len(h.refs) > 4 else ""
-                line += f"  <- {names}{extra}"
-            else:
-                line += "  <- (no refs)"
-        out.append(line)
+    head = f"strings matching '{pattern}': {len(merged)}{'+' if capped else ''}"
+    if skipped:
+        head += f" ({skipped} binaries not ready, skipped)"
+    out = [head, *merged]
     args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
             "limit": limit}
     return _page(out, "strings", args, bud)

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from airlock.index.store import Binary, Function, Store
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
-from airlock.server.selectors import fmt_addr
+from airlock.server.selectors import MAX_CANDIDATES, fmt_addr, resolve_function, split_binary_target
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,87 @@ def bind_binary(ctx: ServerContext, binary: str = "", *, require_ready: bool = T
         if err:
             return err
     return Bound(proj, st, b)
+
+
+def bound_of(bd: Bound, binary_id: int) -> Bound:
+    """Bound for another binary of the same project store."""
+    if bd.binary.id == binary_id:
+        return bd
+    b = bd.store.get_binary_by_id(binary_id)
+    assert b is not None
+    return Bound(bd.project, bd.store, b)
+
+
+def bind_many(ctx: ServerContext, binary: str = "") -> tuple[list[Bound], int] | str:
+    """Binaries a search-like tool covers: ``binary`` if given, else every ready binary.
+
+    Returns ``(bounds, skipped)`` (skipped = binaries not ready) or an error line. A project
+    with one binary behaves as in ``bind_binary``."""
+    if binary:
+        bd = bind_binary(ctx, binary)
+        return bd if isinstance(bd, str) else ([bd], 0)
+    ix = ctx.indexer
+    try:
+        proj = ix.resolve_project(None)
+    except IndexerError as e:
+        return e.message
+    st = ix.store(proj)
+    every = st.list_binaries()
+    if len(every) <= 1:
+        bd = bind_binary(ctx, "")
+        return bd if isinstance(bd, str) else ([bd], 0)
+    ready = [Bound(proj, st, b) for b in every if ix.not_ready_error(proj, st, b) is None]
+    if not ready:
+        return ix.not_ready_error(proj, st, every[0]) or "error not_analysed: no binary is ready."
+    return ready, len(every) - len(ready)
+
+
+def bind_target(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, str, str | None] | str:
+    """Resolve ``binary`` and ``target`` (which may be ``binary!target``) to
+    ``(Bound, bare_target, note)`` or an error line. DESIGN 7.3 rule 6.
+
+    With no binary given in a multi-binary project the bare target is looked up in every ready
+    binary: exactly one hit wins (``note`` names the binary), several give ``error ambiguous``."""
+    ix = ctx.indexer
+    try:
+        proj = ix.resolve_project(None)
+    except IndexerError as e:
+        return e.message
+    st = ix.store(proj)
+    pre, bare = split_binary_target(st, target)
+    if pre:
+        if binary and not any(b.name.lower() == pre.lower() for b in st.find_binaries(binary)):
+            return (f"error bad_args: target names binary '{pre}' but binary='{binary}'. "
+                    "Pass one of them.")
+        bd = bind_binary(ctx, pre)
+        return bd if isinstance(bd, str) else (bd, bare, None)
+    if binary or len(st.list_binaries()) <= 1:
+        bd = bind_binary(ctx, binary)
+        return bd if isinstance(bd, str) else (bd, target, None)
+    many = bind_many(ctx, "")
+    if isinstance(many, str):
+        return many
+    bounds, skipped = many
+    cands: list[tuple[Bound, Function]] = []
+    for bd in bounds:
+        r = resolve_function(bd.store, bd.binary.id, bare)
+        if r.function is not None:
+            cands.append((bd, r.function))
+        elif r.error and r.error.startswith("error ambiguous"):
+            cands += [(bd, f) for f in bd.store.functions_by_name(bd.binary.id, bare)]
+    if len(cands) == 1:
+        bd = cands[0][0]
+        return bd, bare, f"binary {bd.binary.name}"
+    if not cands:
+        extra = f" ({skipped} not ready)" if skipped else ""
+        return (f"error not_found: no function '{bare}' in {len(bounds)} ready binaries{extra}. "
+                "Use search, or pass binary!name or binary!0xaddress.")
+    shown = cands[:MAX_CANDIDATES]
+    lst = ", ".join(f"{bd.binary.name}!{f.qualified_name} {bd.addr(f.entry, f.space)}"
+                    for bd, f in shown)
+    more = f" (+{len(cands) - len(shown)} more)" if len(cands) > len(shown) else ""
+    return (f"error ambiguous: '{bare}' matches {len(cands)} functions: {lst}{more}. "
+            "Retry with binary!name or binary!address.")
 
 
 FALLBACK_BUDGETS = {"token_budget": 2000, "function_budget": 10000, "max_budget": 32000}

@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from airlock.projects import (
-    MANIFEST_VERSION, copy_artifact, hash_file, new_manifest, project_paths, slugify,
-    write_clean_deny_rules, write_manifest,
+    MANIFEST_VERSION, copy_artifact, hash_file, new_manifest, project_paths, read_manifest,
+    slugify, write_clean_deny_rules, write_manifest,
 )
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
@@ -111,16 +111,18 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
     write_manifest(pp.manifest, man)
     write_clean_deny_rules(pp)
 
-    # Single-binary flow for the root executable; the multi-binary queue comes later.
-    root_note = "queued"
+    # Every selected PE file goes on the analysis queue (the indexer updates the manifest states).
     try:
-        res = ctx.indexer.open_binary(slug, str(scan.root / root_f.rel_path), wait_s=0)
-        root_note = res.status
+        ctx.indexer.enqueue(slug, files)
     except IndexerError as e:
-        root_note = "error"
         entry[root_f.rel_path]["error"] = e.message
-    entry[root_f.rel_path]["state"] = root_note
-    write_manifest(pp.manifest, man)
+        entry[root_f.rel_path]["state"] = "error"
+        write_manifest(pp.manifest, man)
+    try:
+        states = {f["path"]: f.get("state", "queued") for f in read_manifest(pp.manifest)["files"]}
+    except (OSError, ValueError, KeyError):
+        states = {}
+    root_note = states.get(root_f.rel_path, "queued")
 
     code = sum(f.code_size for f in selected)
     rest = len(pes) - 1
@@ -128,7 +130,8 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
     return "\n".join([
         f"project {slug} created at {pp.root}",
         f"option {key}: {len(selected)} files ({len(pes)} executables), {code / _MB:.1f} MB code",
-        f"root {root_f.rel_path}: {root_note}; {rest} other executables queued",
+        f"root {root_f.rel_path}: {root_note}; {rest} other executables "
+        f"({sum(1 for q, s in states.items() if q != root_f.rel_path and s == 'queued')} queued)",
         f"deny rules for the clean folder written in {pp.clean}",
         *(dirty_lines(pp) if bound is None else [bound]),
     ])

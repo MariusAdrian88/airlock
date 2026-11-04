@@ -51,6 +51,21 @@ def parse_address(target: str) -> tuple[str, int] | None:
     return None
 
 
+def split_binary_target(store: Store, target: str) -> tuple[str, str]:
+    """``(binary, bare_target)`` for ``binary!target``, else ``("", target)``.
+
+    Splits on the first ``!`` only when the left part is the exact name (case-insensitive) of
+    a binary of the project, so names that contain ``!`` stay intact. Rule 6 of 7.3."""
+    t = target.strip()
+    left, sep, right = t.partition("!")
+    left, right = left.strip(), right.strip()
+    if sep and left and right:
+        for b in store.list_binaries():
+            if b.name.lower() == left.lower():
+                return b.name, right
+    return "", t
+
+
 def _error(code: str, what: str, nxt: str) -> Resolved:
     return Resolved(error=f"error {code}: {what}. {nxt}.")
 

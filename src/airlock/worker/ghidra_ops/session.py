@@ -1,8 +1,12 @@
 """Worker-side state: the open project and the programs loaded from it.
 
 Locking rules
-- `Entry.lock` guards every access to that program's Ghidra objects. The
-  analysis thread holds it for the whole analysis.
+- `Entry.lock` is a reader/writer lock (worker.rwlock). Readers (decompiling different
+  functions on different threads, extract) share it; writers (analysis, link_externals,
+  save, closing the project) are exclusive. `with e.lock:` is the write side.
+  The analysis thread holds the write side for the whole analysis.
+- `Entry.fg` serialises users of the entry's reserved foreground decompiler. Take it
+  before the read lock, never after.
 - `SESSION.mutex` guards the dicts/state fields only and is never held across
   Ghidra calls, so `hello`/`status` always answer.
 - A program whose `state` is not "ready" is refused by `ready_entry()` with the
@@ -17,7 +21,9 @@ import threading
 from typing import Any, Callable
 
 from airlock.worker.main import STATE
+from airlock.worker.pool import Pool
 from airlock.worker.protocol import WorkerError
+from airlock.worker.rwlock import RWLock
 
 # Entry.state values
 LOADED = "loaded"        # in the project, not analysed yet
@@ -29,7 +35,11 @@ class Entry:
     def __init__(self, name: str, program: Any, analysed: bool):
         self.name = name
         self.program = program
-        self.lock = threading.RLock()
+        self.lock = RWLock()
+        self.fg = threading.Lock()             # reserved foreground decompiler (self.decomp)
+        self.cursor_lock = threading.Lock()    # extract cursors
+        self.closed = False                    # project closed: refuse further work
+        self.bulk: dict[str, Any] | None = None  # latest bulk-decompile snapshot (for status)
         self.state = READY if analysed else LOADED
         self.error: str | None = None          # last analysis failure/cancel
         self.thread: threading.Thread | None = None
@@ -37,7 +47,7 @@ class Entry:
         self.started_at: float | None = None
         self.progress: dict[str, Any] | None = None
         self.analysis_profile: str | None = None
-        self.decomp: Any = None                # DecompInterface (opened lazily)
+        self.decomp: Any = None                # reserved foreground DecompInterface (lazy)
         self.cursors: dict[str, Any] = {}      # extract cursors by kind
 
 
@@ -51,6 +61,14 @@ class _Session:
 
 
 SESSION = _Session()
+
+
+def _analysis_running() -> bool:
+    return any(e.state == ANALYSING for e in list(SESSION.programs.values()))
+
+
+# Decompiler thread budget: processors are detected here, when the worker starts.
+POOL = Pool(analysis_running=_analysis_running)
 
 
 def require_ghidra() -> None:

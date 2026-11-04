@@ -1,4 +1,4 @@
--- airlock index schema v2 (M1 subset of DESIGN.md section 4 plus export/xedge).
+-- airlock index schema v3 (M1 subset of DESIGN.md section 4 plus export/xedge and the feature index).
 CREATE TABLE binary (
   id            INTEGER PRIMARY KEY,
   sha256        TEXT NOT NULL UNIQUE,
@@ -107,6 +107,30 @@ CREATE TABLE xedge (
 );
 CREATE INDEX xedge_src ON xedge(src_binary, src_addr);
 CREATE INDEX xedge_dst ON xedge(dst_binary, dst_entry);
+
+-- feature index (DESIGN 4 "Project map and feature index"); source 'auto' is rebuilt on every
+-- derivation, source 'agent' (feature_define) survives it.
+CREATE TABLE feature (
+  key           TEXT PRIMARY KEY,
+  title         TEXT NOT NULL,
+  source        TEXT NOT NULL DEFAULT 'auto',
+  topics        TEXT NOT NULL DEFAULT '',
+  evidence      TEXT NOT NULL DEFAULT '',
+  updated       TEXT
+);
+
+CREATE TABLE feature_entry (
+  feature_key   TEXT NOT NULL REFERENCES feature(key) ON DELETE CASCADE,
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  space         TEXT NOT NULL DEFAULT 'ram',
+  entry         INTEGER NOT NULL,
+  reason        TEXT NOT NULL,
+  evidence      TEXT NOT NULL DEFAULT '',
+  depth         INTEGER NOT NULL DEFAULT 0,
+  source        TEXT NOT NULL DEFAULT 'auto',
+  PRIMARY KEY (feature_key, binary_id, space, entry)
+);
+CREATE INDEX feature_entry_by_fn ON feature_entry(binary_id, space, entry);
 
 CREATE VIRTUAL TABLE fts USING fts5(
   kind, ref_id UNINDEXED, binary_id UNINDEXED, text,

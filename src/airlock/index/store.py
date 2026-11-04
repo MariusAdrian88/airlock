@@ -13,7 +13,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 FTS_KINDS = ("function", "string", "import")
 CODE_EDGES = ("call", "call_ind", "jump")
@@ -271,6 +271,7 @@ class Store:
             q("DELETE FROM import WHERE binary_id=?", (binary_id,))
             q("DELETE FROM export WHERE binary_id=?", (binary_id,))
             q("DELETE FROM xedge WHERE src_binary=? OR dst_binary=?", (binary_id, binary_id))
+            q("DELETE FROM feature_entry WHERE binary_id=?", (binary_id,))
             q("DELETE FROM function WHERE binary_id=?", (binary_id,))
             q("DELETE FROM fts WHERE binary_id=?", (binary_id,))
 
@@ -740,6 +741,13 @@ class Store:
     def cross_from_binary(self, binary_id: int, limit: int = 1000) -> list[CrossRef]:
         return self._crossrefs("src_binary=?", [binary_id], limit)
 
+    def cross_from_function(self, fn: Function, limit: int = 200) -> list[CrossRef]:
+        """Cross-binary links reached from ``fn``: its own entry (a thunk) or an import slot
+        it has an edge to."""
+        return self._crossrefs(
+            "src_binary=? AND (src_addr=? OR src_addr IN (SELECT dst_addr FROM edge WHERE src_fn=? AND dst_fn IS NULL))",
+            [fn.binary_id, fn.entry, fn.id], limit)
+
     def cross_counts(self, binary_id: int) -> tuple[int, int]:
         """(edges from this binary into others, edges from other binaries into it)."""
         a = self.db.execute("SELECT COUNT(*) FROM xedge WHERE src_binary=?", (binary_id,)).fetchone()[0]
@@ -758,6 +766,76 @@ class Store:
             return None
         return Decomp(r["function_id"], r["fn_version"], r["analysis_profile"], r["c_text"],
                       r["status"], r["error"], r["produced_at"])
+
+    def decomp_candidates(self, binary_id: int, analysis_profile: str) -> list[sqlite3.Row]:
+        """Functions the background pass should decompile: not thunk, not external, in ram,
+        with no cached row for the current fn_version and analysis_profile. Columns: id,
+        entry, version, callers (call and indirect-call edges into the function)."""
+        return self.db.execute(
+            "SELECT f.id, f.entry, f.version, "
+            "(SELECT COUNT(*) FROM edge e WHERE e.dst_fn=f.id AND e.kind IN ('call','call_ind')) "
+            "AS callers FROM function f WHERE f.binary_id=? AND f.is_thunk=0 AND f.is_external=0 "
+            "AND f.space='ram' AND NOT EXISTS (SELECT 1 FROM decomp d WHERE d.function_id=f.id "
+            "AND d.fn_version=f.version AND d.analysis_profile=?)",
+            (binary_id, analysis_profile)).fetchall()
+
+    def decomp_target_count(self, binary_id: int) -> int:
+        """Functions the background pass covers (see decomp_candidates)."""
+        return int(self.db.execute(
+            "SELECT COUNT(*) FROM function WHERE binary_id=? AND is_thunk=0 AND is_external=0 "
+            "AND space='ram'", (binary_id,)).fetchone()[0])
+
+    def decomp_current_count(self, binary_id: int, analysis_profile: str) -> int:
+        """Covered functions that have a cached row valid for fn_version and the profile."""
+        return int(self.db.execute(
+            "SELECT COUNT(*) FROM function f JOIN decomp d ON d.function_id=f.id "
+            "WHERE f.binary_id=? AND f.is_thunk=0 AND f.is_external=0 AND f.space='ram' "
+            "AND d.fn_version=f.version AND d.analysis_profile=?",
+            (binary_id, analysis_profile)).fetchone()[0])
+
+    def save_decomp_batch(self, analysis_profile: str, items: Iterable[dict[str, Any]],
+                          produced_at: str | None = None) -> int:
+        """Write many decompile results in one transaction. Items: function_id, fn_version,
+        status, c_text, error, ast (list of dicts as insert_ast_nodes takes). A result whose
+        function version changed meanwhile (a rename) is skipped. Returns rows written."""
+        n = 0
+        with self.db:
+            for it in items:
+                row = self.db.execute("SELECT version FROM function WHERE id=?",
+                                      (it["function_id"],)).fetchone()
+                if row is None or row[0] != it["fn_version"]:
+                    continue
+                fid = it["function_id"]
+                self.db.execute(
+                    "INSERT INTO decomp(function_id, fn_version, analysis_profile, c_text, "
+                    "status, error, produced_at) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(function_id) DO UPDATE SET fn_version=excluded.fn_version, "
+                    "analysis_profile=excluded.analysis_profile, c_text=excluded.c_text, "
+                    "status=excluded.status, error=excluded.error, "
+                    "produced_at=excluded.produced_at",
+                    (fid, it["fn_version"], analysis_profile, it.get("c_text"), it["status"],
+                     it.get("error"), produced_at))
+                self.db.execute("DELETE FROM ast_node WHERE function_id=?", (fid,))
+                ast = it.get("ast") or []
+                if ast:
+                    self.db.executemany(
+                        "INSERT INTO ast_node(function_id, kind, start_off, end_off, address, "
+                        "target, text) VALUES (?,?,?,?,?,?,?)",
+                        [(fid, r["kind"], r["start_off"], r["end_off"], r.get("address"),
+                          r.get("target"), r.get("text")) for r in ast])
+                n += 1
+        return n
+
+    def feature_entry_function_ids(self, binary_id: int) -> set[int]:
+        """Function ids that are feature entry points. Empty when the feature index does not
+        exist (an older index) or cannot be read."""
+        try:
+            return {int(r[0]) for r in self.db.execute(
+                "SELECT DISTINCT f.id FROM feature_entry fe JOIN function f "
+                "ON f.binary_id=fe.binary_id AND f.space=fe.space AND f.entry=fe.entry "
+                "WHERE fe.binary_id=?", (binary_id,))}
+        except sqlite3.Error:
+            return set()
 
     def get_ast_nodes(self, function_id: int, kind: str | None = None) -> list[sqlite3.Row]:
         sql = "SELECT * FROM ast_node WHERE function_id=?"
@@ -815,3 +893,77 @@ class Store:
             "SELECT COALESCE(dll,'?') AS d, COUNT(*) AS n FROM import WHERE binary_id=? "
             "GROUP BY d ORDER BY n DESC, d", (binary_id,)).fetchall()
         return [(r["d"], r["n"]) for r in rows]
+
+    # -- feature index -------------------------------------------------------
+
+    def replace_auto_features(
+        self, features: Iterable[tuple[str, str, str]],
+        entries: Iterable[tuple[str, int, str, int, str, str, int]], now: str,
+    ) -> None:
+        """Rebuild the derived part of the feature index. ``features``: (key, title, evidence);
+        ``entries``: (key, binary_id, space, entry, reason, evidence, depth). Rows with source
+        'agent' (features and entries) are kept; an auto entry never replaces an agent one."""
+        with self.db:
+            q = self.db.execute
+            q("DELETE FROM feature_entry WHERE source='auto'")
+            q("DELETE FROM feature WHERE source='auto'")
+            self.db.executemany(
+                "INSERT INTO feature(key, title, source, evidence, updated) VALUES (?,?, 'auto', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET evidence=excluded.evidence",
+                [(k, t, ev, now) for k, t, ev in features])
+            self.db.executemany(
+                "INSERT OR IGNORE INTO feature_entry(feature_key, binary_id, space, entry, reason, "
+                "evidence, depth, source) VALUES (?,?,?,?,?,?,?, 'auto')", list(entries))
+
+    def define_feature(self, key: str, title: str, topics: str, now: str) -> None:
+        """Create or refine a feature as agent-owned (it then survives re-derivation)."""
+        with self.db:
+            self.db.execute(
+                "INSERT INTO feature(key, title, source, topics, updated) VALUES (?,?, 'agent', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET title=excluded.title, source='agent', "
+                "topics=excluded.topics, updated=excluded.updated", (key, title, topics, now))
+
+    def add_feature_entries(self, key: str, binary_id: int, rows: Iterable[tuple[str, int, str]]) -> None:
+        """Agent entry points: (space, entry, reason). Replaces an auto row for the same function."""
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO feature_entry(feature_key, binary_id, space, entry, reason, evidence, "
+                "depth, source) VALUES (?,?,?,?,?, '', 0, 'agent') "
+                "ON CONFLICT(feature_key, binary_id, space, entry) DO UPDATE SET "
+                "reason=excluded.reason, source='agent'",
+                [(key, binary_id, sp, e, r) for sp, e, r in rows])
+
+    def get_feature(self, key: str) -> sqlite3.Row | None:
+        return self.db.execute("SELECT key, title, source, topics, evidence FROM feature WHERE key=?",
+                               (key,)).fetchone()
+
+    def feature_stats(self) -> list[sqlite3.Row]:
+        """Per feature: key, title, source, topics, n (entry points), named (name_state not auto)."""
+        return self.db.execute(
+            "SELECT f.key, f.title, f.source, f.topics, COUNT(e.entry) AS n, "
+            "COALESCE(SUM(CASE WHEN fn.name_state IS NOT NULL AND fn.name_state<>'auto' "
+            "THEN 1 ELSE 0 END), 0) AS named FROM feature f "
+            "LEFT JOIN feature_entry e ON e.feature_key=f.key "
+            "LEFT JOIN function fn ON fn.binary_id=e.binary_id AND fn.space=e.space AND fn.entry=e.entry "
+            "GROUP BY f.key ORDER BY f.key").fetchall()
+
+    def feature_entries(self, key: str) -> list[sqlite3.Row]:
+        """Entry points with the live function row: binary_id, space, entry, reason, evidence, depth,
+        source, name, namespace, name_state; unnamed (auto) ones first, then by binary and address."""
+        return self.db.execute(
+            "SELECT e.binary_id, e.space, e.entry, e.reason, e.evidence, e.depth, e.source, "
+            "fn.name, fn.namespace, fn.name_state FROM feature_entry e "
+            "LEFT JOIN function fn ON fn.binary_id=e.binary_id AND fn.space=e.space AND fn.entry=e.entry "
+            "WHERE e.feature_key=? ORDER BY (COALESCE(fn.name_state,'auto')<>'auto'), e.depth, "
+            "e.binary_id, e.entry", (key,)).fetchall()
+
+    def callers_of_ids(self, binary_id: int) -> dict[int, set[int]]:
+        """{callee function id: caller function ids} over call/call_ind/jump edges of a binary
+        (self-calls dropped)."""
+        out: dict[int, set[int]] = {}
+        for r in self.db.execute(
+            "SELECT src_fn, dst_fn FROM edge WHERE binary_id=? AND src_fn IS NOT NULL AND "
+            "dst_fn IS NOT NULL AND src_fn<>dst_fn AND kind IN ('call','call_ind','jump')",
+            (binary_id,)):
+            out.setdefault(r["dst_fn"], set()).add(r["src_fn"])
+        return out

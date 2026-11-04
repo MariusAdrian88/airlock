@@ -43,8 +43,10 @@ CATALOG: dict[str, ToolInfo] = {
         *_set("fileformat", ["ole_streams", "hexdump", "file_diff", "record_guess"]),
         *_set("spec_write", ["spec_write"]),
         *_set("spec_read", ["spec_read", "spec_list", "spec_export"], clean_safe=True),
+        *_set("map", ["overview", "project_describe", "features", "feature", "feature_define",
+                      "path", "graph_export"]),
         *_set("admin", ["index_status", "reindex", "frontier", "program_scan",
-                       "project_create", "program_add"]),
+                       "project_create", "program_add", "function_map", "cluster_label"]),
         # Role-aware: they redact their output in a clean session.
         *_set("admin", ["projects", "project_open", "project_info"], clean_safe=True),
     ]

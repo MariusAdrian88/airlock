@@ -16,8 +16,11 @@
     "max_budget": 32000,             // cap for a per-call budget override
     "detail": "brief",               // brief | full | evidence
     "decompile_timeout_s": 60,
-    "bulk_decompile": "lazy",        // lazy | background
+    "bulk_decompile": "background",  // lazy | background: decompile every function after analysis
+    "decompile_cpu_min": 0.5,        // share of the processors while analysis or a request runs
+    "decompile_cpu_max": 0.75,       // share of the processors while idle (0 < x <= 1)
     "analysis_timeout_min": 60,
+    "mermaid": false,                // true: also write Mermaid charts to dirty\diagrams\ after each map update
     "analysis_s_per_code_mb": 80,    // light-scan time estimate: seconds per MB of code
     "allow_writes": false,           // gate for every tool in "annotate"
     "mirror_notes_to_ghidra": true,  // agent notes also become plate comments
@@ -30,7 +33,7 @@
     "dirty": {
       "role": "dirty",
       "enabled_sets": ["core", "cpp", "resources", "types", "annotate",
-                       "dataflow", "fileformat", "spec_write", "admin"],
+                       "dataflow", "fileformat", "spec_write", "map", "admin"],
       "allow_writes": true
     },
     "clean": {
@@ -60,8 +63,11 @@
     "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
     "spec_write": ["spec_write", "spec_list"],
     "spec_read": ["spec_read", "spec_list", "spec_export"],
+    "map": ["overview", "project_describe", "features", "feature", "feature_define",
+            "path", "graph_export"],
     "session": ["projects", "project_open", "project_info"],
     "admin": ["index_status", "reindex", "project_info", "frontier", "program_scan",
-              "projects", "project_open", "project_create", "program_add"]
+              "projects", "project_open", "project_create", "program_add",
+              "function_map", "cluster_label"]
   }
 }

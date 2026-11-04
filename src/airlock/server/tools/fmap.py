@@ -1,0 +1,151 @@
+"""fmap set: function_map, cluster_label (dirty sessions only). DESIGN 4 "Function map (subsystems)".
+
+Subsystem clusters over the call graph; every line carries the identifiers for the next call.
+"""
+
+from __future__ import annotations
+
+from airlock.projects import ProjectPaths
+from airlock.server import clusters as cl
+from airlock.server.budget import CursorError, estimate_tokens, fit_lines, footer, resume_lines
+from airlock.server.context import ServerContext
+from airlock.server.registry import tool
+from airlock.server.selectors import resolve_function
+from airlock.server.tools.common import bind_target, budget_for
+
+MAX_MEMBER_LINES = 500
+
+
+def _session(ctx: ServerContext) -> ProjectPaths | str:
+    pp = ctx.session.project
+    if pp is None:
+        return "error unbound: no project is open. Call projects, then project_open."
+    return pp
+
+
+def _cost(line: str) -> int:
+    return estimate_tokens(line + "\n", "prose")
+
+
+def _page(lines: list[str], head: int, limit: int, budget: int, args: dict) -> str:
+    """fit_lines, with at most ``limit`` entry lines after ``head`` header lines on this page."""
+    if limit < 1 or len(lines) - head <= limit:
+        return fit_lines(lines, budget, "prose", tool="function_map", args=args)[0]
+    need = (sum(_cost(x) for x in lines[:head + limit])
+            + estimate_tokens(footer(99999, "c_0000") + "\n", "prose"))
+    return fit_lines(lines, min(budget, need), "prose", tool="function_map", args=args)[0]
+
+
+def _have(cs: cl.ClusterSet) -> str:
+    ids = [c.id for c in cl.ordered(cs)]
+    return ", ".join(ids[:12]) + (f", … {len(ids) - 12} more" if len(ids) > 12 else "")
+
+
+def _scope_filter(ctx: ServerContext, pp: ProjectPaths, cs: cl.ClusterSet, scope: str):
+    """(predicate on Cluster | None, member-binary id | None, header lines, error | None)."""
+    st = ctx.indexer.store(pp.name)
+    low = scope.strip().lower()
+    try:
+        feat = st.get_feature(low)
+    except Exception:  # noqa: BLE001  no feature tables
+        feat = None
+    if feat is not None:
+        return (lambda c: low in c.features), None, [], None
+    bins = [b for b in st.list_binaries() if b.name.lower() == low]
+    if not bins:
+        bins = [b for b in st.find_binaries(scope) if b.id in cs.binaries] if "!" not in scope else []
+        bins = bins if len(bins) == 1 else []
+    if bins:
+        bid = bins[0].id
+        return (lambda c: any(m.key[0] == bid for m in c.members)), bid, [], None
+    bd = bind_target(ctx, "", scope)
+    if isinstance(bd, str):
+        return None, None, [], bd
+    bound, bare, _note = bd
+    r = resolve_function(bound.store, bound.binary.id, bare)
+    if r.function is None:
+        return None, None, [], r.error
+    fn = r.function
+    key = (fn.binary_id, fn.space, fn.entry)
+    own = cs.of(key)
+    if own is None:
+        return None, None, [], (f"error not_clustered: {fn.qualified_name} is a thunk, external or in a "
+                                "runtime binary. Pick a function it calls.")
+    near: dict[str, list[int]] = {}
+    for i, lst in enumerate((bound.store.callers(fn), bound.store.callees(fn))):
+        for f in lst:
+            c = cs.of((f.binary_id, f.space, f.entry))
+            if c is not None and c.id != own.id:
+                near.setdefault(c.id, [0, 0])[i] += 1
+    head = [f"{fn.qualified_name} ({bound.addr(fn.entry, fn.space)}) is in {own.id} {own.label}".rstrip()
+            + (f"; neighbours: " + ", ".join(f"{k} ({v[0]} callers, {v[1]} callees)"
+                                             for k, v in sorted(near.items())) if near else "")]
+    ids = {own.id, *near}
+    return (lambda c: c.id in ids), None, head, None
+
+
+@tool("function_map", "List the subsystem clusters of the program (scope narrows by feature, binary "
+                      "or function) or, with cluster=C3, the functions of one subsystem.")
+def function_map(ctx: ServerContext, scope: str = "", cluster: str = "", limit: int = 30,
+                 cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    args = {"scope": scope, "cluster": cluster}
+    if cursor:
+        try:
+            return resume_lines(cursor, bud, "prose", tool="function_map", args=args)[0]
+        except CursorError as e:
+            return e.message
+    pp = _session(ctx)
+    if isinstance(pp, str):
+        return pp
+    cs = cl.get_clusters(ctx, pp.name)
+    if not cs.clusters:
+        return "no subsystem map yet: no analysed binary outside the runtime group. Call list_binaries."
+    pred, member_bin, head, err = None, None, [], None
+    if scope.strip():
+        pred, member_bin, head, err = _scope_filter(ctx, pp, cs, scope)
+        if err:
+            return err
+    if cluster.strip():
+        c = cs.get(cluster)
+        if c is None:
+            return f"error not_found: no cluster '{cluster}' (have: {_have(cs)}). Call function_map."
+        st = ctx.indexer.store(pp.name)
+        ev = cl.Evidence(st)
+        members = [m for m in c.ranked() if member_bin is None or m.key[0] == member_bin]
+        shown = members[:MAX_MEMBER_LINES]
+        top = f"{c.id} {c.label}".rstrip() + f": {len(members)} fns ({c.named} named)"
+        if member_bin is not None:
+            top += f" in {cs.bin_name(member_bin)}"
+        lines = [top]
+        for m in shown:
+            e = ev.of(m.key[0], m.fid)
+            lines.append(f"[{cs.bin_name(m.key[0])}] {m.qname} {cs.addr(m)} callers {m.callers} "
+                         f"callees {m.callees}" + (f"  evidence: {e}" if e else ""))
+        if len(members) > len(shown):
+            lines.append(f"… {len(members) - len(shown)} more members not listed (lowest importance).")
+        return _page(lines, 1, int(limit), bud, args)
+    rows = [c for c in cl.ordered(cs) if pred is None or pred(c)]
+    if not rows:
+        return "no subsystem matches the scope. Call function_map without scope."
+    lines = head + [cl.cluster_line(cs, c) for c in rows]
+    return _page(lines, len(head), int(limit), bud, args)
+
+
+@tool("cluster_label", "Name a subsystem cluster (empty label clears it); the name survives recomputation.")
+def cluster_label(ctx: ServerContext, cluster: str, label: str = "") -> str:
+    pp = _session(ctx)
+    if isinstance(pp, str):
+        return pp
+    cs = cl.get_clusters(ctx, pp.name)
+    c = cs.get(cluster)
+    if c is None:
+        return f"error not_found: no cluster '{cluster}' (have: {_have(cs)}). Call function_map."
+    text = " ".join(label.split())
+    if len(text) > cl.MAX_LABEL:
+        return (f"error too_long: label has {len(text)} characters, the limit is {cl.MAX_LABEL}. "
+                "Use a short name like file-io+config.")
+    cl.set_label(pp, cs, c.id, text)
+    if not text:
+        return f"{c.id} label cleared (auto label: {c.auto_label}). function_map(cluster=\"{c.id}\") lists it."
+    return f"{c.id} labeled \"{text}\" ({c.total} fns). function_map(cluster=\"{c.id}\") lists it."

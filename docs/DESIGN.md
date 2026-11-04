@@ -167,7 +167,9 @@ selected profile. Keys present in a later layer win; keys absent fall through.
     "decompile_timeout_s": 60,
     "bulk_decompile": "background", // lazy | background
     "decompile_cpu_min": 0.5,       // share of logical processors while other work runs
-    "decompile_cpu_max": 0.75,      // share of logical processors when idle    "analysis_timeout_min": 60,
+    "decompile_cpu_max": 0.75,      // share of logical processors when idle
+    "analysis_timeout_min": 60,
+    "mermaid": false,               // true: also write Mermaid charts to dirty\diagrams\
     "max_budget": 32000,            // cap for a per-call budget override
     "allow_writes": false,          // gate for every tool in "annotate"
     "mirror_notes_to_ghidra": true, // agent notes also become plate comments
@@ -356,6 +358,60 @@ agent. Each feature has a stable key, a title, evidence and entry points
   example a user-visible function such as "open a project file").
 - Notes and specs share the topic tree; a feature key is a topic prefix, so
   the work on one feature is found together.
+
+**Function map (subsystems).** The level between features (behaviour) and
+`callgraph` (one function). A flat list of "all connected functions" is not
+offered: in a real program nearly every function reaches every other within
+a few calls, so it would be the whole program with no structure.
+
+- Clusters are computed from the call graph of the program's own binaries
+  (runtime-group binaries, thunks and externals excluded; cross-binary edges
+  included): functions that call each other much more than they call the
+  rest form one cluster. Algorithm: weighted label propagation or Louvain
+  over undirected call edges (pure Python, deterministic seed), with
+  very-high-degree utility functions (top 1% by callers) kept out of
+  clustering and listed as a `util` group, so they do not glue everything
+  into one cluster. Target: seconds for 20,000 functions.
+- Each cluster gets a stable id per analysis profile (`C1`, `C2`, … ordered
+  by size), a label from the features and import categories of its members
+  (`file-io + config`), size (named/total), the 3–5 most central members,
+  its links to other clusters (call counts), and the features it serves.
+- Recomputed after every binary becomes ready and after renames; agent
+  labels (`cluster_label`) survive recomputation by member overlap.
+- Shown in the project map as section 4b *Subsystems* (top clusters), and
+  through the tool `function_map`.
+
+**Graph view: paths and export.** Functions, clusters, features, strings and
+imports form one graph (call/reference edges from `edge`/`xedge`, membership
+from `feature_entry` and clusters). Storage stays in SQLite; a shared graph
+module (the one the clusters use) answers graph questions:
+
+- `path(from, to)`: shortest call chains between two points, across
+  binaries, one step per line with the call-site address. `from`/`to` are
+  functions (`binary!name`, address), an import (`KERNEL32!ReadFile`), a
+  string (`"*.cfg"`: every function that references it), a feature key or a
+  cluster id (any member). Returns up to `k=3` shortest paths (more by
+  cursor), `max_depth=8`; chains without `util` hubs are preferred, a chain
+  through a hub is returned only when no other chain exists and is marked
+  `[via util]`. A bare name resolves to a function first, then an import,
+  then a feature key. Output: header `path A → B, N hops (M more paths:
+  cursor=…)`, one step per line `→ [bin] Name 0xentry   call at 0xsite`; a
+  call to an import no project binary provides ends in `→ import DLL!Name`.
+  Answers questions such as "how does the Open command reach
+  ReadFile" or "how does the plugin call back into the executable".
+- `graph_export(scope, format)`: `mermaid`, `dot` or `graphml` for a
+  binary-relation graph, a cluster graph, one cluster's functions, a feature
+  or a `path` result, capped at 150 nodes (the rest summarised in one node).
+  For the user to view; agents use the text tools. Written to
+  `dirty\diagrams\<name>.<ext>` and the path returned; the response itself
+  holds no graph text unless `inline=true`.
+- Config `defaults.mermaid` (default `false`): when `true`, airlock also
+  writes Mermaid charts after each map update to `dirty\diagrams\`:
+  `binaries.md` (who imports whom), `subsystems.md` (clusters and their
+  links), `feature-<key>.md` (entry points and their clusters). They are
+  separate files, so `PROJECT.md` and tool responses stay compact.
+- `neighbors(node, kinds, depth)` (all edge kinds around any node) is
+  deferred to M3/M4, when notes and specs add more node kinds.
 
 **`clean\PROJECT.md`**: project name, purpose paragraph, published specs with
 topic, title, version and status. Nothing from code, no addresses, no binary
@@ -668,17 +724,37 @@ not a project folder, goes through `project_create`:
      - always at least 1, and at most what `jvm_max_memory` allows (each
        decompiler process needs memory; the worker lowers N and logs it if
        decompiles fail with out-of-memory).
-   - Implementation: a worker-side pool with per-thread `DecompInterface`
-     (or `ghidra.app.decompiler.parallel.ParallelDecompiler` /
-     `ChunkingParallelDecompiler`, which exist in 12.1.4 **[verified]**;
-     whether their thread count can change while running is **[verify]**).
-     Background work runs in chunks of ~50 functions so N can change between
-     chunks and a cancel takes effect quickly. Results are written to the
-     index in batches by the server. `index_status` shows decompiled/total,
-     rate (functions/s) and the current N.
-   - The worker request loop must not block on the pass: `status`, `hello`
-     and foreground `decompile` stay answerable (today the loop is
-     sequential, §8; this needs the request loop to dispatch to threads).
+   - Implementation **[verified]**: a worker-side pool with one
+     `DecompInterface` per thread (`worker/pool.py` Engine, `ghidra_ops/bulk.py`).
+     `ParallelDecompiler` / `ChunkingParallelDecompiler` exist, but
+     `DecompilerCallback` is an abstract class that PyGhidra cannot subclass;
+     with a plain `QCallback` proxy they were no faster (notepad, 473
+     functions, 8 threads: 3.3 s and 4.0 s against 3.2 s for own threads,
+     sequential 7.0 s) and their thread count is the shared `GThreadPool`
+     size, not per call. Own threads follow N between functions: each thread
+     checks the current N before taking the next function, a thread above N
+     closes its decompiler and parks, a cancel aborts in-flight functions
+     through the task monitor (about 0.1 s). The ~50-function chunk is the
+     batch size of result events, not a barrier. The Python conversion of a
+     result into `ast_node` rows holds the GIL (many small JPype calls) and is
+     serialised with one lock: 11 threads 4.0 s unserialised, 2.0 s with the
+     lock; flat from 6 threads up. Results are written to the index in
+     batches by the server. `index_status` shows `decompiled X/Y, R fn/s,
+     threads N of P`.
+   - One decompiler of the N is reserved for foreground `decompile`; the
+     background pass uses max(1, N-1) threads. N follows the min share while
+     a foreground request or an analysis runs (seen: 12 -> 8 on 16
+     processors) and the max share otherwise.
+   - Thread-safety **[verified]** on Ghidra 12.1.4: decompiling different
+     functions of one read-only program from several Python threads, each with
+     its own `DecompInterface`, gives output identical to a single decompiler;
+     the speed-up (measured, cause not isolated: probably Ghidra's program lock plus the GIL)
+     stops at about 6 threads. Writes
+     (analysis, link_externals, save, renames) take the per-program write
+     lock, which waits for the in-flight functions and blocks new readers.
+   - The worker request loop does not block on the pass (§8): `status`,
+     `hello`, `cancel_*` and foreground `decompile` answer while a pass or an
+     `extract` runs.
 9. Each decompile also produces `ast_node` rows from the decompiler's
    `ClangNode` markup tree, so every call or string reference in the C text
    maps to an instruction address.
@@ -709,7 +785,9 @@ same saved file), so it cannot be compared across sessions **[verified]**.
 ## 6. Tool catalog
 
 All tools take `binary` (name or sha256 prefix) where relevant; it may be
-omitted when the project has one binary. Default budget is
+omitted when the project has one binary. With several ready binaries,
+`search` and `strings` cover all of them (§7.4) and `function`, `xrefs` and
+`callgraph` look the target up in all of them (§7.3 rule 6). Default budget is
 `defaults.token_budget` (2000) unless stated; `function` uses
 `defaults.function_budget` (10000).
 
@@ -718,8 +796,8 @@ omitted when the project has one binary. Default budget is
 | Tool | Parameters | Returns |
 |---|---|---|
 | `open_binary` | `project`, `path` | binary id, format, toolchain, status (`queued`/`analysing`/`ready`) |
-| `list_binaries` | `project?` | one line per binary |
-| `outline` | `binary` | sections, entry points, import DLLs with counts, function counts by `name_state`, classes count, toolchain. ~300 tokens |
+| `list_binaries` | `project?` | one line per binary: id, name, format, arch, toolchain, sha256 prefix, status, then `group=` and `code=` (from the manifest, when known), `fns=` and `links=out/in` (cross-binary edges) |
+| `outline` | `binary` | sections, entry points, import DLLs with counts, `exports N`, `imports from project binaries: x.dll 12, …`, function counts by `name_state`, classes count, toolchain. ~300 tokens |
 | `search` | `query`, `kind?` (`function`/`string`/`import`/`const`/`class`/`note`/`any`), `limit=20` | ranked hits, one line each: kind, name, address, short context; ranking and dedup in §7.4 |
 | `function` | `target`, `view=c` (`c`/`asm`/`both`/`signature`), `lines?` | decompiled C (or asm) with address annotations on calls; truncated to budget with a cursor |
 | `xrefs` | `target`, `direction=to` (`to`/`from`), `kind?` (`call`/`read`/`write`/`data`), `limit=50` | one line per reference: from-function, address, kind |
@@ -820,6 +898,10 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 | `features` | | feature index: key, title, entry points, coverage |
 | `feature` | `key`, `limit=40` | entry points of one feature (binary, function, address, reason, evidence strings/imports) + related notes/specs |
 | `feature_define` | `key`, `title`, `functions?`, `topics?` | add or refine a feature |
+| `function_map` | `scope?` (feature key, binary, or `binary!function`), `cluster?`, `limit=30` | without `cluster`: one line per subsystem cluster in the scope (id, label, named/total, key functions with addresses, links to other clusters, features); with `cluster`: its member functions by importance, each with binary, name, address, callers/callees counts, evidence |
+| `cluster_label` | `cluster`, `label` | the agent names a subsystem; kept across recomputation |
+| `path` | `from`, `to`, `k=3`, `max_depth=8`, `cursor` | shortest call chains across binaries, one step per line with call-site address |
+| `graph_export` | `scope`, `format=mermaid` (`mermaid`/`dot`/`graphml`), `inline=false` | writes a graph file to `dirty\diagrams\` for the user and returns its path |
 | `index_status` | `project?` | analysis queue (per binary: state, time, remaining estimate), decompile progress, worker state, stale counts |
 | `reindex` | `binary`, `scope=stale` (`stale`/`all`/`analyzers`) | job id |
 | `project_info` | | config in effect, enabled sets, profile, paths |
@@ -876,6 +958,18 @@ restart.
    candidate's address; the agent retries with the address.
 5. An address inside a function resolves to that function, and the response
    says so (`resolved from interior address`).
+6. **Binary prefix.** `binary!target` (`engine.dll!LoadDoc`,
+   `engine.dll!0x10001000`) names the binary in the target and is equivalent
+   to `binary=engine.dll`. The text is split at the first `!` only when the
+   left part is the exact name (case-insensitive) of a binary of the project;
+   otherwise the whole text is the target, so names containing `!` still
+   work. Naming two different binaries (prefix and `binary=`) is
+   `error bad_args`. Without a prefix and without `binary=`, a project with
+   one binary uses it; a project with several looks the target up in every
+   ready binary: exactly one hit resolves there (the response adds a
+   `binary <name>` line), several hits give `error ambiguous` listing each as
+   `bin!name 0x…`, none gives `error not_found`. Applies to `function`,
+   `xrefs` and `callgraph`.
 
 ### 7.4 Format
 
@@ -889,6 +983,25 @@ xrefs to CAppDoc::LoadSettings (0x004a1c20), 3 calls
   0x004b0e48  CSettingsDlg::OnOK           call
   0x0045f1a2  FUN_0045f100                 call
 ```
+
+Across binaries: `search` and `strings` without `binary` cover every ready
+binary of the project when there are several (binaries not ready are skipped,
+and the header says how many). Each hit line then starts with the binary
+name in brackets (`[engine.dll] function Foo 0x10001000 user,64B`); with
+`binary=` or a single binary there is no prefix. Ranking, dedup and kind
+balance below apply to the merged list (the exact-name hits of all binaries
+first, in binary order for ties), `limit` and cursors count merged lines. In
+`strings` the binaries are interleaved round-robin so one cannot crowd out the
+others.
+
+Cross-binary lines (from the `xedge` table): `xrefs` direction `to` on an
+exported function appends the importing side of other binaries, kind `import`:
+`  [main.exe] 0x00401300  LoadDoc   import` (the importing thunk or import
+slot; callers of a thunk are one `xrefs` away). On a thunk or import slot,
+`xrefs` adds `→ engine.dll!Foo 0x10001000` after the header. `callgraph`
+follows these links: a callee hop is `→ [engine.dll] Foo (0x10001000)`, a
+caller hop `← [main.exe] LoadDoc (0x00401300) [thunk]`; a hop is an ordinary
+edge for depth, `[cycle]` and `[seen]`.
 
 `search` ordering and dedup (deterministic):
 
@@ -942,6 +1055,19 @@ parameter names). No `outputSchema` is advertised.
 - Response: `{"id": 17, "ok": true, "data": {...}}` or
   `{"id": 17, "ok": false, "error": {"code": "...", "message": "..."}}`
 - Progress (unsolicited): `{"event": "progress", "job": "analysis", "pct": 62}`
+- Lanes **[verified]**: `hello`, `status`, `cancel_*`, `decompile`,
+  `decompile_batch`, `bulk_decompile` and `external_paths` run on their own
+  threads; every other op runs one at a time on the main thread in arrival
+  order (the JVM must start there). Responses carry the request id and may
+  arrive in any order; protocol writes share one lock. The request pipe is
+  moved off fd 0 (fd 0 points at NUL): a thread blocked reading the pipe makes
+  `start_ghidra` hang on Windows otherwise.
+- Bulk decompile: `bulk_decompile(program, order, timeout, cpu_min, cpu_max)`
+  returns at once; events `decompile_results` (`job`, `ast_columns`, at most 50
+  results or about 512 KB each) and `decompile_progress` (`state`, `done`,
+  `total`, `rate`, `threads`, `processors`; terminal state last).
+  `cancel_bulk(program)`; `decompile_batch(program, entries<=500, timeout)`
+  answers like `decompile` per entry.
 - Ops are internal (`import`, `analyze`, `list_functions`, `decompile`,
   `xrefs`, `rename`, ...), not one-to-one with MCP tools.
 - Cancellation: `{"op": "cancel", "id": 17}`; decompiles honour it through the

@@ -109,3 +109,17 @@ JVM start + import 18 s, analysis 168 s, extract 1.2 s, first decompile
 ## Next (M2, DESIGN.md §12)
 
 Read DESIGN.md §12 for the M2 scope; start with open issue 1 (thiscall).
+
+## Background parallel decompile (this session)
+
+- Worker: request lanes (`worker/main.py`), reader/writer lock per program
+  (`worker/rwlock.py`), budget + Engine (`worker/pool.py`), ops `bulk_decompile`,
+  `cancel_bulk`, `decompile_batch` (`ghidra_ops/bulk.py`, `decompile.py`).
+- Server: `server/bulk.py` (BulkScheduler, started from `Indexer._extract_job`
+  and `resume_project`), store helpers `decomp_candidates`, `save_decomp_batch`,
+  config `bulk_decompile` (default background), `decompile_cpu_min/max`.
+  A global config.jsonc in the airlock folder of %APPDATA% that sets `bulk_decompile: lazy`
+  keeps the pass off.
+- Verified: JVM start hangs on Windows while another thread blocks reading the
+  request pipe on fd 0 (fixed: fd 0 -> NUL). See DESIGN section 5 step 8 for
+  the measured numbers.
