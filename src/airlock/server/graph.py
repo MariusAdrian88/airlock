@@ -22,11 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
-from airlock.index.store import Store
+from airlock.index.store import CODE_EDGES, CODE_SQL, Store
 from airlock.projects import ProjectPaths, read_manifest
 from airlock.server.selectors import fmt_addr, parse_address, split_binary_target
 
-CALL_KINDS = ("call", "call_ind", "jump")
+CALL_KINDS = CODE_EDGES
 HUB_PERCENT = 0.01
 HUB_MIN_CALLERS = 20
 MAX_SITES = 8
@@ -453,6 +453,8 @@ def fingerprint(st: Store, bins: list[Any], tag: str) -> str:
         nf = st.db.execute("SELECT COUNT(*) FROM function WHERE binary_id=?", (b.id,)).fetchone()[0]
         ne = st.db.execute("SELECT COUNT(*) FROM edge WHERE binary_id=?", (b.id,)).fetchone()[0]
         parts.append(f"{b.id}/{b.analysis_profile or ''}/{nf}/{ne}")
+    parts.append(f"n{st.db.execute('SELECT COUNT(*) FROM edge WHERE kind=?', ('call_imp',)).fetchone()[0]}"
+                 f"/{st.get_meta('link_version') or 0}")           # import-slot normalisation state
     try:
         parts.append(f"x{st.db.execute('SELECT COUNT(*) FROM xedge').fetchone()[0]}")
     except Exception:  # noqa: BLE001
@@ -468,7 +470,7 @@ def get_graph(pp: ProjectPaths, st: Store) -> CallGraph:
     """The call graph of the project (kept in memory; rebuilt when the fingerprint changes).
     Names are refreshed on every call so renames show without a rebuild."""
     bins = ready_bins(pp, st)
-    fp = fingerprint(st, bins, "g1")
+    fp = fingerprint(st, bins, "g2")
     key = str(pp.index_db)
     with _CACHE_LOCK:
         hit = _CACHE.get(key)
@@ -581,7 +583,7 @@ def string_match(st: Store, g: CallGraph, text: str) -> tuple[list[int], str]:
     for r in rows:
         for e in st.db.execute(
                 "SELECT DISTINCT src_fn FROM edge WHERE binary_id=? AND dst_addr=? AND src_fn IS NOT NULL "
-                "AND kind NOT IN ('call','call_ind','jump')", (r["binary_id"], r["address"])):
+                f"AND kind NOT IN ({CODE_SQL})", (r["binary_id"], r["address"])):
             v = g.node_of_fid.get((r["binary_id"], e["src_fn"]))
             if v is not None:
                 out.add(v)

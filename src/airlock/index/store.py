@@ -16,7 +16,12 @@ from airlock.index.migrations import MIGRATIONS
 SCHEMA_VERSION = 5
 
 FTS_KINDS = ("function", "string", "import")
-CODE_EDGES = ("call", "call_ind", "jump")
+# Code edges. ``call_imp`` is a call through an import slot (IAT): Ghidra reports
+# ``CALL dword ptr [slot]`` / ``MOV reg,[slot]; CALL reg`` as a read of the slot, so
+# ``normalise_import_edges`` rewrites read/data edges from code to an import slot to ``call_imp``.
+# xrefs ``kind=call`` includes it; ``kind=read`` no longer lists slot calls.
+CODE_EDGES = ("call", "call_ind", "call_imp", "jump")
+CODE_SQL = ",".join(f"'{k}'" for k in CODE_EDGES)
 
 
 @dataclass(frozen=True)
@@ -319,6 +324,17 @@ class Store:
                 [(binary_id, s, d, k) for s, d, k in rows],
             )
 
+    def normalise_import_edges(self, binary_id: int) -> int:
+        """Turn read/data edges from a function to an import slot of the same binary into
+        ``call_imp`` edges (needs src_fn: run after ``link_edges``). Idempotent; returns rows changed."""
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE edge SET kind='call_imp' WHERE binary_id=? AND src_fn IS NOT NULL "
+                "AND kind IN ('read','data') AND dst_addr IN "
+                "(SELECT address FROM import WHERE binary_id=? AND address IS NOT NULL)",
+                (binary_id, binary_id))
+        return cur.rowcount
+
     def link_edges(self, binary_id: int) -> None:
         """Fill edge.src_fn / dst_fn with the function containing each address
         (ram space; size NULL/0 counts as 1 byte)."""
@@ -345,6 +361,7 @@ class Store:
                 "UPDATE edge SET src_fn=?, dst_fn=? WHERE rowid=?",
                 [(find(r["src_addr"]), find(r["dst_addr"]), r["rowid"]) for r in rows],
             )
+        self.normalise_import_edges(binary_id)
 
     def insert_strings(self, binary_id: int, rows: Iterable[tuple[int, str, str]]) -> None:
         """Rows: (address, encoding, value)."""
@@ -363,6 +380,7 @@ class Store:
                 "INSERT INTO import(binary_id, dll, name, ordinal, address) VALUES (?,?,?,?,?)",
                 [(binary_id, *r) for r in rows],
             )
+        self.normalise_import_edges(binary_id)   # edges extracted before the imports
 
     def insert_exports(
         self, binary_id: int, rows: Iterable[tuple[str | None, int | None, int]]
@@ -582,25 +600,54 @@ class Store:
     ) -> list[Xref]:
         return self._xrefs("e.binary_id=? AND e.src_fn=?", [fn.binary_id, fn.id], kinds, limit)
 
+    def _import_slots(self, fn: Function) -> list[int]:
+        return [i["address"] for i in self.imports_by_name(fn.binary_id, fn.name)
+                if i["address"] is not None]
+
     def callers(self, fn: Function, limit: int = 200) -> list[Function]:
-        """Distinct other functions with a call/call_ind/jump edge to fn's entry."""
+        """Distinct other functions with a call/call_ind/call_imp/jump edge to fn's entry (for an
+        imported function: to any of its import slots)."""
+        if fn.space != "ram":
+            slots = self._import_slots(fn)
+            if not slots:
+                return []
+            rows = self.db.execute(
+                f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.src_fn "
+                f"WHERE e.binary_id=? AND e.dst_addr IN ({','.join('?' * len(slots))}) "
+                f"AND e.kind IN ({CODE_SQL}) ORDER BY f.entry LIMIT ?",
+                (fn.binary_id, *slots, limit)).fetchall()
+            return [_function(r) for r in rows]
         rows = self.db.execute(
             f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.src_fn "
-            "WHERE e.binary_id=? AND e.dst_addr=? AND e.kind IN ('call','call_ind','jump') "
+            f"WHERE e.binary_id=? AND e.dst_addr=? AND e.kind IN ({CODE_SQL}) "
             "AND f.id<>? ORDER BY f.entry LIMIT ?",
             (fn.binary_id, fn.entry, fn.id, limit),
         ).fetchall()
         return [_function(r) for r in rows]
 
     def callees(self, fn: Function, limit: int = 200) -> list[Function]:
-        """Distinct other functions entered by a call/call_ind/jump edge from fn."""
+        """Distinct other functions entered by a call/call_ind/call_imp/jump edge from fn; a call
+        through an import slot yields the imported (EXTERNAL) function of that name."""
         rows = self.db.execute(
             f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.dst_fn "
-            "WHERE e.src_fn=? AND e.kind IN ('call','call_ind','jump') "
+            f"WHERE e.src_fn=? AND e.kind IN ({CODE_SQL}) "
             "AND f.entry=e.dst_addr AND f.id<>? ORDER BY f.entry LIMIT ?",
             (fn.id, fn.id, limit),
         ).fetchall()
-        return [_function(r) for r in rows]
+        out = [_function(r) for r in rows]
+        seen = {f.id for f in out}
+        for r in self.db.execute(
+                f"SELECT DISTINCT {_FN_SELECT} FROM edge e "
+                "JOIN import i ON i.binary_id=e.binary_id AND i.address=e.dst_addr "
+                "JOIN function f ON f.binary_id=e.binary_id AND f.space<>'ram' AND f.is_external=1 "
+                "AND f.name=i.name "
+                f"WHERE e.src_fn=? AND e.kind IN ({CODE_SQL}) AND e.dst_fn IS NULL "
+                "ORDER BY f.name LIMIT ?", (fn.id, limit)):
+            f = _function(r)
+            if f.id not in seen:
+                seen.add(f.id)
+                out.append(f)
+        return out[:limit]
 
     # -- strings / imports -------------------------------------------------
 
@@ -982,12 +1029,12 @@ class Store:
             "e.binary_id, e.entry", (key,)).fetchall()
 
     def callers_of_ids(self, binary_id: int) -> dict[int, set[int]]:
-        """{callee function id: caller function ids} over call/call_ind/jump edges of a binary
+        """{callee function id: caller function ids} over code edges of a binary
         (self-calls dropped)."""
         out: dict[int, set[int]] = {}
         for r in self.db.execute(
             "SELECT src_fn, dst_fn FROM edge WHERE binary_id=? AND src_fn IS NOT NULL AND "
-            "dst_fn IS NOT NULL AND src_fn<>dst_fn AND kind IN ('call','call_ind','jump')",
+            f"dst_fn IS NOT NULL AND src_fn<>dst_fn AND kind IN ({CODE_SQL})",
             (binary_id,)):
             out.setdefault(r["dst_fn"], set()).add(r["src_fn"])
         return out

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-from airlock.index.store import Store
+from airlock.index.store import CODE_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
 
 log = logging.getLogger("airlock")
@@ -357,7 +357,7 @@ def _cross_callers(store: Store, bins: dict[int, _Bin], binary_id: int, entry: i
         sb = bins.get(r["src_binary"])
         if sb is None:
             continue
-        for fid in _edge_sources(store, sb.id, [r["src_addr"]], ("call", "call_ind", "jump")).get(
+        for fid in _edge_sources(store, sb.id, [r["src_addr"]], CODE_EDGES).get(
                 r["src_addr"], ()):
             found.add((sb.id, fid))
         tid = sb.at.get(("ram", r["src_addr"]))
@@ -396,7 +396,7 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
             k = api_feature(q)
             if k and (skip or "::" in q) and entry not in targets:
                 targets[entry] = (k, clean_api(q))
-        for addr, srcs in _edge_sources(store, bid, targets, ("call", "call_ind", "jump")).items():
+        for addr, srcs in _edge_sources(store, bid, targets, CODE_EDGES).items():
             key, api = targets[addr]
             for fid in srcs:
                 if fid not in bn.thunk_ids:

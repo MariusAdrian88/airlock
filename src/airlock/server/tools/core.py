@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from airlock.index.store import CrossRef, Function, StringHit
+from airlock.index.store import CODE_EDGES, CrossRef, Function, StringHit
 from airlock.projects import read_manifest, read_sections
 from airlock.server.bulk import BG_TIMEOUT
 from airlock.server.budget import (
@@ -401,7 +401,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     assert fn is not None
     note = r.note or (f"binary {b.name}" if bnote else None)
     if view == "signature":
-        callers = len(st.callers(fn, 200)) if not fn.is_external else 0
+        callers = len(st.callers(fn, 200))
         sig = fn.signature or fn.qualified_name
         flags = ", ".join(x for x in (fn.calling_conv, f"{fn.size} bytes" if fn.size else None,
                                       fn.name_state, "thunk" if fn.is_thunk else None,
@@ -480,7 +480,7 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
 
 # ── xrefs ──────────────────────────────────────────────────────────────────────
 
-_KIND_MAP = {"call": ("call", "call_ind"), "jump": ("jump",), "read": ("read",),
+_KIND_MAP = {"call": ("call", "call_ind", "call_imp"), "jump": ("jump",), "read": ("read",),
              "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",)}
 
 
@@ -688,7 +688,7 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                     srcs = [x.src_fn]   # a thunk: its own callers come with expanding it
                 else:                   # an import slot: the functions that call through it
                     srcs = [r_.src_fn for r_ in sb.store.xrefs_to_address(
-                        x.src_binary, x.src_addr, ("call", "call_ind", "jump"),
+                        x.src_binary, x.src_addr, CODE_EDGES,
                         CALLGRAPH_FANOUT + 1) if r_.src_fn]
                 for f_ in srcs:
                     if f_.id not in seen:

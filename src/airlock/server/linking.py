@@ -15,18 +15,18 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pefile
 
-from airlock.index.store import Binary, Store
+from airlock.index.store import CODE_EDGES, Binary, Store
 
 log = logging.getLogger(__name__)
 
-LINK_VERSION = 2
-CODE_KINDS = ("call", "call_ind", "jump")
+LINK_VERSION = 3   # 3: import-slot reads rewritten to call_imp edges (Store.normalise_import_edges)
+CODE_KINDS = CODE_EDGES
 _LOAD_RE = re.compile(r"^(?:LoadLibrary(?:Ex)?[AW]?|LdrLoadDll)$")
 _GPA_RE = re.compile(r"^(?:GetProcAddress|LdrGetProcedureAddress)$")
 MAX_EVIDENCE = 200
@@ -137,23 +137,29 @@ def _src_info(store: Store, binary_id: int) -> _Src:
         info.strings[r["address"]] = r["value"]
     for r in q("SELECT id, entry FROM function WHERE binary_id=? AND space='ram'", (binary_id,)):
         info.entry_of[r["id"]] = r["entry"]
-    ll: set[int] = set()
+    ll: set[int] = set()      # slot addresses and thunk entries of the loader APIs
     gpa: set[int] = set()
+    thunks: set[int] = set()
     for r in q("SELECT name, address FROM import WHERE binary_id=? AND address IS NOT NULL", (binary_id,)):
         n = _clean(r["name"])
         (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else set()).add(r["address"])
-    for r in q("SELECT name, entry FROM function WHERE binary_id=? AND space='ram' "
+    for r in q("SELECT id, name, entry, is_thunk FROM function WHERE binary_id=? AND space='ram' "
                "AND (is_thunk=1 OR is_external=1)", (binary_id,)):
+        if r["is_thunk"]:
+            thunks.add(r["id"])
         n = _clean(r["name"])
         (ll if _LOAD_RE.match(n) else gpa if _GPA_RE.match(n) else set()).add(r["entry"])
     for r in q("SELECT src_fn, dst_addr, dst_fn, kind FROM edge WHERE binary_id=? AND src_fn IS NOT NULL",
                (binary_id,)):
         k = r["kind"]
-        if k in CODE_KINDS:
-            if r["dst_addr"] in ll:
+        if k in CODE_KINDS or k in ("read", "data"):
+            # a slot read counts too (projects not yet normalised); a thunk is not a source itself:
+            # its callers are, through the thunk entry in ll / gpa
+            if r["dst_addr"] in ll and r["src_fn"] not in thunks:
                 info.ll_fns.add(r["src_fn"])
-            if r["dst_addr"] in gpa:
+            if r["dst_addr"] in gpa and r["src_fn"] not in thunks:
                 info.gpa_fns.add(r["src_fn"])
+        if k in CODE_KINDS:
             if r["dst_fn"] is not None and r["dst_fn"] != r["src_fn"]:
                 info.out[r["src_fn"]].add(r["dst_fn"])
                 info.inn[r["dst_fn"]].add(r["src_fn"])
@@ -256,9 +262,11 @@ def needs_relink(store: Store) -> bool:
     return v < LINK_VERSION
 
 
-def relink_project(store: Store, artifacts: Path) -> int:
-    """Fix export ordinals from the artifacts, then rebuild import and dynamic links of all
-    ready binaries. No Ghidra involved. Returns the number of xedge rows afterwards."""
+def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | None = None) -> int:
+    """Fix export ordinals from the artifacts, re-normalise import-slot edges (read -> call_imp),
+    then rebuild import and dynamic links of all ready binaries. No Ghidra, no re-analysis.
+    ``after`` runs last (the feature re-derivation hook); the cluster/graph caches re-key on the
+    edge normalisation state and ``link_version``. Returns the number of xedge rows afterwards."""
     ids = ready_ids(store)
     for i in ids:
         b = store.get_binary_by_id(i)
@@ -268,9 +276,16 @@ def relink_project(store: Store, artifacts: Path) -> int:
             fix_export_ordinals(store, b, artifacts / b.sha256)
         except Exception as e:  # noqa: BLE001  a broken PE must not stop the others
             log.warning("export ordinals of %s: %s", b.name, e)
+    for i in ids:
+        store.normalise_import_edges(i)
     for k, i in enumerate(ids):
         store.link_cross_binary(i, ids[k + 1:])
         link_dynamic_for(store, i, ids[k + 1:])
     with store.db:
         store.set_meta("link_version", str(LINK_VERSION))
+    if after is not None:
+        try:
+            after()
+        except Exception as e:  # noqa: BLE001  features are an extra
+            log.warning("feature re-derivation after relink failed: %s", e)
     return int(store.db.execute("SELECT COUNT(*) FROM xedge").fetchone()[0])

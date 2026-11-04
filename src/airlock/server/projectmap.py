@@ -17,7 +17,7 @@ from typing import Any
 
 import json5
 
-from airlock.index.store import Store
+from airlock.index.store import CODE_SQL, Store
 from airlock.projects import ProjectPaths, read_manifest
 from airlock.server import clusters as cl
 from airlock.server import features as fx
@@ -265,7 +265,7 @@ def frontier_rows(store: Store, runtime_ids: set[int], top: int = FRONTIER_TOP) 
         for r in store.db.execute(
                 "SELECT f.id, f.space, f.entry, f.name, f.namespace, COUNT(DISTINCT e.src_fn) AS c "
                 "FROM edge e JOIN function f ON f.id=e.dst_fn WHERE e.binary_id=? AND e.dst_fn IS NOT NULL "
-                "AND e.src_fn IS NOT NULL AND e.src_fn<>e.dst_fn AND e.kind IN ('call','call_ind','jump') "
+                f"AND e.src_fn IS NOT NULL AND e.src_fn<>e.dst_fn AND e.kind IN ({CODE_SQL}) "
                 "AND f.name_state='auto' AND f.is_thunk=0 AND f.is_external=0 AND f.space='ram' "
                 "GROUP BY f.id ORDER BY c DESC, f.entry LIMIT 30", (b.id,)):
             pool.append({"binary": b, "id": r["id"], "space": r["space"], "entry": r["entry"],
@@ -280,9 +280,9 @@ def frontier_rows(store: Store, runtime_ids: set[int], top: int = FRONTIER_TOP) 
         p["imports"] = [r["name"] for r in store.db.execute(
             "SELECT name FROM (SELECT i.name AS name FROM edge e JOIN import i ON "
             "i.binary_id=e.binary_id AND i.address=e.dst_addr WHERE e.src_fn=? AND "
-            "e.kind IN ('call','call_ind','jump') AND i.name IS NOT NULL "
+            f"e.kind IN ({CODE_SQL}) AND i.name IS NOT NULL "
             "UNION SELECT t.name FROM edge e JOIN function t ON t.id=e.dst_fn WHERE e.src_fn=? "
-            "AND t.is_thunk=1 AND e.kind IN ('call','call_ind','jump')) ORDER BY name LIMIT 3",
+            f"AND t.is_thunk=1 AND e.kind IN ({CODE_SQL})) ORDER BY name LIMIT 3",
             (p["id"], p["id"]))]
         p["score"] = p["callers"] + (3 if p["strings"] or p["imports"] else 0)
     ranked = sorted(pool[:max(top * 3, 30)],

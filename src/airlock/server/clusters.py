@@ -31,11 +31,12 @@ from airlock.server.graph import (  # noqa: F401  re-exported: tests and callers
 from airlock.server.selectors import fmt_addr
 
 MIN_CLUSTER = 3
-ALGO_VERSION = 1
+ALGO_VERSION = 2   # 2: call_imp edges (import-slot calls)
 LABEL_JACCARD = 0.5
 LABELS_FILE = "cluster_labels.json"
 CACHE_FILE = "clusters.json"
-KEY_FUNCTIONS = 5
+KEY_FUNCTIONS = 5       # function_map
+MAP_KEY_FUNCTIONS = 3   # project map, Subsystems section
 MAX_LABEL = 60
 
 _LOCK = threading.Lock()
@@ -530,10 +531,11 @@ def _fn_ref(cs: ClusterSet, m: Member) -> str:
     return f"{pre}{m.qname} {cs.addr(m)}"
 
 
-def cluster_line(cs: ClusterSet, c: Cluster, link_limit: int = 5, feat_limit: int = 3) -> str:
+def cluster_line(cs: ClusterSet, c: Cluster, link_limit: int = 5, feat_limit: int = 3,
+                 key_limit: int = KEY_FUNCTIONS) -> str:
     head = c.id if not c.label else f"{c.id} {c.label}"
     bits = [f"{head}  {c.total} fns ({c.named} named)"]
-    keys = c.key_functions()
+    keys = c.key_functions(key_limit)
     if keys:
         bits.append("key: " + ", ".join(_fn_ref(cs, m) for m in keys))
     links = sorted(c.links.items(), key=lambda kv: (-kv[1], kv[0]))[:link_limit]
@@ -553,12 +555,12 @@ def ordered(cs: ClusterSet) -> list[Cluster]:
 def cluster_summary_lines(cs: ClusterSet, limit: int = 8) -> list[str]:
     """Lines for the project map section "Subsystems": top clusters by size, then util/misc."""
     regular = [c for c in ordered(cs) if c.kind == "c"]
-    lines = [cluster_line(cs, c) for c in regular[:max(0, limit)]]
+    lines = [cluster_line(cs, c, key_limit=MAP_KEY_FUNCTIONS) for c in regular[:max(0, limit)]]
     if len(regular) > limit:
         lines.append(f"… {len(regular) - limit} more subsystems. function_map() lists them.")
     for c in ordered(cs):
         if c.kind != "c":
-            lines.append(cluster_line(cs, c, link_limit=3))
+            lines.append(cluster_line(cs, c, link_limit=3, key_limit=MAP_KEY_FUNCTIONS))
     if lines:
         lines.append('function_map(cluster="C1") lists the functions of a subsystem.')
     return lines

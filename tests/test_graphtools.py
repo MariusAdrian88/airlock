@@ -14,6 +14,7 @@ from airlock.config.loader import ConfigError, deep_merge, default_config_text, 
 from airlock.server import clusters as cl
 from airlock.server import diagrams as dg
 from airlock.server import graph as gr
+from airlock.server import linking
 from airlock.server import projectmap as pm
 from airlock.server import roles
 from airlock.server.budget import estimate_tokens
@@ -90,6 +91,7 @@ def proj(tmp_path):
     man["files"] = [{"path": "app.exe", "group": "core", "sha256": "aa" * 32},
                     {"path": "plug.dll", "group": "own_plugin", "sha256": "bb" * 32}]
     P.write_manifest(pp.manifest, man)
+    st.set_meta("link_version", str(linking.LINK_VERSION))     # a current project: no relink on bind
     assert ctx.bind_session("dirty", pp) is None
     return ctx, pp, st, (app, plug), base
 

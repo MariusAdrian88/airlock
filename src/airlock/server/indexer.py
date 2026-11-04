@@ -420,7 +420,9 @@ class Indexer:
                 n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
         try:
             if linking.needs_relink(store):  # links built by an older version: no re-analysis
-                linking.relink_project(store, paths.artifacts)
+                ready = linking.ready_ids(store)
+                linking.relink_project(store, paths.artifacts,
+                                       after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  links are an extra
             log.warning("cannot relink %s: %s", slug, e)
         try:
@@ -800,11 +802,15 @@ class Indexer:
                     (o.id, me.name.lower()))):
                 links.append({"program": self.program_of(st, o), "libs": {me.name.lower(): job.program}})
         self._link_externals(links)
+        self._fire_ready(job.project, bid, job.program)
+
+    def _fire_ready(self, project: str, bid: int, what: str = "") -> None:
+        """Run the ready hooks (feature derivation + project map) for ``project``."""
         for hook in list(self.ready_hooks):
             try:
-                hook(job.project, bid)
+                hook(project, bid)
             except Exception as e:  # a hook is an extra; the binary stays ready
-                log.warning("ready hook failed for %s: %s", job.program, e)
+                log.warning("ready hook failed for %s: %s", what or project, e)
 
     # -- worker session for decompile --------------------------------------
 
