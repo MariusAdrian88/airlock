@@ -251,7 +251,7 @@ def _parse_lines(spec: str) -> tuple[int, int] | None:
                   "(view=signature), by name or address.")
 def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
              lines: str = "", cursor: str = "", budget: int = 0) -> str:
-    bud = budget_for(ctx, budget)
+    bud = budget_for(ctx, budget, "function_budget")
     if not target.strip():
         return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
     if view in ("asm", "both"):

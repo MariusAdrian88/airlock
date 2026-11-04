@@ -61,10 +61,18 @@ def bind_binary(ctx: ServerContext, binary: str = "", *, require_ready: bool = T
     return Bound(proj, st, b)
 
 
-def budget_for(ctx: ServerContext, budget: int = 0) -> int:
+FALLBACK_BUDGETS = {"token_budget": 2000, "function_budget": 10000, "max_budget": 32000}
+
+
+def budget_for(ctx: ServerContext, budget: int = 0, key: str = "token_budget") -> int:
+    """Per-call budget: `budget` if given (capped), else the config default `key`.
+
+    The cap is never below the tool's own default, so an override can always
+    ask for at least what the tool returns without one.
+    """
     d = ctx.config.defaults
-    default = int(d.get("token_budget") or 2000)
-    cap = int(d.get("max_budget") or 8000)
+    default = int(d.get(key) or FALLBACK_BUDGETS[key])
+    cap = max(int(d.get("max_budget") or FALLBACK_BUDGETS["max_budget"]), default)
     return max(100, min(int(budget), cap)) if budget and budget > 0 else default
 
 

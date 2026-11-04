@@ -157,12 +157,13 @@ selected profile. Keys present in a later layer win; keys absent fall through.
 
   // ── Behaviour ─────────────────────────────────────────────────────────
   "defaults": {
-    "token_budget": 2000,           // per response
+    "token_budget": 2000,           // per response (list tools, outline, ...)
+    "function_budget": 10000,       // per response of `function` (decompiled C)
     "detail": "brief",              // brief | full | evidence
     "decompile_timeout_s": 60,
     "bulk_decompile": "lazy",       // lazy | background
     "analysis_timeout_min": 60,
-    "max_budget": 8000,             // cap for a per-call budget override
+    "max_budget": 32000,            // cap for a per-call budget override
     "allow_writes": false,          // gate for every tool in "annotate"
     "mirror_notes_to_ghidra": true, // agent notes also become plate comments
     "jvm_max_memory": null          // e.g. "8G"; null: Ghidra's default
@@ -499,7 +500,8 @@ same saved file), so it cannot be compared across sessions **[verified]**.
 
 All tools take `binary` (name or sha256 prefix) where relevant; it may be
 omitted when the project has one binary. Default budget is
-`defaults.token_budget` (2000) unless stated.
+`defaults.token_budget` (2000) unless stated; `function` uses
+`defaults.function_budget` (10000).
 
 ### core
 
@@ -621,8 +623,14 @@ clean profile 3.
 - `detail=full`: wider context (e.g. asm next to C, more callers).
 - `detail=evidence`: adds how the fact was obtained (analyzer, profile,
   limitations). Never default.
+- Default budgets: `defaults.token_budget` (2000) for every tool except
+  `function`, which uses `defaults.function_budget` (10000). Measured on a
+  32-bit MSVC application (sample of decompiled functions): the median
+  function is about 70 tokens and about 1% exceed 2000, but the largest
+  (parsers, dispatch switches, loaders) reach 8000–30000, and those are the
+  functions an agent reads most. **[verified]**
 - Any tool accepts `budget` to override, capped by config `max_budget`
-  (default 8000).
+  (default 32000). The cap is never below the tool's own default.
 
 ### 7.2 Cursors
 

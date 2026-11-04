@@ -121,7 +121,8 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         defaults = deep_merge(defaults, prof["defaults"])
     allow_writes = bool(prof.get("allow_writes", defaults.get("allow_writes", False)))
 
-    for key in ("token_budget", "max_budget", "decompile_timeout_s", "analysis_timeout_min"):
+    for key in ("token_budget", "function_budget", "max_budget",
+                "decompile_timeout_s", "analysis_timeout_min"):
         v = defaults.get(key)
         if v is not None and (not isinstance(v, int) or v <= 0):
             raise ConfigError(f"defaults.{key} must be a positive integer")
