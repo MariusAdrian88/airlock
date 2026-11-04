@@ -103,3 +103,25 @@ def test_detect_notepad(tmp_path):
     info = P.detect(f)
     assert info.format == "pe32+" and info.arch == "x86_64"
     assert info.toolchain in {"msvc", "unknown"}
+
+
+def _with_rich_header(pe_bytes: bytes) -> bytes:
+    """Insert a Rich header between the DOS header and the PE header."""
+    key = 0x1234ABCD
+    words = [0x536E6144, 0, 0, 0, (0x0100 << 16) | 0x5D, 7]  # DanS, pad, (compid, count)
+    blob = struct.pack("<I", words[0] ^ key) + struct.pack("<III", key, key, key) \
+        + struct.pack("<II", words[4] ^ key, words[5] ^ key) + b"Rich" + struct.pack("<I", key)
+    blob += b"\0" * (-len(blob) % 8)
+    old = struct.unpack_from("<I", pe_bytes, 0x3C)[0]
+    blob = b"\x00" * (0x80 - old) + blob  # pefile looks for "Rich" at or after 0x80
+    out = bytearray(pe_bytes[:old] + blob + pe_bytes[old:])
+    struct.pack_into("<I", out, 0x3C, old + len(blob))
+    return bytes(out)
+
+
+def test_rich_header_means_msvc_without_runtime_imports(tmp_path):
+    plain = make_pe(tmp_path / "plain.exe")
+    assert P.detect(plain).toolchain == "unknown"
+    rich = tmp_path / "rich.exe"
+    rich.write_bytes(_with_rich_header(plain.read_bytes()))
+    assert P.detect(rich).toolchain == "msvc"

@@ -76,6 +76,12 @@ def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
     if len(fns) == 1:
         return Resolved(function=fns[0])
     if len(fns) > 1:
+        # An imported function is an EXTERNAL row plus a ram thunk of the same
+        # name; the thunk is the one with callers, so external rows lose the tie.
+        local = [f for f in fns if not f.is_external]
+        if len(local) == 1:
+            return Resolved(function=local[0])
+    if len(fns) > 1:
         shown = fns[:MAX_CANDIDATES]
         cands = ", ".join(fmt_addr(f.entry, psize, f.space) for f in shown)
         more = f" (+{len(fns) - len(shown)} more)" if len(fns) > len(shown) else ""

@@ -150,7 +150,7 @@ def test_imports(st, bid):
 
 def test_fts(st, bid):
     hits = st.fts_search(bid, "onfoo", kind="function")
-    assert [(h.kind, h.text) for h in hits] == [("function", "CMainFrame::OnFoo")]
+    assert [(h.kind, h.text.split(" ")[0]) for h in hits] == [("function", "CMainFrame::OnFoo")]
     assert st.get_function(hits[0].ref_id).name == "OnFoo"
     assert {h.kind for h in st.fts_search(bid, "createfile")} == {"function", "import"}
     s = st.fts_search(bid, "open file", kind="string")
@@ -170,6 +170,8 @@ def test_decomp_cache_validity(st, bid):
     st.upsert_decomp(fn.id, fn.version, PROFILE, "ok", c_text="v2")
     assert st.get_decomp(fn, PROFILE).c_text == "v2"
     st.insert_functions(bid, [{"entry": 0x1000, "name": "main", "name_state": "user", "size": 0x40}])
+    assert st.get_decomp(st.function_at(bid, 0x1000), PROFILE) is not None  # unchanged
+    st.insert_functions(bid, [{"entry": 0x1000, "name": "main", "name_state": "user", "size": 0x44}])
     assert st.get_decomp(st.function_at(bid, 0x1000), PROFILE) is None  # version bumped
 
 
@@ -199,3 +201,23 @@ def test_clear_binary_data(st, bid):
 def test_foreign_keys_enforced(st):
     with pytest.raises(sqlite3.IntegrityError):
         st.insert_strings(999, [(1, "ascii", "x")])
+
+
+def test_reinsert_same_content_keeps_version(st, bid):
+    row = {"entry": 0x1000, "name": "main", "name_state": "user", "size": 0x40}
+    st.insert_functions(bid, [row, {**row, "entry": 0x1100, "name": "OnFoo",
+                                    "namespace": "CMainFrame", "size": 0x20}])
+    assert st.function_at(bid, 0x1000).version == 0
+    assert st.function_at(bid, 0x1100).version == 0
+    # name_state / is_thunk changes alone do not affect decompilation
+    st.insert_functions(bid, [{**row, "name_state": "agent"}])
+    assert st.function_at(bid, 0x1000).version == 0
+    for change in ({"name": "m"}, {"namespace": "NS"}, {"signature": "int m(void)"},
+                   {"calling_conv": "__cdecl"}, {"size": 0x41}):
+        before = st.function_at(bid, 0x1000)
+        st.insert_functions(bid, [{**row, **{k: v for k, v in change.items()}}])
+        after = st.function_at(bid, 0x1000)
+        assert after.version == before.version + 1, change
+        st.insert_functions(bid, [{**row, **{k: v for k, v in change.items()}}])  # same again
+        assert st.function_at(bid, 0x1000).version == after.version
+        st.insert_functions(bid, [row])  # back (counts as another change; fine)

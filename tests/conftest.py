@@ -1,7 +1,12 @@
 """Shared pytest setup.
 
-`--binary <exe>` enables the `ghidra` integration tests, which drive the real
+`--binary=<exe>` enables the `ghidra` integration tests, which drive the real
 worker (JVM + Ghidra, minutes for the first analysis). Without it they are skipped.
+
+Write it as `--binary=<exe>` (with the equals sign). With `--binary <exe>` pytest does not
+yet know the option takes a value, so it treats <exe> as a test path, derives the rootdir
+and ini file from the exe's folder, and never loads pyproject.toml or this conftest:
+hence "unrecognized arguments: --binary".
 """
 
 from __future__ import annotations

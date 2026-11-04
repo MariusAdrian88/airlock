@@ -1,0 +1,527 @@
+"""core set: open_binary, list_binaries, outline, search, function, xrefs, callgraph, strings.
+
+Output is compact plain text, one item per line (DESIGN.md section 7.4); lists are
+cut to the token budget with a cursor; errors are one line `error <code>: ...`.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+
+from airlock.index.store import Function
+from airlock.projects import read_sections
+from airlock.server.budget import STORE, CursorError, fit_lines, fit_text, resume_lines
+from airlock.server.context import ServerContext
+from airlock.server.indexer import IndexerError, worker_error
+from airlock.server.registry import tool
+from airlock.server.selectors import fmt_addr, parse_address, resolve_function
+from airlock.server.tools.common import (
+    Bound, bind_binary, budget_for, fn_desc, preview,
+)
+from airlock.worker.protocol import WorkerError
+
+_HEX = re.compile(r"^[0-9a-fA-F]+$")
+MAX_DEPTH = 6
+CALLGRAPH_FANOUT = 15
+CALLGRAPH_MAX_LINES = 500
+
+
+def _cursor_page(cursor: str, tool_name: str, budget: int) -> str:
+    try:
+        return resume_lines(cursor, budget, "code", tool=tool_name)[0]
+    except CursorError as e:
+        return e.message
+
+
+def _page(lines: list[str], tool_name: str, args: dict, budget: int) -> str:
+    return fit_lines(lines, budget, "code", tool=tool_name, args=args)[0]
+
+
+# ── open_binary / list_binaries ────────────────────────────────────────────────
+
+def _binary_line(b, status: str, project: str | None = None) -> str:
+    head = f"{project}/" if project else ""
+    return (f"{head}#{b.id} {b.name} {b.format or '?'} {b.arch or '?'} {b.toolchain or '?'} "
+            f"sha256:{b.sha256[:12]} {status}")
+
+
+@tool("open_binary", "Register a PE file in a project and start Ghidra analysis in the background; "
+                     "returns at once, then poll index_status.")
+def open_binary(ctx: ServerContext, project: str, path: str) -> str:
+    if not project.strip():
+        return "error bad_args: project is empty. Pass a project name."
+    try:
+        res = ctx.indexer.open_binary(project, path)
+    except IndexerError as e:
+        return e.message
+    out = [_binary_line(res.binary, "status=" + res.status)]
+    if res.status == "error":
+        out.append(ctx.indexer.describe(ctx.indexer.current or project,
+                                        ctx.indexer.store(ctx.indexer.current or project),
+                                        res.binary)[1])
+    elif res.status != "ready":
+        out.append("Analysis takes minutes. Call index_status; tools work once status is ready.")
+    if res.note:
+        out.append(res.note)
+    return "\n".join(out)
+
+
+@tool("list_binaries", "List the binaries of a project (all projects when none is given) with "
+                       "their status.")
+def list_binaries(ctx: ServerContext, project: str = "") -> str:
+    ix = ctx.indexer
+    try:
+        names = [ix.resolve_project(project)] if project else ix.projects()
+    except IndexerError as e:
+        return e.message
+    out = []
+    for p in names:
+        st = ix.store(p)
+        for b in st.list_binaries():
+            out.append(_binary_line(b, ix.describe(p, st, b)[0], p))
+    return "\n".join(out) if out else "no binaries. Call open_binary with a project and a file path."
+
+
+# ── outline ────────────────────────────────────────────────────────────────────
+
+@tool("outline", "Summarise a binary: sections, entry point, imported DLLs, function counts.")
+def outline(ctx: ServerContext, binary: str = "") -> str:
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    ix = ctx.indexer
+    out = [f"{b.name} {b.format} {b.arch} {b.toolchain} ptr {b.pointer_size} "
+           f"base {bd.addr(b.image_base or 0)} sha256:{b.sha256[:12]}"]
+    artifact = ix.paths(bd.project).artifacts / b.sha256
+    if artifact.is_file():
+        from airlock.projects import detect
+        info = detect(artifact)
+        if info.entry_point is not None and b.image_base is not None:
+            ep = b.image_base + info.entry_point
+            fn = st.function_containing(b.id, ep)
+            out.append(f"entry {bd.addr(ep)}" + (f" {fn.qualified_name}" if fn else ""))
+        secs = read_sections(artifact)
+        if secs:
+            out.append("sections " + ", ".join(f"{n} {f} {bd.addr(b.image_base + rva)}+0x{vs:x}"
+                                               for n, rva, vs, f in secs))
+    c = st.counts(b.id)
+    states = ", ".join(f"{k} {v}" for k, v in st.count_by_name_state(b.id).items())
+    out.append(f"functions {c['functions']} ({states}; thunks {c['thunks']}, external {c['externals']})")
+    dlls = st.import_dll_counts(b.id)
+    shown = ", ".join(f"{d} {n}" for d, n in dlls[:10])
+    more = f", +{len(dlls) - 10} more DLLs" if len(dlls) > 10 else ""
+    out.append(f"imports {c['imports']} from {len(dlls)} DLLs: {shown}{more}")
+    out.append(f"strings {c['strings']}, edges {c['edges']}, decompiled {c['decompiled']}")
+    return "\n".join(out)
+
+
+# ── search ─────────────────────────────────────────────────────────────────────
+
+_SEARCH_KINDS = {"function": ("function",), "string": ("string",), "import": ("import",),
+                 "any": ("function", "string", "import")}
+_UNINDEXED_KINDS = ("const", "class", "note")
+
+
+@tool("search", "Full-text search over function names, strings and imports; hits are one line each.")
+def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "any",
+           limit: int = 20, cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    if cursor:
+        return _cursor_page(cursor, "search", bud)
+    if not query.strip():
+        return "error bad_args: query is empty. Pass words to look for."
+    if kind in _UNINDEXED_KINDS:
+        return (f"error not_supported: kind '{kind}' is not indexed yet. "
+                "Use function, string, import or any.")
+    if kind not in _SEARCH_KINDS:
+        return f"error bad_args: unknown kind '{kind}'. Use function, string, import or any."
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    limit = max(1, min(int(limit), 200))
+    per_kind = []
+    for k in _SEARCH_KINDS[kind]:
+        lines = []
+        for h in st.fts_search(b.id, query, k, limit):
+            line = _search_line(bd, h)
+            if line:
+                lines.append(line)
+        per_kind.append(lines)
+    merged: list[str] = []  # round-robin so one kind cannot crowd out the others
+    for i in range(max((len(x) for x in per_kind), default=0)):
+        for lines in per_kind:
+            if i < len(lines):
+                merged.append(lines[i])
+    merged = merged[:limit]
+    if not merged:
+        return f"no hits for '{query}'"
+    args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
+    return _page([f"search '{query}': {len(merged)} hits", *merged], "search", args, bud)
+
+
+def _search_line(bd: Bound, h) -> str | None:
+    st, b = bd.store, bd.binary
+    if h.kind == "function":
+        fn = st.get_function(h.ref_id)
+        if fn is None:
+            return None
+        extra = "external" if fn.is_external else (f"{fn.size}B" if fn.size else "")
+        flags = ",".join(x for x in (fn.name_state, "thunk" if fn.is_thunk else "", extra) if x)
+        return f"function {fn.qualified_name} {bd.addr(fn.entry, fn.space)} {flags}"
+    if h.kind == "string":
+        s = st.get_string(h.ref_id)
+        if s is None:
+            return None
+        enc = "" if s.encoding == "ascii" else f" {s.encoding}"
+        return f"string {bd.addr(s.address)}{enc} {preview(s.value)}"
+    row = st.get_import(h.ref_id)
+    if row is None:
+        return None
+    name = row["name"] or f"#{row['ordinal']}"
+    slot = f" slot {bd.addr(row['address'])}" if row["address"] is not None else ""
+    return f"import {row['dll']}!{name}{slot}"
+
+
+# ── function ───────────────────────────────────────────────────────────────────
+
+def annotate_calls(c_text: str, nodes, psize: int) -> str:
+    """Append ``/*0xaddr*/`` after each call's callee token, unless the callee's name
+    already carries the address (FUN_00401234)."""
+    inserts: list[tuple[int, str]] = []
+    for n in nodes:
+        if n["kind"] != "call" or n["target"] is None:
+            continue
+        end = n["end_off"]
+        if c_text[n["start_off"]:end] != (n["text"] or ""):
+            continue
+        if f"{n['target']:x}" in (n["text"] or "").lower():
+            continue
+        inserts.append((end, f"/*{fmt_addr(n['target'], psize)}*/"))
+    for pos, text in sorted(inserts, reverse=True):
+        c_text = c_text[:pos] + text + c_text[pos:]
+    return c_text
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[str | None, str | None]:
+    """(c_text, error line). Uses the cache when fn_version and analysis_profile match."""
+    st, b = bd.store, bd.binary
+    profile = b.analysis_profile or "unknown"
+    cached = st.get_decomp(fn, profile)
+    if cached is not None and cached.status == "ok" and cached.c_text is not None:
+        return cached.c_text, None
+    ix = ctx.indexer
+    timeout = int(ctx.config.defaults.get("decompile_timeout_s") or 60)
+    try:
+        ix.ensure_open(bd.project)
+        d = ctx.worker.request("decompile", {
+            "program": ix.program_of(st, b), "entry": fn.entry, "timeout": timeout,
+        }, timeout=timeout + 120)
+    except WorkerError as e:
+        return None, worker_error(e, "Call index_status to check the worker")
+    if d.get("status") != "ok":
+        st.upsert_decomp(fn.id, fn.version, profile, d.get("status") or "error",
+                         error=d.get("error"), produced_at=_now())
+        what = d.get("error") or d.get("status")
+        code = "decompile_timeout" if d.get("status") == "timeout" else "decompile_failed"
+        return None, (f"error {code}: {fn.qualified_name}: {what}. "
+                      "Try view=signature or xrefs, or raise defaults.decompile_timeout_s.")
+    st.upsert_decomp(fn.id, fn.version, profile, "ok", c_text=d["c_text"], produced_at=_now())
+    cols = d["ast_columns"]
+    st.insert_ast_nodes(fn.id, [dict(zip(cols, row)) for row in d["ast"]])
+    return d["c_text"], None
+
+
+def _parse_lines(spec: str) -> tuple[int, int] | None:
+    m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d*))?\s*", spec)
+    if not m:
+        return None
+    a = int(m.group(1))
+    b = int(m.group(2)) if m.group(2) else (a if "-" not in spec else 10**9)
+    return (max(a, 1), max(b, a))
+
+
+@tool("function", "Show a function's decompiled C with call addresses (view=c) or its signature "
+                  "(view=signature), by name or address.")
+def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
+             lines: str = "", cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    if not target.strip():
+        return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
+    if view in ("asm", "both"):
+        return (f"error not_implemented: view={view} is not available yet. "
+                "Use view=c or view=signature.")
+    if view not in ("c", "signature"):
+        return f"error bad_args: unknown view '{view}'. Use c or signature."
+    span = None
+    if lines:
+        span = _parse_lines(lines)
+        if span is None:
+            return "error bad_args: lines must look like 40-80. Fix and retry."
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    r = resolve_function(st, b.id, target)
+    if not r.ok:
+        return r.error or "error not_found: no such function. Use search."
+    fn = r.function
+    assert fn is not None
+    if view == "signature":
+        callers = len(st.callers(fn, 200)) if not fn.is_external else 0
+        sig = fn.signature or fn.qualified_name
+        flags = ", ".join(x for x in (fn.calling_conv, f"{fn.size} bytes" if fn.size else None,
+                                      fn.name_state, "thunk" if fn.is_thunk else None,
+                                      "external" if fn.is_external else None) if x)
+        out = ([r.note] if r.note else []) + [
+            f"{bd.addr(fn.entry, fn.space)} {sig} [{flags}] callers {callers}"]
+        return "\n".join(out)
+    if fn.is_external:
+        return (f"error external: {fn.qualified_name} is an imported function with no code. "
+                "Use xrefs on it to see its callers.")
+    args = {"binary": binary, "target": target, "view": view, "lines": lines}
+    identity = (b.id, fn.entry, fn.version, b.analysis_profile)
+    offset = 0
+    if cursor:
+        try:
+            offset = STORE.get(cursor, "function", args, identity).offset
+        except CursorError as e:
+            return e.message
+    c_text, err = _get_decompiled(ctx, bd, fn)
+    if err:
+        return err
+    assert c_text is not None
+    text = annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize).rstrip("\n")
+    if r.note:
+        text = f"// {r.note}\n{text}"
+    if span:
+        text = "\n".join(text.split("\n")[span[0] - 1: span[1]])
+        if not text:
+            return f"error bad_args: lines {lines} is past the end of the function. Use a smaller range."
+    return fit_text(text, bud, "code", offset=offset, tool="function", args=args,
+                    identity=identity)[0]
+
+
+# ── xrefs ──────────────────────────────────────────────────────────────────────
+
+_KIND_MAP = {"call": ("call", "call_ind"), "jump": ("jump",), "read": ("read",),
+             "write": ("write",), "data": ("data",)}
+
+
+def _resolve_ref_target(bd: Bound, target: str):
+    """('fn', Function, note) | ('addr', (space, value)) | ('err', message)."""
+    st, b = bd.store, bd.binary
+    addr = parse_address(target)
+    if addr is None and not st.functions_by_name(b.id, target.strip()) \
+            and _HEX.match(target.strip()):
+        addr = ("ram", int(target.strip(), 16))
+    if addr is None:
+        r = resolve_function(st, b.id, target)
+        return ("fn", r.function, r.note) if r.ok else ("err", r.error)
+    fn = st.function_at(b.id, addr[1], addr[0])
+    if fn is not None:
+        return ("fn", fn, None)
+    has_refs = (st.xrefs_to_address(b.id, addr[1], None, 1) or
+                st.xrefs_from_address(b.id, addr[1], None, 1))
+    if not has_refs:  # nothing at the address itself: an interior address means its function
+        r = resolve_function(st, b.id, target)
+        if r.ok:
+            return ("fn", r.function, r.note)
+    return ("addr", addr)
+
+
+def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
+    st, b = bd.store, bd.binary
+    if fn is not None and fn.entry == addr:
+        return fn.qualified_name
+    s = st.string_at(b.id, addr)
+    if s is not None:
+        return preview(s.value, 40)
+    imp = st.import_at(b.id, addr)
+    if imp is not None:
+        return f"{imp['dll']}!{imp['name'] or '#' + str(imp['ordinal'])}"
+    if fn is not None:
+        return f"{fn.qualified_name}+0x{addr - fn.entry:x}"
+    return "-"
+
+
+@tool("xrefs", "List references to (or from) a function or address, one line each with the "
+               "referencing function and kind.")
+def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str = "to",
+          kind: str = "", limit: int = 50, cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    if cursor:
+        return _cursor_page(cursor, "xrefs", bud)
+    if not target.strip():
+        return "error bad_target: target is empty. Pass a function name or an address."
+    if direction not in ("to", "from"):
+        return "error bad_args: direction must be to or from. Fix and retry."
+    kinds = None
+    if kind:
+        kinds = _KIND_MAP.get(kind)
+        if kinds is None:
+            return f"error bad_args: unknown kind '{kind}'. Use call, jump, read, write or data."
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    limit = max(1, min(int(limit), 1000))
+    res = _resolve_ref_target(bd, target)
+    if res[0] == "err":
+        return res[1]
+    notes: list[str] = []
+    if res[0] == "fn":
+        fn: Function = res[1]
+        if res[2]:
+            notes.append(res[2])
+        label = fn_desc(bd, fn)
+        if direction == "to":
+            if fn.space != "ram":  # imported function: callers reach it through its IAT slot
+                refs = []
+                for imp in st.imports_by_name(b.id, fn.name):
+                    if imp["address"] is not None:
+                        refs += st.xrefs_to_address(b.id, imp["address"], kinds, limit + 1)
+            else:
+                refs = st.xrefs_to_function(fn, kinds, limit + 1)
+        else:
+            refs = st.xrefs_from_function(fn, kinds, limit + 1)
+    else:
+        space, value = res[1]
+        s = st.string_at(b.id, value)
+        label = bd.addr(value, space) + (f" {preview(s.value, 40)}" if s else "")
+        notes.append("no function starts here; showing raw references")
+        refs = (st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
+            b.id, value, kinds, limit + 1)
+    over = len(refs) > limit
+    refs = refs[:limit]
+    counts: dict[str, int] = {}
+    for x in refs:
+        counts[x.kind] = counts.get(x.kind, 0) + 1
+    if len(counts) == 1:
+        (k, n), = counts.items()
+        summary = f"{n} {k}{'s' if n != 1 else ''}"
+    else:
+        summary = f"{len(refs)} refs: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+    if not refs:
+        summary = "no references"
+    out = [f"xrefs {direction} {label}, {summary}{'+' if over else ''}", *notes]
+    for x in refs:
+        if direction == "to":
+            who = x.src_fn.qualified_name if x.src_fn else "-"
+            out.append(f"  {bd.addr(x.src_addr)}  {who:<36} {x.kind}")
+        else:
+            what = _describe_addr(bd, x.dst_addr, x.dst_fn)
+            out.append(f"  {bd.addr(x.src_addr)}  -> {bd.addr(x.dst_addr)} {what:<30} {x.kind}")
+    if over:
+        out.append(f"… limit {limit} reached. Raise limit or filter with kind.")
+    args = {"binary": binary, "target": target, "direction": direction, "kind": kind,
+            "limit": limit}
+    return _page(out, "xrefs", args, bud)
+
+
+# ── callgraph ──────────────────────────────────────────────────────────────────
+
+@tool("callgraph", "Show the call tree below (callees) or above (callers) a function as an "
+                   "indented list; cycles are marked.")
+def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction: str = "callees",
+              depth: int = 2, cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    if cursor:
+        return _cursor_page(cursor, "callgraph", bud)
+    if not target.strip():
+        return "error bad_target: target is empty. Pass a function name or an address."
+    if direction not in ("callees", "callers"):
+        return "error bad_args: direction must be callees or callers. Fix and retry."
+    depth = max(1, min(int(depth), MAX_DEPTH))
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    r = resolve_function(st, b.id, target)
+    if not r.ok:
+        return r.error or "error not_found: no such function. Use search."
+    root = r.function
+    assert root is not None
+    step = st.callees if direction == "callees" else st.callers
+    out = [f"{direction} of {fn_desc(bd, root)}, depth {depth}"]
+    if r.note:
+        out.append(r.note)
+    expanded = {root.id}
+    state = {"truncated": False}
+
+    def label(f: Function) -> str:
+        return fn_desc(bd, f) + (" [thunk]" if f.is_thunk else "")
+
+    def walk(fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
+        kids = step(fn, CALLGRAPH_FANOUT + 1)
+        for c in kids[:CALLGRAPH_FANOUT]:
+            if len(out) >= CALLGRAPH_MAX_LINES:
+                state["truncated"] = True
+                return
+            pad = "  " * indent
+            if c.id in path:
+                out.append(f"{pad}{label(c)} [cycle]")
+            elif c.id in expanded:
+                out.append(f"{pad}{label(c)} [seen]")
+            else:
+                out.append(f"{pad}{label(c)}")
+                if left > 1:
+                    expanded.add(c.id)
+                    walk(c, left - 1, indent + 1, path | {c.id})
+        if len(kids) > CALLGRAPH_FANOUT:
+            out.append(f"{'  ' * indent}… more than {CALLGRAPH_FANOUT} {direction} not shown")
+
+    walk(root, depth, 1, frozenset({root.id}))
+    if len(out) == 1 + (1 if r.note else 0):
+        out.append("  (none)")
+    if state["truncated"]:
+        out.append(f"… stopped at {CALLGRAPH_MAX_LINES} lines. Lower depth.")
+    args = {"binary": binary, "target": target, "direction": direction, "depth": depth}
+    return _page(out, "callgraph", args, bud)
+
+
+# ── strings ────────────────────────────────────────────────────────────────────
+
+@tool("strings", "Find defined strings by substring or regex (case-insensitive) with the "
+                 "functions that reference them.")
+def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool = False,
+            with_refs: bool = True, limit: int = 30, cursor: str = "", budget: int = 0) -> str:
+    bud = budget_for(ctx, budget)
+    if cursor:
+        return _cursor_page(cursor, "strings", bud)
+    if not pattern:
+        return "error bad_args: pattern is empty. Pass text or a regex."
+    if regex:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            return f"error bad_regex: {e}. Fix the pattern and retry."
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    st, b = bd.store, bd.binary
+    limit = max(1, min(int(limit), 500))
+    hits = st.search_strings(b.id, pattern, regex=regex, limit=limit, with_refs=with_refs)
+    if not hits:
+        return f"no strings match '{pattern}'"
+    out = [f"strings matching '{pattern}': {len(hits)}{'+' if len(hits) == limit else ''}"]
+    for h in hits:
+        enc = "" if h.encoding == "ascii" else f" {h.encoding}"
+        line = f"{bd.addr(h.address)}{enc} {preview(h.value)}"
+        if with_refs:
+            if h.refs:
+                names = " ".join(f.qualified_name for f in h.refs[:4])
+                extra = f" +{len(h.refs) - 4}" if len(h.refs) > 4 else ""
+                line += f"  <- {names}{extra}"
+            else:
+                line += "  <- (no refs)"
+        out.append(line)
+    args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
+            "limit": limit}
+    return _page(out, "strings", args, bud)

@@ -14,10 +14,12 @@ def test_only_implemented_configured_tools_are_listed(tmp_path):
     server, ctx = build_server(_cfg(tmp_path))
     tools = anyio.run(server.list_tools)
     names = [t.name for t in tools]
-    assert names == ["project_info"]
-    assert "function" in ctx.not_implemented
-    dumped = tools[0].model_dump(exclude_none=True)
-    assert "output_schema" not in dumped  # no output schemas advertised
+    assert set(names) == {"project_info", "index_status", "open_binary", "list_binaries",
+                          "outline", "search", "function", "xrefs", "callgraph", "strings"}
+    assert "rename" in ctx.not_implemented
+    pi = next(t for t in tools if t.name == "project_info")
+    dumped = pi.model_dump(exclude_none=True)
+    assert all("output_schema" not in t.model_dump(exclude_none=True) for t in tools)
     assert set(dumped["input_schema"]["properties"]) == {"check_ghidra"}
     assert len(ctx.config.tools) == 36
 

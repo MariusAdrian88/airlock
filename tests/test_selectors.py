@@ -95,3 +95,15 @@ def test_external_space(env):
 def test_empty(env):
     s, b = env
     assert resolve_function(s, b, "  ").error.startswith("error bad_target: ")
+
+
+def test_import_thunk_beats_external_of_same_name(tmp_path):
+    s = Store(tmp_path / "i.sqlite")
+    b = s.upsert_binary("cd" * 32, "a.exe", pointer_size=4)
+    s.insert_functions(b, [
+        {"entry": 0x401000, "name": "CreateFileW", "name_state": "library", "size": 6, "is_thunk": True},
+        {"entry": 1, "space": "EXTERNAL", "name": "CreateFileW", "name_state": "library", "is_external": True},
+    ])
+    r = resolve_function(s, b, "CreateFileW")
+    assert r.ok and r.function.entry == 0x401000
+    s.close()

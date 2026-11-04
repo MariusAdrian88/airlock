@@ -6,3 +6,11 @@ venv/
 build/
 dist/
 .pytest_cache/
+
+# analysed binaries, Ghidra projects and index files (never commit)
+tests/fixtures/
+*.gpr
+*.rep/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

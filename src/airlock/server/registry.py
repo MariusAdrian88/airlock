@@ -66,4 +66,4 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
 
 def load_tool_modules() -> None:
     """Import every module that defines tools (each registers on import)."""
-    from airlock.server.tools import admin  # noqa: F401
+    from airlock.server.tools import admin, core  # noqa: F401

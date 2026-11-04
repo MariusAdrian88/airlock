@@ -1,6 +1,6 @@
 """Integration tests: the real worker, Ghidra and a real PE.
 
-    pytest -q -m ghidra --binary <path-to-exe>
+    pytest -q -m ghidra --binary=<path-to-exe>
 
 One module-scoped worker imports and analyses the binary once (minutes for the
 first run); the individual tests then read the results.

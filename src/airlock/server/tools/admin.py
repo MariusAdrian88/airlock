@@ -1,4 +1,4 @@
-"""admin set: project_info (M0). index_status, reindex, frontier come later."""
+"""admin set: project_info, index_status. reindex, frontier come later."""
 
 from __future__ import annotations
 
@@ -61,3 +61,33 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
         state = "running" if ctx.worker.running() else "not started"
         out.append(f"worker  {state}")
     return "\n".join(out)
+
+
+@tool("index_status", "Show worker state and, per binary, analysis progress or index counts.")
+def index_status(ctx: ServerContext, project: str = "") -> str:
+    from airlock.server.indexer import IndexerError
+    ix = ctx.indexer
+    w = ctx.worker
+    out = [f"worker {'running' if w.running() else 'not started'}, "
+           f"ghidra {'started' if w.ghidra is not None and w.running() else 'not started'}"]
+    try:
+        names = [ix.resolve_project(project)] if project else ix.projects()
+    except IndexerError as e:
+        return e.message
+    if not names:
+        out.append("no projects. Call open_binary with a project and a file path.")
+    for p in names:
+        st = ix.store(p)
+        bins = st.list_binaries()
+        out.append(f"project {p}: {len(bins)} binaries")
+        for b in bins:
+            status, detail = ix.describe(p, st, b)
+            if status == "ready":
+                c = st.counts(b.id)
+                out.append(
+                    f"  #{b.id} {b.name} ready: {c['functions']} functions, {c['strings']} strings, "
+                    f"{c['imports']} imports, {c['edges']} edges; decompiled {c['decompiled']} "
+                    f"(stale {c['decomp_stale']})")
+            else:
+                out.append(f"  #{b.id} {b.name} {status}: {detail}")
+    return chr(10).join(out)

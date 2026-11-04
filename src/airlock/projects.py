@@ -188,7 +188,25 @@ def detect(path: Path) -> BinaryInfo:
             ptr,
             pe.OPTIONAL_HEADER.ImageBase,
             pe.OPTIONAL_HEADER.AddressOfEntryPoint,
-            classify_toolchain(imports, rtypes, has_cli, getattr(pe, "RICH_HEADER", None) is not None),
+            classify_toolchain(imports, rtypes, has_cli, pe.parse_rich_header() is not None),
         )
+    finally:
+        pe.close()
+
+
+def read_sections(path: Path) -> list[tuple[str, int, int, str]]:
+    """(name, rva, virtual size, flags like 'rx') for each PE section; [] if not a PE."""
+    try:
+        pe = pefile.PE(str(path), fast_load=True)
+    except (pefile.PEFormatError, OSError):
+        return []
+    try:
+        out = []
+        for s in pe.sections:
+            c = s.Characteristics
+            flags = ("r" if c & 0x40000000 else "") + ("w" if c & 0x80000000 else "") +                     ("x" if c & 0x20000000 else "")
+            out.append((s.Name.rstrip(b"\x00").decode("latin-1"), s.VirtualAddress,
+                        s.Misc_VirtualSize, flags))
+        return out
     finally:
         pe.close()

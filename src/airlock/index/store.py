@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import re
 import sqlite3
 from collections.abc import Iterable, Sequence
@@ -119,6 +120,14 @@ def _function(row: sqlite3.Row, prefix: str = "") -> Function:
     return Function(**d)
 
 
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _camel_words(text: str | None) -> str:
+    """'CreateFileW' -> 'Create File W', so name parts are searchable."""
+    return _CAMEL.sub(" ", text) if text else ""
+
+
 def _fts_query(text: str) -> str | None:
     toks = re.findall(r"[^\W_]+", text)
     if not toks:
@@ -135,6 +144,7 @@ class Store:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
+        self.db.create_function("camel_words", 1, _camel_words, deterministic=True)
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
@@ -249,8 +259,9 @@ class Store:
     def insert_functions(self, binary_id: int, rows: Iterable[dict[str, Any]]) -> None:
         """Rows: dicts with ``entry``, ``name``, ``name_state`` and optional
         space, namespace, signature, calling_conv, size, is_thunk, is_external,
-        bytes_hash, masked_hash. A row for an existing (space, entry) updates it
-        and bumps ``version``."""
+        bytes_hash, masked_hash. A row for an existing (space, entry) updates it;
+        ``version`` is bumped only if name, namespace, signature, calling_conv
+        or size changed."""
         data = [
             (
                 binary_id, r.get("space", "ram"), r["entry"], r["name"], r["name_state"],
@@ -271,7 +282,12 @@ class Store:
                 "calling_conv=excluded.calling_conv, size=excluded.size, "
                 "is_thunk=excluded.is_thunk, is_external=excluded.is_external, "
                 "bytes_hash=excluded.bytes_hash, masked_hash=excluded.masked_hash, "
-                "version=function.version+1",
+                "version=function.version + CASE WHEN "
+                "function.name IS NOT excluded.name OR "
+                "function.namespace IS NOT excluded.namespace OR "
+                "function.signature IS NOT excluded.signature OR "
+                "function.calling_conv IS NOT excluded.calling_conv OR "
+                "function.size IS NOT excluded.size THEN 1 ELSE 0 END",
                 data,
             )
 
@@ -287,16 +303,28 @@ class Store:
     def link_edges(self, binary_id: int) -> None:
         """Fill edge.src_fn / dst_fn with the function containing each address
         (ram space; size NULL/0 counts as 1 byte)."""
-        sub = (
-            "(SELECT f.id FROM function f WHERE f.binary_id=edge.binary_id AND f.space='ram' "
-            "AND f.entry <= edge.{a} AND edge.{a} < f.entry + MAX(COALESCE(f.size,0),1) "
-            "ORDER BY f.entry DESC LIMIT 1)"
-        )
+        # Done in Python with a sorted entry table: a correlated SQL lookup is
+        # O(functions) per address that lies in no function (data, strings).
+        fns = self.db.execute(
+            "SELECT id, entry, MAX(COALESCE(size,0),1) AS sz FROM function "
+            "WHERE binary_id=? AND space='ram' ORDER BY entry", (binary_id,)
+        ).fetchall()
+        entries = [r["entry"] for r in fns]
+
+        def find(addr: int) -> int | None:
+            i = bisect.bisect_right(entries, addr) - 1
+            for k in range(i, max(i - 8, -1), -1):  # overlapping bodies are rare
+                if addr < fns[k]["entry"] + fns[k]["sz"]:
+                    return fns[k]["id"]
+            return None
+
+        rows = self.db.execute(
+            "SELECT rowid, src_addr, dst_addr FROM edge WHERE binary_id=?", (binary_id,)
+        ).fetchall()
         with self.db:
-            self.db.execute(
-                f"UPDATE edge SET src_fn = {sub.format(a='src_addr')}, "
-                f"dst_fn = {sub.format(a='dst_addr')} WHERE binary_id=?",
-                (binary_id,),
+            self.db.executemany(
+                "UPDATE edge SET src_fn=?, dst_fn=? WHERE rowid=?",
+                [(find(r["src_addr"]), find(r["dst_addr"]), r["rowid"]) for r in rows],
             )
 
     def insert_strings(self, binary_id: int, rows: Iterable[tuple[int, str, str]]) -> None:
@@ -357,7 +385,9 @@ class Store:
                 "INSERT INTO fts(kind, ref_id, binary_id, text) "
                 "SELECT 'function', id, binary_id, "
                 "CASE WHEN namespace IS NULL OR namespace='' THEN name "
-                "ELSE namespace || '::' || name END FROM function WHERE binary_id=?",
+                "ELSE namespace || '::' || name END || ' ' || "
+                "camel_words(COALESCE(namespace || ' ', '') || name) "
+                "FROM function WHERE binary_id=?",
                 (binary_id,),
             )
             self.db.execute(
@@ -368,7 +398,8 @@ class Store:
             self.db.execute(
                 "INSERT INTO fts(kind, ref_id, binary_id, text) "
                 "SELECT 'import', rowid, binary_id, "
-                "COALESCE(dll || '!', '') || COALESCE(name, '#' || ordinal) "
+                "COALESCE(dll || '!', '') || COALESCE(name, '#' || ordinal) || ' ' || "
+                "camel_words(COALESCE(name, '')) "
                 "FROM import WHERE binary_id=?",
                 (binary_id,),
             )
@@ -594,3 +625,52 @@ class Store:
             sql += " AND kind=?"
             args.append(kind)
         return self.db.execute(sql + " ORDER BY start_off", args).fetchall()
+
+    # -- lookups for tools -------------------------------------------------
+
+    def string_at(self, binary_id: int, addr: int) -> StringHit | None:
+        r = self.db.execute(
+            "SELECT id, address, encoding, value FROM string WHERE binary_id=? AND address=? "
+            "LIMIT 1", (binary_id, addr)).fetchone()
+        return StringHit(r["id"], r["address"], r["encoding"], r["value"]) if r else None
+
+    def get_import(self, rowid: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT dll, name, ordinal, address FROM import WHERE rowid=?", (rowid,)
+        ).fetchone()
+
+    def imports_by_name(self, binary_id: int, name: str) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT dll, name, ordinal, address FROM import WHERE binary_id=? AND name=?",
+            (binary_id, name)).fetchall()
+
+    def import_at(self, binary_id: int, addr: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT dll, name, ordinal, address FROM import WHERE binary_id=? AND address=? "
+            "LIMIT 1", (binary_id, addr)).fetchone()
+
+    def counts(self, binary_id: int) -> dict[str, int]:
+        """Row counts for index_status/outline, including stale cached decompiles."""
+        def q(sql: str) -> int:
+            return int(self.db.execute(sql, (binary_id,)).fetchone()[0])
+        return {
+            "functions": q("SELECT COUNT(*) FROM function WHERE binary_id=?"),
+            "thunks": q("SELECT COUNT(*) FROM function WHERE binary_id=? AND is_thunk=1"),
+            "externals": q("SELECT COUNT(*) FROM function WHERE binary_id=? AND is_external=1"),
+            "strings": q("SELECT COUNT(*) FROM string WHERE binary_id=?"),
+            "imports": q("SELECT COUNT(*) FROM import WHERE binary_id=?"),
+            "edges": q("SELECT COUNT(*) FROM edge WHERE binary_id=?"),
+            "decompiled": q(
+                "SELECT COUNT(*) FROM decomp d JOIN function f ON f.id=d.function_id "
+                "WHERE f.binary_id=?"),
+            "decomp_stale": q(
+                "SELECT COUNT(*) FROM decomp d JOIN function f ON f.id=d.function_id "
+                "JOIN binary b ON b.id=f.binary_id WHERE f.binary_id=? AND "
+                "(d.fn_version<>f.version OR d.analysis_profile IS NOT b.analysis_profile)"),
+        }
+
+    def import_dll_counts(self, binary_id: int) -> list[tuple[str, int]]:
+        rows = self.db.execute(
+            "SELECT COALESCE(dll,'?') AS d, COUNT(*) AS n FROM import WHERE binary_id=? "
+            "GROUP BY d ORDER BY n DESC, d", (binary_id,)).fetchall()
+        return [(r["d"], r["n"]) for r in rows]
