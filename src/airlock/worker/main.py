@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 import traceback
 from typing import Any, BinaryIO, Callable
@@ -37,9 +38,25 @@ def op(name: str) -> Callable[[Handler], Handler]:
 class _State:
     launcher: Any = None
     ghidra: dict[str, Any] | None = None
+    out: BinaryIO | None = None
+    out_lock = threading.Lock()
 
 
 STATE = _State()
+
+
+def _write(obj: dict[str, Any]) -> None:
+    """Write one protocol line. Safe to call from any thread."""
+    if STATE.out is None:  # not running as a worker (unit tests)
+        return
+    data = encode(obj)
+    with STATE.out_lock:
+        STATE.out.write(data)
+
+
+def emit(event: str, **fields: Any) -> None:
+    """Send an unsolicited event line: {"event": <event>, ...fields}."""
+    _write({"event": event, **fields})
 
 
 # ── Ops ────────────────────────────────────────────────────────────────────
@@ -141,6 +158,8 @@ def _handle(msg: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     out = _isolate_stdout()
+    STATE.out = out
+    import airlock.worker.ghidra_ops  # noqa: F401  registers the Ghidra ops (no JVM needed)
     stdin = sys.stdin.buffer
     print(f"[worker] airlock {__version__} pid {os.getpid()} python {sys.version.split()[0]}",
           file=sys.stderr, flush=True)
@@ -150,13 +169,13 @@ def main() -> int:
         try:
             msg = decode(line)
         except ValueError as e:
-            out.write(encode({"id": None, "ok": False,
-                              "error": {"code": "bad_request", "message": str(e)}}))
+            _write({"id": None, "ok": False,
+                    "error": {"code": "bad_request", "message": str(e)}})
             continue
         try:
             reply = _handle(msg)
         except SystemExit:
-            out.write(encode({"id": msg.get("id"), "ok": True, "data": {"bye": True}}))
+            _write({"id": msg.get("id"), "ok": True, "data": {"bye": True}})
             break
-        out.write(encode(reply))
+        _write(reply)
     return 0

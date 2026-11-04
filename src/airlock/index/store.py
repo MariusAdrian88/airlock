@@ -1,0 +1,596 @@
+"""SQLite index store (DESIGN.md section 4). No Ghidra imports here."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from importlib import resources
+from pathlib import Path
+from typing import Any
+
+from airlock.index.migrations import MIGRATIONS
+
+SCHEMA_VERSION = 1
+
+FTS_KINDS = ("function", "string", "import")
+CODE_EDGES = ("call", "call_ind", "jump")
+
+
+@dataclass(frozen=True)
+class Binary:
+    id: int
+    sha256: str
+    name: str
+    original_path: str | None
+    format: str | None
+    arch: str | None
+    pointer_size: int | None
+    image_base: int | None
+    toolchain: str | None
+    toolchain_ver: str | None
+    analysis_profile: str | None
+    imported_at: str | None
+    analysed_at: str | None
+
+
+@dataclass(frozen=True)
+class Function:
+    id: int
+    binary_id: int
+    space: str
+    entry: int
+    name: str
+    name_state: str
+    namespace: str | None
+    signature: str | None
+    calling_conv: str | None
+    size: int | None
+    is_thunk: bool
+    is_external: bool
+    bytes_hash: str | None
+    masked_hash: str | None
+    version: int
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.namespace}::{self.name}" if self.namespace else self.name
+
+
+@dataclass(frozen=True)
+class Xref:
+    """One edge. ``src_fn``/``dst_fn`` are function rows when known."""
+
+    src_addr: int
+    dst_addr: int
+    kind: str
+    src_fn: Function | None
+    dst_fn: Function | None
+
+
+@dataclass(frozen=True)
+class StringHit:
+    id: int
+    address: int
+    encoding: str
+    value: str
+    refs: tuple[Function, ...] = ()
+
+
+@dataclass(frozen=True)
+class FtsHit:
+    kind: str
+    ref_id: int
+    text: str
+
+
+@dataclass(frozen=True)
+class Decomp:
+    function_id: int
+    fn_version: int
+    analysis_profile: str
+    c_text: str | None
+    status: str
+    error: str | None
+    produced_at: str | None
+
+
+_BINARY_COLS = (
+    "id sha256 name original_path format arch pointer_size image_base "
+    "toolchain toolchain_ver analysis_profile imported_at analysed_at"
+).split()
+_FUNCTION_COLS = (
+    "id binary_id space entry name name_state namespace signature calling_conv "
+    "size is_thunk is_external bytes_hash masked_hash version"
+).split()
+_FN_SELECT = ", ".join(f"f.{c}" for c in _FUNCTION_COLS)
+_LIKE_ESC = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
+
+
+def _binary(row: sqlite3.Row) -> Binary:
+    return Binary(**{c: row[c] for c in _BINARY_COLS})
+
+
+def _function(row: sqlite3.Row, prefix: str = "") -> Function:
+    d = {c: row[prefix + c] for c in _FUNCTION_COLS}
+    d["is_thunk"] = bool(d["is_thunk"])
+    d["is_external"] = bool(d["is_external"])
+    return Function(**d)
+
+
+def _fts_query(text: str) -> str | None:
+    toks = re.findall(r"[^\W_]+", text)
+    if not toks:
+        return None
+    return " ".join(f'"{t}"*' for t in toks)
+
+
+class Store:
+    """One index.sqlite. Not thread-safe; use one Store per thread."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path))
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = NORMAL")
+        self._init_schema()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _init_schema(self) -> None:
+        has = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if not has:
+            sql = resources.files("airlock.index").joinpath("schema.sql").read_text("utf-8")
+            self.db.executescript(sql)
+            with self.db:
+                self.set_meta("schema_version", str(SCHEMA_VERSION))
+            return
+        cur = self.schema_version
+        if cur > SCHEMA_VERSION:
+            raise RuntimeError(f"index schema {cur} is newer than supported {SCHEMA_VERSION}")
+        while cur < SCHEMA_VERSION:
+            cur += 1
+            mig = MIGRATIONS.get(cur)
+            if mig is None:
+                raise RuntimeError(f"no migration to schema version {cur}")
+            with self.db:
+                mig(self.db)
+                self.set_meta("schema_version", str(cur))
+
+    @property
+    def schema_version(self) -> int:
+        v = self.get_meta("schema_version")
+        return int(v) if v else 0
+
+    def get_meta(self, key: str) -> str | None:
+        r = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    # -- binaries ----------------------------------------------------------
+
+    def upsert_binary(self, sha256: str, name: str, **fields: Any) -> int:
+        """Insert or update by sha256; returns the binary id. ``fields`` are
+        other ``binary`` columns (format, arch, image_base, ...)."""
+        bad = set(fields) - set(_BINARY_COLS) - {"id", "sha256", "name"}
+        if bad:
+            raise ValueError(f"unknown binary columns: {sorted(bad)}")
+        cols = ["sha256", "name", *fields]
+        vals = [sha256, name, *fields.values()]
+        upd = ", ".join(f"{c}=excluded.{c}" for c in cols[1:])
+        with self.db:
+            self.db.execute(
+                f"INSERT INTO binary({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+                f"ON CONFLICT(sha256) DO UPDATE SET {upd}",
+                vals,
+            )
+            r = self.db.execute("SELECT id FROM binary WHERE sha256=?", (sha256,)).fetchone()
+        return int(r["id"])
+
+    def list_binaries(self) -> list[Binary]:
+        return [_binary(r) for r in self.db.execute("SELECT * FROM binary ORDER BY id")]
+
+    def find_binaries(self, ref: str) -> list[Binary]:
+        """All binaries matching ``ref`` by exact name (case-insensitive) or
+        sha256 prefix."""
+        rows = self.db.execute(
+            "SELECT * FROM binary WHERE lower(name)=lower(?) OR sha256 LIKE ? ESCAPE '\\' "
+            "ORDER BY id",
+            (ref, ref.lower().translate(_LIKE_ESC) + "%"),
+        ).fetchall()
+        return [_binary(r) for r in rows]
+
+    def get_binary(self, ref: str) -> Binary | None:
+        """The unique match for ``ref`` (name or sha256 prefix), else None."""
+        found = self.find_binaries(ref)
+        return found[0] if len(found) == 1 else None
+
+    def get_binary_by_id(self, binary_id: int) -> Binary | None:
+        r = self.db.execute("SELECT * FROM binary WHERE id=?", (binary_id,)).fetchone()
+        return _binary(r) if r else None
+
+    # -- batch inserts (each call is one transaction) ------------------------
+
+    def clear_binary_data(self, binary_id: int) -> None:
+        """Drop all derived rows of a binary (before a re-extract)."""
+        fids = "SELECT id FROM function WHERE binary_id=?"
+        with self.db:
+            q = self.db.execute
+            q(f"DELETE FROM ast_node WHERE function_id IN ({fids})", (binary_id,))
+            q(f"DELETE FROM decomp WHERE function_id IN ({fids})", (binary_id,))
+            q("DELETE FROM edge WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM string WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM import WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM function WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM fts WHERE binary_id=?", (binary_id,))
+
+    def insert_functions(self, binary_id: int, rows: Iterable[dict[str, Any]]) -> None:
+        """Rows: dicts with ``entry``, ``name``, ``name_state`` and optional
+        space, namespace, signature, calling_conv, size, is_thunk, is_external,
+        bytes_hash, masked_hash. A row for an existing (space, entry) updates it
+        and bumps ``version``."""
+        data = [
+            (
+                binary_id, r.get("space", "ram"), r["entry"], r["name"], r["name_state"],
+                r.get("namespace"), r.get("signature"), r.get("calling_conv"), r.get("size"),
+                int(bool(r.get("is_thunk", 0))), int(bool(r.get("is_external", 0))),
+                r.get("bytes_hash"), r.get("masked_hash"),
+            )
+            for r in rows
+        ]
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO function(binary_id, space, entry, name, name_state, namespace, "
+                "signature, calling_conv, size, is_thunk, is_external, bytes_hash, masked_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(binary_id, space, entry) DO UPDATE SET "
+                "name=excluded.name, name_state=excluded.name_state, "
+                "namespace=excluded.namespace, signature=excluded.signature, "
+                "calling_conv=excluded.calling_conv, size=excluded.size, "
+                "is_thunk=excluded.is_thunk, is_external=excluded.is_external, "
+                "bytes_hash=excluded.bytes_hash, masked_hash=excluded.masked_hash, "
+                "version=function.version+1",
+                data,
+            )
+
+    def insert_edges(self, binary_id: int, rows: Iterable[tuple[int, int, str]]) -> None:
+        """Rows: (src_addr, dst_addr, kind). Call ``link_edges`` afterwards to
+        fill src_fn / dst_fn."""
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO edge(binary_id, src_addr, dst_addr, kind) VALUES (?,?,?,?)",
+                [(binary_id, s, d, k) for s, d, k in rows],
+            )
+
+    def link_edges(self, binary_id: int) -> None:
+        """Fill edge.src_fn / dst_fn with the function containing each address
+        (ram space; size NULL/0 counts as 1 byte)."""
+        sub = (
+            "(SELECT f.id FROM function f WHERE f.binary_id=edge.binary_id AND f.space='ram' "
+            "AND f.entry <= edge.{a} AND edge.{a} < f.entry + MAX(COALESCE(f.size,0),1) "
+            "ORDER BY f.entry DESC LIMIT 1)"
+        )
+        with self.db:
+            self.db.execute(
+                f"UPDATE edge SET src_fn = {sub.format(a='src_addr')}, "
+                f"dst_fn = {sub.format(a='dst_addr')} WHERE binary_id=?",
+                (binary_id,),
+            )
+
+    def insert_strings(self, binary_id: int, rows: Iterable[tuple[int, str, str]]) -> None:
+        """Rows: (address, encoding, value)."""
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO string(binary_id, address, encoding, value) VALUES (?,?,?,?)",
+                [(binary_id, a, e, v) for a, e, v in rows],
+            )
+
+    def insert_imports(
+        self, binary_id: int, rows: Iterable[tuple[str | None, str | None, int | None, int | None]]
+    ) -> None:
+        """Rows: (dll, name, ordinal, address)."""
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO import(binary_id, dll, name, ordinal, address) VALUES (?,?,?,?,?)",
+                [(binary_id, *r) for r in rows],
+            )
+
+    def insert_ast_nodes(self, function_id: int, rows: Iterable[dict[str, Any]]) -> None:
+        """Replace all ast nodes of the function. Rows: kind, start_off,
+        end_off and optional address, target, text."""
+        with self.db:
+            self.db.execute("DELETE FROM ast_node WHERE function_id=?", (function_id,))
+            self.db.executemany(
+                "INSERT INTO ast_node(function_id, kind, start_off, end_off, address, target, "
+                "text) VALUES (?,?,?,?,?,?,?)",
+                [
+                    (function_id, r["kind"], r["start_off"], r["end_off"], r.get("address"),
+                     r.get("target"), r.get("text"))
+                    for r in rows
+                ],
+            )
+
+    def upsert_decomp(
+        self, function_id: int, fn_version: int, analysis_profile: str, status: str,
+        c_text: str | None = None, error: str | None = None, produced_at: str | None = None,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO decomp(function_id, fn_version, analysis_profile, c_text, status, "
+                "error, produced_at) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(function_id) DO UPDATE SET fn_version=excluded.fn_version, "
+                "analysis_profile=excluded.analysis_profile, c_text=excluded.c_text, "
+                "status=excluded.status, error=excluded.error, produced_at=excluded.produced_at",
+                (function_id, fn_version, analysis_profile, c_text, status, error, produced_at),
+            )
+
+    # -- FTS ---------------------------------------------------------------
+
+    def rebuild_fts(self, binary_id: int) -> None:
+        """Repopulate fts rows (function names, strings, imports) of a binary.
+        ref_id is function.id, string.id or import rowid."""
+        with self.db:
+            self.db.execute("DELETE FROM fts WHERE binary_id=?", (binary_id,))
+            self.db.execute(
+                "INSERT INTO fts(kind, ref_id, binary_id, text) "
+                "SELECT 'function', id, binary_id, "
+                "CASE WHEN namespace IS NULL OR namespace='' THEN name "
+                "ELSE namespace || '::' || name END FROM function WHERE binary_id=?",
+                (binary_id,),
+            )
+            self.db.execute(
+                "INSERT INTO fts(kind, ref_id, binary_id, text) "
+                "SELECT 'string', id, binary_id, value FROM string WHERE binary_id=?",
+                (binary_id,),
+            )
+            self.db.execute(
+                "INSERT INTO fts(kind, ref_id, binary_id, text) "
+                "SELECT 'import', rowid, binary_id, "
+                "COALESCE(dll || '!', '') || COALESCE(name, '#' || ordinal) "
+                "FROM import WHERE binary_id=?",
+                (binary_id,),
+            )
+
+    def fts_search(
+        self, binary_id: int, query: str, kind: str | None = None, limit: int = 50
+    ) -> list[FtsHit]:
+        """Token-prefix AND search; ``kind`` is function | string | import."""
+        q = _fts_query(query)
+        if q is None:
+            return []
+        sql = "SELECT kind, ref_id, text FROM fts WHERE fts MATCH ? AND binary_id=?"
+        args: list[Any] = [q, binary_id]
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        sql += " ORDER BY rank LIMIT ?"
+        args.append(limit)
+        return [FtsHit(r["kind"], r["ref_id"], r["text"]) for r in self.db.execute(sql, args)]
+
+    # -- functions ---------------------------------------------------------
+
+    def get_function(self, function_id: int) -> Function | None:
+        r = self.db.execute(
+            f"SELECT {_FN_SELECT} FROM function f WHERE f.id=?", (function_id,)
+        ).fetchone()
+        return _function(r) if r else None
+
+    def function_at(self, binary_id: int, entry: int, space: str = "ram") -> Function | None:
+        r = self.db.execute(
+            f"SELECT {_FN_SELECT} FROM function f WHERE binary_id=? AND space=? AND entry=?",
+            (binary_id, space, entry),
+        ).fetchone()
+        return _function(r) if r else None
+
+    def function_containing(
+        self, binary_id: int, addr: int, space: str = "ram"
+    ) -> Function | None:
+        """Function with entry <= addr < entry+size (size NULL/0 counts as 1)."""
+        r = self.db.execute(
+            f"SELECT {_FN_SELECT} FROM function f WHERE binary_id=? AND space=? AND entry<=? "
+            "ORDER BY entry DESC LIMIT 1",
+            (binary_id, space, addr),
+        ).fetchone()
+        if not r:
+            return None
+        fn = _function(r)
+        return fn if addr < fn.entry + max(fn.size or 0, 1) else None
+
+    def functions_by_name(self, binary_id: int, name: str) -> list[Function]:
+        """Exact match on ``name`` or ``namespace::name``, ordered by address."""
+        rows = self.db.execute(
+            f"SELECT {_FN_SELECT} FROM function f WHERE binary_id=? AND "
+            "(name=? OR (namespace IS NOT NULL AND namespace<>'' AND namespace || '::' || name=?)) "
+            "ORDER BY space, entry",
+            (binary_id, name, name),
+        ).fetchall()
+        return [_function(r) for r in rows]
+
+    def list_functions(
+        self, binary_id: int, name_state: str | None = None, limit: int = 100, offset: int = 0
+    ) -> list[Function]:
+        sql = f"SELECT {_FN_SELECT} FROM function f WHERE binary_id=?"
+        args: list[Any] = [binary_id]
+        if name_state:
+            sql += " AND name_state=?"
+            args.append(name_state)
+        sql += " ORDER BY space, entry LIMIT ? OFFSET ?"
+        args += [limit, offset]
+        return [_function(r) for r in self.db.execute(sql, args)]
+
+    def count_by_name_state(self, binary_id: int) -> dict[str, int]:
+        rows = self.db.execute(
+            "SELECT name_state, COUNT(*) AS n FROM function WHERE binary_id=? "
+            "GROUP BY name_state ORDER BY name_state",
+            (binary_id,),
+        ).fetchall()
+        return {r["name_state"]: r["n"] for r in rows}
+
+    # -- xrefs -------------------------------------------------------------
+
+    def _xrefs(
+        self, where: str, args: list[Any], kinds: Sequence[str] | None, limit: int
+    ) -> list[Xref]:
+        if kinds:
+            where += f" AND e.kind IN ({','.join('?' * len(kinds))})"
+            args = args + list(kinds)
+        sel_s = ", ".join(f"s.{c} AS s_{c}" for c in _FUNCTION_COLS)
+        sel_d = ", ".join(f"d.{c} AS d_{c}" for c in _FUNCTION_COLS)
+        rows = self.db.execute(
+            f"SELECT e.src_addr, e.dst_addr, e.kind, {sel_s}, {sel_d} FROM edge e "
+            "LEFT JOIN function s ON s.id=e.src_fn LEFT JOIN function d ON d.id=e.dst_fn "
+            f"WHERE {where} ORDER BY e.src_addr, e.dst_addr, e.kind LIMIT ?",
+            [*args, limit],
+        ).fetchall()
+        return [
+            Xref(
+                r["src_addr"], r["dst_addr"], r["kind"],
+                _function(r, "s_") if r["s_id"] is not None else None,
+                _function(r, "d_") if r["d_id"] is not None else None,
+            )
+            for r in rows
+        ]
+
+    def xrefs_to_address(
+        self, binary_id: int, addr: int, kinds: Sequence[str] | None = None, limit: int = 200
+    ) -> list[Xref]:
+        return self._xrefs("e.binary_id=? AND e.dst_addr=?", [binary_id, addr], kinds, limit)
+
+    def xrefs_from_address(
+        self, binary_id: int, addr: int, kinds: Sequence[str] | None = None, limit: int = 200
+    ) -> list[Xref]:
+        return self._xrefs("e.binary_id=? AND e.src_addr=?", [binary_id, addr], kinds, limit)
+
+    def xrefs_to_function(
+        self, fn: Function, kinds: Sequence[str] | None = None, limit: int = 200
+    ) -> list[Xref]:
+        """Edges whose destination is the function's entry (or lies in its body)."""
+        return self._xrefs(
+            "e.binary_id=? AND e.dst_addr>=? AND e.dst_addr<?",
+            [fn.binary_id, fn.entry, fn.entry + max(fn.size or 0, 1)], kinds, limit,
+        )
+
+    def xrefs_from_function(
+        self, fn: Function, kinds: Sequence[str] | None = None, limit: int = 200
+    ) -> list[Xref]:
+        return self._xrefs("e.binary_id=? AND e.src_fn=?", [fn.binary_id, fn.id], kinds, limit)
+
+    def callers(self, fn: Function, limit: int = 200) -> list[Function]:
+        """Distinct other functions with a call/call_ind/jump edge to fn's entry."""
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.src_fn "
+            "WHERE e.binary_id=? AND e.dst_addr=? AND e.kind IN ('call','call_ind','jump') "
+            "AND f.id<>? ORDER BY f.entry LIMIT ?",
+            (fn.binary_id, fn.entry, fn.id, limit),
+        ).fetchall()
+        return [_function(r) for r in rows]
+
+    def callees(self, fn: Function, limit: int = 200) -> list[Function]:
+        """Distinct other functions entered by a call/call_ind/jump edge from fn."""
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.dst_fn "
+            "WHERE e.src_fn=? AND e.kind IN ('call','call_ind','jump') "
+            "AND f.entry=e.dst_addr AND f.id<>? ORDER BY f.entry LIMIT ?",
+            (fn.id, fn.id, limit),
+        ).fetchall()
+        return [_function(r) for r in rows]
+
+    # -- strings / imports -------------------------------------------------
+
+    def search_strings(
+        self, binary_id: int, pattern: str, regex: bool = False, limit: int = 50,
+        with_refs: bool = True,
+    ) -> list[StringHit]:
+        """Case-insensitive substring or regex search over defined strings,
+        each with the functions holding a read/write/data edge to its address."""
+        if regex:
+            rx = re.compile(pattern, re.IGNORECASE)
+            hits: list[sqlite3.Row] = []
+            for r in self.db.execute(
+                "SELECT id, address, encoding, value FROM string WHERE binary_id=? "
+                "ORDER BY address", (binary_id,)
+            ):
+                if rx.search(r["value"]):
+                    hits.append(r)
+                    if len(hits) >= limit:
+                        break
+        else:
+            hits = self.db.execute(
+                "SELECT id, address, encoding, value FROM string WHERE binary_id=? "
+                "AND value LIKE ? ESCAPE '\\' ORDER BY address LIMIT ?",
+                (binary_id, f"%{pattern.translate(_LIKE_ESC)}%", limit),
+            ).fetchall()
+        out = []
+        for r in hits:
+            refs: tuple[Function, ...] = ()
+            if with_refs:
+                rr = self.db.execute(
+                    f"SELECT DISTINCT {_FN_SELECT} FROM edge e JOIN function f ON f.id=e.src_fn "
+                    "WHERE e.binary_id=? AND e.dst_addr=? AND e.kind IN ('read','write','data') "
+                    "ORDER BY f.entry",
+                    (binary_id, r["address"]),
+                ).fetchall()
+                refs = tuple(_function(x) for x in rr)
+            out.append(StringHit(r["id"], r["address"], r["encoding"], r["value"], refs))
+        return out
+
+    def get_string(self, string_id: int) -> StringHit | None:
+        r = self.db.execute(
+            "SELECT id, address, encoding, value FROM string WHERE id=?", (string_id,)
+        ).fetchone()
+        return StringHit(r["id"], r["address"], r["encoding"], r["value"]) if r else None
+
+    def list_imports(
+        self, binary_id: int, dll: str | None = None, limit: int = 200
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT dll, name, ordinal, address FROM import WHERE binary_id=?"
+        args: list[Any] = [binary_id]
+        if dll:
+            sql += " AND lower(dll)=lower(?)"
+            args.append(dll)
+        sql += " ORDER BY dll, name LIMIT ?"
+        args.append(limit)
+        return self.db.execute(sql, args).fetchall()
+
+    # -- decomp cache ------------------------------------------------------
+
+    def get_decomp(self, fn: Function, analysis_profile: str) -> Decomp | None:
+        """Cached decompilation, only if fn_version and analysis_profile match."""
+        r = self.db.execute(
+            "SELECT * FROM decomp WHERE function_id=? AND fn_version=? AND analysis_profile=?",
+            (fn.id, fn.version, analysis_profile),
+        ).fetchone()
+        if not r:
+            return None
+        return Decomp(r["function_id"], r["fn_version"], r["analysis_profile"], r["c_text"],
+                      r["status"], r["error"], r["produced_at"])
+
+    def get_ast_nodes(self, function_id: int, kind: str | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM ast_node WHERE function_id=?"
+        args: list[Any] = [function_id]
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        return self.db.execute(sql + " ORDER BY start_off", args).fetchall()

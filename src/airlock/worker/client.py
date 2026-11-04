@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from airlock.config import Config
 from airlock.win import jobobject
@@ -33,6 +33,42 @@ class WorkerClient:
         self._pending: dict[int, tuple[threading.Event, list[dict[str, Any]]]] = {}
         self._reader: threading.Thread | None = None
         self._log_file = None
+        # Latest progress event per program ("" when the event names none).
+        self._progress: dict[str, dict[str, Any]] = {}
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        self._event_seq = 0
+
+    # ── events ─────────────────────────────────────────────────────────────
+
+    def progress(self, program: str | None = None) -> dict[str, Any] | None:
+        """Latest progress event for a program (None if none received).
+
+        With no argument: the latest event of any program. Fields: event,
+        job, program, state (running|done|error|cancelled), pct (int|None),
+        message, elapsed_s. State "done"/"error" is terminal.
+        """
+        if program is None:
+            if not self._progress:
+                return None
+            return max(self._progress.values(), key=lambda e: e.get("_seq", 0))
+        return self._progress.get(program)
+
+    def all_progress(self) -> dict[str, dict[str, Any]]:
+        return dict(self._progress)
+
+    def on_event(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Call callback(event_dict) for every event, on the reader thread."""
+        self._listeners.append(callback)
+
+    def _dispatch_event(self, msg: dict[str, Any]) -> None:
+        if msg.get("event") == "progress":
+            self._event_seq += 1
+            self._progress[str(msg.get("program") or "")] = {**msg, "_seq": self._event_seq}
+        for cb in list(self._listeners):
+            try:
+                cb(msg)
+            except Exception:  # a bad listener must not kill the reader
+                pass
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -62,6 +98,7 @@ class WorkerClient:
             if sys.platform == "win32":
                 self.in_job = jobobject.assign(int(self.proc._handle))  # type: ignore[attr-defined]
             self.ghidra = None
+            self._progress.clear()
             self._reader = threading.Thread(target=self._read_loop, name="airlock-worker-reader",
                                             daemon=True)
             self._reader.start()
@@ -72,6 +109,9 @@ class WorkerClient:
             try:
                 msg = decode(line)
             except ValueError:
+                continue
+            if "event" in msg and "id" not in msg:
+                self._dispatch_event(msg)
                 continue
             rid = msg.get("id")
             if rid in self._pending:

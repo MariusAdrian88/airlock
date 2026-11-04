@@ -487,9 +487,11 @@ match. Invalid rows are recomputed on next request, not eagerly.
 
 The Ghidra project cannot be open in the GUI and the worker at the same time.
 `airlock close <project>` releases it; the next tool call reopens it. Changes
-made in the GUI are picked up by comparing Ghidra's program modification
-number with the one stored at close, and marking all decompiles stale if it
-changed **[verify `Program.getModificationNumber` semantics]**.
+made in the GUI are picked up by comparing the project file's last-modified
+time (`DomainFile.getLastModifiedTime()`) with the one stored at close, and
+marking all decompiles stale if it changed. `Program.getModificationNumber`
+is a per-session counter (142498 after an analysis run, 3 on reopening the
+same saved file), so it cannot be compared across sessions **[verified]**.
 
 ---
 
