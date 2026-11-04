@@ -283,6 +283,61 @@ def _analysis_thread(e: Entry, timeout_min: Any) -> None:
                    analysis_profile=e.analysis_profile)
 
 
+@op("link_externals")
+@guarded
+def link_externals(args: dict[str, Any]) -> dict[str, Any]:
+    """link_externals(links=[{program, libs: {library name (any case): target program}}]):
+    point each program's external libraries at programs of this project
+    (ExternalManager.setExternalPath), so imports resolve across binaries. Libraries the
+    program does not import are ignored. Programs being analysed are skipped."""
+    gp = S.require_project()
+    done: list[list[str]] = []
+    skipped: list[str] = []
+    for link in args.get("links") or []:
+        e = S.get_entry(link.get("program"))
+        want = {str(k).lower(): str(v) for k, v in (link.get("libs") or {}).items()}
+        if e.state == ANALYSING:
+            skipped.append(e.name)
+            continue
+        with e.lock:
+            em = e.program.getExternalManager()
+            todo = []
+            for lib in (str(n) for n in em.getExternalLibraryNames()):
+                target = want.get(lib.lower())
+                if target is None or target == e.name:
+                    continue
+                if gp.getRootFolder().getFile(target) is None:
+                    continue
+                path = "/" + target
+                if str(em.getExternalLibraryPath(lib) or "") != path:
+                    todo.append((lib, path))
+            if not todo:
+                continue
+            tx = e.program.startTransaction("airlock link externals")
+            ok = False
+            try:
+                for lib, path in todo:
+                    em.setExternalPath(lib, path, True)
+                ok = True
+            finally:
+                e.program.endTransaction(tx, ok)
+            gp.save(e.program)
+            done += [[e.name, lib, path] for lib, path in todo]
+    return {"linked": done, "skipped": skipped}
+
+
+@op("external_paths")
+@guarded
+def external_paths(args: dict[str, Any]) -> dict[str, Any]:
+    """external_paths(program): {library name: project path or ''} of the program's externals."""
+    e = S.get_entry(args.get("program"))
+    with e.lock:
+        em = e.program.getExternalManager()
+        return {"program": e.name,
+                "paths": {str(n): str(em.getExternalLibraryPath(n) or "")
+                          for n in em.getExternalLibraryNames()}}
+
+
 @op("cancel_analysis")
 @guarded
 def cancel_analysis(args: dict[str, Any]) -> dict[str, Any]:

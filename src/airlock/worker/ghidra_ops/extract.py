@@ -31,6 +31,7 @@ FUNCTION_COLUMNS = ["space", "entry", "name", "name_state", "source", "namespace
                     "calling_conv", "size", "is_thunk", "is_external"]
 IMPORT_COLUMNS = ["dll", "name", "ordinal", "space", "address"]
 STRING_COLUMNS = ["space", "address", "encoding", "length", "value"]
+EXPORT_COLUMNS = ["name", "ordinal", "space", "address"]
 EDGE_COLUMNS = ["src_addr", "src_fn", "dst_space", "dst_addr", "dst_fn", "kind"]
 
 
@@ -117,6 +118,21 @@ def _imports(p: Any) -> Iterator[list[Any]]:
                    S.addr_int(slot) if slot is not None else None]
 
 
+# ── exports ────────────────────────────────────────────────────────────────
+
+def _exports(p: Any) -> Iterator[list[Any]]:
+    """External entry points (PE export table). Ordinal-only exports are named
+    ``Ordinal_N`` by the PE loader."""
+    st = p.getSymbolTable()
+    it = st.getExternalEntryPointIterator()
+    while it.hasNext():
+        a = it.next()
+        sym = st.getPrimarySymbol(a)
+        name = str(sym.getName()) if sym is not None else None
+        m = _ORDINAL.match(name or "")
+        yield [name, int(m.group(1)) if m else None, S.space_of(a), S.addr_int(a)]
+
+
 # ── strings ────────────────────────────────────────────────────────────────
 
 def _encoding(dt_name: str) -> str:
@@ -201,6 +217,7 @@ KINDS: dict[str, tuple[list[str], Callable[[Any], Iterator[list[Any]]]]] = {
     "functions": (FUNCTION_COLUMNS, _functions),
     "imports": (IMPORT_COLUMNS, _imports),
     "strings": (STRING_COLUMNS, _strings),
+    "exports": (EXPORT_COLUMNS, _exports),
     "edges": (EDGE_COLUMNS, _edges),
 }
 
@@ -221,7 +238,7 @@ def _cursor_for(e: Entry, kind: str, offset: int) -> Cursor:
 @guarded
 def extract(args: dict[str, Any]) -> dict[str, Any]:
     """extract(program, kind, offset=0, limit=2000): one batch of rows of
-    kind functions | imports | strings | edges."""
+    kind functions | imports | strings | exports | edges."""
     e = S.ready_entry(args.get("program"))
     kind = args.get("kind")
     if kind not in KINDS:

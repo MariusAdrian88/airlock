@@ -1,4 +1,4 @@
--- airlock index schema v1 (M1 subset of DESIGN.md section 4).
+-- airlock index schema v2 (M1 subset of DESIGN.md section 4 plus export/xedge).
 CREATE TABLE binary (
   id            INTEGER PRIMARY KEY,
   sha256        TEXT NOT NULL UNIQUE,
@@ -87,6 +87,26 @@ CREATE TABLE import (
   address       INTEGER
 );
 CREATE INDEX import_by_binary ON import(binary_id, dll);
+
+CREATE TABLE export (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  name          TEXT,
+  ordinal       INTEGER,
+  address       INTEGER NOT NULL
+);
+CREATE INDEX export_by_name ON export(binary_id, name);
+CREATE INDEX export_by_ordinal ON export(binary_id, ordinal);
+
+-- cross-binary edges: an import slot (or its thunk) in src_binary -> function entry in dst_binary
+CREATE TABLE xedge (
+  src_binary    INTEGER NOT NULL REFERENCES binary(id),
+  src_addr      INTEGER NOT NULL,
+  dst_binary    INTEGER NOT NULL REFERENCES binary(id),
+  dst_entry     INTEGER NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'import'
+);
+CREATE INDEX xedge_src ON xedge(src_binary, src_addr);
+CREATE INDEX xedge_dst ON xedge(dst_binary, dst_entry);
 
 CREATE VIRTUAL TABLE fts USING fts5(
   kind, ref_id UNINDEXED, binary_id UNINDEXED, text,

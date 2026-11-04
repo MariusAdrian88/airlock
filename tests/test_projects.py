@@ -41,7 +41,7 @@ def test_layout(tmp_path):
     pp = P.project_paths(tmp_path, "a b")
     assert pp.root == tmp_path / "a_b"
     assert pp.data == pp.root / "dirty" / ".airlock"
-    assert pp.ghidra == pp.data / "ghidra" and pp.index_db == pp.data / "index.sqlite"
+    assert pp.ghidra == pp.root / "dirty" / "airlock_ghidra" and pp.index_db == pp.data / "index.sqlite"
     assert pp.specs == pp.root / "clean" / "specs"
     for d in (pp.ghidra, pp.artifacts, pp.cache, pp.logs, pp.specs):
         assert d.is_dir()

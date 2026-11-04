@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import anyio.to_thread
-from mcp.server.mcpserver import Context as McpContext
 
 from airlock.config.catalog import CATALOG
 from airlock.server import roles
@@ -56,15 +55,7 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
     params = [p.replace(annotation=hints.get(p.name, p.annotation))
               for p in list(sig.parameters.values())[1:]]
 
-    ctx_param = inspect.Parameter("mcp_ctx", inspect.Parameter.KEYWORD_ONLY, default=None,
-                                  annotation=McpContext)
-
-    async def bound(*args: Any, mcp_ctx: Any = None, **kwargs: Any) -> str:
-        if not ctx.roots_done and mcp_ctx is not None:
-            try:
-                await ctx.ensure_roots(mcp_ctx.request_context.session)
-            except ValueError:  # no request context (direct call)
-                pass
+    async def bound(*args: Any, **kwargs: Any) -> str:
         refusal = roles.gate(ctx.session, impl.name)
         if refusal is not None:
             return refusal
@@ -72,11 +63,11 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
 
     bound.__name__ = impl.name
     bound.__doc__ = impl.description
-    bound.__signature__ = sig.replace(parameters=[*params, ctx_param], return_annotation=str)  # type: ignore[attr-defined]
-    bound.__annotations__ = {p.name: p.annotation for p in params} | {"mcp_ctx": McpContext, "return": str}
+    bound.__signature__ = sig.replace(parameters=params, return_annotation=str)  # type: ignore[attr-defined]
+    bound.__annotations__ = {p.name: p.annotation for p in params} | {"return": str}
     return bound
 
 
 def load_tool_modules() -> None:
     """Import every module that defines tools (each registers on import)."""
-    from airlock.server.tools import admin, core, project, project_create  # noqa: F401
+    from airlock.server.tools import admin, core, project, project_create, queue, session  # noqa: F401

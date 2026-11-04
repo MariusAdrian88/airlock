@@ -1,6 +1,6 @@
 """project_create: make a project folder from a scanned program (DESIGN 5.0).
 
-Allowed only in an unbound session (registry gating). Needs a name (TODO: MCP
+Allowed only in an unbound session (registry gating); success binds it as dirty. Needs a name (TODO: MCP
 elicitation when the client supports it), then an option from the scan table.
 """
 
@@ -17,6 +17,7 @@ from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
 from airlock.server.registry import tool
 from airlock.server.scan import render_scan, scan_program
+from airlock.server.tools.session import dirty_lines
 
 _MB = 1 << 20
 
@@ -43,6 +44,8 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
         return ("error need_name: a project name is required. Ask the user for a project "
                 "name and call again with name=.")
     cfg = ctx.config
+    if ctx.profile_role and ctx.profile_role != "dirty":
+        return f"error wrong_role: this server was started with --profile {ctx.profile_role}."
     slug = slugify(name)
     pp = project_paths(cfg.projects_root, slug, create=False)
     if pp.root.exists():
@@ -121,10 +124,11 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
 
     code = sum(f.code_size for f in selected)
     rest = len(pes) - 1
+    bound = ctx.bind_session("dirty", pp)
     return "\n".join([
         f"project {slug} created at {pp.root}",
         f"option {key}: {len(selected)} files ({len(pes)} executables), {code / _MB:.1f} MB code",
         f"root {root_f.rel_path}: {root_note}; {rest} other executables queued",
         f"deny rules for the clean folder written in {pp.clean}",
-        f"Open the MCP client in {pp.dirty} to continue.",
+        *(dirty_lines(pp) if bound is None else [bound]),
     ])

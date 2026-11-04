@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +46,7 @@ MANIFEST_HEADER = (
 
 @dataclass(frozen=True)
 class ProjectPaths:
-    """<projects_root>/<name>/{airlock-project.jsonc, dirty/.airlock/..., clean/specs}."""
+    """<projects_root>/<name>/{airlock-project.jsonc, dirty/{.airlock/..., airlock_ghidra}, clean/specs}."""
 
     root: Path
     name: str
@@ -69,7 +69,9 @@ class ProjectPaths:
 
     @property
     def ghidra(self) -> Path:
-        return self.data / "ghidra"
+        # Not under .airlock: Ghidra rejects project paths with a '.'-prefixed element
+        # ("Path element starting with '.' is not permitted"), verified with 12.1.4.
+        return self.dirty / "airlock_ghidra"
 
     @property
     def artifacts(self) -> Path:
@@ -98,7 +100,15 @@ class ProjectPaths:
 
 
 def read_manifest(path: Path) -> dict:
-    data = json5.loads(Path(path).read_text("utf-8-sig"))
+    for attempt in range(10):  # Windows: reading while write_manifest replaces the file
+        try:
+            text = Path(path).read_text("utf-8-sig")
+            break
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.02)
+    data = json5.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"{path}: manifest must be an object")
     return data
@@ -110,7 +120,14 @@ def write_manifest(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
     tmp.write_text(MANIFEST_HEADER + json.dumps(data, indent=2, ensure_ascii=False) + "\n", "utf-8")
-    tmp.replace(path)
+    for attempt in range(25):  # Windows: replace fails while a reader has the file open
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 24:
+                raise
+            time.sleep(0.02)
 
 
 def new_manifest(name: str) -> dict:
@@ -136,27 +153,49 @@ def list_projects(root: Path) -> list[str]:
     return sorted(p.name for p in root.iterdir() if (p / MANIFEST_NAME).is_file())
 
 
-def _norm(p: Path) -> str:
-    return os.path.normcase(os.path.normpath(str(p)))
-
-
-def locate_project(workspace: Path) -> tuple[str, ProjectPaths] | None:
-    """(role, project) when the workspace is the dirty or clean folder of a project, or
-    below it. Walks up looking for the marker; the marker's folder must have a dirty or
-    clean child that contains the workspace. Otherwise None."""
-    try:
-        ws = Path(workspace).resolve()
-    except OSError:
-        return None
-    for cand in (ws, *ws.parents):
-        if not (cand / MANIFEST_NAME).is_file():
-            continue
-        pp = ProjectPaths(cand, cand.name)
-        for role, folder in (("dirty", pp.dirty), ("clean", pp.clean)):
-            f, w = _norm(folder), _norm(ws)
-            if w == f or w.startswith(f + os.sep):
-                return role, pp
+def find_project(root: Path, name: str) -> ProjectPaths | None:
+    """The project called ``name`` (exact, case-insensitive, or as its slug), or None."""
+    want = {name.strip().lower(), slugify(name).lower()}
+    for n in list_projects(root):
+        if n.lower() in want:
+            return ProjectPaths(Path(root) / n, n)
     return None
+
+
+def count_specs(pp: ProjectPaths) -> int:
+    """Published specs in clean/specs: entries of specs.json, else the Markdown files."""
+    idx = pp.specs / "specs.json"
+    if idx.is_file():
+        try:
+            data = json5.loads(idx.read_text("utf-8-sig"))
+            items = data.get("specs", []) if isinstance(data, dict) else data
+            if isinstance(items, list):
+                return len(items)
+        except ValueError:
+            pass
+    return len(list(pp.specs.glob("*.md"))) if pp.specs.is_dir() else 0
+
+
+@dataclass(frozen=True)
+class ProjectSummary:
+    root_exe: str
+    ready: int
+    queued: int
+    errors: int
+
+
+def summarize(pp: ProjectPaths) -> ProjectSummary:
+    """Binary counts from the manifest (state ready / error / anything else = queued)."""
+    try:
+        man = read_manifest(pp.manifest)
+    except (OSError, ValueError):
+        return ProjectSummary("?", 0, 0, 0)
+    files = [f for f in man.get("files") or [] if isinstance(f, dict) and f.get("kind") == "pe"]
+    states = [str(f.get("state", "queued")) for f in files]
+    ready = states.count("ready")
+    errors = states.count("error")
+    root_exe = str((man.get("source") or {}).get("root_exe") or "?")
+    return ProjectSummary(root_exe, ready, len(states) - ready - errors, errors)
 
 
 def _claude_rule_path(p: Path) -> str:

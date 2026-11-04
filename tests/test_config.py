@@ -42,10 +42,11 @@ def test_writes_off_removes_annotate_tools(tmp_path):
     assert any(i.level == "info" and "rename" in i.message for i in cfg.issues)
 
 
-def test_clean_profile_exposes_only_spec_tools(tmp_path):
+def test_clean_profile_exposes_only_clean_safe_tools(tmp_path):
     cfg = load_config(write_default_config(tmp_path / "c.jsonc"), "clean")
     assert cfg.is_clean
-    assert set(cfg.tools) == {"spec_read", "spec_list", "spec_export"}
+    assert set(cfg.tools) == {"spec_read", "spec_list", "spec_export", "projects",
+                              "project_open", "project_info"}
     assert not any(i.level == "error" for i in cfg.issues)  # no ghidra_dir needed
 
 

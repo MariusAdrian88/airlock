@@ -34,9 +34,10 @@
       "allow_writes": true
     },
     "clean": {
-      // A clean profile may only contain spec_read, spec_list, spec_export.
+      // A clean profile may only contain clean-safe tools: the spec_read tools and
+      // the role-aware session tools.
       "role": "clean",
-      "enabled_sets": ["spec_read"]
+      "enabled_sets": ["spec_read", "session"]
     }
   },
 
@@ -59,7 +60,8 @@
     "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
     "spec_write": ["spec_write", "spec_list"],
     "spec_read": ["spec_read", "spec_list", "spec_export"],
+    "session": ["projects", "project_open", "project_info"],
     "admin": ["index_status", "reindex", "project_info", "frontier", "program_scan",
-              "project_create"]
+              "projects", "project_open", "project_create", "program_add"]
   }
 }

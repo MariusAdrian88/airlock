@@ -6,7 +6,8 @@ reported by `airlock doctor` and at startup.
 
 Flags:
   writes      modifies the Ghidra project; hidden unless allow_writes is on
-  clean_safe  returns no code, addresses or bytes; allowed in a clean profile
+  clean_safe  returns no code, addresses or bytes (or redacts by session role);
+              allowed in a clean profile and in a clean session
 """
 
 from __future__ import annotations
@@ -42,7 +43,9 @@ CATALOG: dict[str, ToolInfo] = {
         *_set("fileformat", ["ole_streams", "hexdump", "file_diff", "record_guess"]),
         *_set("spec_write", ["spec_write"]),
         *_set("spec_read", ["spec_read", "spec_list", "spec_export"], clean_safe=True),
-        *_set("admin", ["index_status", "reindex", "project_info", "frontier",
-                       "program_scan", "project_create"]),
+        *_set("admin", ["index_status", "reindex", "frontier", "program_scan",
+                       "project_create", "program_add"]),
+        # Role-aware: they redact their output in a clean session.
+        *_set("admin", ["projects", "project_open", "project_info"], clean_safe=True),
     ]
 }

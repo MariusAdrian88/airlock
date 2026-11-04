@@ -1,4 +1,4 @@
-"""Role from workspace, tool gating, project_create, manifest and deny rules (no Ghidra)."""
+"""Session roles, tool gating, project_create, manifest and deny rules (no Ghidra)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ from pathlib import Path
 
 import anyio
 import pytest
-from mcp import types
-from mcp.client import Client
 
 from airlock import projects as P
 from airlock.config.loader import deep_merge, default_config_text, parse_jsonc, resolve
@@ -30,11 +28,6 @@ def make_project(root: Path, name="demo") -> P.ProjectPaths:
     return P.project_paths(root, name, create=True)
 
 
-@pytest.fixture(autouse=True)
-def _no_env(monkeypatch):
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
-
-
 # -- config / layout / manifest ------------------------------------------------
 
 def test_projects_root_config(tmp_path):
@@ -53,80 +46,7 @@ def test_manifest_round_trip(tmp_path):
     assert P.read_manifest(f) == data
 
 
-# -- role resolution -------------------------------------------------------------
-
-def test_role_table(tmp_path):
-    pp = make_project(tmp_path)
-    (pp.dirty / "sub" / "deep").mkdir(parents=True)
-    cases = [
-        (pp.dirty, "dirty"), (pp.dirty / "sub" / "deep", "dirty"),
-        (pp.clean, "clean"), (pp.specs, "clean"),
-        (pp.root, "unbound"), (tmp_path, "unbound"),
-    ]
-    for ws, role in cases:
-        s = roles.resolve_session(ws, "cwd")
-        assert s.role == role, ws
-        assert (s.project.name if s.project else None) == (None if role == "unbound" else "demo")
-
-
-def test_folder_named_dirty_without_marker_is_unbound(tmp_path):
-    (tmp_path / "x" / "dirty").mkdir(parents=True)
-    assert roles.resolve_session(tmp_path / "x" / "dirty", "cwd").role == "unbound"
-
-
-def test_profile_override(tmp_path):
-    pp = make_project(tmp_path)
-    assert roles.resolve_session(pp.dirty, "cwd", "dirty").role == "dirty"
-    with pytest.raises(roles.RoleConflict, match="clean"):
-        roles.resolve_session(pp.dirty, "cwd", "clean")
-    s = roles.resolve_session(tmp_path, "cwd", "clean")  # unbound folder: profile applies
-    assert (s.role, s.project, s.source) == ("clean", None, "profile")
-
-
-def test_workspace_detection_order(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert roles.detect_workspace()[1] == "cwd"
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "env"))
-    assert roles.detect_workspace() == (tmp_path / "env", "env CLAUDE_PROJECT_DIR")
-    ws, src = roles.detect_workspace([(tmp_path / "r").as_uri()])
-    assert src == "roots" and ws.name == "r"
-
-
-def test_build_server_start_role_and_conflict(tmp_path, monkeypatch):
-    pp = make_project(tmp_path / "projects")
-    monkeypatch.chdir(pp.clean)
-    _, ctx = build_server(_cfg(tmp_path))
-    assert ctx.session.role == "clean" and ctx.session.source == "cwd"
-    with pytest.raises(roles.RoleConflict):
-        build_server(_cfg(tmp_path, "dirty"), profile_explicit=True)
-    build_server(_cfg(tmp_path, "clean"), profile_explicit=True)
-
-
-# -- gating -----------------------------------------------------------------------
-
-@pytest.mark.parametrize("tool", ["open_binary", "function", "index_status", "spec_write"])
-def test_unbound_blocks_other_tools(tool):
-    assert roles.gate(roles.SessionState(), tool).startswith("error unbound:")
-
-
-@pytest.mark.parametrize("tool", ["program_scan", "project_create", "project_info"])
-def test_unbound_allows(tool):
-    assert roles.gate(roles.SessionState(), tool) is None
-
-
-def test_clean_only_clean_safe(tmp_path):
-    s = roles.resolve_session(make_project(tmp_path).clean, "cwd")
-    for t in ("spec_read", "spec_list", "spec_export"):
-        assert roles.gate(s, t) is None
-    for t in ("function", "project_info", "project_create", "spec_write"):
-        assert roles.gate(s, t).startswith("error wrong_role:")
-
-
-def test_dirty_blocks_project_create_only(tmp_path):
-    s = roles.resolve_session(make_project(tmp_path).dirty, "cwd")
-    assert roles.gate(s, "project_create").startswith("error wrong_role: already in project demo")
-    assert roles.gate(s, "function") is None and roles.gate(s, "program_scan") is None
-
+# -- gating and session tools ---------------------------------------------------------
 
 def _call(server, name, args=None):
     async def go():
@@ -134,55 +54,117 @@ def _call(server, name, args=None):
     return anyio.run(go)
 
 
-def test_gate_applies_through_server_and_clean_never_opens_index(tmp_path, monkeypatch):
+def _server(tmp_path, profile="dirty", explicit=False):
     pp = make_project(tmp_path / "projects")
-    monkeypatch.chdir(pp.clean)
-    server, ctx = build_server(_cfg(tmp_path))
-    assert _call(server, "index_status").startswith("error wrong_role:")
-    assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
+    man = P.read_manifest(pp.manifest)
+    man.update({"source": {"root_exe": "app.exe"}, "files": [
+        {"path": "app.exe", "kind": "pe", "state": "ready"},
+        {"path": "a.dll", "kind": "pe", "state": "queued"},
+        {"path": "d.bin", "kind": "data", "state": "queued"}]})
+    P.write_manifest(pp.manifest, man)
+    (pp.specs / "one.md").write_text("x")
+    server, ctx = build_server(_cfg(tmp_path, profile), profile_explicit=explicit)
+    return server, ctx, pp
+
+
+@pytest.mark.parametrize("tool", ["open_binary", "function", "index_status", "spec_write"])
+def test_unbound_blocks_other_tools(tool):
+    assert roles.gate(roles.SessionState(), tool).startswith("error unbound:")
+
+
+@pytest.mark.parametrize("tool", ["projects", "project_open", "project_create", "program_scan",
+                                  "project_info"])
+def test_unbound_allows(tool):
+    assert roles.gate(roles.SessionState(), tool) is None
+
+
+def test_clean_gate(tmp_path):
+    s = roles.SessionState(roles.CLEAN, make_project(tmp_path))
+    for t in ("spec_read", "spec_list", "spec_export", "projects", "project_info"):
+        assert roles.gate(s, t) is None
+    for t in ("function", "program_scan", "spec_write"):
+        assert roles.gate(s, t).startswith("error wrong_role:")
+    for t in ("project_open", "project_create"):
+        assert roles.gate(s, t).startswith("error role_locked:")
+
+
+def test_dirty_gate(tmp_path):
+    s = roles.SessionState(roles.DIRTY, make_project(tmp_path))
+    assert roles.gate(s, "function") is None and roles.gate(s, "program_scan") is None
+    for t in ("project_open", "project_create"):
+        assert roles.gate(s, t).startswith("error role_locked:")
+
+
+def test_new_session_is_unbound(tmp_path):
+    server, ctx, pp = _server(tmp_path)
+    assert ctx.session.role == "unbound"
+    assert _call(server, "function", {"query": "x"}).startswith("error unbound:")
     assert not pp.index_db.exists()
-    monkeypatch.chdir(tmp_path)
-    server, _ = build_server(_cfg(tmp_path))
-    assert _call(server, "index_status").startswith("error unbound:")
+
+
+def test_projects_lists_full_when_not_clean(tmp_path):
+    server, ctx, pp = _server(tmp_path)
+    assert _call(server, "projects") == (
+        f"demo | root app.exe | binaries 1 ready/1 queued | specs 1 | {pp.root}")
+
+
+def test_project_open_dirty_then_locked(tmp_path):
+    server, ctx, pp = _server(tmp_path)
+    out = _call(server, "project_open", {"name": "demo", "role": "dirty"})
+    assert out.splitlines()[0] == (
+        f"session dirty for demo: write notes and scratch files only under {pp.dirty}")
+    assert out.splitlines()[1] == "binaries: 1 ready, 1 queued"
+    assert ctx.session.role == "dirty" and ctx.indexer.current == "demo"
+    locked = ("error role_locked: this session is already dirty for demo. "
+              "Start a new session for other work.")
+    assert _call(server, "project_open", {"name": "demo", "role": "clean"}) == locked
+    assert _call(server, "project_open", {"name": "nope", "role": "dirty"}) == locked
+    assert _call(server, "project_create", {"path": str(tmp_path), "name": "z"}) == locked
+    assert ctx.session.role == "dirty"
+
+
+def test_project_open_clean_and_redaction(tmp_path):
+    server, ctx, pp = _server(tmp_path)
+    out = _call(server, "project_open", {"name": "demo", "role": "clean"})
+    assert out == (f"session clean for demo: write the implementation under {pp.clean}; "
+                   f"never read {pp.dirty}. Specs: 1 published in {pp.specs}")
+    assert _call(server, "projects") == "demo | specs 1"
     info = _call(server, "project_info")
-    assert "session role unbound" in info and "(from cwd)" in info
+    assert "role clean | project demo" in info
+    for leak in (str(tmp_path), "app.exe", "ghidra", "jdk", "config"):
+        assert leak not in info
+    assert "function" not in info and "project_open" in info
+    assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
+    assert _call(server, "project_open", {"name": "demo", "role": "dirty"}).startswith(
+        "error role_locked:")
 
 
-def test_roots_decide_role_over_cwd(tmp_path, monkeypatch):
-    pp = make_project(tmp_path / "projects")
-    monkeypatch.chdir(tmp_path)  # cwd unbound
-    server, ctx = build_server(_cfg(tmp_path))
-
-    async def cb(context):
-        return types.ListRootsResult(roots=[types.Root(uri=pp.clean.as_uri())])
-
-    async def go():
-        # legacy handshake (what stdio clients use): the server may call roots/list
-        async with Client(server, list_roots_callback=cb, mode="legacy") as c:
-            with anyio.fail_after(10):
-                while not ctx.roots_done:  # resolved by notifications/initialized
-                    await anyio.sleep(0.01)
-            assert ctx.session.source == "roots"
-            r = await c.call_tool("index_status", {})
-            return r.content[0].text
-
-    assert anyio.run(go).startswith("error wrong_role:")
-    assert ctx.session.role == "clean" and ctx.session.source == "roots"
+def test_project_open_errors(tmp_path):
+    server, ctx, _ = _server(tmp_path)
+    assert _call(server, "project_open", {"name": "nope", "role": "dirty"}).startswith(
+        "error not_found: no project 'nope'. Call projects")
+    assert _call(server, "project_open", {"name": "demo", "role": "x"}).startswith("error bad_role:")
+    assert ctx.session.role == "unbound"  # failures do not bind
+    assert _call(server, "project_open", {"name": "DEMO", "role": "Dirty"}).startswith("session dirty")
 
 
-def test_client_without_roots_keeps_cwd(tmp_path, monkeypatch):
-    pp = make_project(tmp_path / "projects")
-    monkeypatch.chdir(pp.dirty)
-    server, ctx = build_server(_cfg(tmp_path))
+def test_profile_mismatch(tmp_path):
+    server, ctx, _ = _server(tmp_path, "clean", explicit=True)
+    assert _call(server, "project_open", {"name": "demo", "role": "dirty"}) == (
+        "error wrong_role: this server was started with --profile clean.")
+    assert ctx.session.role == "unbound"
+    assert _call(server, "projects") == "demo | specs 1"  # clean profile redacts when unbound too
+    assert _call(server, "project_open", {"name": "demo", "role": "clean"}).startswith("session clean")
+    server, ctx, _ = _server(tmp_path / "b", "dirty", explicit=True)
+    assert _call(server, "project_open", {"name": "demo", "role": "dirty"}).startswith("session dirty")
+    server, ctx, _ = _server(tmp_path / "c", "dirty")  # not explicit: no restriction
+    assert _call(server, "project_open", {"name": "demo", "role": "clean"}).startswith("session clean")
 
-    async def go():
-        async with Client(server) as c:
-            with anyio.fail_after(10):
-                r = await c.call_tool("project_create", {"path": str(tmp_path), "name": "z"})
-            return r.content[0].text
 
-    assert "already in project demo" in anyio.run(go)
-    assert ctx.session.role == "dirty" and ctx.session.source == "cwd"
+def test_clean_profile_lists_session_tools_only(tmp_path):
+    server, _ = build_server(_cfg(tmp_path, "clean"))
+    names = {t.name for t in anyio.run(server.list_tools)}
+    assert names == {"projects", "project_open", "project_info"}
 
 
 # -- project_create ------------------------------------------------------------------
@@ -228,7 +210,10 @@ def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
     out = pc.project_create(ctx, str(fake_scan), name="My Prog", option="b", remove="core.dll",
                             add="data.bin")
     root = tmp_path / "projects" / "My_Prog"
-    assert out.splitlines()[-1] == f"Open the MCP client in {root / 'dirty'} to continue."
+    assert out.splitlines()[-2] == (
+        f"session dirty for My_Prog: write notes and scratch files only under {root / 'dirty'}")
+    assert ctx.session.role == "dirty" and ctx.session.project.name == "My_Prog"
+    assert "Open the MCP client" not in out
     man = P.read_manifest(root / P.MANIFEST_NAME)
     assert man["selected_option"] == "B" and man["source"]["root_exe"] == "app.exe"
     paths = {f["path"]: f for f in man["files"]}
@@ -239,7 +224,6 @@ def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
     for f in man["files"]:
         assert (root / "dirty" / ".airlock" / "artifacts" / f["sha256"]).is_file()
     assert (root / "clean" / "specs").is_dir()
-    assert roles.resolve_session(root / "dirty", "cwd").role == "dirty"
     assert pc.project_create(ctx, str(fake_scan), name="my prog!", option="A").startswith("error exists:")
     assert pc.project_create(ctx, str(fake_scan), name="q", option="Z").startswith("error bad_option:")
     assert pc.project_create(ctx, str(fake_scan), name="q", option="A",

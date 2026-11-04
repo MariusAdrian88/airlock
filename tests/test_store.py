@@ -63,17 +63,17 @@ def test_migration_hook(tmp_path, monkeypatch):
         calls.append(1)
         db.execute("CREATE TABLE extra(x)")
 
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 2)
-    monkeypatch.setitem(store_mod.MIGRATIONS, 2, mig)
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 3)
+    monkeypatch.setitem(store_mod.MIGRATIONS, 3, mig)
     s = Store(p)
-    assert calls == [1] and s.schema_version == 2
+    assert calls == [1] and s.schema_version == 3
     s.close()
 
 
 def test_missing_migration_and_newer_schema(tmp_path, monkeypatch):
     p = tmp_path / "i.sqlite"
     Store(p).close()
-    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 3)
     with pytest.raises(RuntimeError):
         Store(p)
     monkeypatch.setattr(store_mod, "SCHEMA_VERSION", 0)
@@ -233,3 +233,75 @@ def test_reinsert_same_content_keeps_version(st, bid):
         st.insert_functions(bid, [{**row, **{k: v for k, v in change.items()}}])  # same again
         assert st.function_at(bid, 0x1000).version == after.version
         st.insert_functions(bid, [row])  # back (counts as another change; fine)
+
+
+# -- schema v2: exports and cross-binary edges ---------------------------------------
+
+def test_migration_v1_to_v2(tmp_path):
+    p = tmp_path / "old.sqlite"
+    s = Store(p)
+    b = s.upsert_binary("ab" * 32, "app.exe")
+    with s.db:
+        for t in ("xedge", "export"):
+            s.db.execute(f"DROP TABLE {t}")
+        s.set_meta("schema_version", "1")
+    s.close()
+    s = Store(p)
+    assert s.schema_version == 2
+    s.insert_exports(b, [("Foo", 1, 0x1000)])
+    assert [tuple(r) for r in s.exports_of(b)] == [("Foo", 1, 0x1000)]
+    assert s.cross_counts(b) == (0, 0)
+    assert s.get_binary_by_id(b).name == "app.exe"  # data kept
+    s.close()
+
+
+@pytest.fixture
+def two(st):
+    """app.exe imports Foo (by name, thunk + slot), Bar (by ordinal) and Baz (missing) from
+    lib.dll; lib.dll exports them."""
+    app = st.upsert_binary("aa" * 32, "app.exe")
+    lib = st.upsert_binary("bb" * 32, "Lib.DLL")
+    st.insert_functions(app, [
+        {"entry": 0x1000, "name": "main", "name_state": "user", "size": 0x40},
+        {"entry": 0x1100, "name": "Foo", "name_state": "library", "size": 6, "is_thunk": True},
+        {"entry": 1, "space": "EXTERNAL", "name": "Foo", "name_state": "library", "is_external": True},
+    ])
+    st.insert_imports(app, [("lib.dll", "Foo", None, 0x3000), ("LIB.DLL", "Ordinal_7", 7, 0x3008),
+                            ("lib.dll", "Baz", None, 0x3010), ("other.dll", "Foo", None, 0x3018)])
+    st.insert_edges(app, [(0x1010, 0x1100, "call"), (0x1020, 0x3000, "call_ind")])
+    st.link_edges(app)
+    st.insert_functions(lib, [
+        {"entry": 0x2000, "name": "Foo", "name_state": "auto", "size": 0x30},
+        {"entry": 0x2100, "name": "FUN_2100", "name_state": "auto", "size": 0x30},
+    ])
+    st.insert_exports(lib, [("Foo", None, 0x2000), ("Ordinal_7", 7, 0x2110)])
+    return app, lib
+
+
+def test_cross_binary_links_both_directions(st, two):
+    app, lib = two
+    assert st.link_cross_binary(lib, [app]) == 2  # Foo by name, Ordinal_7 by ordinal
+    # importer side: slot and thunk of Foo, slot of the ordinal import (inside FUN_2100)
+    got = {(x.src_addr, x.dst_entry, x.kind) for x in st.cross_from_binary(app)}
+    assert got == {(0x3000, 0x2000, "import"), (0x1100, 0x2000, "import"),
+                   (0x3008, 0x2100, "import")}
+    assert st.cross_from_address(app, 0x1100)[0].dst_fn.name == "Foo"
+    assert st.cross_from_address(app, 0x1100)[0].src_fn.name == "Foo"  # the thunk itself
+    assert st.cross_from_address(app, 0x3018) == []  # other.dll is not in the project
+    foo = st.function_at(lib, 0x2000)
+    assert {x.src_addr for x in st.cross_to_function(foo)} == {0x3000, 0x1100}
+    assert st.cross_counts(app) == (3, 0) and st.cross_counts(lib) == (0, 3)
+    # idempotent, and from the importer's side too
+    assert st.link_cross_binary(app, [lib]) == 2
+    assert st.cross_counts(app) == (3, 0)
+
+
+def test_clear_binary_data_drops_exports_and_links(st, two):
+    app, lib = two
+    st.link_cross_binary(app, [lib])
+    st.clear_binary_data(lib)
+    assert st.exports_of(lib) == [] and st.cross_counts(app) == (0, 0)
+    st.insert_exports(lib, [("Foo", None, 0x2000)])
+    st.insert_functions(lib, [{"entry": 0x2000, "name": "Foo", "name_state": "auto", "size": 4}])
+    st.link_cross_binary(lib, [app])
+    assert st.cross_counts(app) == (2, 0)  # Foo only: slot + thunk

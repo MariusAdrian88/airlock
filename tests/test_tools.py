@@ -19,6 +19,7 @@ FN_COLS = ["space", "entry", "name", "name_state", "source", "namespace", "signa
 EDGE_COLS = ["src_addr", "src_fn", "dst_space", "dst_addr", "dst_fn", "kind"]
 STR_COLS = ["space", "address", "encoding", "length", "value"]
 IMP_COLS = ["dll", "name", "ordinal", "space", "address"]
+EXP_COLS = ["name", "ordinal", "space", "address"]
 
 FUNCTIONS = [
     ["ram", 0x401000, "main", "user", "USER_DEFINED", None, "int main(void)", "__cdecl", 0x40, 0, 0],
@@ -43,8 +44,10 @@ STRINGS = [
     ["OTHER", 0x10, "ascii", 3, "xyz"],
 ]
 IMPORTS = [["KERNEL32.DLL", "CreateFileW", None, "ram", 0x402000]]
+EXPORTS = [["main", None, "ram", 0x401000]]
 DATA = {"functions": (FN_COLS, FUNCTIONS), "edges": (EDGE_COLS, EDGES),
-        "strings": (STR_COLS, STRINGS), "imports": (IMP_COLS, IMPORTS)}
+        "strings": (STR_COLS, STRINGS), "imports": (IMP_COLS, IMPORTS),
+        "exports": (EXP_COLS, EXPORTS)}
 
 C_TEXT = "void main(void)\n{\n  OnFoo();\n  FUN_00401200();\n  return;\n}\n"
 
@@ -172,7 +175,7 @@ def test_row_mapping():
 def test_run_extraction_pages_and_links(ctx):
     st = ctx.indexer.store("proj")
     b = st.list_binaries()[0]
-    assert ctx.worker.count("extract") == 7  # page size 3 forces several requests
+    assert ctx.worker.count("extract") == 8  # page size 3 forces several requests
     assert st.counts(b.id)["functions"] == 5
     assert st.counts(b.id)["edges"] == 7
     main = st.function_at(b.id, 0x401000)

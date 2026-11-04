@@ -1,19 +1,24 @@
 """Indexing orchestration (DESIGN.md section 5), server side. Never imports pyghidra.
 
-open_binary: detect + hash + copy + register (status ``queued``), then a job
-thread drives the worker: ensure_ghidra, open_project, import_binary, analyze.
-When the worker reports analysis ``done``, a second thread pages through the
-``extract`` kinds into the project's Store, links edges, rebuilds the FTS table
-and sets the binary ``ready``.
+Every binary goes through ONE queue and one queue thread (one binary at a time, priority
+core -> own_plugin -> others by code size). open_binary and ``enqueue`` (manifest entries,
+program_add, resume after a restart) register the binary (status ``queued``); the thread runs
+ensure_ghidra, open_project, import_binary (+ external library links to programs already in
+the project), analyze. When the worker reports analysis ``done``, a second thread pages
+through the ``extract`` kinds into the project's Store, links edges, rebuilds the FTS table,
+sets the binary ``ready`` and links it to the project's other binaries (import slot -> export).
 
-Binary status lives in the index ``meta`` table (``status:<id>``), so it survives
-a server restart: queued -> importing -> analysing -> extracting -> ready | error.
+Binary status lives in the index ``meta`` table (``status:<id>``) and, mirrored, in the
+manifest file entry (``state``), with measured ``analysis_s``/``code_size`` that refine the
+remaining-time estimate: queued -> importing -> analysing -> extracting -> ready | error.
 A persisted non-final status with no live job means the server stopped mid-way;
-open_binary on the same file resumes it.
+``resume_project`` (first use of the project) queues it again.
 """
 
 from __future__ import annotations
 
+import itertools
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,13 +29,19 @@ from typing import Any, Callable
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.projects import (
-    ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, slugify,
+    ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
+    read_sections, slugify, write_manifest,
 )
 from airlock.worker.protocol import WorkerError
 
 GHIDRA_PROJECT_NAME = "airlock"
-EXTRACT_KINDS = ("functions", "imports", "strings", "edges")
-PAGE_SIZE = {"functions": 5000, "imports": 5000, "strings": 5000, "edges": 10000}
+EXTRACT_KINDS = ("functions", "imports", "exports", "strings", "edges")
+PAGE_SIZE = {"functions": 5000, "imports": 5000, "exports": 5000, "strings": 5000, "edges": 10000}
+GROUP_RANK = {"core": 0, "own_plugin": 1}  # every other group ranks 2
+ACTIVE = ("importing", "analysing", "extracting")
+RATE_PRIOR_MB = 0.5  # weight of the configured s/MB prior, in MB of code, against measurements
+_MB = 1 << 20
+log = logging.getLogger("airlock")
 FINAL = ("ready", "error")
 OPEN_WAIT_S = 30.0
 
@@ -77,6 +88,12 @@ def map_import_rows(columns: list[str], rows: list[list[Any]]) -> list[tuple]:
     return [(d["dll"], d["name"], d["ordinal"], d["address"]) for d in _dicts(columns, rows)]
 
 
+def map_export_rows(columns: list[str], rows: list[list[Any]]) -> list[tuple]:
+    """(name, ordinal, address) of exports in ram space."""
+    return [(d["name"], d["ordinal"], d["address"])
+            for d in _dicts(columns, rows) if d["space"] == "ram"]
+
+
 def map_string_rows(columns: list[str], rows: list[list[Any]]) -> list[tuple]:
     """(address, encoding, value); strings outside ram have no column to live in."""
     return [(d["address"], d["encoding"], d["value"])
@@ -110,6 +127,8 @@ def run_extraction(worker: Any, store: Store, binary_id: int, program: str,
                 store.insert_functions(binary_id, map_function_rows(cols, rows))
             elif kind == "imports":
                 store.insert_imports(binary_id, map_import_rows(cols, rows))
+            elif kind == "exports":
+                store.insert_exports(binary_id, map_export_rows(cols, rows))
             elif kind == "strings":
                 store.insert_strings(binary_id, map_string_rows(cols, rows))
             else:
@@ -145,6 +164,36 @@ class Job:
     extracting: bool = False
     finished: threading.Event = field(default_factory=threading.Event)
     timings: dict[str, float] = field(default_factory=dict)
+    sha256: str = ""
+    rel_path: str | None = None
+    group: str = "core"
+    code_size: int = 0
+    seq: int = 0
+    analysis_started: float | None = None
+    already_analysed: bool = False
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """core, then own_plugin, then the rest; within a group the smaller code size first."""
+        return GROUP_RANK.get(self.group, 2), self.code_size, self.seq
+
+
+@dataclass(frozen=True)
+class QueueRow:
+    binary_id: int
+    name: str
+    state: str
+    seconds: float | None      # elapsed so far (running) or measured analysis time (ready)
+    est_seconds: float | None  # estimate (not finished)
+    code_size: int
+
+
+@dataclass(frozen=True)
+class QueueStatus:
+    rows: tuple[QueueRow, ...]       # current first, then waiting in run order, then the rest
+    remaining_s: float
+    s_per_mb: float
+    current: QueueRow | None
 
 
 @dataclass(frozen=True)
@@ -166,13 +215,19 @@ class Indexer:
         self._tls = threading.local()
         self._jobs: dict[tuple[str, int], Job] = {}
         self._by_program: dict[str, Job] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._queue: list[Job] = []          # waiting jobs (guarded by _lock)
+        self._running: Job | None = None     # the job the queue thread is on
+        self._runner: threading.Thread | None = None
+        self._seq = itertools.count()
+        self._mf_lock = threading.RLock()
+        self._resumed: set[str] = set()
         worker.on_event(self._on_event)
 
     # -- stores / projects -------------------------------------------------
 
     def paths(self, project: str, create: bool = False) -> ProjectPaths:
-        return project_paths(self.config.data_dir, project, create=create)
+        return project_paths(self.config.projects_root, project, create=create)
 
     def store(self, project: str) -> Store:
         """This thread's Store for the project (sqlite connections are per thread)."""
@@ -184,10 +239,15 @@ class Indexer:
         return st
 
     def projects(self) -> list[str]:
-        return list_projects(self.config.data_dir)
+        return list_projects(self.config.projects_root)
 
     def resolve_project(self, project: str | None = None) -> str:
         """Explicit project, else the last opened one, else the only one on disk."""
+        slug = self._resolve_project(project)
+        self.resume_project(slug)
+        return slug
+
+    def _resolve_project(self, project: str | None) -> str:
         if project:
             slug = slugify(project)
             if slug not in self.projects():
@@ -231,7 +291,12 @@ class Indexer:
             return status, ""
         if job is None:
             return "interrupted", (f"was {status} when the server stopped. "
-                                   "Call open_binary on the file again to resume")
+                                   "Call index_status or open_binary on the file to resume")
+        if status == "queued":
+            with self._lock:
+                waiting = sorted(self._queue, key=lambda j: j.priority)
+            pos = waiting.index(job) + 1 if job in waiting else 0
+            return status, (f"waiting, position {pos} of {len(waiting)}" if pos else "waiting")
         if status == "analysing":
             p = self.worker.progress(job.program) or {}
             bits = []
@@ -256,7 +321,7 @@ class Indexer:
         return (f"error not_analysed: binary '{b.name}' is {status} ({detail}). "
                 "Retry later or call index_status.")
 
-    # -- open_binary -------------------------------------------------------
+    # -- open_binary / queue -------------------------------------------------
 
     def open_binary(self, project: str, path: str, wait_s: float = OPEN_WAIT_S) -> OpenResult:
         src = Path(path).expanduser()
@@ -280,34 +345,262 @@ class Indexer:
             live = self.job_for(paths.name, existing.id)
             if status == "ready" or live is not None:
                 return OpenResult(existing, status, "already opened")
-        sha, artifact = copy_artifact(src, paths, sha)
-        program = program_name_for(src.name)
+        sha, _ = copy_artifact(src, paths, sha)
+        job = self._enqueue_one(paths, store, sha, src.name, None, "core", None, str(src))
+        assert job is not None
+        job.reached.wait(wait_s)
+        b = store.get_binary_by_id(job.binary_id)
+        assert b is not None
+        status, _ = self.get_status(store, job.binary_id)
+        note = "resumed after restart" if existing is not None else None
+        return OpenResult(b, status, note)
+
+    def enqueue(self, project: str, files: list[dict[str, Any]]) -> list[str]:
+        """Queue manifest file entries ({path, sha256, group, code_size, ...}; the artifact is
+        ``artifacts/<sha256>``). Binaries already ready or queued are skipped. Returns the
+        rel_paths queued."""
+        paths = self.paths(project, create=True)
+        store = self.store(paths.name)
+        queued = []
+        for f in files:
+            sha = f.get("sha256")
+            rel = f.get("path") or f.get("rel_path")
+            if not sha or not rel or f.get("kind", "pe") != "pe":
+                continue
+            if not (paths.artifacts / sha).is_file():
+                self._mf_update(paths.name, sha, state="error", error="artifact missing")
+                continue
+            job = self._enqueue_one(paths, store, sha, Path(str(rel).replace("\\", "/")).name,
+                                    rel, f.get("group") or "other", f.get("code_size"),
+                                    str(f.get("source") or rel))
+            if job is not None:
+                queued.append(rel)
+        return queued
+
+    def resume_project(self, project: str) -> int:
+        """Once per process and project: queue the manifest entries and index binaries that are
+        neither ready nor failed (the server stopped before they finished). Returns the count."""
+        slug = slugify(project)
+        with self._lock:
+            if slug in self._resumed:
+                return 0
+            self._resumed.add(slug)
+        if slug not in self.projects():
+            return 0
+        paths = self.paths(slug)
+        n = 0
+        try:
+            man = read_manifest(paths.manifest)
+        except (OSError, ValueError):
+            man = {}
+        todo = [f for f in man.get("files") or []
+                if f.get("kind", "pe") == "pe" and f.get("state", "queued") not in ("ready", "error")]
+        n += len(self.enqueue(slug, todo))
+        store = self.store(slug)
+        for b in store.list_binaries():  # opened with open_binary, no manifest entry
+            status, _ = self.get_status(store, b.id)
+            if status in FINAL or self.job_for(slug, b.id) is not None:
+                continue
+            if (paths.artifacts / b.sha256).is_file():
+                n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
+        return n
+
+    def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
+                     rel_path: str | None, group: str, code_size: int | None,
+                     original_path: str | None) -> Job | None:
+        """Register the binary (status queued) and put a job on the queue. None when the binary
+        is ready, already queued/running, or not analysable."""
+        slug = paths.name
+        artifact = paths.artifacts / sha
+        existing = next((b for b in store.list_binaries() if b.sha256 == sha), None)
+        if existing is not None:
+            status, _ = self.get_status(store, existing.id)
+            if self.job_for(slug, existing.id) is not None:
+                return None
+            if status == "ready":
+                self._mf_update(slug, sha, state="ready")
+                return None
+        info = detect(artifact)
+        if info.format == "not-pe" or info.toolchain == "dotnet":
+            self._mf_update(slug, sha, state="error", error="not a native PE file")
+            return None
+        if code_size is None:
+            code_size = sum(vs for _n, _rva, vs, flags in read_sections(artifact) if "x" in flags)
         bid = store.upsert_binary(
-            sha, src.name, original_path=str(src), format=info.format, arch=info.arch,
+            sha, name, original_path=original_path, format=info.format, arch=info.arch,
             pointer_size=info.pointer_size, image_base=info.image_base,
             toolchain=info.toolchain, imported_at=_now(),
         )
+        program = (store.get_meta(f"program:{bid}") if existing is not None else None) \
+            or self._free_program_name(store, name, sha)
         store.set_meta(f"program:{bid}", program)
+        job = Job(slug, bid, program, artifact, paths, sha256=sha, rel_path=rel_path,
+                  group=group, code_size=int(code_size or 0), seq=next(self._seq))
         self.set_status(store, bid, "queued")
-        job = Job(paths.name, bid, program, artifact, paths)
+        self._mf_update(slug, sha, state="queued", error=None)  # before the job can advance
         with self._lock:
-            self._jobs[(paths.name, bid)] = job
+            self._jobs[(slug, bid)] = job
             self._by_program[program] = job
-        threading.Thread(target=self._run_job, args=(job,), name=f"airlock-open-{program}",
-                         daemon=True).start()
-        job.reached.wait(wait_s)
-        b = store.get_binary_by_id(bid)
-        assert b is not None
-        status, _ = self.get_status(store, bid)
-        note = "resumed after restart" if existing is not None else None
-        return OpenResult(b, status, note)
+            self._queue.append(job)
+            self._ensure_runner()
+        return job
+
+    @staticmethod
+    def _free_program_name(store: Store, name: str, sha: str) -> str:
+        """Slug of the file name; two files with the same name in one project get a sha suffix."""
+        base = program_name_for(name)
+        used = {r["value"] for r in store.db.execute(
+            "SELECT value FROM meta WHERE key LIKE 'program:%'")}
+        return base if base not in used else f"{base}_{sha[:6]}"
+
+    def _ensure_runner(self) -> None:
+        with self._lock:
+            if self._runner is None or not self._runner.is_alive():
+                self._runner = threading.Thread(target=self._run_queue, name="airlock-queue",
+                                                daemon=True)
+                self._runner.start()
+
+    def _next_job(self) -> Job | None:
+        with self._lock:
+            if not self._queue:
+                self._running = None
+                self._runner = None
+                return None
+            job = min(self._queue, key=lambda j: j.priority)
+            self._queue.remove(job)
+            self._running = job
+            return job
+
+    def _run_queue(self) -> None:
+        """The one queue thread: one binary at a time, import -> analyse -> extract."""
+        while True:
+            job = self._next_job()
+            if job is None:
+                return
+            try:
+                job.started = time.monotonic()
+                self._run_job(job)
+                while not job.finished.wait(2.0):
+                    if not self.worker.running():
+                        self._fail(job, "worker stopped while the binary was being processed. "
+                                        "Restart the server to resume")
+                        break
+            except Exception as e:  # keep the queue alive
+                self._fail(job, f"{type(e).__name__}: {e}")
+
+    # -- manifest ------------------------------------------------------------
+
+    def _mf_update(self, project: str, sha: str, **fields: Any) -> None:
+        """Set (or, with None, remove) fields on the manifest file entries with this sha256."""
+        paths = self.paths(project)
+        with self._mf_lock:
+            try:
+                man = read_manifest(paths.manifest)
+            except (OSError, ValueError):
+                return
+            hit = False
+            for f in man.get("files") or []:
+                if f.get("sha256") == sha:
+                    hit = True
+                    for k, v in fields.items():
+                        if v is None:
+                            f.pop(k, None)
+                        else:
+                            f[k] = v
+            if hit:
+                write_manifest(paths.manifest, man)
+
+    def _state(self, job: Job, status: str, error: str | None = None, **manifest: Any) -> None:
+        """Binary status in the index and the manifest entry state, together."""
+        self.set_status(self.store(job.project), job.binary_id, status, error)
+        self._mf_update(job.project, job.sha256, state=status, error=error or None, **manifest)
+
+    def s_per_mb(self, files: list[dict[str, Any]]) -> float:
+        """Seconds of analysis per MB of code: the configured prior, refined by the measured
+        entries (prior counts as RATE_PRIOR_MB of code)."""
+        prior = float(self.config.defaults.get("analysis_s_per_code_mb") or 80.0)
+        secs = mb = 0.0
+        for f in files:
+            if f.get("analysis_s") and f.get("code_size"):
+                secs += float(f["analysis_s"])
+                mb += float(f["code_size"]) / _MB
+        return (prior * RATE_PRIOR_MB + secs) / (RATE_PRIOR_MB + mb)
+
+    def queue_status(self, project: str) -> QueueStatus:
+        """Rows for every binary of the project and the refined remaining-time estimate."""
+        store = self.store(project)
+        try:
+            man = read_manifest(self.paths(project).manifest)
+        except (OSError, ValueError):
+            man = {}
+        files = man.get("files") or []
+        by_sha = {f.get("sha256"): f for f in files}
+        rate = self.s_per_mb(files)
+        with self._lock:
+            waiting = sorted((j for j in self._queue if j.project == project),
+                             key=lambda j: j.priority)
+            running = self._running if self._running and self._running.project == project else None
+        order = {j.binary_id: i for i, j in enumerate(waiting)}
+        now = time.monotonic()
+        rows: list[QueueRow] = []
+        remaining = 0.0
+        for b in store.list_binaries():
+            status, _ = self.get_status(store, b.id)
+            f = by_sha.get(b.sha256, {})
+            job = self.job_for(project, b.id)
+            code = int(f.get("code_size") or (job.code_size if job else 0) or 0)
+            est = code / _MB * rate
+            secs: float | None = None
+            e: float | None = est
+            if status == "ready":
+                secs, e = f.get("analysis_s"), None
+            elif status == "error":
+                e = None
+            elif job is not None and job is running:
+                secs = now - job.started
+                remaining += max(est - secs, 0.0)
+            elif b.id in order or status == "queued":
+                remaining += est
+            rows.append(QueueRow(b.id, b.name, status, secs, e, code))
+
+        def key(r: QueueRow) -> tuple:
+            if running is not None and r.binary_id == running.binary_id:
+                return (0, 0, r.binary_id)
+            if r.binary_id in order:
+                return (1, order[r.binary_id], r.binary_id)
+            return (2 if r.state not in FINAL else 3, 0, r.binary_id)
+
+        rows.sort(key=key)
+        cur = next((r for r in rows if running is not None and r.binary_id == running.binary_id), None)
+        return QueueStatus(tuple(rows), remaining, rate, cur)
+
+    # -- job: import -> analyse -> extract ------------------------------------
+
+    def _link_libs(self, st: Store, exclude: int, statuses: tuple[str, ...]) -> dict[str, str]:
+        """{dll file name (lower): program name} of the project's binaries in these statuses;
+        names that occur twice are left out (ambiguous)."""
+        seen: dict[str, list[str]] = {}
+        for b in st.list_binaries():
+            if b.id != exclude and self.get_status(st, b.id)[0] in statuses:
+                seen.setdefault(b.name.lower(), []).append(self.program_of(st, b))
+        return {n: p[0] for n, p in seen.items() if len(p) == 1}
+
+    def _link_externals(self, links: list[dict[str, Any]]) -> None:
+        """Point external library paths at project programs; never fails a binary."""
+        links = [x for x in links if x["libs"]]
+        if not links:
+            return
+        try:
+            self.worker.request("link_externals", {"links": links}, timeout=300)
+        except WorkerError as e:
+            log.warning("link_externals failed: %s", e)
 
     def _run_job(self, job: Job) -> None:
         w = self.worker
         st = self.store(job.project)
         bid = job.binary_id
         try:
-            self.set_status(st, bid, "importing")
+            self._state(job, "importing")
             w.ensure_ghidra()
             w.request("open_project", {"path": str(job.paths.ghidra), "name": GHIDRA_PROJECT_NAME},
                       timeout=300)
@@ -317,13 +610,18 @@ class Indexer:
             assert b is not None
             st.upsert_binary(b.sha256, b.name, pointer_size=imp.get("pointer_size"),
                              image_base=imp.get("image_base"))
-            self.set_status(st, bid, "analysing")
+            # imports of programs already in the project resolve to them before analysis
+            self._link_externals([{"program": job.program, "libs": self._link_libs(
+                st, bid, ("analysing", "extracting", "ready"))}])
+            job.analysis_started = time.monotonic()
+            self._state(job, "analysing")
             job.reached.set()
             res = w.request("analyze", {
                 "program": job.program,
                 "timeout_min": self.config.defaults.get("analysis_timeout_min"),
             }, timeout=300)
             if res.get("already_analysed") or res.get("state") == "ready":
+                job.already_analysed = bool(res.get("already_analysed"))
                 self._start_extract(job)
         except WorkerError as e:
             self._fail(job, worker_error(e))
@@ -331,7 +629,7 @@ class Indexer:
             self._fail(job, f"{type(e).__name__}: {e}")
 
     def _fail(self, job: Job, message: str) -> None:
-        self.set_status(self.store(job.project), job.binary_id, "error", message)
+        self._state(job, "error", message)
         job.reached.set()
         job.finished.set()
 
@@ -365,7 +663,10 @@ class Indexer:
         st = self.store(job.project)
         bid = job.binary_id
         try:
-            self.set_status(st, bid, "extracting")
+            analysis_s = None
+            if job.analysis_started is not None and not job.already_analysed:
+                analysis_s = round(time.monotonic() - job.analysis_started, 1)
+            self._state(job, "extracting")
             t0 = time.monotonic()
             res = run_extraction(self.worker, st, bid, job.program)
             job.timings = {**{f"extract_{k}": v for k, v in res["secs"].items()},
@@ -381,7 +682,11 @@ class Indexer:
             st.upsert_binary(b.sha256, b.name, pointer_size=res["pointer_size"],
                              image_base=res["image_base"], analysis_profile=profile,
                              analysed_at=_now())
-            self.set_status(st, bid, "ready")
+            extra: dict[str, Any] = {"code_size": job.code_size,
+                                     "extract_s": job.timings["extract_total"]}
+            if analysis_s is not None:
+                extra["analysis_s"] = analysis_s
+            self._state(job, "ready", **extra)
         except WorkerError as e:
             self._fail(job, worker_error(e))
             return
@@ -389,7 +694,38 @@ class Indexer:
             self._fail(job, f"extraction failed: {type(e).__name__}: {e}")
             return
         job.reached.set()
+        try:
+            self._after_ready(job)
+        except Exception as e:  # links are an extra; the binary stays ready
+            log.warning("cross-binary linking failed for %s: %s", job.program, e)
         job.finished.set()
+
+    def _after_ready(self, job: Job) -> None:
+        """Refine the s/MB estimate, then link this binary with the project's other ready ones:
+        index edges (import slot/thunk -> exporting function) and Ghidra external paths of the
+        earlier programs that import this one."""
+        st = self.store(job.project)
+        bid = job.binary_id
+        with self._mf_lock:
+            try:
+                man = read_manifest(self.paths(job.project).manifest)
+            except (OSError, ValueError):
+                man = None
+            if man is not None and man.get("files"):
+                man["queue"] = {"s_per_mb": round(self.s_per_mb(man["files"]), 1)}
+                write_manifest(self.paths(job.project).manifest, man)
+        me = st.get_binary_by_id(bid)
+        assert me is not None
+        others = [b for b in st.list_binaries()
+                  if b.id != bid and self.get_status(st, b.id)[0] == "ready"]
+        st.link_cross_binary(bid, [b.id for b in others])
+        links = []
+        for o in others:
+            if any(True for _ in st.db.execute(
+                    "SELECT 1 FROM import WHERE binary_id=? AND lower(dll)=? LIMIT 1",
+                    (o.id, me.name.lower()))):
+                links.append({"program": self.program_of(st, o), "libs": {me.name.lower(): job.program}})
+        self._link_externals(links)
 
     # -- worker session for decompile --------------------------------------
 

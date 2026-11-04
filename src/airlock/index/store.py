@@ -13,7 +13,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 FTS_KINDS = ("function", "string", "import")
 CODE_EDGES = ("call", "call_ind", "jump")
@@ -65,6 +65,20 @@ class Xref:
 
     src_addr: int
     dst_addr: int
+    kind: str
+    src_fn: Function | None
+    dst_fn: Function | None
+
+
+@dataclass(frozen=True)
+class CrossRef:
+    """One cross-binary edge: an import slot or thunk in ``src_binary`` bound to the exporting
+    function ``dst_entry`` of ``dst_binary``. ``src_fn``/``dst_fn`` are function rows when known."""
+
+    src_binary: int
+    src_addr: int
+    dst_binary: int
+    dst_entry: int
     kind: str
     src_fn: Function | None
     dst_fn: Function | None
@@ -255,6 +269,8 @@ class Store:
             q("DELETE FROM edge WHERE binary_id=?", (binary_id,))
             q("DELETE FROM string WHERE binary_id=?", (binary_id,))
             q("DELETE FROM import WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM export WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM xedge WHERE src_binary=? OR dst_binary=?", (binary_id, binary_id))
             q("DELETE FROM function WHERE binary_id=?", (binary_id,))
             q("DELETE FROM fts WHERE binary_id=?", (binary_id,))
 
@@ -344,6 +360,16 @@ class Store:
         with self.db:
             self.db.executemany(
                 "INSERT INTO import(binary_id, dll, name, ordinal, address) VALUES (?,?,?,?,?)",
+                [(binary_id, *r) for r in rows],
+            )
+
+    def insert_exports(
+        self, binary_id: int, rows: Iterable[tuple[str | None, int | None, int]]
+    ) -> None:
+        """Rows: (name, ordinal, address)."""
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO export(binary_id, name, ordinal, address) VALUES (?,?,?,?)",
                 [(binary_id, *r) for r in rows],
             )
 
@@ -631,6 +657,94 @@ class Store:
         sql += " ORDER BY dll, name LIMIT ?"
         args.append(limit)
         return self.db.execute(sql, args).fetchall()
+
+    # -- cross-binary links --------------------------------------------------
+
+    def exports_of(self, binary_id: int) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT name, ordinal, address FROM export WHERE binary_id=? ORDER BY address",
+            (binary_id,)).fetchall()
+
+    def _link_pair(self, src_id: int, dst_id: int) -> int:
+        """Rebuild the edges from src's imports of dst's DLL name to dst's exports; returns
+        the number of imports bound. An import is matched by name, else by ordinal. Edges start
+        at the import slot and at each thunk function named like the import."""
+        dst = self.get_binary_by_id(dst_id)
+        with self.db:
+            self.db.execute("DELETE FROM xedge WHERE src_binary=? AND dst_binary=?",
+                            (src_id, dst_id))
+            if dst is None or src_id == dst_id:
+                return 0
+            imps = self.db.execute(
+                "SELECT name, ordinal, address FROM import WHERE binary_id=? AND lower(dll)=?",
+                (src_id, dst.name.lower())).fetchall()
+            if not imps:
+                return 0
+            by_name: dict[str, int] = {}
+            by_ord: dict[int, int] = {}
+            for e in self.exports_of(dst_id):
+                if e["name"] and not e["name"].startswith("Ordinal_"):
+                    by_name.setdefault(e["name"], e["address"])
+                if e["ordinal"] is not None:
+                    by_ord.setdefault(e["ordinal"], e["address"])
+            rows: list[tuple[int, int, int, int, str]] = []
+            bound = 0
+            for i in imps:
+                addr = by_name.get(i["name"]) if i["name"] else None
+                if addr is None and i["ordinal"] is not None:
+                    addr = by_ord.get(i["ordinal"])
+                if addr is None:
+                    continue
+                fn = self.function_containing(dst_id, addr)
+                entry = fn.entry if fn is not None else addr
+                bound += 1
+                if i["address"] is not None:
+                    rows.append((src_id, i["address"], dst_id, entry, "import"))
+                for t in self.db.execute(
+                    "SELECT entry FROM function WHERE binary_id=? AND space='ram' AND is_thunk=1 "
+                    "AND is_external=0 AND name=?", (src_id, i["name"])).fetchall():
+                    rows.append((src_id, t["entry"], dst_id, entry, "import"))
+            self.db.executemany(
+                "INSERT INTO xedge(src_binary, src_addr, dst_binary, dst_entry, kind) "
+                "VALUES (?,?,?,?,?)", rows)
+            return bound
+
+    def link_cross_binary(self, binary_id: int, others: Iterable[int]) -> int:
+        """(Re)build cross-binary edges between ``binary_id`` and each binary in ``others``, in
+        both directions (``binary_id`` importing from them and them importing from it). Returns
+        the number of imports bound. Call after ``binary_id`` has been extracted."""
+        n = 0
+        for o in others:
+            if o == binary_id:
+                continue
+            n += self._link_pair(binary_id, o) + self._link_pair(o, binary_id)
+        return n
+
+    def _crossrefs(self, where: str, args: list[Any], limit: int) -> list[CrossRef]:
+        rows = self.db.execute(
+            "SELECT src_binary, src_addr, dst_binary, dst_entry, kind FROM xedge "
+            f"WHERE {where} ORDER BY src_binary, src_addr, dst_entry LIMIT ?", [*args, limit],
+        ).fetchall()
+        return [CrossRef(r["src_binary"], r["src_addr"], r["dst_binary"], r["dst_entry"], r["kind"],
+                         self.function_containing(r["src_binary"], r["src_addr"]),
+                         self.function_at(r["dst_binary"], r["dst_entry"])) for r in rows]
+
+    def cross_to_function(self, fn: Function, limit: int = 200) -> list[CrossRef]:
+        """Import slots/thunks of other binaries bound to this function (an exported one)."""
+        return self._crossrefs("dst_binary=? AND dst_entry=?", [fn.binary_id, fn.entry], limit)
+
+    def cross_from_address(self, binary_id: int, addr: int, limit: int = 20) -> list[CrossRef]:
+        """The exporting function(s) an import slot or thunk address of this binary resolves to."""
+        return self._crossrefs("src_binary=? AND src_addr=?", [binary_id, addr], limit)
+
+    def cross_from_binary(self, binary_id: int, limit: int = 1000) -> list[CrossRef]:
+        return self._crossrefs("src_binary=?", [binary_id], limit)
+
+    def cross_counts(self, binary_id: int) -> tuple[int, int]:
+        """(edges from this binary into others, edges from other binaries into it)."""
+        a = self.db.execute("SELECT COUNT(*) FROM xedge WHERE src_binary=?", (binary_id,)).fetchone()[0]
+        b = self.db.execute("SELECT COUNT(*) FROM xedge WHERE dst_binary=?", (binary_id,)).fetchone()[0]
+        return int(a), int(b)
 
     # -- decomp cache ------------------------------------------------------
 

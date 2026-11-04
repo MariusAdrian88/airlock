@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
-
-import anyio
+import threading
 
 from airlock.config import Config
+from airlock.projects import ProjectPaths
 from airlock.server import roles
 from airlock.server.indexer import Indexer
 from airlock.worker.client import WorkerClient
@@ -24,30 +23,22 @@ class ServerContext:
     indexer: Indexer = field(init=False)
     session: roles.SessionState = field(default_factory=roles.SessionState)
     profile_role: str | None = None  # role of an explicit --profile, else None
-    roots_done: bool = False
 
     def __post_init__(self) -> None:
         self.indexer = Indexer(self.config, self.worker)
-        self._roots_lock = anyio.Lock()
+        self._bind_lock = threading.Lock()
 
-    def set_session(self, state: roles.SessionState) -> None:
-        self.session = state
-        if state.role == roles.DIRTY and state.project is not None:
-            self.indexer.current = state.project.name
-
-    async def ensure_roots(self, mcp_session: Any) -> None:
-        """Once per process: if the client offers roots, they decide the workspace
-        (replacing the env/cwd guess made at start). Never changes the role afterwards."""
-        async with self._roots_lock:
-            if self.roots_done:
-                return
-            self.roots_done = True
-            roots = await roles.roots_of(mcp_session)
-            if not roots:
-                return
-            ws, source = roles.detect_workspace(roots)
-            try:
-                self.set_session(roles.resolve_session(ws, source, self.profile_role))
-            except roles.RoleConflict as e:
-                log.error("%s", e)
-                self.session = roles.SessionState(roles.UNBOUND, None, ws, source, note=str(e))
+    def bind_session(self, role: str, pp: ProjectPaths) -> str | None:
+        """Bind the process to (project, role) once. None on success, else the error line."""
+        if role not in (roles.DIRTY, roles.CLEAN):
+            return f"error bad_role: role '{role}' is not dirty or clean. Use dirty or clean."
+        with self._bind_lock:
+            if self.session.role != roles.UNBOUND:
+                return roles.role_locked(self.session)
+            if self.profile_role and self.profile_role != role:
+                return (f"error wrong_role: this server was started with --profile "
+                        f"{self.profile_role}.")
+            self.session = roles.SessionState(role, pp)
+            if role == roles.DIRTY:
+                self.indexer.current = pp.name
+        return None
