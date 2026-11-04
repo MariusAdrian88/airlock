@@ -1,0 +1,61 @@
+// airlock global configuration.
+// JSONC: comments and trailing commas are allowed.
+// Comment out a tool in "sets" to remove it from the tool list.
+{
+  // ── Locations. Only ghidra_dir is required. ──────────────────────────────
+  "ghidra_dir": null,        // e.g. "C:/Tools/ghidra_12.1.4_PUBLIC"
+  "jdk_dir": null,           // null: java on PATH, else Ghidra's LaunchSupport picks one
+  "ilspycmd": null,          // e.g. "C:/Tools/ilspycmd/ilspycmd.exe" (optional, .NET)
+  "index_dir": null,         // null: %LOCALAPPDATA%/airlock
+
+  // ── Behaviour ─────────────────────────────────────────────────────────────
+  "defaults": {
+    "token_budget": 2000,            // per response
+    "max_budget": 8000,              // cap for a per-call budget override
+    "detail": "brief",               // brief | full | evidence
+    "decompile_timeout_s": 60,
+    "bulk_decompile": "lazy",        // lazy | background
+    "analysis_timeout_min": 60,
+    "allow_writes": false,           // gate for every tool in "annotate"
+    "mirror_notes_to_ghidra": true,  // agent notes also become plate comments
+    "jvm_max_memory": null           // e.g. "8G"; null: Ghidra's default
+  },
+
+  // ── Profiles. Select one with `airlock serve --profile <name>`. ──────────
+  "default_profile": "dirty",
+  "profiles": {
+    "dirty": {
+      "role": "dirty",
+      "enabled_sets": ["core", "cpp", "resources", "types", "annotate",
+                       "dataflow", "fileformat", "spec_write", "admin"],
+      "allow_writes": true
+    },
+    "clean": {
+      // A clean profile may only contain spec_read, spec_list, spec_export.
+      "role": "clean",
+      "enabled_sets": ["spec_read"]
+    }
+  },
+
+  // ── Tool sets ─────────────────────────────────────────────────────────────
+  "sets": {
+    "core": [
+      "open_binary", "list_binaries", "outline",
+      "search", "function", "xrefs", "callgraph", "strings"
+    ],
+    "types": ["type_inspect", "type_search"],
+    "annotate": [
+      "rename", "retype", "comment", "annotate", "struct_define"
+      // "patch_bytes"
+    ],
+    "cpp": ["rtti_classes", "vtable", "mfc_message_maps", "qt_metaobjects"],
+    "delphi": ["delphi_classes", "delphi_forms", "delphi_events"],
+    "dotnet": ["dotnet_types", "dotnet_decompile"],
+    "resources": ["pe_resources", "dialogs", "string_tables", "version_info"],
+    "dataflow": ["trace_values", "switch_tables", "constants"],
+    "fileformat": ["ole_streams", "hexdump", "file_diff", "record_guess"],
+    "spec_write": ["spec_write", "spec_list"],
+    "spec_read": ["spec_read", "spec_list", "spec_export"],
+    "admin": ["index_status", "reindex", "project_info", "frontier"]
+  }
+}
