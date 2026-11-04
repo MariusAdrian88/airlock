@@ -510,7 +510,7 @@ omitted when the project has one binary. Default budget is
 | `open_binary` | `project`, `path` | binary id, format, toolchain, status (`queued`/`analysing`/`ready`) |
 | `list_binaries` | `project?` | one line per binary |
 | `outline` | `binary` | sections, entry points, import DLLs with counts, function counts by `name_state`, classes count, toolchain. ~300 tokens |
-| `search` | `query`, `kind?` (`function`/`string`/`import`/`const`/`class`/`note`/`any`), `limit=20` | ranked hits, one line each: kind, name, address, short context |
+| `search` | `query`, `kind?` (`function`/`string`/`import`/`const`/`class`/`note`/`any`), `limit=20` | ranked hits, one line each: kind, name, address, short context; ranking and dedup in §7.4 |
 | `function` | `target`, `view=c` (`c`/`asm`/`both`/`signature`), `lines?` | decompiled C (or asm) with address annotations on calls; truncated to budget with a cursor |
 | `xrefs` | `target`, `direction=to` (`to`/`from`), `kind?` (`call`/`read`/`write`/`data`), `limit=50` | one line per reference: from-function, address, kind |
 | `callgraph` | `target`, `direction=callees`, `depth=2` | indented tree, names + addresses; cycles marked |
@@ -631,6 +631,13 @@ clean profile 3.
   functions an agent reads most. **[verified]**
 - Any tool accepts `budget` to override, capped by config `max_budget`
   (default 32000). The cap is never below the tool's own default.
+- `function` (view=c) honours `detail`: `brief` (default) strips decompiler
+  `/* WARNING */` lines and collapses a local-declaration block of more than 6
+  lines into one `// N locals: ...` line; `full` returns the cached text
+  unchanged. Line numbers (`lines=`, page header, outline) refer to the text of
+  the chosen detail level, and cursors are bound to it. Reduction is purely
+  presentational (the cached `decomp.c_text` stays raw) and runs after call
+  annotation.
 
 ### 7.2 Cursors
 
@@ -664,6 +671,29 @@ xrefs to CAppDoc::LoadSettings (0x004a1c20), 3 calls
   0x004b0e48  CSettingsDlg::OnOK           call
   0x0045f1a2  FUN_0045f100                 call
 ```
+
+`search` ordering and dedup (deterministic):
+
+1. Match rank: exact name, then prefix, then token match.
+2. Within a rank: functions with a real name, then default-named (`FUN_…`)
+   functions, then strings, then imports.
+3. Remaining ties keep the full-text engine's order.
+
+An imported function exists as an EXTERNAL function row, usually a thunk and an
+import row. The EXTERNAL row carries no code and a pseudo address, so it is
+dropped when a non-external function or an import row has the same name; the
+thunk and the import row stay. An EXTERNAL row with neither is printed as
+`import-only DLL::Name`. `limit` applies after dedup and ranking (the search
+fetches more candidates than `limit`); paging uses the usual cursor footer.
+
+`function` over budget: when the reduced C does not fit the budget and no
+`cursor` or `lines` is given, the response is an outline instead of page 1
+(`outline=false` pages as usual): a header with line count, estimated tokens and
+how to read on, the signature, the control skeleton (top two nesting levels of
+`if`/`switch`/loops with line ranges; switch case labels compressed into
+ranges), callees with call count and first line, and referenced strings with
+line numbers. It is built by a line/brace scanner, not a C parser, and is cut
+to the budget with the usual cursor footer.
 
 ### 7.5 Errors
 

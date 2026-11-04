@@ -15,6 +15,7 @@ from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
 )
 from airlock.server.context import ServerContext
+from airlock.server.cview import outline_lines, reduce_c
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr, parse_address, resolve_function
@@ -144,47 +145,72 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
         return bd
     st, b = bd.store, bd.binary
     limit = max(1, min(int(limit), 200))
-    per_kind = []
+    # Fetch more than `limit` per kind: dedup drops rows, and ranking needs candidates.
+    fetch = limit * 5 + 20
+    ranked: list[tuple[tuple[int, int, int], str]] = []
+    seq = 0
     for k in _SEARCH_KINDS[kind]:
-        lines = []
-        for h in st.fts_search(b.id, query, k, limit):
-            line = _search_line(bd, h)
-            if line:
-                lines.append(line)
-        per_kind.append(lines)
-    merged: list[str] = []  # round-robin so one kind cannot crowd out the others
-    for i in range(max((len(x) for x in per_kind), default=0)):
-        for lines in per_kind:
-            if i < len(lines):
-                merged.append(lines[i])
-    merged = merged[:limit]
+        for h in st.fts_search(b.id, query, k, fetch):
+            seq += 1
+            item = _search_item(bd, h, query)
+            if item:
+                key, line = item
+                ranked.append(((*key, seq), line))
+    ranked.sort(key=lambda x: x[0])
+    merged = [line for _, line in ranked[:limit]]
     if not merged:
         return f"no hits for '{query}'"
     args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
     return _page([f"search '{query}': {len(merged)} hits", *merged], "search", args, bud)
 
 
-def _search_line(bd: Bound, h) -> str | None:
-    st, b = bd.store, bd.binary
+def _match_rank(query: str, *names: str) -> int:
+    """0 exact name match, 1 prefix, 2 token (anything else FTS returned)."""
+    q = query.strip().lower()
+    low = [n.lower() for n in names if n]
+    if q in low:
+        return 0
+    if any(n.startswith(q) for n in low):
+        return 1
+    return 2
+
+
+def _search_item(bd: Bound, h, query: str) -> tuple[tuple[int, int], str] | None:
+    """(sort key, output line) for one FTS hit, or None when the hit is dropped.
+
+    Order: match rank (exact name, then prefix, then token); within a rank, named
+    functions (user/library/recovered), then FUN_ functions, then strings, then
+    imports. Ties keep FTS order (caller appends the sequence number). An EXTERNAL
+    function row is dropped when a non-external function or an import row has the
+    same name; otherwise it is shown as `import-only DLL::Name` without its
+    pseudo address."""
+    st = bd.store
     if h.kind == "function":
         fn = st.get_function(h.ref_id)
         if fn is None:
             return None
-        extra = "external" if fn.is_external else (f"{fn.size}B" if fn.size else "")
+        rank = _match_rank(query, fn.name, fn.qualified_name)
+        if fn.is_external:
+            if st.has_local_twin(fn.binary_id, fn.name):
+                return None
+            return (rank, 3), f"import-only {fn.qualified_name}"
+        extra = f"{fn.size}B" if fn.size else ""
         flags = ",".join(x for x in (fn.name_state, "thunk" if fn.is_thunk else "", extra) if x)
-        return f"function {fn.qualified_name} {bd.addr(fn.entry, fn.space)} {flags}"
+        group = 1 if fn.name.startswith("FUN_") else 0
+        return (rank, group), f"function {fn.qualified_name} {bd.addr(fn.entry, fn.space)} {flags}"
     if h.kind == "string":
         s = st.get_string(h.ref_id)
         if s is None:
             return None
         enc = "" if s.encoding == "ascii" else f" {s.encoding}"
-        return f"string {bd.addr(s.address)}{enc} {preview(s.value)}"
+        return (_match_rank(query, s.value), 2), f"string {bd.addr(s.address)}{enc} {preview(s.value)}"
     row = st.get_import(h.ref_id)
     if row is None:
         return None
     name = row["name"] or f"#{row['ordinal']}"
     slot = f" slot {bd.addr(row['address'])}" if row["address"] is not None else ""
-    return f"import {row['dll']}!{name}{slot}"
+    rank = _match_rank(query, name, f"{row['dll']}!{name}")
+    return (rank, 3), f"import {row['dll']}!{name}{slot}"
 
 
 # ── function ───────────────────────────────────────────────────────────────────
@@ -252,7 +278,8 @@ def _parse_lines(spec: str) -> tuple[int, int] | None:
 @tool("function", "Show a function's decompiled C with call addresses (view=c) or its signature "
                   "(view=signature), by name or address.")
 def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
-             lines: str = "", cursor: str = "", budget: int = 0) -> str:
+             lines: str = "", cursor: str = "", budget: int = 0, detail: str = "brief",
+             outline: bool = True) -> str:
     bud = budget_for(ctx, budget, "function_budget")
     if not target.strip():
         return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
@@ -261,6 +288,8 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
                 "Use view=c or view=signature.")
     if view not in ("c", "signature"):
         return f"error bad_args: unknown view '{view}'. Use c or signature."
+    if detail not in ("brief", "full"):
+        return f"error bad_args: unknown detail '{detail}'. Use brief or full."
     span = None
     if lines:
         span = _parse_lines(lines)
@@ -287,11 +316,16 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if fn.is_external:
         return (f"error external: {fn.qualified_name} is an imported function with no code. "
                 "Use xrefs on it to see its callers.")
-    args = {"binary": binary, "target": target, "view": view, "lines": lines}
+    args = {"binary": binary, "target": target, "view": view, "lines": lines, "detail": detail}
+    oargs = {**args, "outline": 1}
     identity = (b.id, fn.entry, fn.version, b.analysis_profile)
     offset = 0
     if cursor:
         try:
+            cur = STORE.get(cursor, "function")
+            if cur.lines is not None:   # continuation of an outline
+                STORE.get(cursor, "function", oargs)
+                return resume_lines(cursor, bud, "code", tool="function", args=oargs)[0]
             offset = STORE.get(cursor, "function", args, identity).offset
         except CursorError as e:
             return e.message
@@ -300,6 +334,14 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         return err
     assert c_text is not None
     full = annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize).rstrip("\n")
+    full = reduce_c(full, detail)   # after annotation: it needs raw char offsets
+    if outline and not cursor and not span and estimate_tokens(full, "code") > bud:
+        all_lines = full.split("\n")
+        head = (f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)}: {len(all_lines)} lines, "
+                f"~{estimate_tokens(full, 'code')} tokens (budget {bud}). "
+                "Read with lines=a-b, or outline=false to page.")
+        olines = ([f"// {r.note}"] if r.note else []) + outline_lines(all_lines, head)
+        return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
     return _function_page(full, bud, span, lines, offset, r.note, args, identity)
 
 

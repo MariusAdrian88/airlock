@@ -306,7 +306,8 @@ def test_strings(ctx):
 def test_search(ctx):
     out = core.search(ctx, "file")
     lines = out.splitlines()
-    assert lines[0] == "search 'file': 4 hits"
+    assert lines[0] == "search 'file': 3 hits"  # the EXTERNAL CreateFileW row is dropped
+    assert "EXTERNAL" not in out
     kinds = {ln.split()[0] for ln in lines[1:]}
     assert kinds == {"function", "string", "import"}
     assert "function CreateFileW 0x00401300 library,thunk,6B" in out
@@ -318,6 +319,73 @@ def test_search(ctx):
     assert core.search(ctx, "x", kind="class").startswith("error not_supported:")
     assert core.search(ctx, "x", kind="bogus").startswith("error bad_args:")
     assert len(core.search(ctx, "file", limit=2).splitlines()) == 3
+
+
+def _synthetic_search_store(ctx):
+    st = ctx.indexer.store("proj")
+    b = st.list_binaries()[0]
+    st.insert_functions(b.id, [
+        {"entry": 0x501000, "name": "WidgetOpen", "name_state": "user", "size": 8},
+        {"entry": 0x501100, "name": "FUN_00501100", "name_state": "auto", "size": 8},
+        {"entry": 0x501200, "name": "Widget", "name_state": "user", "size": 8},
+        {"entry": 0x501300, "name": "OpenWidgetNow", "name_state": "user", "size": 8},
+        {"entry": 0x501400, "name": "QueryThing", "name_state": "library", "is_thunk": True, "size": 6},
+        {"space": "EXTERNAL", "entry": 0x101, "name": "QueryThing", "namespace": "LIB-A.DLL",
+         "name_state": "library", "is_external": True},
+        {"space": "EXTERNAL", "entry": 0x102, "name": "OnlyExt", "namespace": "LIB-B.DLL",
+         "name_state": "library", "is_external": True},
+        {"space": "EXTERNAL", "entry": 0x103, "name": "ViaImport", "namespace": "LIB-C.DLL",
+         "name_state": "library", "is_external": True},
+    ])
+    st.insert_imports(b.id, [("LIB-A.DLL", "QueryThing", None, 0x502000),
+                             ("LIB-C.DLL", "ViaImport", None, 0x502004),
+                             ("LIB-D.DLL", "WidgetImp", None, 0x502008)])
+    st.insert_strings(b.id, [(0x503000, "ascii", "widget text"), (0x503100, "ascii", "Widget")])
+    st.rebuild_fts(b.id)
+
+
+def test_search_external_dedup(ctx):
+    _synthetic_search_store(ctx)
+    out = core.search(ctx, "querything")
+    assert "EXTERNAL" not in out
+    assert out.splitlines()[0] == "search 'querything': 2 hits"
+    assert out.splitlines()[1].startswith("function QueryThing 0x00501400 library,thunk,6B")
+    assert out.splitlines()[2] == "import LIB-A.DLL!QueryThing slot 0x00502000"
+    assert core.search(ctx, "viaimport").splitlines()[1:] == [
+        "import LIB-C.DLL!ViaImport slot 0x00502004"]
+    assert core.search(ctx, "onlyext").splitlines()[1:] == ["import-only LIB-B.DLL::OnlyExt"]
+
+
+def test_search_ranking(ctx):
+    _synthetic_search_store(ctx)
+    lines = core.search(ctx, "widget").splitlines()[1:]
+    kinds = [ln.split()[0] + " " + ln.split()[1] for ln in lines]
+    # exact (function, string) -> prefix (function, string, import) -> token
+    assert lines[0].startswith("function Widget ")
+    assert lines[1].startswith('string 0x00503100 "Widget"')
+    assert lines[2].startswith("function WidgetOpen ")
+    assert lines[3].startswith('string 0x00503000 "widget text"')
+    assert lines[4].startswith("import LIB-D.DLL!WidgetImp")
+    assert lines[5].startswith("function OpenWidgetNow ")
+    assert len(lines) == 6, kinds
+
+
+def test_search_fun_after_named_and_limit_after_dedup(ctx):
+    _synthetic_search_store(ctx)
+    st = ctx.indexer.store("proj")
+    b = st.list_binaries()[0]
+    st.insert_functions(b.id, [{"entry": 0x504000, "name": "FUN_00504000", "name_state": "auto"},
+                               {"entry": 0x504100, "name": "FunnyHelper", "name_state": "user"}])
+    st.rebuild_fts(b.id)
+    lines = core.search(ctx, "fun", kind="function").splitlines()[1:]
+    names = [ln.split()[1] for ln in lines]
+    assert names == ["FunnyHelper", "FUN_00401200", "FUN_00501100", "FUN_00504000"]
+    # the kind column is not searched: "string" must not match every string row
+    assert core.search(ctx, "string") == "no hits for 'string'"
+    # limit counts after dedup: both externals of 'querything'/'viaimport' vanish, so
+    # limit=2 still returns two real hits.
+    out = core.search(ctx, "querything", limit=2).splitlines()
+    assert out[0] == "search 'querything': 2 hits" and len(out) == 3
 
 
 def test_xrefs_to_function(ctx):
@@ -417,7 +485,7 @@ def test_function_worker_error_is_one_line(ctx):
 
 def test_function_lines_and_cursor(ctx):
     ctx.worker.c_text = "\n".join(f"  x{i} = OnFoo();" for i in range(200)) + "\n"
-    first = core.function(ctx, "main", budget=100)
+    first = core.function(ctx, "main", budget=100, outline=False)
     lines = first.splitlines()
     assert lines[-1].startswith("… ") and "more lines. cursor=c_" in lines[-1]
     cid = lines[-1].split("cursor=")[1]
@@ -458,7 +526,7 @@ def test_function_header_paging(ctx):
     ctx.worker.c_text = "\n".join(f"  x{i} = {i};" for i in range(n)) + "\n"
     pages, cid, budget = [], None, 120
     while True:
-        out = (core.function(ctx, "main", budget=budget) if cid is None
+        out = (core.function(ctx, "main", budget=budget, outline=False) if cid is None
                else core.function(ctx, "main", cursor=cid, budget=budget))
         assert estimate_tokens(out, "code") <= budget
         pages.append(out)
@@ -482,7 +550,7 @@ def test_function_header_paging(ctx):
 def test_function_header_with_note_and_lines(ctx):
     from airlock.server.budget import estimate_tokens
     ctx.worker.c_text = "\n".join(f"  x{i} = {i};" for i in range(300)) + "\n"
-    out = core.function(ctx, "0x00401104", budget=150)
+    out = core.function(ctx, "0x00401104", budget=150, outline=False)
     ls = out.splitlines()
     assert ls[0].startswith("// resolved from interior address") and ls[1].startswith("// lines 1-")
     assert estimate_tokens(out, "code") <= 150
@@ -520,3 +588,89 @@ def test_calls_are_registered_with_one_sentence_descriptions():
                  "callgraph", "strings", "index_status"):
         d = IMPLEMENTED[name].description
         assert d.count(". ") == 0 and d.endswith("."), name
+
+
+# ── function: detail / outline (synthetic C) ──────────────────────────────────
+
+def _big_c(n_locals: int = 10, n_body: int = 400) -> str:
+    decls = [f"  int iVar{i};" for i in range(n_locals)]
+    body = ["  /* WARNING: Removing unreachable block (ram,0x00401050) */", "",
+            "  switch(iVar0) {", "  case 0:", "  case 1:", "  case 2:", "  case 3:",
+            "    OnFoo();", "    break;", "  case 0x10:", "    FUN_00401200();", "    break;",
+            "  default:", "    break;", "  }",
+            "  if (iVar1 != 0) {", '    OnFoo("hello world");', "  }"]
+    body += [f"  iVar2 = iVar2 + {i};" for i in range(n_body)]
+    return "\n".join(["int main(void)", "", "{"] + decls + [""] + body + ["  return 0;", "}"]) + "\n"
+
+
+def test_function_detail_brief_and_full(ctx):
+    raw = _big_c(10, 5)
+    ctx.worker.c_text = raw
+    brief = core.function(ctx, "main")
+    assert "// 10 locals: iVar0, iVar1" in brief and "WARNING" not in brief
+    assert "int iVar3;" not in brief and "OnFoo/*0x00401100*/();" in brief
+    full = core.function(ctx, "main", detail="full")
+    assert full == core.function(ctx, "main", detail="full") and "WARNING" in full
+    assert "int iVar3;" in full
+    assert core.function(ctx, "main", detail="x").startswith("error bad_args:")
+
+
+def test_function_outline_over_budget(ctx):
+    from airlock.server.budget import estimate_tokens
+    ctx.worker.c_text = _big_c(10, 400)
+    out = core.function(ctx, "main", budget=400)
+    ls = out.splitlines()
+    assert ls[0].startswith("// main 0x00401000: ") and "(budget 400)" in ls[0]
+    assert "outline=false" in ls[0] and "lines=a-b" in ls[0]
+    assert estimate_tokens(out, "code") <= 400
+    assert ls[1] == "int main(void)"
+    assert any("switch(iVar0)" in x for x in ls) and any("case 0..3,0x10,default (6 cases)" in x for x in ls)
+    assert any("OnFoo" in x and "x2 L" in x for x in ls)
+    assert any('"hello world"' in x for x in ls)
+    # line numbers from the outline index the reduced text (brief) and agree with lines=
+    m = [x for x in ls if "switch(iVar0)" in x][0].split()[0]
+    n = int(m[1:].split("-")[0])
+    chunk = core.function(ctx, "main", lines=f"{n}-{n}").splitlines()
+    assert chunk[0].startswith(f"// lines {n}-{n} of ") and "switch(iVar0)" in chunk[1]
+    hdr_lines = int(ls[0].split(": ")[1].split(" lines")[0])
+    assert chunk[0].split(" of ")[1].startswith(str(hdr_lines))
+
+
+def test_function_outline_detail_full_numbering(ctx):
+    ctx.worker.c_text = _big_c(10, 400)
+    b = core.function(ctx, "main", budget=400).splitlines()[0]
+    f = core.function(ctx, "main", budget=400, detail="full").splitlines()[0]
+    nb = int(b.split(": ")[1].split(" lines")[0])
+    nf = int(f.split(": ")[1].split(" lines")[0])
+    assert nf - nb == 11   # 10 decls -> 1 line (-9), warning + its blank line (-2)
+
+
+def test_function_outline_false_pages_and_cursors(ctx):
+    ctx.worker.c_text = _big_c(10, 400)
+    p1 = core.function(ctx, "main", budget=400, outline=False)
+    assert p1.startswith("// lines 1-") and "more lines. cursor=c_" in p1
+    cid = _cursor(p1)
+    p2 = core.function(ctx, "main", cursor=cid, budget=400, outline=False)
+    assert p2.startswith("// lines ")
+    # a cursor never crosses detail modes
+    assert core.function(ctx, "main", cursor=_cursor(core.function(
+        ctx, "main", budget=400, outline=False)), budget=400,
+        detail="full").startswith("error bad_cursor:")
+
+
+def test_function_outline_footer_cursor(ctx):
+    from airlock.server.budget import estimate_tokens
+    names = "\n".join(f'  FUN_{i:08x}("s{i}");' for i in range(60))
+    ctx.worker.c_text = "void main(void)\n{\n" + names + "\n" + "\n".join(
+        f"  a = {i};" for i in range(300)) + "\n}\n"
+    out = core.function(ctx, "main", budget=150)
+    assert estimate_tokens(out, "code") <= 150 and "more lines. cursor=c_" in out
+    nxt = core.function(ctx, "main", cursor=_cursor(out), budget=150)
+    assert not nxt.startswith("error") and "// lines" not in nxt
+
+
+def test_function_small_unchanged_except_noise(ctx):
+    ctx.worker.c_text = ("int main(void)\n\n{\n  int a;\n  int b;\n\n"
+                         "  /* WARNING: x */\n\n  OnFoo();\n  return 0;\n}\n")
+    assert core.function(ctx, "main") == (
+        "int main(void)\n\n{\n  int a;\n  int b;\n\n  OnFoo/*0x00401100*/();\n  return 0;\n}")

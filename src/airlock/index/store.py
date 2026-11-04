@@ -132,7 +132,9 @@ def _fts_query(text: str) -> str | None:
     toks = re.findall(r"[^\W_]+", text)
     if not toks:
         return None
-    return " ".join(f'"{t}"*' for t in toks)
+    # Restrict to the text column: `kind` is indexed too, and a query such as "fun"
+    # or "import" would otherwise match every row of that kind.
+    return "text : (" + " ".join(f'"{t}"*' for t in toks) + ")"
 
 
 class Store:
@@ -419,6 +421,18 @@ class Store:
         sql += " ORDER BY rank LIMIT ?"
         args.append(limit)
         return [FtsHit(r["kind"], r["ref_id"], r["text"]) for r in self.db.execute(sql, args)]
+
+    def has_local_twin(self, binary_id: int, name: str) -> bool:
+        """True when a non-external function or an import row has exactly ``name``
+        (so an EXTERNAL function row of that name adds nothing to search output)."""
+        if self.db.execute(
+            "SELECT 1 FROM function WHERE binary_id=? AND is_external=0 AND name=? LIMIT 1",
+            (binary_id, name),
+        ).fetchone():
+            return True
+        return self.db.execute(
+            "SELECT 1 FROM import WHERE binary_id=? AND name=? LIMIT 1", (binary_id, name),
+        ).fetchone() is not None
 
     # -- functions ---------------------------------------------------------
 

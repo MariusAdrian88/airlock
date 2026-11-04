@@ -148,6 +148,18 @@ def test_imports(st, bid):
     assert [r["name"] for r in st.list_imports(bid, dll="kernel32.dll")] == ["CreateFileW"]
 
 
+def test_has_local_twin(st, bid):
+    assert st.has_local_twin(bid, "CreateFileW")  # import row with that name
+    assert st.has_local_twin(bid, "main")  # non-external function
+    assert not st.has_local_twin(bid, "NoSuchName")
+    st.insert_functions(bid, [{"space": "EXTERNAL", "entry": 2, "name": "Lonely",
+                               "name_state": "library", "is_external": True}])
+    assert not st.has_local_twin(bid, "Lonely")  # an external alone is no twin of itself
+    st.insert_functions(bid, [{"entry": 0x1500, "name": "Lonely", "name_state": "library",
+                               "is_thunk": True}])
+    assert st.has_local_twin(bid, "Lonely")
+
+
 def test_fts(st, bid):
     hits = st.fts_search(bid, "onfoo", kind="function")
     assert [(h.kind, h.text.split(" ")[0]) for h in hits] == [("function", "CMainFrame::OnFoo")]
