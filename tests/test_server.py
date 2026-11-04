@@ -18,9 +18,11 @@ def test_only_implemented_configured_tools_are_listed(tmp_path):
     assert set(names) - {"function_map", "cluster_label", "path", "graph_export"} == {"project_info", "index_status", "open_binary", "list_binaries",
                           "outline", "search", "function", "xrefs", "callgraph", "strings",
                           "program_scan", "project_create", "program_add", "projects", "project_open",
-                          "overview", "project_describe", "features", "feature", "feature_define"}
+                          "overview", "project_describe", "features", "feature", "feature_define",
+                          "spec_write", "spec_read", "spec_list", "spec_export",
+                          "rename", "retype", "comment", "annotate", "struct_define"}
     assert {"function_map", "cluster_label", "path", "graph_export"} <= set(names)
-    assert "rename" in ctx.not_implemented
+    assert "type_inspect" in ctx.not_implemented
     pi = next(t for t in tools if t.name == "project_info")
     dumped = pi.model_dump(exclude_none=True)
     assert all("output_schema" not in t.model_dump(exclude_none=True) for t in tools)
@@ -31,8 +33,9 @@ def test_only_implemented_configured_tools_are_listed(tmp_path):
 def test_clean_profile_lists_no_code_tools(tmp_path):
     server, ctx = build_server(_cfg(tmp_path, "clean"))
     names = [t.name for t in anyio.run(server.list_tools)]
-    assert set(names) == {"projects", "project_open", "project_info"}  # spec tools not implemented yet
-    assert set(ctx.not_implemented) == {"spec_read", "spec_list", "spec_export"}
+    assert set(names) == {"projects", "project_open", "project_info", "spec_read", "spec_list",
+                          "spec_export"}
+    assert not ({"spec_read", "spec_list", "spec_export"} & set(ctx.not_implemented))
 
 
 def test_project_info_call(tmp_path):
@@ -57,7 +60,7 @@ def test_project_info_lists_only_usable_tools_when_unbound(tmp_path):
     assert "index_status" not in tools and "function" not in tools.split("(+")[0].split()
     assert "project_open" in tools and "program_scan" in tools
     assert "more after project_open)" in tools
-    assert "not implemented" not in text and "rename" not in text
+    assert "not implemented" not in text and "type_inspect" not in text
     ctx.worker.stop()
 
 
@@ -65,13 +68,10 @@ def test_unimplemented_tools_return_one_line_error(tmp_path):
     from airlock.server import registry
     server, ctx = build_server(_cfg(tmp_path, "clean"))
     ctx.session = __import__("airlock.server.roles", fromlist=["x"]).SessionState("clean", None)
-    for name, ms in (("spec_list", "M4"), ("spec_read", "M4"), ("spec_export", "M4")):
-        out = registry.call(ctx, name)
-        assert out == f"error not_implemented: {name} is planned for {ms} and not available yet."
     assert registry.call(ctx, "function").startswith("error wrong_role:")
-    # the catalog-only spec_write in a dirty session
+    # a catalog tool without an implementation (annotate set) in a dirty session
     ctx.session = __import__("airlock.server.roles", fromlist=["x"]).SessionState("dirty", None)
-    assert registry.call(ctx, "spec_write") == (
-        "error not_implemented: spec_write is planned for M4 and not available yet.")
+    assert registry.call(ctx, "patch_bytes") == (
+        "error not_implemented: patch_bytes is planned for M3 and not available yet.")
     assert registry.call(ctx, "nope").startswith("error unknown_tool:")
     ctx.worker.stop()

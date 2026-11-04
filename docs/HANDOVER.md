@@ -92,7 +92,7 @@ disabled. The user's global config was upgraded to `config_version` 1
 7. Named strings with no references (dispatch/automation tables): M2
    (MFC/OLE analysers).
 8. (fixed) `view=asm`/`both` implemented (worker `disassemble`, JSON cache under `.airlock\cache\asm`).
-9. Spec tools (M4) and annotate tools (M3) are not implemented.
+9. Spec tools (M4) are implemented (`server/tools/spec.py`, `specs.py`, `specfilter.py`, schema v7). Annotate tools (M3) are not implemented.
 10. The new time estimate is not yet measured on a fresh analysis.
 
 ## Working rules for this project

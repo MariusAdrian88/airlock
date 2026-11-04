@@ -536,6 +536,14 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
                 for fid in srcs:
                     if fid not in bn.thunk_ids and fid not in bn.lib:
                         seed(k, bid, fid, f"refs {lab}", lab)
+        # a string in a command/dispatch table points at its handler function
+        if hits:
+            for r in store.db.execute("SELECT l.string_addr, f.id AS fid FROM string_link l "
+                                      "JOIN function f ON f.binary_id=l.binary_id AND f.space='ram' "
+                                      "AND f.entry=l.fn_entry WHERE l.binary_id=? ORDER BY l.slot_addr", (bid,)):
+                for k, lab in hits.get(r["string_addr"], ()):
+                    if r["fid"] not in bn.thunk_ids and r["fid"] not in bn.lib:
+                        seed(k, bid, r["fid"], f"table string {lab}", lab)
         # a data-format extension that appears in strings is a feature even when no code refs it
         for addr, lst in hits.items():
             for k, lab in lst:

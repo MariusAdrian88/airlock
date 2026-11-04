@@ -23,6 +23,7 @@ from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, forma
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr
+from airlock.server import notes
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
     Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
@@ -150,8 +151,8 @@ def outline(ctx: ServerContext, binary: str = "") -> str:
 # ── search ─────────────────────────────────────────────────────────────────────
 
 _SEARCH_KINDS = {"function": ("function",), "string": ("string",), "import": ("import",),
-                 "any": ("function", "string", "import")}
-_UNINDEXED_KINDS = ("const", "class", "note")
+                 "note": ("note",), "any": ("function", "string", "import", "note")}
+_UNINDEXED_KINDS = ("const", "class")
 
 
 @tool("search", "Full-text search over function names, strings and imports; hits are one line each.")
@@ -164,9 +165,9 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
         return "error bad_args: query is empty. Pass words to look for."
     if kind in _UNINDEXED_KINDS:
         return (f"error not_supported: kind '{kind}' is not indexed yet. "
-                "Use function, string, import or any.")
+                "Use function, string, import, note or any.")
     if kind not in _SEARCH_KINDS:
-        return f"error bad_args: unknown kind '{kind}'. Use function, string, import or any."
+        return f"error bad_args: unknown kind '{kind}'. Use function, string, import, note or any."
     many = bind_many(ctx, binary)
     if isinstance(many, str):
         return many
@@ -227,7 +228,7 @@ def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
     return seq
 
 
-_QUOTA = (("function", 0.4), ("import", 0.2), ("string", 0.2))
+_QUOTA = (("function", 0.4), ("import", 0.2), ("string", 0.2), ("note", 0.2))
 
 
 def _balance(groups: dict[str, list[tuple[tuple[int, ...], str]]], limit: int) -> list[str]:
@@ -275,6 +276,15 @@ def _search_item(bd: Bound, h, query: str) -> tuple[tuple[int, int], str] | None
     same name; otherwise it is shown as `import-only DLL::Name` without its
     pseudo address."""
     st = bd.store
+    if h.kind == "note":
+        row = st.get_note(h.ref_id)
+        if row is None:
+            return None
+        nfn = st.function_at(row["binary_id"], row["entry"], row["space"])
+        where = f"{nfn.qualified_name} " if nfn is not None else ""
+        return (_match_rank(query, row["summary"]), 0), (
+            f"note #{row['id']} {where}{bd.addr(row['entry'], row['space'])} "
+            + notes.format_note(row["summary"], row["tags"], row["confidence"], 100))
     if h.kind == "function":
         fn = st.get_function(h.ref_id)
         if fn is None:
@@ -460,6 +470,15 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     assert isinstance(ft, tg.FunctionTarget)
     bd, fn, note = ft.bound, ft.fn, ft.any_note
     st, b = bd.store, bd.binary
+    if not fn.is_external:
+        ts = st.table_strings(fn, 3)
+        if ts:
+            hint = "table string " + ", ".join(preview(t.value, 40) for t in ts[:2])
+            hint += f" +{len(ts) - 2}" if len(ts) > 2 else ""
+            note = f"{note}; {hint}" if note else hint
+    nl = notes.function_lines(st, fn)       # agent notes: "// note #id ..." above the code
+    if nl:
+        note = chr(10).join(([note] + nl) if note else [nl[0][3:], *nl[1:]])
     if view == "signature":
         callers = len(st.callers(fn, 200))
         sig = fn.signature or fn.qualified_name
@@ -548,7 +567,8 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
 # ── xrefs ──────────────────────────────────────────────────────────────────────
 
 _KIND_MAP = {"call": ("call", "call_ind", "call_imp"), "jump": ("jump",), "read": ("read",),
-             "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",), "fnptr": ("fnptr",)}
+             "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",), "fnptr": ("fnptr",),
+             "table": ("table",)}
 
 
 def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
@@ -582,7 +602,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         kinds = _KIND_MAP.get(kind)
         if kinds is None:
             return (f"error bad_args: unknown kind '{kind}'. "
-                    "Use call, jump, read, write, data, import or dynamic.")
+                    "Use call, jump, read, write, data, import, dynamic or table.")
     limit = max(1, min(int(limit), 1000))
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
     if isinstance(tr, str):
@@ -646,6 +666,11 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
             b.id, value, kinds, limit + 1)
         refs = [(bd, x) for x in xs]
         links = [(bd, x) for x in st.cross_from_address(b.id, value, 5)]
+        if direction == "to" and s is not None and (kinds is None or "table" in kinds):
+            for entry, tab, ev in st.string_table_at(b.id, value):
+                tf = st.function_at(b.id, entry)
+                who = tf.qualified_name if tf else bd.addr(entry)
+                entries.append(("table", f"  {bd.addr(tab)}  {who:<36} table ({ev})"))
     for lb, x in links[:5]:
         n = _cross_target(lb, x)
         if n not in notes:
@@ -872,7 +897,8 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
         lines_b = []
         for h in hits:
             enc = "" if h.encoding == "ascii" else f" {h.encoding}"
-            line = f"{'[' + bd.binary.name + '] ' if multi else ''}{bd.addr(h.address)}{enc} "                    f"{preview(h.value)}"
+            line = (f"{'[' + bd.binary.name + '] ' if multi else ''}{bd.addr(h.address)}{enc} "
+                    f"{preview(h.value)}")
             if with_refs:
                 if h.refs:
                     names = " ".join(f.qualified_name for f in h.refs[:4])
@@ -880,6 +906,10 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
                     line += f"  <- {names}{extra}"
                 else:
                     line += "  <- (no refs)"
+                tfs = bd.store.string_link_fns(bd.binary.id, h.address, 5)
+                if tfs:
+                    line += "  table: " + " ".join(f.qualified_name for f in tfs[:4])
+                    line += f" +{len(tfs) - 4}" if len(tfs) > 4 else ""
             lines_b.append(line)
         per_binary.append(lines_b)
     # Round-robin over the binaries, so one chatty binary cannot crowd out the others.

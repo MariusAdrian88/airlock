@@ -62,3 +62,61 @@ def _v5(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[5] = _v5
+
+
+def _v6(db: sqlite3.Connection) -> None:
+    """string_link: strings tied to functions through data tables (derived; rebuilt by the link phase)."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS string_link (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "string_addr INTEGER NOT NULL, fn_entry INTEGER NOT NULL, table_addr INTEGER NOT NULL, "
+        "slot_addr INTEGER NOT NULL, evidence TEXT NOT NULL DEFAULT '')",
+        "CREATE INDEX IF NOT EXISTS string_link_by_string ON string_link(binary_id, string_addr)",
+        "CREATE INDEX IF NOT EXISTS string_link_by_fn ON string_link(binary_id, fn_entry)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[6] = _v6
+
+
+MIGRATIONS.setdefault(6, lambda db: None)   # placeholder; the real v6 is registered above when present
+
+
+def _v7(db: sqlite3.Connection) -> None:
+    """Specs (versioned pages), their dirty-only provenance, and the audit log (DESIGN 4, 9)."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS spec (id INTEGER PRIMARY KEY, topic TEXT NOT NULL, "
+        "title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, "
+        "version INTEGER NOT NULL DEFAULT 1, author TEXT, created_at TEXT, updated_at TEXT, "
+        "UNIQUE (topic, version))",
+        "CREATE TABLE IF NOT EXISTS spec_provenance (spec_id INTEGER NOT NULL REFERENCES spec(id), "
+        "binary_id INTEGER REFERENCES binary(id), function_id INTEGER REFERENCES function(id), "
+        "address INTEGER, method TEXT)",
+        "CREATE INDEX IF NOT EXISTS spec_provenance_by_spec ON spec_provenance(spec_id)",
+        "CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, "
+        "profile TEXT NOT NULL, tool TEXT NOT NULL, args_digest TEXT, result_kind TEXT, detail TEXT)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[7] = _v7
+
+
+MIGRATIONS.setdefault(6, lambda db: None)   # placeholders: the real v6/v7 are registered by their own blocks
+MIGRATIONS.setdefault(7, lambda db: None)
+
+
+def _v8(db: sqlite3.Connection) -> None:
+    """Agent notes on functions. Keyed by (binary, space, entry), not function.id: the function rows
+    are rebuilt by every re-extraction, the notes must survive it."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS note (id INTEGER PRIMARY KEY, "
+        "binary_id INTEGER NOT NULL REFERENCES binary(id), space TEXT NOT NULL DEFAULT 'ram', "
+        "entry INTEGER NOT NULL, summary TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '', "
+        "confidence TEXT, author TEXT, created_at TEXT)",
+        "CREATE INDEX IF NOT EXISTS note_by_fn ON note(binary_id, space, entry)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[8] = _v8

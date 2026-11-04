@@ -13,9 +13,9 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
-FTS_KINDS = ("function", "string", "import")
+FTS_KINDS = ("function", "string", "import", "note")
 # Code edges. ``call_imp`` is a call through an import slot (IAT): Ghidra reports
 # ``CALL dword ptr [slot]`` / ``MOV reg,[slot]; CALL reg`` as a read of the slot, so
 # ``normalise_import_edges`` rewrites read/data edges from code to an import slot to ``call_imp``.
@@ -30,6 +30,9 @@ GRAPH_SQL = ",".join(f"'{k}'" for k in GRAPH_EDGES)
 FNPTR_TABLE_MIN = 3        # consecutive function pointers that make a table
 FNPTR_TABLE_CAP = 256      # entries used per table
 FNPTR_TABLE_REFS = 64      # referencing functions used per table
+STRTAB_MIN = 3             # records that make a string/function table
+STRTAB_WINDOW = 2          # string and function pointer within this many pointer slots of each other
+STRTAB_CAP = 2048          # records used per table
 
 
 @dataclass(frozen=True)
@@ -280,13 +283,16 @@ class Store:
             q(f"DELETE FROM ast_node WHERE function_id IN ({fids})", (binary_id,))
             q(f"DELETE FROM decomp WHERE function_id IN ({fids})", (binary_id,))
             q("DELETE FROM edge WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM string_link WHERE binary_id=?", (binary_id,))
             q("DELETE FROM string WHERE binary_id=?", (binary_id,))
             q("DELETE FROM import WHERE binary_id=?", (binary_id,))
             q("DELETE FROM export WHERE binary_id=?", (binary_id,))
             q("DELETE FROM xedge WHERE src_binary=? OR dst_binary=?", (binary_id, binary_id))
             q("DELETE FROM feature_entry WHERE binary_id=?", (binary_id,))
+            # spec provenance is agent data: keep the row (binary + address), drop the function link
+            q(f"UPDATE spec_provenance SET function_id=NULL WHERE function_id IN ({fids})", (binary_id,))
             q("DELETE FROM function WHERE binary_id=?", (binary_id,))
-            q("DELETE FROM fts WHERE binary_id=?", (binary_id,))
+            q("DELETE FROM fts WHERE binary_id=? AND kind<>'note'", (binary_id,))   # notes are agent data
 
     def insert_functions(self, binary_id: int, rows: Iterable[dict[str, Any]]) -> None:
         """Rows: dicts with ``entry``, ``name``, ``name_state`` and optional
@@ -371,6 +377,7 @@ class Store:
             )
         self.normalise_import_edges(binary_id)
         self.link_fnptr(binary_id)
+        self.link_string_tables(binary_id)
 
     def link_fnptr(self, binary_id: int) -> int:
         """Rebuild the ``fnptr`` edges of a binary (needs src_fn / dst_fn: run after ``link_edges``):
@@ -432,6 +439,125 @@ class Store:
                 "VALUES (?,?,?,?,?,'fnptr')",
                 [(binary_id, sf, sa, df, da) for sa, da, sf, df in rows.values()])
         return len(rows)
+
+    def link_string_tables(self, binary_id: int) -> int:
+        """Rebuild ``string_link``: strings tied to functions through data tables. Data slots (outside
+        every function) that point at a string or at a function entry are paired when a string slot
+        and a function slot lie within STRTAB_WINDOW pointer slots of each other; a run of >=
+        STRTAB_MIN records with one stride and one slot offset is a table (command/dispatch tables).
+        Two parallel pointer arrays (strings, then functions or the reverse, equal length, gap <=
+        window) pair index-wise. Needs edges, functions and strings. Returns the row count."""
+        b = self.get_binary_by_id(binary_id)
+        ptr = (b.pointer_size if b else 4) or 4
+        q = self.db.execute
+        with self.db:
+            q("DELETE FROM string_link WHERE binary_id=?", (binary_id,))
+        smap: dict[int, int] = {}      # slot -> string address
+        for r in q(
+                "SELECT e.src_addr, e.dst_addr FROM edge e JOIN string s ON s.binary_id=e.binary_id "
+                "AND s.address=e.dst_addr WHERE e.binary_id=? AND e.src_fn IS NULL "
+                "AND e.kind IN ('data','read','write') ORDER BY e.src_addr, e.dst_addr", (binary_id,)):
+            smap.setdefault(r["src_addr"], r["dst_addr"])
+        if len(smap) < STRTAB_MIN:
+            return 0
+        fmap: dict[int, int] = {}      # slot -> function entry
+        for r in q(
+                "SELECT e.src_addr, e.dst_addr FROM edge e JOIN function g ON g.id=e.dst_fn "
+                "WHERE e.binary_id=? AND e.src_fn IS NULL AND e.kind IN ('data','read','write') "
+                "AND g.space='ram' AND g.entry=e.dst_addr AND g.is_external=0 "
+                "ORDER BY e.src_addr, e.dst_addr", (binary_id,)):
+            fmap.setdefault(r["src_addr"], r["dst_addr"])
+        if len(fmap) < STRTAB_MIN:
+            return 0
+        out: dict[tuple[int, int, int], tuple[int, str]] = {}   # (string, entry, slot) -> table, evidence
+
+        def emit(recs: list[tuple[int, int]], what: str) -> None:
+            recs = recs[:STRTAB_CAP]
+            for i, (sslot, fslot) in enumerate(recs):
+                out.setdefault((smap[sslot], fmap[fslot], sslot),
+                               (recs[0][0], f"{what} {i + 1}/{len(recs)}"))
+
+        # interleaved records: per slot offset k, runs of string slots with one stride
+        by_k: dict[int, list[tuple[int, int]]] = {}
+        for sslot in sorted(smap):
+            for k in range(-STRTAB_WINDOW, STRTAB_WINDOW + 1):
+                if k and sslot + k * ptr in fmap:
+                    by_k.setdefault(k, []).append((sslot, sslot + k * ptr))
+        taken: set[int] = set()
+        cand: list[tuple[int, int, list[tuple[int, int]]]] = []   # (stride, ...) per run
+        for k in sorted(by_k, key=lambda x: (abs(x), x)):
+            run: list[tuple[int, int]] = []
+            stride = 0
+            for pr in [*by_k[k], None]:
+                if run and pr is not None:
+                    d = pr[0] - run[-1][0]
+                    if d % ptr == 0 and 2 * ptr <= d <= 16 * ptr and stride in (0, d):
+                        stride = d
+                        run.append(pr)
+                        continue
+                if len(run) >= STRTAB_MIN:
+                    cand.append((stride, len(run), run))
+                run, stride = ([pr] if pr is not None else []), 0
+        for stride, _n, recs in sorted(cand, key=lambda c: (-c[1], c[2][0][0])):
+            if any(r[0] in taken for r in recs):
+                continue
+            taken.update(r[0] for r in recs)
+            emit(recs, f"record stride 0x{stride:x}")
+
+        # parallel arrays: consecutive string slots next to consecutive function slots
+        def runs(m: dict[int, int]) -> list[list[int]]:
+            res: list[list[int]] = []
+            cur: list[int] = []
+            for a in sorted(m):
+                if cur and a != cur[-1] + ptr:
+                    res.append(cur)
+                    cur = []
+                cur.append(a)
+            return [*res, cur] if cur else res
+
+        fruns = {r[0]: r for r in runs(fmap) if len(r) >= STRTAB_MIN}
+        for sr in runs(smap):
+            if len(sr) < STRTAB_MIN or sr[0] in taken:
+                continue
+            for gap in range(STRTAB_WINDOW + 1):
+                fr = fruns.get(sr[-1] + ptr * (1 + gap))                  # functions follow
+                if fr is None:
+                    fr = fruns.get(sr[0] - ptr * (len(sr) + gap))         # functions precede
+                    if fr is not None and fr[-1] + ptr * (1 + gap) != sr[0]:
+                        fr = None
+                if fr is not None and len(fr) == len(sr):
+                    emit(list(zip(sr, fr)), "parallel arrays")
+                    break
+        rows = [(binary_id, sa, fe, tab, slot, ev) for (sa, fe, slot), (tab, ev) in out.items()]
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO string_link(binary_id, string_addr, fn_entry, table_addr, slot_addr, "
+                "evidence) VALUES (?,?,?,?,?,?)", rows)
+        return len(rows)
+
+    def string_link_fns(self, binary_id: int, string_addr: int, limit: int = 8) -> list[Function]:
+        """Functions tied to a string through a data table."""
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT} FROM string_link l JOIN function f ON "
+            "f.binary_id=l.binary_id AND f.space='ram' AND f.entry=l.fn_entry "
+            "WHERE l.binary_id=? AND l.string_addr=? ORDER BY f.entry LIMIT ?",
+            (binary_id, string_addr, limit)).fetchall()
+        return [_function(r) for r in rows]
+
+    def table_strings(self, fn: Function, limit: int = 8) -> list[StringHit]:
+        """Strings tied to fn through a data table (name hints), in table order."""
+        rows = self.db.execute(
+            "SELECT s.id, s.address, s.encoding, s.value FROM string_link l "
+            "JOIN string s ON s.binary_id=l.binary_id AND s.address=l.string_addr "
+            "WHERE l.binary_id=? AND l.fn_entry=? GROUP BY s.id ORDER BY MIN(l.slot_addr) LIMIT ?",
+            (fn.binary_id, fn.entry, limit)).fetchall()
+        return [StringHit(r["id"], r["address"], r["encoding"], r["value"]) for r in rows]
+
+    def string_table_at(self, binary_id: int, string_addr: int) -> list[tuple[int, int, str]]:
+        """(fn_entry, table_addr, evidence) rows of a string."""
+        return [(r[0], r[1], r[2]) for r in self.db.execute(
+            "SELECT fn_entry, table_addr, evidence FROM string_link WHERE binary_id=? AND string_addr=? "
+            "ORDER BY fn_entry", (binary_id, string_addr))]
 
     def ptr_callees(self, fn: Function, limit: int = 200) -> list[Function]:
         """Distinct functions G with a ``fnptr`` edge from fn."""
@@ -513,7 +639,7 @@ class Store:
         """Repopulate fts rows (function names, strings, imports) of a binary.
         ref_id is function.id, string.id or import rowid."""
         with self.db:
-            self.db.execute("DELETE FROM fts WHERE binary_id=?", (binary_id,))
+            self.db.execute("DELETE FROM fts WHERE binary_id=? AND kind<>'note'", (binary_id,))
             self.db.execute(
                 "INSERT INTO fts(kind, ref_id, binary_id, text) "
                 "SELECT 'function', id, binary_id, "
@@ -998,6 +1124,94 @@ class Store:
             sql += " AND kind=?"
             args.append(kind)
         return self.db.execute(sql + " ORDER BY start_off", args).fetchall()
+
+    # -- annotate: renames, invalidation, notes ------------------------------
+
+    def bump_versions(self, function_ids: Iterable[int]) -> int:
+        """function.version += 1 for each id (DESIGN 5 Invalidation): the cached decompile, asm and
+        outline of an older version are recomputed on the next request. Returns rows changed."""
+        ids = sorted(set(function_ids))
+        n = 0
+        with self.db:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                n += self.db.execute(
+                    f"UPDATE function SET version=version+1 WHERE id IN ({','.join('?' * len(chunk))})",
+                    chunk).rowcount
+        return n
+
+    def _apply_rename(self, fn_id: int, name: str, namespace: str | None, signature: str | None,
+                      calling_conv: str | None) -> None:
+        """Caller holds the transaction."""
+        self.db.execute(
+            "UPDATE function SET name=?, namespace=?, name_state='user', signature=COALESCE(?, signature), "
+            "calling_conv=COALESCE(?, calling_conv) WHERE id=?",
+            (name, namespace, signature, calling_conv, fn_id))
+        self.db.execute(
+            "UPDATE fts SET text=? WHERE kind='function' AND ref_id=?",
+            ((f"{namespace}::{name}" if namespace else name) + " "
+             + _camel_words((namespace + " " if namespace else "") + name), fn_id))
+
+    def apply_rename(self, fn_id: int, name: str, namespace: str | None, signature: str | None,
+                     calling_conv: str | None, bump: Iterable[int]) -> None:
+        """Record a function rename done in Ghidra (name_state becomes 'user') and bump `bump`."""
+        with self.db:
+            self._apply_rename(fn_id, name, namespace, signature, calling_conv)
+            self.bump_versions(bump)
+
+    def set_signature(self, fn_id: int, signature: str | None, calling_conv: str | None) -> None:
+        with self.db:
+            self.db.execute("UPDATE function SET signature=COALESCE(?, signature), "
+                            "calling_conv=COALESCE(?, calling_conv) WHERE id=?",
+                            (signature, calling_conv, fn_id))
+
+    def functions_referencing(self, binary_id: int, addr: int) -> list[int]:
+        """Ids of the functions with an edge to `addr` (a global's readers and writers)."""
+        return [r[0] for r in self.db.execute(
+            "SELECT DISTINCT src_fn FROM edge WHERE binary_id=? AND dst_addr=? AND src_fn IS NOT NULL",
+            (binary_id, addr))]
+
+    def function_ids_mentioning(self, binary_id: int, word: str) -> list[int]:
+        """Functions whose cached decompile text contains `word` (a type name) as an identifier."""
+        like = "%" + word.translate(_LIKE_ESC) + "%"
+        rx = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+        return [r["function_id"] for r in self.db.execute(
+            "SELECT d.function_id, d.c_text FROM decomp d JOIN function f ON f.id=d.function_id "
+            "WHERE f.binary_id=? AND d.c_text LIKE ? ESCAPE '\\'", (binary_id, like))
+            if rx.search(r["c_text"] or "")]
+
+    def add_note(self, binary_id: int, space: str, entry: int, summary: str, tags: str,
+                 confidence: str | None, author: str | None, created_at: str,
+                 rename: dict[str, Any] | None = None, bump: Iterable[int] = ()) -> int:
+        """One transaction: the note row and its fts row, plus (optionally) the rename of the
+        function at (space, entry) and the version bumps. Returns the note id."""
+        with self.db:
+            cur = self.db.execute(
+                "INSERT INTO note(binary_id, space, entry, summary, tags, confidence, author, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (binary_id, space, entry, summary, tags, confidence, author, created_at))
+            nid = int(cur.lastrowid)
+            self.db.execute("INSERT INTO fts(kind, ref_id, binary_id, text) VALUES ('note', ?, ?, ?)",
+                            (nid, binary_id, summary + (" " + tags.replace(",", " ") if tags else "")))
+            if rename is not None:
+                self._apply_rename(rename["fn_id"], rename["name"], rename["namespace"],
+                                   rename.get("signature"), rename.get("calling_conv"))
+            self.bump_versions(bump)
+        return nid
+
+    def notes_for(self, binary_id: int, space: str, entry: int) -> list[sqlite3.Row]:
+        """Notes on one function, oldest first."""
+        return self.db.execute(
+            "SELECT id, summary, tags, confidence, author, created_at FROM note "
+            "WHERE binary_id=? AND space=? AND entry=? ORDER BY id", (binary_id, space, entry)).fetchall()
+
+    def get_note(self, note_id: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT id, binary_id, space, entry, summary, tags, confidence, author, created_at "
+            "FROM note WHERE id=?", (note_id,)).fetchone()
+
+    def count_notes(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM note").fetchone()[0])
 
     # -- lookups for tools -------------------------------------------------
 

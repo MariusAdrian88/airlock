@@ -25,7 +25,7 @@ from airlock.index.store import CODE_EDGES, Binary, Store
 
 log = logging.getLogger(__name__)
 
-LINK_VERSION = 4   # 3: import-slot reads rewritten to call_imp edges; 4: plugin-interface links + fnptr edges
+LINK_VERSION = 5   # 3: import-slot reads rewritten to call_imp edges; 4: plugin-interface links + fnptr edges; 5: string_link
 CODE_KINDS = CODE_EDGES
 _LOAD_RE = re.compile(r"^(?:LoadLibrary(?:Ex)?[AW]?|LdrLoadDll)$")
 _GPA_RE = re.compile(r"^(?:GetProcAddress|LdrGetProcedureAddress)$")
@@ -384,6 +384,10 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
             store.link_fnptr(i)
         except Exception as e:  # noqa: BLE001
             log.warning("function-pointer edges of binary %s: %s", i, e)
+        try:
+            store.link_string_tables(i)
+        except Exception as e:  # noqa: BLE001
+            log.warning("string tables of binary %s: %s", i, e)
     with store.db:
         store.set_meta("link_version", str(LINK_VERSION))
     if after is not None:

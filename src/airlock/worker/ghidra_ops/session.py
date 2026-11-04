@@ -49,6 +49,7 @@ class Entry:
         self.analysis_profile: str | None = None
         self.decomp: Any = None                # reserved foreground DecompInterface (lazy)
         self.cursors: dict[str, Any] = {}      # extract cursors by kind
+        self.epoch = 0                         # +1 per annotate write: decompilers opened earlier are stale
 
 
 class _Session:

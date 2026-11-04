@@ -100,5 +100,5 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
 def load_tool_modules() -> None:
     """Import every module that defines tools (each registers on import)."""
     from airlock.server.tools import (  # noqa: F401
-        admin, core, fmap, graphtools, map, project, project_create, queue, session,
+        admin, annotate, core, fmap, graphtools, map, project, project_create, queue, session, spec,
     )

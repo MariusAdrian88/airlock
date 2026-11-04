@@ -519,6 +519,19 @@ CREATE TABLE edge (
 CREATE INDEX edge_dst ON edge(binary_id, dst_addr, kind);
 CREATE INDEX edge_src ON edge(binary_id, src_addr, kind);
 
+-- schema v6: strings tied to functions through data tables. Derived by the link phase from `edge`
+-- (no worker data): data slots outside functions that point at a string and at a function entry,
+-- within +-2 pointer slots, in a run of >= 3 records with one stride (or two parallel arrays).
+-- Rebuilt by link_edges / relink (LINK_VERSION 5); old projects get it on open without re-analysis.
+CREATE TABLE string_link (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  string_addr   INTEGER NOT NULL,
+  fn_entry      INTEGER NOT NULL,
+  table_addr    INTEGER NOT NULL,   -- first slot of the table
+  slot_addr     INTEGER NOT NULL,   -- the string pointer slot
+  evidence      TEXT NOT NULL DEFAULT ''   -- 'record stride 0x8 2/4' | 'parallel arrays 2/4'
+);
+
 CREATE TABLE string (
   id            INTEGER PRIMARY KEY,
   binary_id     INTEGER NOT NULL REFERENCES binary(id),
@@ -575,10 +588,12 @@ CREATE VIRTUAL TABLE fts USING fts5(
 -- Agent knowledge (dirty side).
 CREATE TABLE note (
   id            INTEGER PRIMARY KEY,
-  function_id   INTEGER REFERENCES function(id),
-  class_id      INTEGER REFERENCES class(id),
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  space         TEXT NOT NULL DEFAULT 'ram',
+  entry         INTEGER NOT NULL,  -- function entry; NOT function.id: function rows are recreated by
+                                   -- every re-extraction, notes must survive it (class notes: M2)
   summary       TEXT NOT NULL,
-  tags          TEXT,           -- comma separated
+  tags          TEXT NOT NULL DEFAULT '',  -- comma separated
   confidence    TEXT,           -- low | medium | high
   author        TEXT,           -- session/agent label
   created_at    TEXT
@@ -611,7 +626,8 @@ CREATE TABLE audit (
   profile       TEXT NOT NULL,
   tool          TEXT NOT NULL,
   args_digest   TEXT,
-  result_kind   TEXT
+  result_kind   TEXT,
+  detail        TEXT            -- e.g. "topic v3 final" (added in schema v7)
 );
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);  -- schema_version, etc.
@@ -775,7 +791,9 @@ not a project folder, goes through `project_create`:
 | rename function | the function and its direct callers |
 | change signature / calling convention | the function and its direct callers |
 | retype a local | the function |
-| change a struct / field | every function using that type (queried from Ghidra's data type references) |
+| change a struct / field | every function whose cached decompile text names the struct (`struct_define` on an existing name; uncached functions are decompiled fresh anyway) |
+| retype a parameter | the function and its direct callers |
+| comment, plate-comment mirror of a note | the function (comments are part of the decompile text) |
 | rename a global | functions referencing it |
 
 A cached `decomp` row is valid only if `fn_version` and `analysis_profile`
@@ -830,6 +848,30 @@ omitted when the project has one binary. With several ready binaries,
 | `annotate` | `target`, `summary`, `tags?`, `confidence?`, `new_name?` | atomic: optional rename + note row (+ plate comment if configured) |
 | `struct_define` | `name`, `fields` (list of `{offset, type, name}`), `size?` | creates or replaces a struct |
 | `patch_bytes` | `address`, `hex` | off by default |
+
+Details settled in M3:
+
+- Each write is one worker op: write lock, one Ghidra transaction, program saved before the reply,
+  foreground decompiler dropped and `Entry.epoch` bumped so bulk decompilers reopen. The index is
+  updated only after the worker answered. `function.name_state` becomes `user`; `function.version` is
+  bumped as in §5 (direct callers include `fnptr` callers); the next request recomputes decompile, asm
+  and outline lazily, never eagerly.
+- `rename` function: `A::B::name` moves the function into that namespace, a bare name keeps it. Global
+  and label renames take an address (creates a label when there is none) or an existing global label
+  name; they invalidate the referencing functions and the containing function. A local is renamed with
+  `target=<name shown in the decompile>` and `function=`.
+- `retype` returns the decompile lines that name the variable (at most 12).
+- `comment` takes an exact address; a function name means its entry. A plate comment keeps the airlock
+  notes block.
+- `annotate` stores a note keyed by function entry (any number per function, newest listed first, up to
+  5 shown as `// note #id [confidence] summary (tags: ...)` above `function` output). With
+  `mirror_notes_to_ghidra` the newest 10 notes are mirrored into the function's plate comment between
+  `--- airlock notes ---` and `--- end airlock notes ---` lines, together with the optional rename in one
+  transaction; without rename and mirror no Ghidra write happens. `search kind=note` (and `any`) finds
+  summary and tags. A failed Ghidra write stores no note.
+- `struct_define` fields may not overlap; gaps stay undefined; types are parsed by Ghidra's data type
+  parser (`int`, `char *`, structs of the project).
+- `patch_bytes` stays `not_implemented`.
 
 ### cpp
 
@@ -890,10 +932,10 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `spec_write` | `topic`, `title`, `body`, `status=draft`, `sources` | spec id + version; rejects code/addresses (§9) |
-| `spec_list` | `topic_prefix?` | topics, titles, status, versions |
-| `spec_read` | `topic`, `version?` | spec body |
-| `spec_export` | `topic_prefix?`, `format=md` | spec document file path + audit summary |
+| `spec_write` | `topic`, `title`, `body`, `sources`, `status=draft` | `spec <id> <topic> v<n> <status>`; rejects code/addresses (§9); an identical rewrite returns `unchanged`, a changed one is a new version |
+| `spec_list` | `topic_prefix?` | topics, titles, versions, status; dirty also publish state and id |
+| `spec_read` | `topic` or `id` (dirty only), `version?` | title line + body; a clean session gets the published version only |
+| `spec_export` | `topic_prefix?`, `format=md` | dirty: publishes (§9 Publishing specs); clean: only reports the published count |
 
 ### admin
 
@@ -1039,6 +1081,15 @@ slot; callers of a thunk are one `xrefs` away). On a thunk or import slot,
 follows these links: a callee hop is `→ [engine.dll] Foo (0x10001000)`, a
 caller hop `← [main.exe] LoadDoc (0x00401300) [thunk]`; a hop is an ordinary
 edge for depth, `[cycle]` and `[seen]`.
+
+Table links (`string_link`): a string held by a command/dispatch table record
+next to its handler pointer has no code reference. `strings` appends
+`  table: Handler1 Handler2` to the line (after `<- (no refs)` when there are
+none), `xrefs` on the string address adds `  0x00404008  Handler  table
+(record stride 0x8 2/3)` (kind `table`, address = first table slot; filter with
+`kind=table`), and `function` (brief and full, any view) adds the note
+`// table string "name", ...` as a name hint. Feature seeding treats the
+handler as referencing the string.
 
 `search` ordering and dedup (deterministic):
 
@@ -1205,6 +1256,10 @@ with provenance. "Publish" (`spec_export` in the dirty role) writes the
 `final` specs to `clean\specs\` as Markdown plus a `specs.json` index
 (topic, title, version, status), without provenance, addresses or notes.
 The clean role reads only `clean\specs\`; it never opens `dirty\.airlock\`.
+Export publishes the latest version of each `final` topic under the prefix as
+`specs\<topic>.md` (front matter: topic, title, version, status), rewrites `specs.json`
+(`{"specs":[{topic,title,version,status,file}]}`) and `audit-summary.md`; topics under the
+prefix that are no longer final are withdrawn (file and entry removed).
 
 ### Enforcement
 
@@ -1224,8 +1279,26 @@ The clean role reads only `clean\specs\`; it never opens `dirty\.airlock\`.
 - Data layouts in specs use a neutral table form (field, offset, size,
   meaning), which describes the format without copying code.
 - `spec_write` requires `sources`, stored in `spec_provenance` (dirty only).
-- Every tool call is written to `audit` with profile, tool and an argument
-  digest.
+  `sources` is a list (newline, `;` or `,`) of `[method:]binary!function-or-address` items
+  or bare method words (`decompile`, `file_diff`, `resources`, `observation`). Targets
+  resolve with the §7.3 rules; a non-decompile method with an unresolvable target keeps
+  just the method. `binary_id`, `function_id` and `address` are stored; re-extraction of a
+  binary keeps the rows and clears only `function_id`.
+- Filter details (module `server/specfilter.py`, errors `spec_has_code`,
+  `spec_has_ghidra_names`, `spec_has_bytes`, `spec_has_address`; each names the line):
+  N = 8 consecutive hex bytes; "image range" = `[image_base, highest known function or
+  string address + 1 MB]` per binary; any pointer-sized hex literal (8+ digits) is also
+  rejected; fenced code blocks are rejected; small values (field offsets, magic numbers of
+  up to 7 digits) stay allowed. Title and body are both checked. Topics are lowercase path
+  segments (`a-z0-9._-`), which also name the published file.
+- Spec versions are immutable rows (`UNIQUE (topic, version)`); specs, provenance and audit
+  are agent data and are never dropped by re-extraction or rebuild of derived rows.
+- Audit: the `audit` table (`at`, `profile` = session role, `tool`, `args_digest`,
+  `result_kind`, `detail` = `topic vN status`) is append-only. Dirty `spec_write` and each
+  published spec in `spec_export` write a row; clean sessions never open the index, so their
+  reads are not logged there.
+- Target: every tool call is written to `audit` with profile, tool and an argument
+  digest. Implemented so far: spec writes and publishes.
 
 ### Export
 

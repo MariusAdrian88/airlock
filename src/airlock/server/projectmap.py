@@ -239,10 +239,7 @@ def knowledge_lines(pp: ProjectPaths, store: Store) -> list[str]:
     topics: list[str] = []
     if _table_exists(store, "note"):
         try:
-            rows = store.db.execute("SELECT topic, COUNT(*) AS n FROM note GROUP BY topic "
-                                    "ORDER BY topic").fetchall()
-            notes = sum(r["n"] for r in rows)
-            topics += [f"{r['topic']}: {r['n']} notes" for r in rows[:8]]
+            notes = int(store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0])
         except sqlite3.Error:
             pass
     if _table_exists(store, "spec"):

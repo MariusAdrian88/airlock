@@ -218,12 +218,14 @@ def make_engine(e: Entry, entries: list[int], timeout: int, monitor: Any, with_v
 
     class Ctx:
         di: Any = None
+        epoch = 0
 
     def make_ctx() -> Ctx:
         c = Ctx()
         with e.lock.read():
             check_open(e)
             c.di = open_decompiler(e.program)
+            c.epoch = e.epoch
         return c
 
     def close_ctx(c: Ctx) -> None:
@@ -243,8 +245,14 @@ def make_engine(e: Entry, entries: list[int], timeout: int, monitor: Any, with_v
                     func = _resolve_function(e.program, req)
                 except WorkerError as ex:
                     return {"entry": req, "req": req, "status": "error", "error": ex.message}
+                if c.di is not None and c.epoch != e.epoch:   # an annotate write happened: reopen
+                    try:
+                        c.di.dispose()
+                    finally:
+                        c.di = None
                 if c.di is None:
                     c.di = open_decompiler(e.program)
+                    c.epoch = e.epoch
                 out = decompile_function(e, c.di, func, timeout, monitor, with_version)
         except WorkerError:
             raise

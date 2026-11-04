@@ -134,9 +134,70 @@ CREATE TABLE feature_entry (
 );
 CREATE INDEX feature_entry_by_fn ON feature_entry(binary_id, space, entry);
 
+-- strings tied to functions through data tables (derived by the link phase: a record or parallel
+-- arrays holding a string pointer and a function pointer; table_addr = first slot of the table)
+CREATE TABLE string_link (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  string_addr   INTEGER NOT NULL,
+  fn_entry      INTEGER NOT NULL,
+  table_addr    INTEGER NOT NULL,
+  slot_addr     INTEGER NOT NULL,
+  evidence      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX string_link_by_string ON string_link(binary_id, string_addr);
+CREATE INDEX string_link_by_fn ON string_link(binary_id, fn_entry);
+
 CREATE VIRTUAL TABLE fts USING fts5(
   kind, ref_id UNINDEXED, binary_id UNINDEXED, text,
   tokenize = 'unicode61 remove_diacritics 2'
 );
+
+-- Clean-room specifications (DESIGN 9). Agent data: kept across re-extraction, never rebuilt.
+CREATE TABLE spec (
+  id            INTEGER PRIMARY KEY,
+  topic         TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  body          TEXT NOT NULL,
+  status        TEXT NOT NULL,  -- draft | reviewed | final
+  version       INTEGER NOT NULL DEFAULT 1,
+  author        TEXT,
+  created_at    TEXT,
+  updated_at    TEXT,
+  UNIQUE (topic, version)
+);
+-- Dirty-only: what each spec version was derived from.
+CREATE TABLE spec_provenance (
+  spec_id       INTEGER NOT NULL REFERENCES spec(id),
+  binary_id     INTEGER REFERENCES binary(id),
+  function_id   INTEGER REFERENCES function(id),
+  address       INTEGER,
+  method        TEXT            -- decompile | file_diff | resources | observation
+);
+CREATE INDEX spec_provenance_by_spec ON spec_provenance(spec_id);
+-- Append-only log of spec writes and publishes (profile = session role).
+CREATE TABLE audit (
+  id            INTEGER PRIMARY KEY,
+  at            TEXT NOT NULL,
+  profile       TEXT NOT NULL,
+  tool          TEXT NOT NULL,
+  args_digest   TEXT,
+  result_kind   TEXT,
+  detail        TEXT
+);
+
+-- Agent notes on functions (DESIGN 4). Agent data: kept across re-extraction, never rebuilt. Keyed by
+-- address, not function.id, because function rows are recreated by every re-extraction.
+CREATE TABLE note (
+  id            INTEGER PRIMARY KEY,
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  space         TEXT NOT NULL DEFAULT 'ram',
+  entry         INTEGER NOT NULL,
+  summary       TEXT NOT NULL,
+  tags          TEXT NOT NULL DEFAULT '',   -- comma separated
+  confidence    TEXT,                       -- low | medium | high
+  author        TEXT,
+  created_at    TEXT
+);
+CREATE INDEX note_by_fn ON note(binary_id, space, entry);
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);

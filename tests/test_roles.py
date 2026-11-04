@@ -134,7 +134,7 @@ def test_project_open_clean_and_redaction(tmp_path):
     assert "role clean | project demo" in info
     for leak in (str(tmp_path), "app.exe", "ghidra", "jdk", "config"):
         assert leak not in info
-    assert "function" not in info and "spec_read" not in info
+    assert "function" not in info.replace("spec_read", "")
     assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
     assert _call(server, "project_open", {"name": "demo", "role": "dirty"}).startswith(
         "error role_locked:")
@@ -165,7 +165,8 @@ def test_profile_mismatch(tmp_path):
 def test_clean_profile_lists_session_tools_only(tmp_path):
     server, _ = build_server(_cfg(tmp_path, "clean"))
     names = {t.name for t in anyio.run(server.list_tools)}
-    assert names == {"projects", "project_open", "project_info"}
+    assert names == {"projects", "project_open", "project_info", "spec_read", "spec_list",
+                     "spec_export"}
 
 
 # -- project_create ------------------------------------------------------------------
