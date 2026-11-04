@@ -1,125 +1,109 @@
 # Handover
 
-Last updated: 2026-11-04, end of M1. Next: **M1 polish, then M2**.
+Last updated: 2026-11-04, end of M1.5. Next: **M1.5 polish (open issues
+1–4), then M2**.
 
 ## State
 
-M1 is done. The acceptance run (DESIGN.md §12) passed on the 32-bit MSVC
-acceptance target: `open_binary` → `index_status` ready → `strings` for
-file-related text → `xrefs` → `function`, every step far below its budget.
-The target is a local fixture only (gitignored); do not name it or quote
-anything from it in tracked files.
+M1 and M1.5 are done and pushed to `origin main` (public repository).
+Acceptance runs passed on the 32-bit MSVC acceptance target (a multi-binary
+program: main executable, own DLLs and plugins). The target is a local
+fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
+path in `.git/info/exclude`). Never name it or quote anything from it in
+tracked files or commit messages; results live in local memory notes only.
 
-Commits this session:
+Tests: `pytest -q` → 460 passed, 30 skipped (~2 min). Ghidra suites:
+`pytest -q -m ghidra --binary=<exe>` (notepad copy) and
+`--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
-| Commit | Content |
-|---|---|
-| `699dfb2` | index store + schema, projects/PE detection, budget + cursors, selectors, worker Ghidra ops |
-| `dc9abdf` | indexer (open_binary flow) and the 9 M1 tools |
-| `382ebfa` | `function_budget` 10000 (separate from `token_budget` 2000), `max_budget` 32000 |
-| `f5a6e65` | `function` page header: `// lines S-E of N, function ~T tokens (budget B)` |
-| `2335e7f` | worker: name `__EH_prolog` + set its call fixup after analysis |
+## How a user works with airlock
 
-Tests: `pytest -q` → 107 passed, 21 skipped. Ghidra suite on a copy of
-`C:\Windows\System32\notepad.exe` → 21 passed (~6 min).
+1. Register `airlock serve` once per MCP client, no flags.
+2. Every session starts unbound. "Reverse engineer `<folder>`" →
+   `program_scan` (light pefile scan, options A–D with estimated time) →
+   `project_create(path, name, option)` → the session is dirty for the new
+   project; the binaries are analysed in a queue, then decompiled in the
+   background.
+3. Later sessions: `projects` → `project_open(name, "dirty"|"clean")`. The
+   role is locked for the session. Clean work belongs in a new conversation.
+4. Dirty: `overview` (project map), `features`/`feature`, `function_map`,
+   `path`, `search`/`strings`/`xrefs`/`callgraph`/`function` across binaries
+   (`binary!target`), `graph_export` for the user.
+5. Clean: specs only (spec tools are M4; today they return
+   `error not_implemented`).
+
+Project folder: `<projects_root>\<name>\` with `airlock-project.jsonc`,
+`dirty\{PROJECT.md, work\, airlock_ghidra\, .airlock\}`,
+`clean\{PROJECT.md, specs\, deny-rule files}` (DESIGN.md §4).
+
+## Main components (M1.5)
 
 | Area | Files |
 |---|---|
-| Index | `index/schema.sql`, `index/store.py`, `index/migrations/` |
-| Projects | `projects.py` (layout, SHA-256 artifacts, `detect` with pefile) |
-| Server | `server/indexer.py`, `budget.py`, `selectors.py`, `tools/core.py`, `tools/common.py`, `tools/admin.py` |
-| Worker | `worker/ghidra_ops/{session,project,extract,decompile,fixups}.py` |
+| Config (jcodemunch-style) | `config/keys.py` (single source), `template.py` (generated JSONC), `edit.py`, `upgrade.py`, `report.py`, `legacy.py`, `loader.py`, `catalog.py` (sets, `always_on`, `clean_safe`) |
+| Sessions | `server/roles.py`, `server/context.py`, `tools/session.py`, `tools/project_create.py` |
+| Scan and queue | `server/scan.py`, `server/estimate.py`, `server/indexer.py`, `tools/project.py`, `tools/queue.py` |
+| Links | `server/linking.py` (ordinals via pefile, dynamic LoadLibrary/GetProcAddress links, `call_imp` normalisation, relink) |
+| Map | `server/features.py`, `server/projectmap.py`, `server/clusters.py`, `server/graph.py`, `server/diagrams.py`, `tools/map.py`, `tools/fmap.py`, `tools/graphtools.py` |
+| Decompile | `server/bulk.py`, `worker/pool.py`, `worker/rwlock.py`, `worker/ghidra_ops/bulk.py` |
+| Index | schema v5: `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `import.resolved`, `xedge.evidence` |
 
-## How to run
+## Config
 
-- Ghidra tests: `pytest -q -m ghidra --binary=<exe>`. Use the `=` form:
-  with a space pytest takes the exe as a test path and never loads
-  `tests/conftest.py`.
-- Any Ghidra run can take minutes (notepad: open to ready ~3 min). In an
-  agent: Bash `timeout: 600000` or background, run once, read
-  `logs\worker.log` before a rerun. Iterate with the fake-worker unit tests.
-- Analysed projects can be reused: `open_binary` on the same sha256 is
-  idempotent and `analyze` returns `already_analysed`.
+`airlock config` (report), `--set`/`--unset`, `validate`,
+`upgrade [--dry-run]`. Tools are chosen by `disabled_tools`/`disabled_sets`
+(deny lists), so new tools appear after updates. Always-on tools cannot be
+disabled. The user's global config was upgraded to `config_version` 1
+(`config.jsonc.bak` kept).
 
-## Timings (notepad.exe copy, 853 functions)
+## Verified facts (M1.5)
 
-JVM start + import 18 s, analysis 168 s, extract 1.2 s, first decompile
-0.35 s, cached decompile ~0 s.
-
-## Verified facts (new this session)
-
-- `GhidraProject.importProgram` needs `pathlib.Path`/`java.io.File`;
-  `createProject` needs an existing parent directory.
-- `DefinedDataIterator.definedStrings` does not exist in 12.1.4; use
-  `byDataInstance(program, StringDataInstance.isString)`.
-- `pyghidra.analyze()` marks a cancelled analysis as analysed; the worker
-  has its own loop.
-- Auto-analysis reports no percentage; progress = analyzers done + function
-  count.
-- `Program.getModificationNumber` is not stable across sessions; the worker
-  uses `DomainFile.getLastModifiedTime()`. Not yet checked: does it change
-  on GUI edits.
-- pefile `fast_load` does not set `RICH_HEADER`; use `parse_rich_header()`.
-  Static-CRT MSVC binaries import no runtime DLL, so the Rich header decides.
-- Function ID leaves the static-CRT `__EH_prolog` unnamed. The x86win cspec
-  `EH_prolog` call fixup works only once `Function.setCallFixup` is set;
-  renaming alone changes nothing. See DESIGN.md §11.
-- Decompiled size (32-bit MSVC sample): median ~70 tokens, ~1% over 2000,
-  largest 8000–30000. Hence `function_budget` 10000.
-
-## Done in M1 polish
-
-- `__EH_prolog` fixup verified through a full fresh analysis of the
-  acceptance target: `unaff_EBP` in 30 callers 0 (was 335 in 20).
-  `COLLECTOR_VERSION` is 2: projects analysed before `2335e7f` need
-  `analyze(force)`.
-- `function` `detail=brief` (default): WARNING lines dropped, more than 6
-  locals collapsed into one line; `detail=full` = raw. About 10% fewer
-  tokens on a large function.
-- `function` over budget returns an outline (control skeleton with line
-  ranges, callees, strings); a 20000-token function gives ~1100 tokens.
-  `outline=false` pages instead.
-- `search`: EXTERNAL rows with a thunk/import twin dropped; kind balance
-  (functions, imports, strings); IAT name strings dropped; identical
-  strings collapsed.
+- Ghidra rejects project path elements that start with `.`; the Ghidra
+  project lives in `dirty\airlock_ghidra`.
+- MCP roots are deprecated in the current protocol and not sent by every
+  client; sessions are bound explicitly with `project_open`.
+- `setExternalPath(lib, "/" + program, True)` links a program's external
+  library to a project program; it does not resolve calls by itself, the
+  index binds imports to exports.
+- 32-bit MSVC calls imports through the IAT; Ghidra reports `read`
+  references to the slot. airlock normalises them to `call_imp` edges.
+- Named PE exports come from Ghidra without ordinals; ordinals are read with
+  pefile, so imports by ordinal bind.
+- Parallel decompile with one `DecompInterface` per thread gives output
+  identical to one decompiler; the AST conversion is serialised (GIL).
+  Notepad full pass 7.0 s → 2.0 s with 11 threads.
+- Analysis time model: about 20 s fixed per binary plus about 120 s per MB
+  of code (measured on a 9-binary program; refined per project).
 
 ## Open issues
 
-1. Calling convention `unknown` for most functions of a static-CRT MSVC
-   binary. Evidence: large MFC methods show `in_ECX[...]` (the `this`
-   pointer) everywhere, so `__thiscall` is not detected. Next task.
-2. Outline control section shows nesting levels 0–1 only; brace-less
-   `if (...) goto` has no range.
-3. Profile switching: decided against a runtime tool (it breaks the
-   clean-room model, DESIGN.md §9). Proposed for M2: `airlock init
-   --client <name>` that writes both registrations, and the role shown in
-   `project_info`/server instructions. Waiting for the user's decision.
-4. Named strings with no references (dispatch/automation tables). Needs an
-   analyser for those tables (M2, MFC/OLE).
-5. `view=asm` / `both` return `not_implemented` (needs a worker op).
-6. The edge table has no destination space, so edges into EXTERNAL are
-   dropped; import callers are found via thunk or IAT slot.
-7. The worker loop is sequential: a long `extract`/`decompile` blocks
-   `hello`/`status`. Crash reconciliation is minimal.
-8. A user `config.jsonc` with `max_budget` 8000 caps per-call overrides at
-   the tool default; raise it to 32000 to use larger overrides.
-9. `index_status` with more than one project on disk: a caller that polls
-   for ` ready:` can match another project's line.
+1. Most subsystem clusters stay `unclassified` (runtime MFC/CRT code inside
+   plugins). Recognise library functions and label those clusters.
+2. The `ui` feature hits the 1500 cap; its count is not faithful. Split
+   `ui` (windows, dialogs, menus, drawing) or rank harder.
+3. `xrefs`/`callgraph` do not accept `KERNEL32!ReadFile`; only `path` does.
+   Use the same endpoint resolver everywhere.
+4. Plugins loaded through run-time paths (no string names the DLL) get no
+   dynamic link. Calls through function pointers are not in the graph.
+5. Calling convention `unknown` for most functions; `__thiscall` not
+   detected (`in_ECX[...]` in MFC methods).
+6. Outline control section shows nesting levels 0–1 only.
+7. Named strings with no references (dispatch/automation tables): M2
+   (MFC/OLE analysers).
+8. `view=asm`/`both` return `not_implemented`.
+9. Spec tools (M4) and annotate tools (M3) are not implemented.
+10. The new time estimate is not yet measured on a fresh analysis.
 
-## Next (M2, DESIGN.md §12)
+## Working rules for this project
 
-Read DESIGN.md §12 for the M2 scope; start with open issue 1 (thiscall).
+- Sonnet agents execute; the main session briefs, reviews, runs the full
+  suite with no agent active, commits and pushes.
+- Agents never commit and never run `git stash`/`checkout --`/`reset`.
+- Long Ghidra runs: background or `timeout: 600000`, once; read logs
+  before a rerun.
+- Before each push: scan commit messages and tracked files for target data.
 
-## Background parallel decompile (this session)
+## Next
 
-- Worker: request lanes (`worker/main.py`), reader/writer lock per program
-  (`worker/rwlock.py`), budget + Engine (`worker/pool.py`), ops `bulk_decompile`,
-  `cancel_bulk`, `decompile_batch` (`ghidra_ops/bulk.py`, `decompile.py`).
-- Server: `server/bulk.py` (BulkScheduler, started from `Indexer._extract_job`
-  and `resume_project`), store helpers `decomp_candidates`, `save_decomp_batch`,
-  config `bulk_decompile` (default background), `decompile_cpu_min/max`.
-  A global config.jsonc in the airlock folder of %APPDATA% that sets `bulk_decompile: lazy`
-  keeps the pass off.
-- Verified: JVM start hangs on Windows while another thread blocks reading the
-  request pipe on fd 0 (fixed: fd 0 -> NUL). See DESIGN section 5 step 8 for
-  the measured numbers.
+Open issues 1–4, then M2 (DESIGN.md §12: resources, RTTI/vtables, MFC
+message maps).
