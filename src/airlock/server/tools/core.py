@@ -6,10 +6,11 @@ cut to the token budget with a cursor; errors are one line `error <code>: ...`.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 
-from airlock.index.store import Function
+from airlock.index.store import Function, StringHit
 from airlock.projects import read_sections
 from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
@@ -147,21 +148,68 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     limit = max(1, min(int(limit), 200))
     # Fetch more than `limit` per kind: dedup drops rows, and ranking needs candidates.
     fetch = limit * 5 + 20
-    ranked: list[tuple[tuple[int, int, int], str]] = []
+    groups: dict[str, list[tuple[tuple[int, ...], str]]] = {}
     seq = 0
+    strings: dict[str, tuple[tuple[int, ...], StringHit]] = {}
     for k in _SEARCH_KINDS[kind]:
         for h in st.fts_search(b.id, query, k, fetch):
             seq += 1
+            if k == "string":
+                s = st.get_string(h.ref_id)
+                if s is None or st.has_import_named(b.id, s.value):
+                    continue  # the import name table duplicates the import rows
+                cur = strings.get(s.value)
+                rank = _match_rank(query, s.value)
+                if cur is None or s.address < cur[1].address:
+                    strings[s.value] = ((rank, 2, seq), s)
+                continue
             item = _search_item(bd, h, query)
             if item:
                 key, line = item
-                ranked.append(((*key, seq), line))
-    ranked.sort(key=lambda x: x[0])
-    merged = [line for _, line in ranked[:limit]]
+                groups.setdefault(k, []).append(((*key, seq), line))
+    for value, (key, s) in strings.items():
+        total = st.string_copies(b.id, value)
+        enc = "" if s.encoding == "ascii" else f" {s.encoding}"
+        extra = f" (+{total - 1} copies)" if total > 1 else ""
+        groups.setdefault("string", []).append(
+            (key, f"string {bd.addr(s.address)}{enc} {preview(s.value)}{extra}"))
+    for g in groups.values():
+        g.sort(key=lambda x: x[0])
+    if kind == "any":
+        merged = _balance(groups, limit)
+    else:
+        merged = [ln for _, ln in groups.get(kind, [])[:limit]]
     if not merged:
         return f"no hits for '{query}'"
     args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
     return _page([f"search '{query}': {len(merged)} hits", *merged], "search", args, bud)
+
+
+_QUOTA = (("function", 0.4), ("import", 0.2), ("string", 0.2))
+
+
+def _balance(groups: dict[str, list[tuple[tuple[int, ...], str]]], limit: int) -> list[str]:
+    """Pick up to `limit` lines: each kind with hits gets its quota first (functions
+    40%, imports 20%, strings 20%; one slot each is reserved first), unused
+    slots then go to the kinds with leftovers in the same order. Output order:
+    functions, imports, strings; rank order inside each group."""
+    have = {k: len(groups.get(k, [])) for k, _ in _QUOTA}
+    take = {k: 0 for k, _ in _QUOTA}
+    left = limit
+    for k, _ in _QUOTA:  # one slot per kind with hits
+        n = min(have[k], 1, left)
+        take[k] += n
+        left -= n
+    for k, share in _QUOTA:  # fill to the quota
+        n = min(have[k], math.ceil(limit * share)) - take[k]
+        n = max(0, min(n, left))
+        take[k] += n
+        left -= n
+    for k, _ in _QUOTA:  # surplus flows on
+        n = min(have[k] - take[k], left)
+        take[k] += n
+        left -= n
+    return [ln for k, _ in _QUOTA for _, ln in groups.get(k, [])[:take[k]]]
 
 
 def _match_rank(query: str, *names: str) -> int:
@@ -178,9 +226,9 @@ def _match_rank(query: str, *names: str) -> int:
 def _search_item(bd: Bound, h, query: str) -> tuple[tuple[int, int], str] | None:
     """(sort key, output line) for one FTS hit, or None when the hit is dropped.
 
-    Order: match rank (exact name, then prefix, then token); within a rank, named
-    functions (user/library/recovered), then FUN_ functions, then strings, then
-    imports. Ties keep FTS order (caller appends the sequence number). An EXTERNAL
+    Order within a kind: match rank (exact name, then prefix, then token); named
+    functions (user/library/recovered) before FUN_ ones. Strings are handled by the
+    caller (import-name drop, collapse). Ties keep FTS order (caller appends the sequence number). An EXTERNAL
     function row is dropped when a non-external function or an import row has the
     same name; otherwise it is shown as `import-only DLL::Name` without its
     pseudo address."""
@@ -198,12 +246,6 @@ def _search_item(bd: Bound, h, query: str) -> tuple[tuple[int, int], str] | None
         flags = ",".join(x for x in (fn.name_state, "thunk" if fn.is_thunk else "", extra) if x)
         group = 1 if fn.name.startswith("FUN_") else 0
         return (rank, group), f"function {fn.qualified_name} {bd.addr(fn.entry, fn.space)} {flags}"
-    if h.kind == "string":
-        s = st.get_string(h.ref_id)
-        if s is None:
-            return None
-        enc = "" if s.encoding == "ascii" else f" {s.encoding}"
-        return (_match_rank(query, s.value), 2), f"string {bd.addr(s.address)}{enc} {preview(s.value)}"
     row = st.get_import(h.ref_id)
     if row is None:
         return None

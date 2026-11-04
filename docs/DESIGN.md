@@ -674,10 +674,19 @@ xrefs to CAppDoc::LoadSettings (0x004a1c20), 3 calls
 
 `search` ordering and dedup (deterministic):
 
-1. Match rank: exact name, then prefix, then token match.
-2. Within a rank: functions with a real name, then default-named (`FUN_…`)
-   functions, then strings, then imports.
+1. Kinds are balanced when `kind` is `any`: functions, imports and strings each
+   get one slot first, then a share of `limit` (functions 40%, imports 20%,
+   strings 20%); slots a kind cannot fill flow to the others, functions first.
+   Code entry points therefore never get crowded out by string hits.
+   `kind=function|import|string` applies no quotas.
+2. Inside a kind: match rank (exact name, then prefix, then token match); real
+   names before default-named (`FUN_…`) functions.
 3. Remaining ties keep the full-text engine's order.
+4. Output order is functions, imports, strings; each group in rank order.
+
+String hits whose value equals an import name (case-sensitive) are dropped: they
+are the import name table and duplicate the import rows. Identical string values
+collapse to one line with the lowest address and `(+N copies)`.
 
 An imported function exists as an EXTERNAL function row, usually a thunk and an
 import row. The EXTERNAL row carries no code and a pseudo address, so it is

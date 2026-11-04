@@ -67,28 +67,45 @@ JVM start + import 18 s, analysis 168 s, extract 1.2 s, first decompile
 - Decompiled size (32-bit MSVC sample): median ~70 tokens, ~1% over 2000,
   largest 8000–30000. Hence `function_budget` 10000.
 
-## Open issues (M1 polish)
+## Done in M1 polish
 
-1. `COLLECTOR_VERSION` is 2 now: projects analysed before `2335e7f` need
-   `analyze(force)` to get the `__EH_prolog` fixup.
-2. `function` noise: strip `/* WARNING ... */` lines and collapse local
-   declarations into one line (`// 47 locals`).
-3. `function` over budget, option 2: an outline (signature, callees,
-   strings, switch cases) instead of page 1, then `lines=`.
-4. `search` lists EXTERNAL function rows before the useful thunk/import
-   hits; hide externals that have a same-named thunk.
-5. Named strings with no references (dispatch/automation tables). Needs an
+- `__EH_prolog` fixup verified through a full fresh analysis of the
+  acceptance target: `unaff_EBP` in 30 callers 0 (was 335 in 20).
+  `COLLECTOR_VERSION` is 2: projects analysed before `2335e7f` need
+  `analyze(force)`.
+- `function` `detail=brief` (default): WARNING lines dropped, more than 6
+  locals collapsed into one line; `detail=full` = raw. About 10% fewer
+  tokens on a large function.
+- `function` over budget returns an outline (control skeleton with line
+  ranges, callees, strings); a 20000-token function gives ~1100 tokens.
+  `outline=false` pages instead.
+- `search`: EXTERNAL rows with a thunk/import twin dropped; kind balance
+  (functions, imports, strings); IAT name strings dropped; identical
+  strings collapsed.
+
+## Open issues
+
+1. Calling convention `unknown` for most functions of a static-CRT MSVC
+   binary. Evidence: large MFC methods show `in_ECX[...]` (the `this`
+   pointer) everywhere, so `__thiscall` is not detected. Next task.
+2. Outline control section shows nesting levels 0–1 only; brace-less
+   `if (...) goto` has no range.
+3. Profile switching: decided against a runtime tool (it breaks the
+   clean-room model, DESIGN.md §9). Proposed for M2: `airlock init
+   --client <name>` that writes both registrations, and the role shown in
+   `project_info`/server instructions. Waiting for the user's decision.
+4. Named strings with no references (dispatch/automation tables). Needs an
    analyser for those tables (M2, MFC/OLE).
-6. Calling convention `unknown` for most functions of a static-CRT MSVC
-   binary; not yet investigated whether it affects output quality.
-7. `view=asm` / `both` return `not_implemented` (needs a worker op).
-8. The edge table has no destination space, so edges into EXTERNAL are
+5. `view=asm` / `both` return `not_implemented` (needs a worker op).
+6. The edge table has no destination space, so edges into EXTERNAL are
    dropped; import callers are found via thunk or IAT slot.
-9. The worker loop is sequential: a long `extract`/`decompile` blocks
+7. The worker loop is sequential: a long `extract`/`decompile` blocks
    `hello`/`status`. Crash reconciliation is minimal.
-10. A user `config.jsonc` with `max_budget` 8000 caps per-call overrides at
-    the tool default; raise it to 32000 to use larger overrides.
+8. A user `config.jsonc` with `max_budget` 8000 caps per-call overrides at
+   the tool default; raise it to 32000 to use larger overrides.
+9. `index_status` with more than one project on disk: a caller that polls
+   for ` ready:` can match another project's line.
 
 ## Next (M2, DESIGN.md §12)
 
-Read DESIGN.md §12 for the M2 scope; start with the open issues 1–4 above.
+Read DESIGN.md §12 for the M2 scope; start with open issue 1 (thiscall).

@@ -360,13 +360,13 @@ def test_search_ranking(ctx):
     _synthetic_search_store(ctx)
     lines = core.search(ctx, "widget").splitlines()[1:]
     kinds = [ln.split()[0] + " " + ln.split()[1] for ln in lines]
-    # exact (function, string) -> prefix (function, string, import) -> token
+    # groups: functions, imports, strings; rank order inside each group
     assert lines[0].startswith("function Widget ")
-    assert lines[1].startswith('string 0x00503100 "Widget"')
-    assert lines[2].startswith("function WidgetOpen ")
-    assert lines[3].startswith('string 0x00503000 "widget text"')
-    assert lines[4].startswith("import LIB-D.DLL!WidgetImp")
-    assert lines[5].startswith("function OpenWidgetNow ")
+    assert lines[1].startswith("function WidgetOpen ")
+    assert lines[2].startswith("function OpenWidgetNow ")
+    assert lines[3].startswith("import LIB-D.DLL!WidgetImp")
+    assert lines[4].startswith('string 0x00503100 "Widget"')
+    assert lines[5].startswith('string 0x00503000 "widget text"')
     assert len(lines) == 6, kinds
 
 
@@ -386,6 +386,73 @@ def test_search_fun_after_named_and_limit_after_dedup(ctx):
     # limit=2 still returns two real hits.
     out = core.search(ctx, "querything", limit=2).splitlines()
     assert out[0] == "search 'querything': 2 hits" and len(out) == 3
+
+
+def _balance_store(ctx, n_fn, n_imp, strings):
+    st = ctx.indexer.store("proj")
+    b = st.list_binaries()[0]
+    st.insert_functions(b.id, [{"entry": 0x601000 + i * 16, "name": f"ReadFn{i:02d}",
+                                "name_state": "user", "size": 4} for i in range(n_fn)])
+    st.insert_imports(b.id, [("LIB-Z.DLL", f"ReadImp{i:02d}", None, 0x602000 + 4 * i)
+                             for i in range(n_imp)])
+    st.insert_strings(b.id, strings)
+    st.rebuild_fts(b.id)
+
+
+def _kind_counts(out):
+    lines = out.splitlines()[1:]
+    return [sum(1 for ln in lines if ln.startswith(k + " ")) for k in ("function", "import", "string")]
+
+
+def test_search_drops_import_name_strings(ctx):
+    _balance_store(ctx, 1, 1, [(0x603000, "ascii", "ReadImp00"), (0x603100, "ascii", "readimp00"),
+                               (0x603200, "ascii", "ReadImp00 failed")])
+    out = core.search(ctx, "readimp00")
+    assert '"ReadImp00"' not in out  # exact import name: dropped
+    assert '"readimp00"' in out and '"ReadImp00 failed"' in out  # case differs / longer: kept
+
+
+def test_search_kind_quotas_with_surplus(ctx):
+    strs = [(0x604000 + 16 * i, "ascii", f"read text {i}") for i in range(30)]
+    _balance_store(ctx, 30, 30, strs)
+    # quotas 4/2/2, the 2 unassigned slots go to functions
+    out = core.search(ctx, "read", limit=10).splitlines()[1:]
+    assert [ln.split()[0] for ln in out] == ["function"] * 6 + ["import"] * 2 + ["string"] * 2
+
+
+def test_search_quota_surplus_flows(ctx):
+    _balance_store(ctx, 20, 0, [(0x604000 + 16 * i, "ascii", f"read text {i}") for i in range(2)])
+    counts = _kind_counts(core.search(ctx, "read", limit=10))
+    assert counts == [8, 0, 2]  # strings only have 2; functions take the rest
+
+
+def test_search_collapses_duplicate_strings(ctx):
+    _balance_store(ctx, 1, 0, [(0x606200, "ascii", "same value"), (0x606000, "ascii", "same value"),
+                               (0x606100, "ascii", "same value"), (0x606300, "ascii", "same other")])
+    lines = core.search(ctx, "same", kind="string").splitlines()[1:]
+    assert len(lines) == 2
+    assert '0x00606000 "same value" (+2 copies)' in " ".join(lines)
+    assert any(ln.endswith('"same other"') for ln in lines)
+
+
+def test_search_kind_string_has_no_quotas(ctx):
+    _balance_store(ctx, 5, 5, [(0x607000 + 16 * i, "ascii", f"read text {i}") for i in range(10)])
+    out = core.search(ctx, "read", kind="string", limit=10)
+    assert _kind_counts(out) == [0, 0, 10]
+
+
+def test_search_limit_and_cursor_with_quotas(ctx):
+    _balance_store(ctx, 30, 30, [(0x608000 + 16 * i, "ascii", f"read text {i}") for i in range(30)])
+    out = core.search(ctx, "read", limit=10)
+    assert out.splitlines()[0] == "search 'read': 10 hits"
+    assert len(out.splitlines()) == 11
+    small = core.search(ctx, "read", limit=3).splitlines()
+    assert [ln.split()[0] for ln in small[1:]] == ["function", "import", "string"]
+    cut = core.search(ctx, "read", limit=10, budget=60)
+    assert "cursor=" in cut
+    cur = cut.rsplit("cursor=", 1)[1].split()[0].rstrip(".")
+    rest = core.search(ctx, cursor=cur, budget=2000)
+    assert rest.splitlines()[0] != "" and not rest.startswith("error")
 
 
 def test_xrefs_to_function(ctx):

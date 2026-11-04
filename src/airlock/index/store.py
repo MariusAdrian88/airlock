@@ -434,6 +434,19 @@ class Store:
             "SELECT 1 FROM import WHERE binary_id=? AND name=? LIMIT 1", (binary_id, name),
         ).fetchone() is not None
 
+    def has_import_named(self, binary_id: int, name: str) -> bool:
+        """True when an import row has exactly ``name`` (case-sensitive); a string with
+        that value is the import name table entry."""
+        return self.db.execute(
+            "SELECT 1 FROM import WHERE binary_id=? AND name=? LIMIT 1", (binary_id, name),
+        ).fetchone() is not None
+
+    def string_copies(self, binary_id: int, value: str) -> int:
+        """Number of string rows with exactly this value."""
+        return self.db.execute(
+            "SELECT COUNT(*) FROM string WHERE binary_id=? AND value=?", (binary_id, value),
+        ).fetchone()[0]
+
     # -- functions ---------------------------------------------------------
 
     def get_function(self, function_id: int) -> Function | None:
