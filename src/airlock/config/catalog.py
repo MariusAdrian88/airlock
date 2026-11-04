@@ -8,6 +8,8 @@ Flags:
   writes      modifies the Ghidra project; hidden unless allow_writes is on
   clean_safe  returns no code, addresses or bytes (or redacts by session role);
               allowed in a clean profile and in a clean session
+  always_on   cannot be disabled by disabled_tools or disabled_sets (the loader
+              ignores the entry and warns); role gating still applies
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ class ToolInfo:
     set: str
     writes: bool = False
     clean_safe: bool = False
+    always_on: bool = False
 
 
 def _set(name: str, tools: list[str], **flags: bool) -> list[ToolInfo]:
@@ -42,13 +45,16 @@ CATALOG: dict[str, ToolInfo] = {
         *_set("dataflow", ["trace_values", "switch_tables", "constants"]),
         *_set("fileformat", ["ole_streams", "hexdump", "file_diff", "record_guess"]),
         *_set("spec_write", ["spec_write"]),
-        *_set("spec_read", ["spec_read", "spec_list", "spec_export"], clean_safe=True),
+        *_set("spec_read", ["spec_read", "spec_list"], clean_safe=True, always_on=True),
+        *_set("spec_read", ["spec_export"], clean_safe=True),
         *_set("map", ["overview", "project_describe", "features", "feature", "feature_define",
                       "path", "graph_export"]),
-        *_set("admin", ["index_status", "reindex", "frontier", "program_scan",
-                       "project_create", "program_add", "function_map", "cluster_label"]),
+        *_set("admin", ["reindex", "frontier", "program_add", "function_map",
+                       "cluster_label"]),
+        *_set("admin", ["index_status", "program_scan", "project_create"], always_on=True),
         # Role-aware: they redact their output in a clean session.
-        *_set("admin", ["projects", "project_open", "project_info"], clean_safe=True),
+        *_set("admin", ["projects", "project_open", "project_info"],
+              clean_safe=True, always_on=True),
     ]
 }
 

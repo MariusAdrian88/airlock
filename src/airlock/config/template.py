@@ -44,13 +44,18 @@ def doc_lines(key: Key) -> list[str]:
 def _list_entries(key: Key, value: list[str]) -> list[str]:
     """One line per set or tool: active when in value, commented otherwise."""
     if key.name == "disabled_sets":
-        names = list(dict.fromkeys(i.set for i in CATALOG.values()))
+        names = list(dict.fromkeys(i.set for i in CATALOG.values()
+                                   if not all(j.always_on for j in CATALOG.values() if j.set == i.set)))
         desc = SET_SUMMARIES
+        fixed = [n for n, i in CATALOG.items() if i.always_on]
     else:
-        names = list(CATALOG)
+        names = [n for n, i in CATALOG.items() if not i.always_on]
         desc = TOOL_SUMMARIES
+        fixed = [n for n, i in CATALOG.items() if i.always_on]
     extra = [v for v in value if v not in names]  # unknown names the user keeps
     rows = []
+    if fixed:
+        rows += _wrap(f"{IND}{IND}// ", "always on (cannot be disabled): " + ", ".join(fixed))
     for n in names + extra:
         text = f'"{n}",'
         d = desc.get(n, "")

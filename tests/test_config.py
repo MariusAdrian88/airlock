@@ -62,7 +62,7 @@ def test_every_catalog_tool_and_set_is_listed_once():
     sets_part, text = full.split('"disabled_tools": [')
     for name in CATALOG:
         n = len(re.findall(rf'^\s+(?://\s*)?"{name}",', text, re.MULTILINE))
-        assert n == 1, f"{name} listed {n} times"
+        assert n == (0 if CATALOG[name].always_on else 1), f"{name} listed {n} times"
         assert name in TOOL_SUMMARIES, name
     for s in {i.set for i in CATALOG.values()}:
         assert len(re.findall(rf'^\s+(?://\s*)?"{s}",', sets_part, re.MULTILINE)) == 1, s
@@ -273,3 +273,42 @@ def test_set_creates_the_file_and_coerces(tmp_path):
     cfg = load_config(p)
     assert cfg.defaults["mermaid"] is True and cfg.defaults["jvm_max_memory"] == "8G"
     assert DEFAULTS["mermaid"] is False
+
+
+# ── always-on tools ──────────────────────────────────────────────────────────
+
+ALWAYS_ON = [n for n, i in CATALOG.items() if i.always_on]
+
+
+@pytest.mark.parametrize("role", ["dirty", "clean"])
+@pytest.mark.parametrize("name", ALWAYS_ON)
+def test_disabling_an_always_on_tool_or_its_set_is_ignored(tmp_path, role, name):
+    for key, val in (("disabled_tools", name), ("disabled_sets", CATALOG[name].set)):
+        p = _write(tmp_path, '{"ghidra_dir": "C:/g", "%s": ["%s"]}' % (key, val))
+        cfg = load_config(p, role)
+        msgs = [i.message for i in cfg.issues if i.level == "warning"]
+        assert f"config: {name} is always on and cannot be disabled (ignored)" in msgs
+        if role == "dirty" or CATALOG[name].clean_safe:
+            assert name in cfg.tools
+
+
+def test_clean_tool_list_contents(tmp_path):
+    p = _write(tmp_path, '{"disabled_sets": ["admin", "spec_read"], "disabled_tools": ["spec_export"]}')
+    assert sorted(load_config(p, "clean").tools) == sorted(
+        ["spec_read", "spec_list", "projects", "project_open", "project_info"])
+    p = _write(tmp_path, '{}')
+    assert sorted(load_config(p, "clean").tools) == sorted(
+        ["spec_read", "spec_list", "spec_export", "projects", "project_open", "project_info"])
+
+
+def test_template_lists_always_on_separately():
+    text = generate_template()
+    assert "always on (cannot be disabled)" in text
+    sets_part, tools_part = text.split('"disabled_tools": [')
+    for n in ALWAYS_ON:
+        assert not re.search(rf'^\s+(?://\s*)?"{n}",', tools_part, re.MULTILINE), n
+
+
+def test_validate_shows_always_on_warning(tmp_path):
+    p = _write(tmp_path, '{"disabled_tools": ["project_open"]}')
+    assert any("project_open is always on" in m for m in validate_text(p))

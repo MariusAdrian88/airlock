@@ -193,6 +193,11 @@ Rules:
   dirty|clean` (default `dirty`) picks the role of the tool list. A clean role
   only ever has catalog tools flagged `clean_safe`, never has write tools, and
   `disabled_*` can only remove more (§9).
+- Tools flagged `always_on` in the catalog cannot be disabled. The loader
+  ignores such an entry (directly or through its set) and warns
+  `config: <tool> is always on and cannot be disabled (ignored)`; `airlock
+  config validate` and `doctor` show it. The template lists them in an
+  "always on" comment, not as candidates. Table in §9.
 - A name in `disabled_tools` or `disabled_sets` that is not in the catalog is
   reported by `doctor` and at startup (logged, not fatal).
 - Unknown keys are reported, not fatal: `unknown key 'token_budjet' (ignored);
@@ -1092,6 +1097,21 @@ parameter names). No `outputSchema` is advertised.
 - **Unbound session:** the state of every new session. Only `projects`,
   `project_open`, `project_create`, `program_scan` and `project_info` work;
   every other tool returns `error unbound: ...`.
+
+Always-on tools (config cannot disable them; role gating still applies):
+
+| Tool | Unbound | Dirty | Clean |
+|---|---|---|---|
+| `projects`, `project_open`, `project_info` | yes | yes | yes |
+| `project_create`, `program_scan` | yes | yes | no |
+| `index_status` | no | yes | no |
+| `spec_read`, `spec_list` | no | yes | yes |
+
+`spec_export` is clean-safe but can be disabled. Config can never add tools to
+the clean role: it is the `clean_safe` tools only, and `disabled_*` can only
+remove from them (never the always-on ones). A clean session therefore has
+`spec_read`, `spec_list`, `spec_export` (unless disabled), `projects`,
+`project_open`, `project_info`.
 
 The role is chosen by the agent, with the user, not detected from the client's
 folder, flags or environment. The server instructions tell the agent to start

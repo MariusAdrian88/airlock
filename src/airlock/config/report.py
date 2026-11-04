@@ -88,7 +88,8 @@ def validate_text(path: Path | None, overlay: Path | None = None) -> list[str]:
     msgs += [f"error: {e}" for e in validate_values(effective_values(merged))]
     if not any(m.startswith("error") for m in msgs):
         try:
-            resolve(merged, None, lay.source)
+            cfg = resolve(merged, None, lay.source)
+            msgs += [str(i) for i in cfg.issues if i.level == "warning" and "always on" in i.message]
         except ConfigError as e:
             msgs.append(f"error: {e}")
     return msgs

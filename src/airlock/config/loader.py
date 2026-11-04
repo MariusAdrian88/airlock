@@ -190,11 +190,17 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         if s not in set_names:
             issues.append(Issue("warning", f"unknown set '{s}' in disabled_sets (ignored)"))
 
+    forced = {n for n in disabled_tools if n in CATALOG and CATALOG[n].always_on}
+    forced |= {n for n, i in CATALOG.items() if i.always_on and i.set in disabled_sets}
+    for n in CATALOG:                       # catalog order
+        if n in forced:
+            issues.append(Issue("warning", f"config: {n} is always on and cannot be disabled (ignored)"))
+
     tools: list[str] = []
     for name, info in CATALOG.items():
         if role == CLEAN_ROLE and not info.clean_safe:
             continue            # a clean session only ever gets clean-safe tools
-        if name in disabled_tools or info.set in disabled_sets:
+        if not info.always_on and (name in disabled_tools or info.set in disabled_sets):
             continue
         if info.writes and not allow_writes:
             issues.append(Issue("info", f"'{name}' hidden: allow_writes is off"))
