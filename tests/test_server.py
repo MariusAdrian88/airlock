@@ -20,7 +20,9 @@ def test_only_implemented_configured_tools_are_listed(tmp_path):
                           "program_scan", "project_create", "program_add", "projects", "project_open",
                           "overview", "project_describe", "features", "feature", "feature_define",
                           "spec_write", "spec_read", "spec_list", "spec_export",
-                          "rename", "retype", "comment", "annotate", "struct_define"}
+                          "rename", "retype", "comment", "annotate", "struct_define",
+                          "pe_resources", "dialogs", "menus", "string_tables", "version_info",
+                          "rtti_classes", "vtable", "mfc_message_maps"}
     assert {"function_map", "cluster_label", "path", "graph_export"} <= set(names)
     assert "type_inspect" in ctx.not_implemented
     pi = next(t for t in tools if t.name == "project_info")

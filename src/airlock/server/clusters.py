@@ -33,7 +33,7 @@ from airlock.server.features import MFC_CLASSES, lib_family
 from airlock.server.selectors import fmt_addr
 
 MIN_CLUSTER = 3
-ALGO_VERSION = 4   # 2: call_imp edges; 3: library recognition, runtime labels; 4: static-runtime rules, mixed
+ALGO_VERSION = 5   # 2: call_imp edges; 3: library recognition, runtime labels; 4: static-runtime rules, mixed; 5: CRT underscore rule
 RUNTIME_SHARE = 0.6     # a cluster with at least this share of library members is a runtime cluster
 RUNTIME_PREFIX = "runtime"
 LABEL_JACCARD = 0.5

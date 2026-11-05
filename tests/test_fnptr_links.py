@@ -228,3 +228,58 @@ def test_relink_upgrades_old_project(tmp_path):
     assert st.db.execute("SELECT COUNT(*) FROM xedge WHERE kind='dynamic' AND dst_binary=?",
                          (p,)).fetchone()[0] == 2
     assert G.fingerprint(st, st.list_binaries(), "t") != fp_before
+
+
+def test_fnptr_table_needs_a_data_section(tmp_path):
+    """A pointer table inside a code section (not readable-only data) is no table."""
+    ctx = make_ctx(tmp_path)
+    ix, st = _store(ctx)
+    fns = [_fn(0x401500 + i * 0x20, f"Handler{i}", 0x10) for i in range(5)]
+    edges = [(0x405000 + 4 * i, 0x401500 + i * 0x20, "data") for i in range(4)]       # table in .rdata
+    edges += [(0x401800 + 4 * i, 0x401500 + i * 0x20, "data") for i in range(4)]      # table in .text
+    edges += [(0x401010, 0x405000, "data"), (0x401404, 0x401800, "data")]
+    b = _app(ix, st, fns, edges)
+    q = "SELECT src_addr FROM edge WHERE kind='fnptr'"
+    assert len(st.db.execute(q).fetchall()) == 8          # sections unknown: both tables count
+    with st.db:
+        st.set_meta(f"data_ranges:{b}", "[[4214784,4218880]]")      # 0x405000..0x406000 only
+    st.link_fnptr(b)
+    assert {r[0] for r in st.db.execute(q)} == {0x401010}
+    assert st.db.execute("SELECT COUNT(*) FROM edge WHERE kind='fnptr'").fetchone()[0] == 4
+
+
+def test_pe_data_ranges_and_record_sections(tmp_path):
+    import struct
+    from airlock.server import linking
+
+    def section(name, va, size, ch):
+        return struct.pack("<8sIIIIIIHHI", name, size, va, size, 0x400, 0, 0, 0, 0, ch)
+
+    nt = struct.pack("<IHHIIIHH", 0x4550, 0x14C, 3, 0, 0, 0, 0xE0, 0x102)
+    opt = bytearray(0xE0)
+    struct.pack_into("<H", opt, 0, 0x10B)
+    struct.pack_into("<I", opt, 28, 0x400000)          # ImageBase
+    struct.pack_into("<I", opt, 32, 0x1000)            # SectionAlignment
+    struct.pack_into("<I", opt, 36, 0x200)             # FileAlignment
+    struct.pack_into("<I", opt, 56, 0x4000)            # SizeOfImage
+    struct.pack_into("<I", opt, 60, 0x200)             # SizeOfHeaders
+    struct.pack_into("<I", opt, 92, 16)                # NumberOfRvaAndSizes
+    secs = (section(b".text", 0x1000, 0x1000, 0x60000020) + section(b".rdata", 0x2000, 0x1000, 0x40000040)
+            + section(b".data", 0x3000, 0x1000, 0xC0000040))
+    head = bytearray(0x200)
+    struct.pack_into("<2sH", head, 0, b"MZ", 0)
+    struct.pack_into("<I", head, 0x3C, 0x40)
+    blob = bytes(head[:0x40]) + nt + bytes(opt) + secs
+    blob = blob + bytes(0x600 - len(blob))
+    f = tmp_path / "x.exe"
+    f.write_bytes(blob)
+    assert linking.pe_data_ranges(f) == [(0x402000, 0x403000), (0x403000, 0x404000)]   # no .text
+    bad = tmp_path / "y.bin"
+    bad.write_bytes(b"not a pe")
+    assert linking.pe_data_ranges(bad) is None
+    ctx = make_ctx(tmp_path / "c")
+    ix, st = _store(ctx)
+    b = _app(ix, st)
+    assert st.data_ranges(b) is None
+    assert linking.record_sections(st, b, f) and st.data_ranges(b) == [(0x402000, 0x403000), (0x403000, 0x404000)]
+    assert not linking.record_sections(st, b, bad) and not linking.record_sections(st, b, None)

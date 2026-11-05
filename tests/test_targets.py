@@ -229,3 +229,19 @@ def test_resolve_target_kinds_and_errors(world):
     assert rt(ctx, "", "C7", (tg.CLUSTER,)).startswith("error not_found:")
     # a DLL that nothing imports from is not a DLL hint: the whole text is a name
     assert rt(ctx, "", "NOSUCH!ReadFile", (tg.FUNCTION, tg.IMPORT)).startswith("error not_found:")
+
+
+# -- ambiguity: one rule per tool kind (DESIGN 7.3 rule 8) ------------------------------------------
+
+def test_overloads_in_one_binary_are_listed_by_address(world):
+    ctx, st, ids = world
+    plain = {"space": "ram", "name_state": "user", "is_external": False, "size": 0x20, "namespace": None}
+    st.insert_functions(ids["host.exe"], [dict(plain, entry=0x409000, name="Dup"),
+                                          dict(plain, entry=0x409100, name="Dup")])
+    st.insert_functions(ids["tool.exe"], [dict(plain, entry=0x509000, name="Dup")])
+    amb = core.function(ctx, "Dup", view="signature")
+    assert amb.startswith("error ambiguous: 'Dup' matches 3 functions: ")
+    assert "host.exe!0x00409000 Dup" in amb and "host.exe!0x00409100 Dup" in amb
+    assert "tool.exe!Dup 0x00509000" in amb                      # unique in its binary: the plain name form
+    assert core.function(ctx, "host.exe!0x00409100", view="signature").startswith("0x00409100 Dup")
+    assert core.function(ctx, "tool.exe!Dup", view="signature").startswith("0x00509000 Dup")

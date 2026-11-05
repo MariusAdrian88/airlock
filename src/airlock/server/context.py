@@ -62,6 +62,12 @@ class ServerContext:
         st = self.indexer.store(project)
         pp = self.indexer.paths(project)
         man = projectmap.load_manifest(pp)  # parsed once: JSONC parsing is the slow part
+        from airlock.server import peres
+
+        peres.ensure_project(st, pp.artifacts)   # old projects: resource tables missing or stale
+        from airlock.server import cpp
+
+        cpp.ensure_project(st, pp.artifacts)     # old projects: C++ tables missing or stale
         features.derive_project(pp, st, man)
         projectmap.write_maps(pp, st, man, mermaid=bool(self.config.defaults.get("mermaid")))
 

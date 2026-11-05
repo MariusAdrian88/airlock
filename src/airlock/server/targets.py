@@ -3,8 +3,9 @@
 ``resolve_target`` turns the text an agent passes (``ReadFile``, ``KERNEL32!ReadFile``,
 ``bin!Foo``, ``0x00401000``, ``"quoted text"``, a feature key, a cluster id) into a typed target
 or a one-line error. Each tool names the kinds it accepts; everything else gets the same
-``error bad_target`` wording. The ``path`` tool keeps its own graph-based resolver
-(``graph.resolve_endpoint``) with the same import name rules (``norm_import``, A/W variants).
+``error bad_target`` wording. ``path`` uses it too (``endpoints.py`` turns the result into graph
+nodes) with ``aggregate=True``, so a name that matches several functions is one multi-target
+endpoint instead of ``error ambiguous`` (DESIGN 7.3 rule 8).
 """
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ class ImportTarget:
     library: tuple[tuple[Bound, Function], ...] = ()  # statically linked implementations
     binary_note: str | None = None
     explicit: bool = True                            # the binary was named (or is the only one)
+    keys: tuple[tuple[str, str], ...] = ()           # (dll stem, import name) of every matched import
 
     @property
     def nbinaries(self) -> int:
@@ -92,6 +94,15 @@ class ImportTarget:
     @property
     def stubs(self) -> list[tuple[Bound, Function]]:
         return [(b.bound, f) for b in self.bindings for f in (*b.thunks, *b.externals)]
+
+
+@dataclass(frozen=True)
+class MultiFunctionTarget:
+    """Aggregate result (``aggregate=True``, the ``path`` tool): every function of that name, and
+    the import of that name when one exists."""
+
+    functions: tuple[tuple[Bound, Function], ...]
+    imports: ImportTarget | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +123,8 @@ class ClusterTarget:
     cluster: object
 
 
-Target = FunctionTarget | AddressTarget | ImportTarget | StringTarget | FeatureTarget | ClusterTarget
+Target = (FunctionTarget | AddressTarget | ImportTarget | MultiFunctionTarget | StringTarget
+          | FeatureTarget | ClusterTarget)
 
 
 # -- errors (one wording for every tool) ---------------------------------------------------------
@@ -148,6 +160,17 @@ def wrong_kind(text: str, got: str, accepted: Iterable[str], nxt: str) -> str:
 
 def _cand(bd: Bound, fn: Function) -> str:
     return f"{bd.binary.name}!{fn.qualified_name} {bd.addr(fn.entry, fn.space)}"
+
+
+def _cands(pairs: list[tuple[Bound, Function]]) -> list[str]:
+    """Candidates as ready-to-use ``binary!name 0xaddr`` forms. A name that repeats inside one
+    binary (overloads) is not a selector there, so that candidate is ``binary!0xaddr name``."""
+    seen: dict[tuple[int, str], int] = {}
+    for bd, f in pairs:
+        k = (bd.binary.id, f.qualified_name)
+        seen[k] = seen.get(k, 0) + 1
+    return [_cand(bd, f) if seen[(bd.binary.id, f.qualified_name)] == 1
+            else f"{bd.binary.name}!{bd.addr(f.entry, f.space)} {f.qualified_name}" for bd, f in pairs]
 
 
 # -- imports -------------------------------------------------------------------------------------
@@ -239,7 +262,8 @@ def _import_target(sc: Scope, hits: dict[int, list[_Cand]]) -> ImportTarget:
             lib += [(bd, f) for f in bd.store.functions_by_name(bd.binary.id, n)
                     if not f.is_external and not f.is_thunk]
     note = f"binary {bindings[0].bound.binary.name}" if len(bindings) == 1 and not sc.explicit else None
-    return ImportTarget(label, name, bindings, tuple(lib), note, sc.explicit)
+    keys = tuple(sorted({(c.stem, c.name) for cs in hits.values() for c in cs}))
+    return ImportTarget(label, name, bindings, tuple(lib), note, sc.explicit, keys)
 
 
 def _stub_cand(b: ImportBinding, label: str) -> str:
@@ -264,7 +288,7 @@ def function_of_import(t: ImportTarget) -> FunctionTarget | str:
             return FunctionTarget(bd, fn, None,
                                   t.binary_note or (None if t.explicit else f"binary {bd.binary.name}"))
         if rank:
-            return ambiguous(t.label, [_cand(bd, f) for bd, f in rank], len(rank))
+            return ambiguous(t.label, _cands(rank), len(rank))
     return err("external", f"{t.label} is an imported function with no code",
                "Use xrefs on it to see its callers")
 
@@ -312,11 +336,14 @@ def import_callers(t: ImportTarget, limit: int) -> list[tuple[Bound, Function]]:
 
 # -- resolution ----------------------------------------------------------------------------------
 
-def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str]) -> Target | str:
+def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
+                   aggregate: bool = False) -> Target | str:
     """Resolve ``target`` to a typed target the tool accepts, or return a one-line error.
 
     ``binary`` and a ``binary!`` prefix narrow the lookup; otherwise a project with several ready
-    binaries searches all of them (DESIGN 7.3 rule 6)."""
+    binaries searches all of them (DESIGN 7.3 rule 6). ``aggregate`` (tools that list relations
+    over several matches, i.e. ``path``) returns a MultiFunctionTarget for a name that matches
+    several functions, or a function and an import, instead of ``error ambiguous``."""
     ks = frozenset(kinds)
     sc = bind_scope(ctx, binary, target)
     if isinstance(sc, str):
@@ -333,9 +360,14 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
         return _by_address(sc, t, ks)
     cands = {bd.binary.id: _candidates(bd) for bd in sc.bounds}
     for name, stem in _attempts(t, cands):
-        r = _by_name(sc, name, stem, cands, ks)
+        r = _by_name(sc, name, stem, cands, aggregate)
         if r is not None:
             return _policy(sc, r, t, ks)
+    if CLUSTER in ks and _CLUSTER_ID.match(t):
+        from airlock.server import clusters as cl   # late: clusters imports graph
+        c = cl.get_clusters(ctx, sc.project).get(t)
+        if c is not None:
+            return ClusterTarget(c.id, c)
     if _HEX.match(t):
         return _by_address(sc, t, ks)
     if FEATURE in ks:
@@ -345,11 +377,6 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
             feat = None
         if feat is not None:
             return FeatureTarget(t.lower(), feat)
-    if CLUSTER in ks and _CLUSTER_ID.match(t):
-        from airlock.server import clusters as cl   # late: clusters imports graph
-        c = cl.get_clusters(ctx, sc.project).get(t)
-        if c is not None:
-            return ClusterTarget(c.id, c)
     if STRING in ks:
         s = _strings(sc, t)
         if s:
@@ -372,9 +399,37 @@ def _attempts(t: str, cands: dict[int, list[_Cand]]) -> list[tuple[str, str]]:
     return out
 
 
+def _binds_to(imp: ImportTarget, fcands: list[tuple[Bound, Function]]) -> list[tuple[Bound, Function]]:
+    """The functions every binding of the import resolves to (xedge from its slots and thunks into
+    a function of ``fcands``); empty when some binding does not bind to one of them."""
+    want = {(bd.binary.id, f.entry): (bd, f) for bd, f in fcands}
+    found: dict[tuple[int, int], tuple[Bound, Function]] = {}
+    for b in imp.bindings:
+        addrs = [*b.slots, *(f.entry for f in b.thunks)]
+        if not addrs:
+            return []
+        marks = ",".join("?" * len(addrs))
+        try:
+            rows = b.bound.store.db.execute(
+                f"SELECT dst_binary, dst_entry FROM xedge WHERE src_binary=? AND src_addr IN ({marks})",
+                (b.bound.binary.id, *addrs)).fetchall()
+        except sqlite3.Error:
+            return []
+        hit = [(r[0], r[1]) for r in rows if (r[0], r[1]) in want]
+        if not hit:
+            return []
+        for k in hit:
+            found[k] = want[k]
+    return list(found.values())
+
+
 def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
-             ks: frozenset[str]) -> Target | str | None:
-    """Function(s) and/or import for a name. None when nothing matches."""
+             aggregate: bool = False) -> Target | str | None:
+    """Function(s) and/or import for a name. None when nothing matches.
+
+    DESIGN 7.3 rule 8: the single-target tools get exactly one function (several are
+    ``error ambiguous``); a function in one binary and an import elsewhere is the function when the
+    import binds to it (xedge), else ambiguous. ``aggregate`` keeps every match."""
     hits = _match(cands, name, stem, wide=False)
     fcands: list[tuple[Bound, Function]] = []
     if not stem:
@@ -386,22 +441,27 @@ def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
                 fcands.append((bd, f))
         if not fcands and not hits:
             hits = _match(cands, name, stem, wide=True)   # ReadFile -> ReadFileW / ReadFileA
+    if aggregate and fcands and (len(fcands) > 1 or hits):
+        return MultiFunctionTarget(tuple(fcands), _import_target(sc, hits) if hits else None)
     if len(sc.bounds) == 1:
         bd = sc.bounds[0]
         if fcands:
             return _single(bd, name)
         return _import_target(sc, hits) if hits else None
-    if fcands and not hits:
-        if len(fcands) == 1:
-            bd, f = fcands[0]
-            return FunctionTarget(bd, f, None, f"binary {bd.binary.name}")
-        return ambiguous(name, [_cand(bd, f) for bd, f in fcands], len(fcands))
     if not fcands and hits:
         return _import_target(sc, hits)
-    if fcands:
+    if fcands and hits:
         imp = _import_target(sc, hits)
-        listed = [_cand(bd, f) for bd, f in fcands] + [_stub_cand(b, imp.label) for b in imp.bindings]
-        return ambiguous(name, listed, len(listed))
+        bound = _binds_to(imp, fcands)
+        if not bound:
+            listed = _cands(fcands) + [_stub_cand(b, imp.label) for b in imp.bindings]
+            return ambiguous(name, listed, len(listed))
+        fcands = bound                                    # the import is this definition
+    if len(fcands) == 1:
+        bd, f = fcands[0]
+        return FunctionTarget(bd, f, None, f"binary {bd.binary.name}")
+    if fcands:
+        return ambiguous(name, _cands(fcands), len(fcands))
     return None
 
 
@@ -450,16 +510,22 @@ def _by_address(sc: Scope, raw: str, ks: frozenset[str]) -> Target | str:
         bd, f, note = found[0]
         return FunctionTarget(bd, f, note, f"binary {bd.binary.name}")
     if found:
-        return ambiguous(raw, [_cand(bd, f) for bd, f, _n in found], len(found))
+        return ambiguous(raw, _cands([(bd, f) for bd, f, _n in found]), len(found))
     return err("not_found", f"no function at or containing {raw}{_where(sc)}",
                "Check the address, or pass binary!0xaddress")
 
 
 def _strings(sc: Scope, text: str) -> StringTarget | None:
-    like_exact = text
-    esc = "".join("\\" + c if c in "%_\\" else c for c in text)
-    for how, sql, arg in (("exact", "value=?", like_exact),
-                          ("substring", "value LIKE ? ESCAPE '\\'", f"%{esc}%")):
+    """Strings equal to ``text`` (``*``/``?`` is a glob), else containing it."""
+    def esc(x: str) -> str:
+        return "".join("\\" + c if c in "%_\\" else c for c in x)
+
+    if "*" in text or "?" in text:
+        like = "".join("%" if c == "*" else "_" if c == "?" else esc(c) for c in text)
+        plans = (("glob", "value LIKE ? ESCAPE '\\'", like),)
+    else:
+        plans = (("exact", "value=?", text), ("substring", "value LIKE ? ESCAPE '\\'", f"%{esc(text)}%"))
+    for how, sql, arg in plans:
         out: list[tuple[Bound, StringHit]] = []
         for bd in sc.bounds:
             for r in bd.store.db.execute(

@@ -13,6 +13,7 @@ from pydantic import Field
 
 from airlock.projects import ProjectPaths
 from airlock.server import diagrams as dg
+from airlock.server import endpoints as ep
 from airlock.server import graph as gr
 from airlock.server.budget import CursorError, estimate_tokens, fit_lines, footer, resume_lines
 from airlock.server.context import ServerContext
@@ -84,8 +85,8 @@ def path(ctx: ServerContext, from_: Annotated[str, Field(alias="from")] = "", to
     if not g.nodes:
         return "error not_ready: no analysed binary outside the runtime group. Call list_binaries."
     try:
-        a, b, res = gr.path_query(pp, st, frm, dst, k + MORE_PATHS, max_depth, g)
-    except gr.EndpointError as e:
+        a, b, res = ep.path_query(ctx, pp, st, frm, dst, k + MORE_PATHS, max_depth, g)
+    except ep.EndpointError as e:
         return e.message
     if not res.paths:
         if res.reach:
@@ -128,12 +129,12 @@ def graph_export(ctx: ServerContext, scope: str, format: str = "mermaid", inline
     if fmt not in dg.FORMATS:
         return f"error bad_args: format '{format}' is not one of mermaid, dot, graphml. Pass one of them."
     st = ctx.indexer.store(pp.name)
-    env = dg.Env(pp, st)
+    env = dg.Env(pp, st, ctx)
     try:
         d = dg.diagram_for(env, scope)
     except dg.ScopeError as e:
         return e.message
-    except gr.EndpointError as e:
+    except ep.EndpointError as e:
         return e.message
     path_ = dg.write_diagram(pp, scope, fmt, d)
     more = f", {d.hidden} more nodes summarised" if d.hidden else ""

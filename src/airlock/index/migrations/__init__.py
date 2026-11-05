@@ -120,3 +120,59 @@ def _v8(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[8] = _v8
+
+
+def _v9(db: sqlite3.Connection) -> None:
+    """PE resource tables (dialogs, controls, menu items, strings); derived, filled by server/peres.py."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS res_dialog (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "dialog_id TEXT NOT NULL, lang INTEGER NOT NULL, caption TEXT, x INTEGER, y INTEGER, "
+        "cx INTEGER, cy INTEGER, PRIMARY KEY (binary_id, dialog_id, lang))",
+        "CREATE TABLE IF NOT EXISTS res_control (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "dialog_id TEXT NOT NULL, lang INTEGER NOT NULL, ctrl_id INTEGER, class TEXT, caption TEXT, "
+        "style TEXT, seq INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS res_control_by_dialog ON res_control(binary_id, dialog_id, lang, seq)",
+        "CREATE INDEX IF NOT EXISTS res_control_by_id ON res_control(binary_id, ctrl_id)",
+        "CREATE TABLE IF NOT EXISTS res_menu_item (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "menu_id TEXT NOT NULL, lang INTEGER NOT NULL, item_id INTEGER, caption TEXT, path TEXT, "
+        "seq INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS res_menu_item_by_menu ON res_menu_item(binary_id, menu_id, lang, seq)",
+        "CREATE INDEX IF NOT EXISTS res_menu_item_by_id ON res_menu_item(binary_id, item_id)",
+        "CREATE TABLE IF NOT EXISTS res_string (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "string_id INTEGER NOT NULL, lang INTEGER NOT NULL, text TEXT)",
+        "CREATE INDEX IF NOT EXISTS res_string_by_id ON res_string(binary_id, string_id)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[9] = _v9
+
+
+MIGRATIONS.setdefault(9, lambda db: None)   # placeholder: the real v9 (resource tables) is registered above when present
+
+
+def _v10(db: sqlite3.Connection) -> None:
+    """C++ tables from the PE bytes (MSVC RTTI, vtables, MFC message maps); derived, rebuilt by
+    server/cpp.py. ``handler`` and ``ctrl_id`` join with function entries and resource ids."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS rtti_class (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "name TEXT NOT NULL, td_addr INTEGER NOT NULL, col_addr INTEGER NOT NULL, vtable_addr INTEGER, "
+        "bases TEXT NOT NULL DEFAULT '', PRIMARY KEY (binary_id, td_addr, col_addr))",
+        "CREATE INDEX IF NOT EXISTS rtti_class_by_name ON rtti_class(binary_id, name)",
+        "CREATE INDEX IF NOT EXISTS rtti_class_by_vtable ON rtti_class(binary_id, vtable_addr)",
+        "CREATE TABLE IF NOT EXISTS vtable_slot (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "vtable_addr INTEGER NOT NULL, slot INTEGER NOT NULL, target INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS vtable_slot_by_vtable ON vtable_slot(binary_id, vtable_addr, slot)",
+        "CREATE INDEX IF NOT EXISTS vtable_slot_by_target ON vtable_slot(binary_id, target)",
+        "CREATE TABLE IF NOT EXISTS msgmap_entry (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "class TEXT NOT NULL, map_addr INTEGER NOT NULL, message INTEGER NOT NULL, code INTEGER NOT NULL, "
+        "ctrl_id INTEGER NOT NULL, last_id INTEGER NOT NULL, sig INTEGER NOT NULL, "
+        "handler INTEGER NOT NULL, seq INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS msgmap_entry_by_ctrl ON msgmap_entry(binary_id, ctrl_id)",
+        "CREATE INDEX IF NOT EXISTS msgmap_entry_by_class ON msgmap_entry(binary_id, class, map_addr, seq)",
+        "CREATE INDEX IF NOT EXISTS msgmap_entry_by_handler ON msgmap_entry(binary_id, handler)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[10] = _v10

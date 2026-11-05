@@ -10,14 +10,18 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
 
 from airlock.index.store import Store
 from airlock.projects import ProjectPaths
 from airlock.server import clusters as cl
+from airlock.server import endpoints as ep
 from airlock.server import graph as gr
+
+if TYPE_CHECKING:
+    from airlock.server.context import ServerContext
 
 log = logging.getLogger("airlock")
 
@@ -162,8 +166,8 @@ def write_diagram(pp: ProjectPaths, scope: str, fmt: str, d: Diagram, name: str 
 class Env:
     """Lazy handles on the call graph and clusters of one project."""
 
-    def __init__(self, pp: ProjectPaths, st: Store) -> None:
-        self.pp, self.st = pp, st
+    def __init__(self, pp: ProjectPaths, st: Store, ctx: ServerContext | None = None) -> None:
+        self.pp, self.st, self.ctx = pp, st, ctx
         self._g: gr.CallGraph | None = None
         self._cs: cl.ClusterSet | None = None
 
@@ -278,9 +282,11 @@ def feature_diagram(env: Env, key: str) -> Diagram:
 
 
 def path_diagram(env: Env, frm: str, to: str, k: int = PATH_DIAGRAM_K, max_depth: int = 8) -> Diagram:
+    if env.ctx is None:
+        raise ScopeError("error unbound: no project is open. Call projects, then project_open.")
     try:
-        _a, _b, res = gr.path_query(env.pp, env.st, frm, to, k, max_depth, env.g, lambda: env.cs)
-    except gr.EndpointError as e:
+        _a, _b, res = ep.path_query(env.ctx, env.pp, env.st, frm, to, k, max_depth, env.g)
+    except ep.EndpointError as e:
         raise ScopeError(e.message) from None
     if not res.paths:
         raise ScopeError(f"error no_path: no call chain from {frm} to {to} within {max_depth} hops. "

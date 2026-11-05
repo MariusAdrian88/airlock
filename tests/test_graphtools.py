@@ -450,3 +450,25 @@ def test_graph_export_path_with_ambiguous_names(proj):
     out = gt.graph_export(ctx, "path:dup_fn->Read")
     assert out.startswith("wrote ") and "ambiguous" not in out
     assert gt.graph_export(ctx, "path:Boot->nothing_like_this_zz").startswith("error not_found:")
+
+
+def test_path_and_xrefs_resolve_create_file_the_same(proj):
+    """One resolver: CreateFile (only the W form is imported) means the same import in both tools."""
+    from airlock.server import targets as tg
+    from airlock.server.tools import core
+    ctx = extend(proj)
+    imp = tg.resolve_target(ctx, "", "CreateFile", (tg.FUNCTION, tg.IMPORT))
+    assert isinstance(imp, tg.ImportTarget) and imp.label == "KERNEL32!CreateFileW"
+    xr = core.xrefs(ctx, "CreateFile").splitlines()[0]
+    pa = head(gt.path(ctx, "Opener", "CreateFile"))
+    assert "KERNEL32!CreateFileW" in xr and "KERNEL32!CreateFileW" in pa
+    assert tg.resolve_target(ctx, "", "CreateFileA", (tg.IMPORT,)).keys == imp.keys    # A/W forms alike
+    assert head(gt.path(ctx, "Opener", "CreateFileW")).startswith("path Opener → CreateFileW, 1 hops")
+
+
+def test_path_endpoint_forms_use_the_shared_resolver(proj):
+    ctx = extend(proj)
+    out = gt.path(ctx, "Boot", "plug.dll!ReadFile")
+    assert head(out).startswith("path Boot → plug.dll!ReadFile") and lines(out)[-1].startswith("→ import")
+    assert gt.path(ctx, "Boot", "no_such_name_zz").startswith(
+        "error not_found: no function, import, feature, cluster or string 'no_such_name_zz'")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import json
 import re
 import sqlite3
 from collections.abc import Iterable, Sequence
@@ -13,7 +14,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 FTS_KINDS = ("function", "string", "import", "note")
 # Code edges. ``call_imp`` is a call through an import slot (IAT): Ghidra reports
@@ -379,12 +380,24 @@ class Store:
         self.link_fnptr(binary_id)
         self.link_string_tables(binary_id)
 
+    def data_ranges(self, binary_id: int) -> list[tuple[int, int]] | None:
+        """Address ranges ``[start, end)`` of the readable, non-executable sections of the binary
+        (meta ``data_ranges:<id>``, recorded from the PE by ``linking.record_sections``); None when
+        unknown (then nothing is filtered by section)."""
+        raw = self.get_meta(f"data_ranges:{binary_id}")
+        if not raw:
+            return None
+        try:
+            return [(int(a), int(b)) for a, b in json.loads(raw)]
+        except (ValueError, TypeError):
+            return None
+
     def link_fnptr(self, binary_id: int) -> int:
         """Rebuild the ``fnptr`` edges of a binary (needs src_fn / dst_fn: run after ``link_edges``):
         a read/data/write reference from function F to the entry of a non-thunk function G, and
         references from F to the start of a table of function pointers (>= FNPTR_TABLE_MIN pointers,
-        stride = pointer size, no function around the table) to every function in the table.
-        Returns the number of rows."""
+        stride = pointer size, no function around the table, located in a data section when the
+        sections are known) to every function in the table. Returns the number of rows."""
         b = self.get_binary_by_id(binary_id)
         ptr = (b.pointer_size if b else 4) or 4
         q = self.db.execute
@@ -400,6 +413,7 @@ class Store:
             rows.setdefault((r["src_fn"], r["dst_fn"]), (r["src_addr"], r["dst_addr"], r["src_fn"], r["dst_fn"]))
         # tables: data edges from addresses outside every function to function entries
         ptrs: list[tuple[int, int, int]] = []     # src_addr, dst_addr, dst_fn
+        data = self.data_ranges(binary_id)
         last = None
         for r in q(
                 "SELECT e.src_addr, e.dst_addr, e.dst_fn FROM edge e JOIN function g ON g.id=e.dst_fn "
@@ -407,7 +421,8 @@ class Store:
                 "AND g.space='ram' AND g.entry=e.dst_addr AND g.is_thunk=0 AND g.is_external=0 "
                 "ORDER BY e.src_addr", (binary_id,)):
             if r["src_addr"] != last:
-                ptrs.append((r["src_addr"], r["dst_addr"], r["dst_fn"]))
+                if data is None or any(a <= r["src_addr"] < b for a, b in data):
+                    ptrs.append((r["src_addr"], r["dst_addr"], r["dst_fn"]))
                 last = r["src_addr"]
         tables: dict[int, list[tuple[int, int]]] = {}    # start -> [(entry, fn id)]
         run: list[tuple[int, int, int]] = []

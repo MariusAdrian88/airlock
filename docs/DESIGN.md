@@ -431,6 +431,13 @@ module (the one the clusters use) answers graph questions:
   `binaries.md` (who imports whom), `subsystems.md` (clusters and their
   links), `feature-<key>.md` (entry points and their clusters). They are
   separate files, so `PROJECT.md` and tool responses stay compact.
+- `fnptr` edges come from references to a function entry and from tables of
+  function pointers (>= 3 consecutive pointers). A table must lie in a
+  readable, non-executable PE section (`.rdata`, `.data`); the ranges are read
+  from the stored PE (`meta data_ranges:<id>`, `linking.record_sections`), and
+  without them the section check is skipped. Runtime-library names starting
+  with `_` count as CRT only for a known CRT stem (`_malloc`, `__strlen_sse2`,
+  `_beginthreadex`); a program's own `_do_work` stays program code.
 - `neighbors(node, kinds, depth)` (all edge kinds around any node) is
   deferred to M3/M4, when notes and specs add more node kinds.
 
@@ -899,9 +906,9 @@ Details settled in M3:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, base classes |
-| `vtable` | `class` or `address` | slots: index, function name, address |
-| `mfc_message_maps` | `class?` | per class: message, control id, handler function |
+| `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
+| `vtable` | `target` (class name or address) | slots: index, address, function name |
+| `mfc_message_maps` | `target?` (class) | no class: the classes that have a map; a class: message, control id, handler function per entry (a class without a map of its own shows the nearest base class that has one) |
 | `qt_metaobjects` | `class?` | signals, slots, properties with method indices → functions |
 
 ### delphi
@@ -926,11 +933,20 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 
 ### resources
 
+Parsed on the server with `pefile` (no Ghidra). All take `binary` (default: the root executable;
+`*` = every binary; `binary!id` works for the id parameters), `lang` where a resource has several
+languages (default: neutral, then 0x0409, then the lowest), `cursor` and `budget`. Rows are filled into
+the derived tables `res_dialog`, `res_control`, `res_menu_item`, `res_string` (schema v9) when a binary
+is ready, and again on open or on first use when `RESOURCES_VERSION` (index meta
+`resources_version:<binary id>`) is older. Control and menu item ids are indexed for the M2 join with
+MFC message map entries.
+
 | Tool | Parameters | Returns |
 |---|---|---|
 | `pe_resources` | `type?` | resource inventory: type, id/name, language, size |
-| `dialogs` | `id?` | dialog template: controls with id, class, caption; handler if a message map links it |
-| `string_tables` | `query?`, `limit=50` | id → string |
+| `dialogs` | `id?` | no id: one line per dialog (caption, control count, size, languages). With id: DLGTEMPLATE/DLGTEMPLATEEX controls with id, class (predefined atoms by name), caption, short style words (`BS_DEFPUSHBUTTON,tabstop,hidden`); handler if a message map links it |
+| `menus` | `id?` | no id: one line per menu (item and popup counts, top-level captions). With id: MENU/MENUEX tree, one line per item: `id=<n> <popup path>`, popups as `<caption> >` |
+| `string_tables` | `query?`, `limit=50` | id → string (RT_STRING id = (block-1)*16 + index); query is an id or a substring |
 | `version_info` | | product name, version, company, file description |
 
 ### dataflow
@@ -1041,7 +1057,7 @@ restart.
    ready binary: exactly one hit resolves there (the response adds a
    `binary <name>` line), several hits give `error ambiguous` listing each as
    `bin!name 0x…`, none gives `error not_found`. Applies to `function`,
-   `xrefs` and `callgraph`.
+   `xrefs` and `callgraph` (several matches: rule 8).
 
 7. **Imports and typed targets.** One resolver (`server/targets.py`) serves
    every tool. A name is first looked up as a function; stubs of an import
@@ -1053,8 +1069,8 @@ restart.
    `CreateFileW`). `DLL!` is read as a DLL only when the project imports from
    it, else the whole text is a name. A bare name that is an import in
    several binaries and a function in none is the import across all of them
-   (not ambiguous); a function in one binary plus an import elsewhere is
-   `error ambiguous`. `binary!name`/`binary=` limits the import to one binary.
+   (not ambiguous); a function in one binary plus an import elsewhere: rule 8.
+   `binary!name`/`binary=` limits the import to one binary.
    A statically linked library function (a real function of that name) is the
    import's *library function*.
 
@@ -1066,6 +1082,29 @@ restart.
    | import, any spelling above | its library function, else its one thunk, else `error external` (use xrefs) | callers in all binaries, merged, `[bin]` prefixed | callers tree rooted at the import; callees only via its thunk/library code | clusters of its callers | no (`error bad_target`) | yes (import node) |
    | quoted or plain string | no | no | no | no | no | yes |
    | feature key, cluster id | no | no | no | feature key, binary name | no | yes |
+
+8. **One ambiguity rule per tool kind.** A name can match several functions
+   (same name in several binaries, overloads), or a function in one binary and
+   an import of that name in another.
+   - *Tools that show one body or edit one function* (`function`, `annotate`
+     tools, `feature_define`, `function_map` seeds): single target. Several
+     matches give `error ambiguous`, listing every candidate as a ready-to-use
+     selector, `binary!name 0xaddr` (`binary!0xaddr name` when the name repeats
+     inside one binary, since the name is then no selector).
+   - *Tools that list relations* (`xrefs`, `callgraph`, `path`): an import is
+     aggregated over all binaries that have it (rule 7). `path` also takes
+     every function of a name as one multi-node endpoint (header
+     `(N functions in M binaries)`); `xrefs` and `callgraph` print one tree per
+     call, so they keep a single function and give `error ambiguous` like
+     `function`.
+   - *Function in one binary, import in another*: the function wins when every
+     import binding resolves to it (xedge from the import slot or thunk to the
+     function's entry): the import is that definition. Otherwise the candidates
+     are listed (`error ambiguous`, or in `path` one endpoint with both).
+   `path` resolves its endpoints with `targets.resolve_target(aggregate=True)`
+   and only maps the typed target to call-graph nodes (`server/endpoints.py`);
+   strings accept `*`/`?` globs there. A cluster id (`C1`) is checked before a
+   bare hex string.
 
    Errors have one wording everywhere: `error not_found: no function or import
    named 'X' [in N ready binaries]. Use search …`, `error ambiguous: 'X' matches
@@ -1431,20 +1470,56 @@ formats is the primary use case of this project.
 
 ### MSVC RTTI and vtables
 
+- Parsed server side from the PE bytes with pefile (`server/cpp.py`), no worker: sections, image
+  base and pointer size come from the PE header, never constants. Rows go to `rtti_class`,
+  `vtable_slot`, `msgmap_entry` (schema v10, derived). They are filled when a binary becomes ready
+  and, for old projects, on open when meta `cpp_version:<binary id>` is older than `CPP_VERSION`
+  (about 0.1 s per megabyte; no re-analysis).
 - 32-bit: Complete Object Locator holds absolute pointers (signature 0).
-- 64-bit: COL holds image-relative offsets (signature 1).
-- Walk: type descriptor (`.?AV…@@`) → COL → vtable at COL reference + pointer
-  size. Base classes from the Class Hierarchy Descriptor.
-- Pointer size and image base always come from the program, never constants.
+- 64-bit: COL holds image-relative offsets (signature 1, and a `pSelf` field).
+- Walk: type descriptor (`.?AV…@@`, `.?AU…@@`; `pVFTable`, `spare`, name) → COL (found as the
+  dword that references the descriptor, 12 bytes into the COL) → vtable at the address that holds
+  the COL pointer + pointer size; slots run while they point into an executable section.
+  Base classes from the Class Hierarchy Descriptor: the base array is a pre-order list, so the direct
+  bases are found by skipping `numContainedBases` entries; `bases` stores the direct ones.
+- Class names are demangled to `A::B`; templates go through `dbghelp` (Windows) with a plain fallback.
+- One row per (type descriptor, COL): a class with several vtables (multiple inheritance, COL
+  `offset` != 0) has several rows; the lowest vtable address of a COL wins.
+- A class compiled without `/GR` has no COL: it gets no `rtti_class` row (its message map is still
+  found, see below). Statically linked MFC usually carries RTTI for the framework classes; 32-bit MFC
+  DLLs of the VS2005-VS2015 generation carry type descriptors but no COLs **[verified]**.
+- Name hints: `function` shows `// Class::vslot N` for a vtable target and
+  `// handler WM_COMMAND id N of Class` for a message map handler. Nothing is renamed in Ghidra.
+  vtable targets and handlers need not be function entries in the Ghidra index (unreferenced code
+  that analysis did not turn into a function); the hint only shows where a function exists.
 
 ### MFC message maps
 
-- Locate `GetMessageMap` implementations via vtables of `CCmdTarget`-derived
-  classes; each returns an `AFX_MSGMAP` (`pfnGetBaseMap`, `lpEntries`).
-- `AFX_MSGMAP_ENTRY`: `nMessage`, `nCode`, `nID`, `nLastID`, `nSig`, `pfn`;
-  the table ends with an all-zero entry **[verify layout per MFC version]**.
-- Join `nID` with dialog templates and menus → "menu item 'Open…' →
-  `CMainFrame::OnFileOpen`".
+- `GetMessageMap` is virtual in every `CCmdTarget`-derived class. airlock does not look for a fixed
+  slot: it decodes every vtable slot target (and, for classes without RTTI, every code pointer in the
+  data sections) as a trivial getter and keeps those whose constant is a valid `AFX_MSGMAP`.
+  Getter shapes: 32-bit `mov eax, imm32; ret`, also with a frame (`push ebp; mov ebp,esp; [push ecx;
+  mov [ebp-4],ecx;] mov eax,imm32; [pop ebp | leave]; ret`); 64-bit `lea rax,[rip+d]; ret`; the
+  `_AFXDLL` form that jumps or calls into `GetThisMessageMap` (`jmp rel32`, `call rel32; ret`,
+  `sub rsp,28h; call; add rsp,28h; ret`) is followed up to four hops.
+- `AFX_MSGMAP`: two pointers, `pfnGetBaseMap` (DLL MFC: a function; static MFC: the base class
+  `AFX_MSGMAP`) and `lpEntries`.
+- `AFX_MSGMAP_ENTRY`: `nMessage`, `nCode`, `nID`, `nLastID` (4 x u32), `nSig` (`UINT_PTR`), `pfn`
+  (member function pointer, a code address); the table ends with an all-zero entry. **[verified]**
+  32-bit: 6 x u32 = 24 bytes; 64-bit: 4 x u32, u64, u64 = 32 bytes (no padding: `nSig` is at +16).
+  Checked on real data: MFC 4.0 (32-bit DLL), a statically linked 32-bit MFC program, and the 64-bit
+  MFC 10, 12 and 14 DLLs (hundreds of maps each): every map ends with an all-zero entry of that size,
+  every `pfn` is a code address, `nSig` values agree between 32-bit and 64-bit (same `AfxSig_*`
+  enum), and in 64-bit the upper half of `nSig` is zero except for registered messages.
+  Registered messages (`ON_REGISTERED_MESSAGE`) have `nMessage` 0xC000 and `nSig` holds the address
+  of the message variable (a pointer, so up to 64 bits). `ON_UPDATE_COMMAND_UI` is `WM_COMMAND`
+  with `nCode` 0xFFFFFFFF; `ON_COMMAND` has `nCode` 0; `ON_CONTROL` carries the notification code.
+- A map is attributed to the class whose vtable returns it; a derived class that only inherits the
+  slot (same getter) is not listed (the base, an ancestor of the others, is). Maps of classes
+  without RTTI are named `anon_<map address>`. The tool `mfc_message_maps <class>` follows the
+  recorded base classes to the nearest class with a map.
+- Join `nID` (`msgmap_entry.ctrl_id`, indexed) with dialog templates and menus (`res_control.ctrl_id`,
+  `res_menu_item.item_id`) → "menu item 'Open…' → `CMainFrame::OnFileOpen`" (later step).
 
 ### Qt metaobjects
 

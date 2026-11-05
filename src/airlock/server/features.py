@@ -43,7 +43,7 @@ DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
 MAX_ENTRIES = 1500    # per feature; strong seeds first (strongest evidence), then callers by depth
-FEATURES_VERSION = 2  # meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
+FEATURES_VERSION = 3  # 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
 FEATURES_VERSION_META = "features_version"
 DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
@@ -346,10 +346,41 @@ _CRT_RE = re.compile(r"^(?:__crt|__security_|__SEH_|__except|__CxxFrame|__CxxThr
                      r"__ftol|__CIpow|__CI[a-z]|__unwind|__NLG|__EH|__amsg|__cinit|__initterm|"
                      r"__onexit|__dllonexit|__setargv|__mtinit|__heap|__sbh|__lock|__unlock|"
                      r"_EH|_CxxThrow|_SEH|_except_|_unwind|_security_|_purecall|_RTC_|_encode|_decode)")
-_CRT_UNDERSCORE_RE = re.compile(r"^__?[a-z]\w*$")      # _malloc, _free, __strlen_sse2, __ftol2
+_CRT_UNDERSCORE_RE = re.compile(r"^__?([a-z]\w*)$")      # _malloc, _free, __strlen_sse2, __ftol2
+# Underscore-prefixed names are CRT only when the stem is a known CRT function: a program's own
+# `_do_work` or `__helper` must not be taken for library code.
+_CRT_US_SUFFIX = re.compile(r"(?:_(?:sse2|sse4|avx2?|s|l|nolock|impl))+$")
+_CRT_US = frozenset(
+    "stricmp strnicmp strdup strlwr strupr strrev strset strnset wcsicmp wcsnicmp wcsdup wcslwr wcsupr "
+    "mbscmp mbsicmp mbslen mbscpy mbscat mbschr mbsstr mbsnbcpy mbsnbcmp memicmp memccpy snprintf "
+    "snwprintf vsnprintf vsnwprintf vscprintf scprintf itoa ltoa ultoa i64toa ui64toa itow ltow "
+    "atoi64 atodbl strtoi64 strtoui64 wtoi wtol fopen wfopen fdopen fsopen fclose fread fwrite fseek "
+    "ftell fseeki64 ftelli64 fflush fgetc fputc fgets fputs getc putc getch putch getche kbhit open "
+    "close read write lseek tell eof chsize commit dup dup2 pipe isatty fileno setmode sopen creat "
+    "access unlink remove rename stat fstat stati64 fstati64 chdir getcwd mkdir rmdir findfirst "
+    "findnext findclose beginthread beginthreadex endthread endthreadex cexit c_exit exit amsg_exit "
+    "purecall invalid_parameter errno doserrno get_osfhandle open_osfhandle lock unlock initterm "
+    "initterm_e onexit dllonexit setargv setenvp getmainargs wgetmainargs ftol ftol2 chkstk alloca "
+    "msize expand heapchk heapmin heapwalk callnewh set_new_handler set_se_translator lrotl lrotr "
+    "rotl rotr swab gcvt fcvt ecvt tzset time64 mktime64 localtime64 gmtime64 ftime fullpath "
+    "splitpath makepath wsplitpath wmakepath wfullpath tempnam tmpnam mktemp putenv wgetenv wputenv "
+    "lock_file unlock_file getptd freeptd mtinit mtterm ioinit ioterm cinit cfltcvt fpclass isnan "
+    "finite copysign chgsign logb nextafter scalb".split())
 _STL_NS = ("std", "stdext", "__gnu_cxx", "_STL")
 _ATL_NS = ("ATL", "ATLSafe", "ATL7")
 _MFC_CLS_RE = re.compile(r"^(C[A-Z]\w*)")
+
+
+def _crt_underscore(name: str) -> bool:
+    """``_malloc``, ``__strlen_sse2``, ``_beginthreadex``: a known CRT stem behind one or two
+    underscores (optionally ``_sse2`` / ``_s`` / ``_nolock`` style suffixes), or a ``crt`` stem."""
+    m = _CRT_UNDERSCORE_RE.match(name)
+    if not m:
+        return False
+    base = _CRT_US_SUFFIX.sub("", m.group(1)) or m.group(1)
+    if base.startswith("crt") or base in _CRT_PLAIN or base in _CRT_US:
+        return True
+    return base[:1] == "w" and (base[1:] in _CRT_PLAIN or base[1:] in _CRT_US)
 
 
 def lib_family(name: str, namespace: str | None, state: str) -> str | None:
@@ -370,7 +401,7 @@ def lib_family(name: str, namespace: str | None, state: str) -> str | None:
         return "MFC"
     if name.startswith(("operator new", "operator delete", "operator_")) or (not ns and name in _CRT_PLAIN):
         return "CRT"
-    if not ns and (_CRT_RE.match(name) or _CRT_UNDERSCORE_RE.match(name)):
+    if not ns and (_CRT_RE.match(name) or _crt_underscore(name)):
         return "CRT"
     return "lib" if state == "library" else None
 

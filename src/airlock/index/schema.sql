@@ -200,4 +200,82 @@ CREATE TABLE note (
 );
 CREATE INDEX note_by_fn ON note(binary_id, space, entry);
 
+-- PE resources (DESIGN 6 "resources"), parsed server side with pefile. Derived: rebuilt when the
+-- index meta resources_version:<binary id> is older than RESOURCES_VERSION (server/peres.py).
+CREATE TABLE res_dialog (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  dialog_id     TEXT NOT NULL,           -- numeric resource id or resource name
+  lang          INTEGER NOT NULL,
+  caption       TEXT,
+  x INTEGER, y INTEGER, cx INTEGER, cy INTEGER,
+  PRIMARY KEY (binary_id, dialog_id, lang)
+);
+CREATE TABLE res_control (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  dialog_id     TEXT NOT NULL,
+  lang          INTEGER NOT NULL,
+  ctrl_id       INTEGER,                 -- -1 = IDC_STATIC
+  class         TEXT,                    -- Button, Edit, Static, ... or the registered class name
+  caption       TEXT,
+  style         TEXT,                    -- short words: BS_PUSHBUTTON,tabstop
+  seq           INTEGER NOT NULL
+);
+CREATE INDEX res_control_by_dialog ON res_control(binary_id, dialog_id, lang, seq);
+CREATE INDEX res_control_by_id ON res_control(binary_id, ctrl_id);
+CREATE TABLE res_menu_item (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  menu_id       TEXT NOT NULL,
+  lang          INTEGER NOT NULL,
+  item_id       INTEGER,                 -- NULL for a popup
+  caption       TEXT,
+  path          TEXT,                    -- "File > Open..."
+  seq           INTEGER NOT NULL
+);
+CREATE INDEX res_menu_item_by_menu ON res_menu_item(binary_id, menu_id, lang, seq);
+CREATE INDEX res_menu_item_by_id ON res_menu_item(binary_id, item_id);
+CREATE TABLE res_string (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  string_id     INTEGER NOT NULL,        -- (block - 1) * 16 + index
+  lang          INTEGER NOT NULL,
+  text          TEXT
+);
+CREATE INDEX res_string_by_id ON res_string(binary_id, string_id);
+
+-- C++ (DESIGN 11), parsed server side from the PE bytes (server/cpp.py). Derived: rebuilt when the
+-- index meta cpp_version:<binary id> is older than CPP_VERSION.
+CREATE TABLE rtti_class (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  name          TEXT NOT NULL,           -- demangled: A::B
+  td_addr       INTEGER NOT NULL,        -- type descriptor
+  col_addr      INTEGER NOT NULL,        -- complete object locator
+  vtable_addr   INTEGER,                 -- first slot; NULL when no vtable references the COL
+  bases         TEXT NOT NULL DEFAULT '',   -- direct base classes, ", " separated
+  PRIMARY KEY (binary_id, td_addr, col_addr)
+);
+CREATE INDEX rtti_class_by_name ON rtti_class(binary_id, name);
+CREATE INDEX rtti_class_by_vtable ON rtti_class(binary_id, vtable_addr);
+CREATE TABLE vtable_slot (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  vtable_addr   INTEGER NOT NULL,
+  slot          INTEGER NOT NULL,
+  target        INTEGER NOT NULL
+);
+CREATE INDEX vtable_slot_by_vtable ON vtable_slot(binary_id, vtable_addr, slot);
+CREATE INDEX vtable_slot_by_target ON vtable_slot(binary_id, target);
+CREATE TABLE msgmap_entry (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  class         TEXT NOT NULL,           -- RTTI name, or anon_<map address> without RTTI
+  map_addr      INTEGER NOT NULL,        -- the AFX_MSGMAP
+  message       INTEGER NOT NULL,        -- nMessage
+  code          INTEGER NOT NULL,        -- nCode (WM_COMMAND: 0 command, 0xFFFFFFFF update-UI)
+  ctrl_id       INTEGER NOT NULL,        -- nID
+  last_id       INTEGER NOT NULL,        -- nLastID (ranges)
+  sig           INTEGER NOT NULL,        -- nSig (AfxSig_*; a pointer for registered messages)
+  handler       INTEGER NOT NULL,        -- pfn
+  seq           INTEGER NOT NULL
+);
+CREATE INDEX msgmap_entry_by_ctrl ON msgmap_entry(binary_id, ctrl_id);
+CREATE INDEX msgmap_entry_by_class ON msgmap_entry(binary_id, class, map_addr, seq);
+CREATE INDEX msgmap_entry_by_handler ON msgmap_entry(binary_id, handler);
+
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);

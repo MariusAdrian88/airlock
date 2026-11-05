@@ -372,3 +372,14 @@ def test_extended_mfc_classes_are_library():
     assert fx.lib_family("COleControlSite::Foo", None, "auto") is None
     assert fx.lib_family("Foo", "COleControlSite", "auto") == "MFC"
     assert fx.lib_family("Foo", "CMainFrame", "auto") is None
+
+
+@pytest.mark.parametrize("name,want", [
+    ("_malloc", "CRT"), ("__strlen_sse2", "CRT"), ("_stricmp", "CRT"), ("_beginthreadex", "CRT"),
+    ("_wfopen", "CRT"), ("_fclose_nolock", "CRT"), ("_crtSomething", "CRT"), ("__ftol2", "CRT"),
+    ("_do_work", None), ("_parse_config", None), ("__helper", None), ("_init_widget", None),
+    ("_update_view", None), ("__thiscall_wrap", None),     # the program's own underscore names
+])
+def test_crt_underscore_names_need_a_known_crt_stem(name, want):
+    assert fx.lib_family(name, None, "auto") == want
+    assert fx.lib_family(name, None, "library") == (want or "lib")      # a Function ID hit stays library

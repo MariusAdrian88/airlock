@@ -102,3 +102,5 @@ def load_tool_modules() -> None:
     from airlock.server.tools import (  # noqa: F401
         admin, annotate, core, fmap, graphtools, map, project, project_create, queue, session, spec,
     )
+    from airlock.server.tools import resources  # noqa: F401
+    from airlock.server.tools import cpp as cpp_tools  # noqa: F401

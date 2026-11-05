@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import defaultdict
@@ -25,7 +26,7 @@ from airlock.index.store import CODE_EDGES, Binary, Store
 
 log = logging.getLogger(__name__)
 
-LINK_VERSION = 5   # 3: import-slot reads rewritten to call_imp edges; 4: plugin-interface links + fnptr edges; 5: string_link
+LINK_VERSION = 6   # 3: import-slot reads rewritten to call_imp edges; 4: plugin-interface links + fnptr edges; 5: string_link; 6: fnptr tables only in data sections
 CODE_KINDS = CODE_EDGES
 _LOAD_RE = re.compile(r"^(?:LoadLibrary(?:Ex)?[AW]?|LdrLoadDll)$")
 _GPA_RE = re.compile(r"^(?:GetProcAddress|LdrGetProcedureAddress)$")
@@ -72,6 +73,42 @@ def pe_exports(path: Path) -> tuple[int, list[tuple[str | None, int, int | None]
         return base, out
     finally:
         pe.close()
+
+
+_SCN_EXEC, _SCN_READ = 0x20000000, 0x40000000
+
+
+def pe_data_ranges(path: Path) -> list[tuple[int, int]] | None:
+    """Virtual address ranges ``[start, end)`` of the readable, non-executable sections of a PE
+    (.rdata, .data, ...). None when the file is not a PE."""
+    try:
+        pe = pefile.PE(str(path), fast_load=True)
+    except (pefile.PEFormatError, OSError):
+        return None
+    try:
+        base = int(pe.OPTIONAL_HEADER.ImageBase)
+        out: list[tuple[int, int]] = []
+        for sec in pe.sections:
+            ch = int(sec.Characteristics)
+            if ch & _SCN_READ and not ch & _SCN_EXEC:
+                size = max(int(sec.Misc_VirtualSize), int(sec.SizeOfRawData))
+                out.append((base + int(sec.VirtualAddress), base + int(sec.VirtualAddress) + size))
+        return out
+    finally:
+        pe.close()
+
+
+def record_sections(store: Store, binary_id: int, artifact: Path | None) -> bool:
+    """Store the data-section ranges of the binary (meta ``data_ranges:<id>``) for ``link_fnptr``.
+    False when the artifact is missing or no PE (the table rule then has no section check)."""
+    if artifact is None or not artifact.is_file():
+        return False
+    ranges = pe_data_ranges(artifact)
+    if ranges is None:
+        return False
+    with store.db:
+        store.set_meta(f"data_ranges:{binary_id}", json.dumps(ranges, separators=(",", ":")))
+    return True
 
 
 def apply_pe_exports(store: Store, binary_id: int,
@@ -380,6 +417,12 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
         store.link_cross_binary(i, ids[k + 1:])
         link_dynamic_for(store, i, ids[k + 1:])
     for i in ids:
+        b = store.get_binary_by_id(i)
+        try:
+            if b is not None:
+                record_sections(store, i, artifacts / b.sha256)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sections of binary %s: %s", i, e)
         try:
             store.link_fnptr(i)
         except Exception as e:  # noqa: BLE001

@@ -14,24 +14,22 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
-import re
 import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Callable
+from typing import Any
 
-from airlock.index.store import CODE_EDGES, CODE_SQL, GRAPH_EDGES, Store
+from airlock.index.store import GRAPH_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
-from airlock.server.selectors import fmt_addr, parse_address, split_binary_target
+from airlock.server.selectors import fmt_addr
 
 CALL_KINDS = GRAPH_EDGES   # call edges plus fnptr (call through a pointer)
 HUB_PERCENT = 0.01
 HUB_MIN_CALLERS = 20
 MAX_SITES = 8
 MAX_ENDPOINT = 2000
-MAX_STRINGS = 200
 
 # Fallback API-prefix table, used only when airlock.server.features cannot be imported.
 _LOCAL_PREFIX: tuple[tuple[str, str], ...] = (
@@ -507,261 +505,6 @@ def _refresh_names(st: Store, g: CallGraph) -> None:
         g._names = None
 
 
-# -- endpoints -------------------------------------------------------------------------------
-
-class EndpointError(Exception):
-    """Carries a ready-to-print one-line error."""
-
-    def __init__(self, message: str) -> None:
-        self.message = message
-        super().__init__(message)
-
-
-@dataclass
-class Endpoint:
-    kind: str                  # function, import, string, feature, cluster
-    nodes: list[int]
-    note: str = ""
-    desc: str = ""             # shown in the path header when the match is not a plain single function
-
-
-_CLUSTER_ID = re.compile(r"^(?:[cm]\d+|util)$", re.I)
-
-
-def _cands(g: CallGraph, nodes: list[int]) -> str:
-    shown = nodes[:8]
-    lst = ", ".join(f"{g.bin_name(g.nodes[v][0])}!{g.qname(v)} {g.addr(v)}" for v in shown)
-    return lst + (f" (+{len(nodes) - len(shown)} more)" if len(nodes) > len(shown) else "")
-
-
-def _count(n: int, one: str, many: str) -> str:
-    return f"{n} {one if n == 1 else many}"
-
-
-def _functions(g: CallGraph, nodes: list[int], extra: Endpoint | None = None) -> Endpoint:
-    """A name that matches one or several functions; several are a valid multi-node endpoint."""
-    nodes = sorted(set(nodes))
-    if extra is not None:
-        merged = sorted(set(nodes) | set(extra.nodes))
-        return Endpoint("function", merged[:MAX_ENDPOINT], extra.note, extra.desc)
-    if len(nodes) == 1:
-        return Endpoint("function", nodes)
-    nb = len({g.nodes[v][0] for v in nodes})
-    return Endpoint("function", nodes[:MAX_ENDPOINT],
-                    desc=f"{len(nodes)} functions in {_count(nb, 'binary', 'binaries')}")
-
-
-def _by_exact(g: CallGraph, name: str, only_bid: int | None) -> list[int]:
-    d = g.by_name()
-    hit = list(d.get(name, ()))
-    if not hit:
-        low = name.lower()
-        hit = [v for k, vs in d.items() if k.lower() == low for v in vs]
-    hit = sorted(set(hit))
-    if only_bid is not None:
-        hit = [v for v in hit if g.nodes[v][0] == only_bid]
-    return hit
-
-
-def string_match(st: Store, g: CallGraph, text: str) -> tuple[list[int], str]:
-    """Functions that reference a string equal to ``text`` (``*``/``?`` glob; else exact, then
-    substring). Returns the nodes and how it matched: ``glob``, ``exact`` or ``substring``."""
-    if not g.binaries:
-        return [], ""
-    marks = ",".join("?" * len(g.binaries))
-    bids = list(g.binaries)
-    rows: list[Any] = []
-    how = "exact"
-    if "*" in text or "?" in text:
-        how = "glob"
-        like = "".join("%" if c == "*" else "_" if c == "?" else ("\\" + c if c in "%_\\" else c)
-                       for c in text)
-        rows = st.db.execute(f"SELECT binary_id, address FROM string WHERE binary_id IN ({marks}) AND "
-                             "value LIKE ? ESCAPE '\\' LIMIT ?", (*bids, like, MAX_STRINGS)).fetchall()
-    else:
-        rows = st.db.execute(f"SELECT binary_id, address FROM string WHERE binary_id IN ({marks}) AND "
-                             "value=? LIMIT ?", (*bids, text, MAX_STRINGS)).fetchall()
-        if not rows:
-            how = "substring"
-            esc = "".join("\\" + c if c in "%_\\" else c for c in text)
-            rows = st.db.execute(f"SELECT binary_id, address FROM string WHERE binary_id IN ({marks}) AND "
-                                 "value LIKE ? ESCAPE '\\' LIMIT ?",
-                                 (*bids, f"%{esc}%", MAX_STRINGS)).fetchall()
-    out: set[int] = set()
-    for r in rows:
-        for e in st.db.execute(
-                "SELECT DISTINCT src_fn FROM edge WHERE binary_id=? AND dst_addr=? AND src_fn IS NOT NULL "
-                f"AND kind NOT IN ({CODE_SQL})", (r["binary_id"], r["address"])):
-            v = g.node_of_fid.get((r["binary_id"], e["src_fn"]))
-            if v is not None:
-                out.add(v)
-    return sorted(out), how
-
-
-def string_nodes(st: Store, g: CallGraph, text: str) -> list[int]:
-    return string_match(st, g, text)[0]
-
-
-def _string_endpoint(st: Store, g: CallGraph, text: str) -> Endpoint | None:
-    nodes, how = string_match(st, g, text)
-    if not nodes:
-        return None
-    return Endpoint("string", nodes[:MAX_ENDPOINT],
-                    desc=f"string, {how} match, {_count(len(nodes), 'function', 'functions')}")
-
-
-def _import_keys(g: CallGraph) -> set[ImportKey]:
-    return set(g.imports) | set(g.import_resolved)
-
-
-def _import_endpoint(g: CallGraph, dll: str, name: str, only_bid: int | None = None) -> Endpoint | None:
-    """Import node(s) for ``[DLL!]name``: exact (case- and decoration-insensitive), then the A/W
-    variants. Every library that provides the import counts. ``None`` when the name is not an
-    import of any binary; an Endpoint without nodes when it is imported but never called."""
-    stem = dll_stem(dll) if dll else ""
-    universe = _import_keys(g) | set(g.import_table)
-    normed = {k: norm_import(k[1]) for k in universe}
-    base = norm_import(name)
-    if not base:
-        return None
-    variants = [base, base + "a", base + "w"]
-    if len(base) > 3 and base[-1] in "aw":
-        root = base[:-1]
-        variants += [root, root + "a", root + "w"]
-    keys: list[ImportKey] = []
-    for v in variants:
-        keys = sorted(k for k in universe if normed[k] == v and (not stem or k[0] in (stem, ""))
-                      and (only_bid is None or only_bid in g.import_table.get(k, ())))
-        if keys:
-            break
-    if not keys:
-        return None
-    nodes: set[int] = set()
-    for k in keys:
-        nodes |= g.import_resolved.get(k, set())
-        if k in g.imports:
-            nodes.add(g.n + g.imports.index(k))
-    label = ", ".join(import_label(k) for k in keys[:3]) + (f" +{len(keys) - 3}" if len(keys) > 3 else "")
-    typed = name.strip().lower()
-    desc = ""
-    if len(nodes) > 1 or any(k[1].lower() != typed for k in keys):
-        desc = f"import {label}, {_count(len(nodes), 'node', 'nodes')}"
-    return Endpoint("import", sorted(nodes)[:MAX_ENDPOINT], label, desc)
-
-
-def _uncalled(ep: Endpoint, t: str) -> EndpointError:
-    return EndpointError(f"error not_found: import {ep.note} exists but no analysed function calls it "
-                         f"(or the calls are indirect), so '{t}' cannot end a path. Try a caller "
-                         "found with search or xrefs.")
-
-
-def resolve_endpoint(st: Store, g: CallGraph, text: str,
-                     cluster_members: Callable[[str], list[tuple[int, str, int]] | None] | None = None
-                     ) -> Endpoint:
-    """Map a ``from``/``to`` text to graph nodes. Raises EndpointError with the one-line error.
-
-    A name that matches several functions is a multi-node endpoint (``Endpoint.desc`` says how
-    many). Not a function, import, feature or cluster: exact string, then substring."""
-    t = text.strip()
-    if not t:
-        raise EndpointError("error bad_args: empty endpoint. Pass a function, import, string, "
-                            "feature key or cluster id.")
-    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
-        s = t[1:-1]
-        ep = _string_endpoint(st, g, s)
-        if ep is None:
-            raise EndpointError(f"error not_found: no function references a string matching {t}. "
-                                "Use strings(pattern) to find it.")
-        return ep
-    if len(t) > 3 and t[0] == "<" and ">!" in t:                     # <main.exe>!name
-        t = t[1:].replace(">!", "!", 1)
-    if _CLUSTER_ID.match(t) and cluster_members is not None:
-        keys = cluster_members(t)
-        if keys is not None:
-            nodes = sorted(g.index[k] for k in keys if k in g.index)
-            if not nodes:
-                raise EndpointError(f"error not_found: cluster {t} has no functions in the call graph.")
-            return Endpoint("cluster", nodes[:MAX_ENDPOINT])
-    pre, bare = split_binary_target(st, t)
-    only_bid: int | None = None
-    if pre:
-        only_bid = next((bid for bid, (nm, _p) in g.binaries.items() if nm.lower() == pre.lower()), None)
-        if only_bid is None:
-            raise EndpointError(f"error not_found: binary '{pre}' is not in the call graph (not ready or "
-                                "a runtime binary). Call list_binaries.")
-    addr = parse_address(bare)
-    if addr is not None:
-        return _by_address(st, g, bare, addr, only_bid)
-    hits = _by_exact(g, bare, only_bid)
-    if pre:
-        if hits:
-            return _functions(g, hits)
-        for r in st.exports_of(only_bid):
-            if r["name"] and r["name"].lower() == bare.lower():
-                v = g.index.get((only_bid, "ram", r["address"]))
-                if v is not None:
-                    return Endpoint("function", [v])
-        ep = _import_endpoint(g, "", bare, only_bid) or _import_endpoint(g, "", bare)
-        if ep is not None:
-            if not ep.nodes:
-                raise _uncalled(ep, t)
-            return ep
-        raise EndpointError(f"error not_found: no function or import '{bare}' in {pre}. Use search or "
-                            f"pass {pre}!0xaddress.")
-    left, sep, right = t.partition("!")
-    ep = _import_endpoint(g, left.strip(), right.strip()) if sep and right.strip() else \
-        _import_endpoint(g, "", t)
-    if ep is not None and ep.nodes:
-        return _functions(g, hits, ep) if hits else ep
-    if hits:
-        return _functions(g, hits)
-    if ep is not None:
-        raise _uncalled(ep, t)
-    try:
-        feat = st.get_feature(t.lower())
-    except Exception:  # noqa: BLE001  no feature tables
-        feat = None
-    if feat is not None:
-        nodes = sorted({g.index[(r["binary_id"], r["space"], r["entry"])]
-                        for r in st.feature_entries(t.lower())
-                        if (r["binary_id"], r["space"], r["entry"]) in g.index})
-        if not nodes:
-            raise EndpointError(f"error not_found: feature {t.lower()} has no entry point in the call "
-                                f"graph. feature(key=\"{t.lower()}\") lists them.")
-        return Endpoint("feature", nodes[:MAX_ENDPOINT])
-    sep_ep = _string_endpoint(st, g, t)
-    if sep_ep is not None:
-        return sep_ep
-    raise EndpointError(f"error not_found: no function, import, feature, cluster or string '{t}'. "
-                        "Use search, features or function_map.")
-
-
-def _by_address(st: Store, g: CallGraph, raw: str, addr: tuple[str, int], only_bid: int | None) -> Endpoint:
-    space, value = addr
-    found: list[int] = []
-    thunk = False
-    for bid in g.binaries:
-        if only_bid is not None and bid != only_bid:
-            continue
-        fn = st.function_at(bid, value, space) or st.function_containing(bid, value, space)
-        if fn is None:
-            continue
-        v = g.index.get((bid, fn.space, fn.entry))
-        if v is None:
-            thunk = True
-        else:
-            found.append(v)
-    if len(found) == 1:
-        return Endpoint("function", found)
-    if len(found) > 1:
-        raise EndpointError(f"error ambiguous: '{raw}' is in {len(found)} binaries: {_cands(g, found)}. "
-                            "Retry with binary!address.")
-    if thunk:
-        raise EndpointError(f"error not_found: {raw} is a thunk or external, not in the call graph. "
-                            "Pass the import name or a function it calls.")
-    raise EndpointError(f"error not_found: no function at or containing {raw}. Check the address or use search.")
-
-
 # -- paths -----------------------------------------------------------------------------------
 
 @dataclass
@@ -868,22 +611,3 @@ def find_paths(g: CallGraph, sources: list[int], targets: list[int], want: int, 
     if not paths:
         reach = _reach_hops(g, sources, tset)
     return PathResult(paths, flags, max_depth, reach)
-
-
-def path_query(pp: ProjectPaths, st: Store, frm: str, to: str, want: int, max_depth: int,
-               g: CallGraph | None = None, cs_fn: Callable[[], Any] | None = None
-               ) -> tuple[Endpoint, Endpoint, PathResult]:
-    """Resolve both endpoints and find the paths. Raises EndpointError (one-line message)."""
-    g = g or get_graph(pp, st)
-
-    def members(cid: str) -> list[tuple[int, str, int]] | None:
-        cs = cs_fn() if cs_fn is not None else None
-        if cs is None:
-            from airlock.server import clusters as cl   # late: clusters imports this module
-            cs = cl.clusters_for(pp, st)
-        c = cs.get(cid)
-        return [m.key for m in c.members] if c is not None else None
-
-    a = resolve_endpoint(st, g, frm, members)
-    b = resolve_endpoint(st, g, to, members)
-    return a, b, find_paths(g, a.nodes, b.nodes, want, max_depth)

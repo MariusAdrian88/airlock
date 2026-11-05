@@ -29,7 +29,7 @@ from typing import Any, Callable
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
-from airlock.server import linking
+from airlock.server import cpp, linking, peres
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
@@ -111,7 +111,8 @@ def map_edge_rows(columns: list[str], rows: list[list[Any]]) -> list[tuple]:
 
 
 def run_extraction(worker: Any, store: Store, binary_id: int, program: str,
-                   on_kind: Callable[[str, int], None] | None = None) -> dict[str, Any]:
+                   on_kind: Callable[[str, int], None] | None = None,
+                   artifact: Path | None = None) -> dict[str, Any]:
     """Page through all four kinds into ``store``; returns counts, timings, image
     base and pointer size. Idempotent: derived rows are cleared first."""
     store.clear_binary_data(binary_id)
@@ -145,6 +146,10 @@ def run_extraction(worker: Any, store: Store, binary_id: int, program: str,
         if on_kind:
             on_kind(kind, n)
     t0 = time.monotonic()
+    try:
+        linking.record_sections(store, binary_id, artifact)   # fnptr tables only in data sections
+    except Exception:  # noqa: BLE001
+        log.warning("sections of binary %s unreadable", binary_id)
     store.link_edges(binary_id)
     store.rebuild_fts(binary_id)
     secs["link_fts"] = round(time.monotonic() - t0, 2)
@@ -437,6 +442,10 @@ class Indexer:
                 self._fire_ready(slug, ready[0])
         except Exception as e:  # noqa: BLE001  the feature index is an extra
             log.warning("cannot refresh the features of %s: %s", slug, e)
+        try:
+            cpp.ensure_project(store, paths.artifacts)  # C++ tables missing or stale: no re-analysis
+        except Exception as e:  # noqa: BLE001  an extra
+            log.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
@@ -779,7 +788,7 @@ class Indexer:
                 analysis_s = round(time.monotonic() - job.analysis_started, 1)
             self._state(job, "extracting")
             t0 = time.monotonic()
-            res = run_extraction(self.worker, st, bid, job.program)
+            res = run_extraction(self.worker, st, bid, job.program, artifact=job.artifact)
             job.timings = {**{f"extract_{k}": v for k, v in res["secs"].items()},
                            "extract_total": round(time.monotonic() - t0, 2)}
             profile = collector = None
@@ -843,6 +852,11 @@ class Indexer:
             linking.fix_export_ordinals(st, me, self.paths(job.project).artifacts / me.sha256)
         except Exception as e:  # noqa: BLE001  ordinals are an extra
             log.warning("export ordinals of %s: %s", me.name, e)
+        try:
+            peres.ensure(st, me, self.paths(job.project).artifacts / me.sha256)
+        except Exception as e:  # noqa: BLE001  resources are an extra
+            log.warning("resources of %s: %s", me.name, e)
+        cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
         st.link_cross_binary(bid, [b.id for b in others])
         try:
             linking.link_dynamic_for(st, bid, [b.id for b in others])
