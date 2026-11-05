@@ -1,0 +1,72 @@
+# Builds the wheel and the source archive. A pushed tag v<version> also runs the
+# tests and publishes a GitHub release with both files. A manual run builds and
+# tests only; the files are attached to the run as the artifact "dist".
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check that the tag and __version__ agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/airlock/__init__.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "error: tag $GITHUB_REF_NAME does not match __version__ $version in src/airlock/__init__.py"
+            exit 1
+          fi
+
+      - name: Build the wheel and the source archive
+        run: uv build
+
+      - name: Start airlock from the wheel
+        run: uvx --python 3.13 --from dist/*.whl airlock --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run the tests (no Ghidra; Ghidra tests skip)
+        run: uv run --python 3.13 --extra dev pytest -q
+
+  release:
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "airlock $GITHUB_REF_NAME"
+          --generate-notes
