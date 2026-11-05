@@ -157,3 +157,104 @@ def test_guid_from_blocks_orders_by_address_and_ignores_masked_operands():
     assert warp.guid_from_blocks([b, a]) == warp.guid_from_blocks([a2, b])
     assert warp.guid_from_blocks([a]) != warp.guid_from_blocks([a, b])
     assert warp.guid_from_blocks([]) is None
+
+
+# ---- libraries by compiler, blocks from an image, the tier in idr._pick ---------------------------
+
+def _image(call_rel: int, abs_addr: int, tail: bytes = b""):
+    from airlock.server.cpp import Image, Section
+    code = (b"\x53\x89\xc3" + b"\xe8" + call_rel.to_bytes(4, "little", signed=True)
+            + b"\xa1" + abs_addr.to_bytes(4, "little") + b"\xb9\x05\x00\x00\x00\x5b\xc3")
+    code += b"\x90" * (32 - len(code))
+    stamp = b"Embarcadero Delphi for Win32 compiler version 35.0 (x)\0"
+    return Image(4, 0x400000, [Section(0x401000, code + tail, True, 0x1000),
+                               Section(0x403000, stamp + bytes(0x100), False, 0x1000)])
+
+
+def test_library_stems():
+    assert warp.library_stems(35) == ["core-11"]
+    assert warp.library_stems(34) == ["10.4-only", "core-11"]
+    assert warp.library_stems(30) == ["core-11", "xe2plus-only"]
+    assert warp.library_stems(20) == ["2009-only", "core-8"]
+    assert warp.library_stems(None) == []
+
+
+def test_image_guid_ignores_relocatable_operands_and_matches():
+    a, b = _image(0x100, 0x403010), _image(0x200, 0x403020)
+    regions = warp.image_regions(a)
+    ga = warp.guid_from_blocks(warp.image_blocks(a, 0x401000, 32, regions))
+    gb = warp.guid_from_blocks(warp.image_blocks(b, 0x401000, 32, warp.image_regions(b)))
+    assert ga == gb
+    lib = warp.read_warp(make_warp([(ga, "System::Demo", [])]))
+    assert warp.match_functions(lib, b, [(0x401000, 32), (0x401000, 8)]) == {0x401000: ["System.Demo"]}
+    assert warp.match_functions(lib, _image(0, 0x403000, b""), [(0x401001, 31)]) == {}
+
+
+def test_warp_tier_in_pick_and_stale_signature(tmp_path):
+    from airlock.server import idr
+    img = _image(0x100, 0x403010)
+    g = warp.guid_from_blocks(warp.image_blocks(img, 0x401000, 32, warp.image_regions(img)))
+    wd = tmp_path / "w"
+    wd.mkdir()
+    (wd / "delphi-rtl-core-11.warp").write_bytes(make_warp([(g, "System::Demo", [])]))
+    (wd / "delphi-rtl-core-8.warp").write_bytes(make_warp([(g, "Wrong::Old", [])]))   # not for compiler 35
+    (wd / "notes.txt").write_text("x" * 100)
+    files = idr.kb_files(None, 4, None, wd)
+    assert [f.label for f in files] == ["warp-core-11", "warp-core-8"] and all(f.warp for f in files)
+    assert idr.kb_files(None, 8, None, wd) == []                      # 32-bit only
+    label, hits, notes = idr._pick(files, img, [(0x401000, 32)])
+    assert label == "warp" and hits == {0x401000: ["System.Demo"]}, notes
+    assert idr.kb_signature(files) != idr.kb_signature(files[:1])
+    # a name from an earlier database wins: nothing here, so an unreadable file only adds a note
+    (wd / "delphi-rtl-core-11.warp").write_bytes(b"\xff" * 100)
+    label, hits, notes = idr._pick(idr.kb_files(None, 4, None, wd), img, [(0x401000, 32)])
+    assert hits == {} and any(n.startswith("warp:") for n in notes)
+
+
+def test_warp_dir_config_key(tmp_path):
+    from airlock.config.loader import default_config_text, parse_jsonc, resolve
+    cfg = resolve(parse_jsonc(default_config_text()), "dirty", None)
+    assert cfg.warp_dir == cfg.data_dir / "warp"
+    merged = parse_jsonc(default_config_text())
+    merged["warp_dir"] = str(tmp_path / "w")
+    merged["ghidra_dir"] = str(tmp_path / "g")
+    assert resolve(merged, "dirty", None).warp_dir == tmp_path / "w"
+
+
+def test_dotted_names_follow_the_other_tiers():
+    d = warp.dotted
+    assert d("System::TObject::Free") == "System.TObject.Free"
+    assert d("System::@GetAnsiChar") == "System.@GetAnsiChar"
+    assert d("SysUtils::Exception::Create") == "System.SysUtils.Exception.Create"
+    assert d("Types::EqualRect") == "System.Types.EqualRect"
+    assert d("Graphics::TCanvas::Create") == "Vcl.Graphics.TCanvas.Create"
+    assert d("Windows::GetTickCount") == "Winapi.Windows.GetTickCount"
+    assert d("System.Classes::TList::Add") == "System.Classes.TList.Add"       # already has its namespace
+    assert d("SysInit::_DF_") == "SysInit._DF_."
+    assert d("MyUnit::Foo") == "MyUnit.Foo"
+
+
+def test_idr_file_is_chosen_without_the_functions_warp_names(tmp_path):
+    from airlock.server import idr
+    seen = {}
+    real = idr._pick_idr
+
+    def spy(files, img, funcs, comp, score=None):
+        seen["funcs"], seen["score"] = list(funcs), list(score or [])
+        return real(files, img, funcs, comp, score)
+
+    img = _image(0x100, 0x403010)
+    g = warp.guid_from_blocks(warp.image_blocks(img, 0x401000, 32, warp.image_regions(img)))
+    wd = tmp_path / "w"
+    wd.mkdir()
+    (wd / "delphi-rtl-core-11.warp").write_bytes(make_warp([(g, "System::Demo", [])]))
+    kb = tmp_path / "kb2014.bin"
+    kb.write_bytes(b"x" * 500)
+    files = idr.kb_files(tmp_path, 4, None, wd)
+    mp = pytest.MonkeyPatch()
+    mp.setattr(idr, "_pick_idr", spy)
+    try:
+        idr._pick(files, img, [(0x401000, 32), (0x401010, 16)])
+    finally:
+        mp.undo()
+    assert seen["funcs"] == [(0x401010, 16)] and seen["score"] == [(0x401000, 32), (0x401010, 16)]

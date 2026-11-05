@@ -1061,7 +1061,7 @@ get a runtime name). A generic stub of 10 compared bytes shared by thousands of 
 `GENERIC_MIN`; with it the increase is small. Rules tried and not kept: all procs of one unit, all functions
 with the same name, a lower length threshold.
 
-**WARP signature libraries** (`server/warp.py`, `worker/ghidra_ops/warp.py`, spike, not yet wired into `idr.py`).
+**WARP signature libraries** (`server/warp.py`, `worker/ghidra_ops/warp.py`, tier in `idr._pick`).
 Binary Ninja WARP (github.com/Vector35/warp, Apache-2.0) with the Delphi libraries of psifertex/delphinja
 (`signatures/*.warp`, MIT, built from IDR knowledge bases and Delphi 10.4/11 packages). **[verified]** Function GUID =
 UUIDv5 (namespace `0192a179-61ac-7cef-88ed-012296e9492f`) of the block GUIDs ordered by ascending start address; block
@@ -1082,6 +1082,18 @@ magic. Constraints (called functions, adjacency) are read but not used. Blocks c
 descent over the PE bytes (`image_blocks`, 32-bit, same input as the IDR matcher) or from the worker op `warp_blocks`
 (Ghidra blocks plus per-instruction facts). They agree on 81% of the functions; the rest differ in no-return and
 function extent handling. 64-bit is not done (no Delphi 64-bit library exists).
+Wiring: config key `warp_dir` (null: `warp\` in the data directory) holds the `delphi-rtl-*.warp` files, pinned to
+delphinja commit `b2952e99` and checked by size and git blob id; `airlock doctor` lists them. `kb_files` lists them
+as `KbFile(warp=True)` (32-bit only), so they are part of the stale signature (`IDR_VERSION` 5). `_pick` order: exact
+sigdb, RTTI database, WARP, IDR; an earlier name wins. The libraries come from the compiler version
+(`warp.library_stems`: 34 = `10.4-only` + `core-11`, 35 = `core-11`, 26 to 33 = `core-11` + `xe2plus-only`, older =
+`<year>-only` + `core-8`); an unknown compiler uses none. The matcher is the capstone route (`warp.match_functions`,
+functions of 16 bytes or more, at most 3 names per GUID). Names are written like the other tiers (`warp.dotted`:
+`Unit::Class::Member` becomes `Unit.Class.Member`; units that old compilers wrote without a namespace get it back,
+`SysUtils` to `System.SysUtils`, `Graphics` to `Vcl.Graphics`, `Windows` to `Winapi.Windows`). The IDR file is chosen on
+the functions that no earlier tier named, before WARP runs, so WARP cannot change that choice. On a compiler 30 program
+(no library for it) WARP agrees with the exact sigdb name in about 98% of the functions both name (the rest are code
+aliases such as `Exception.Create` and `CreateFmt`), adds names net and loses none. Cost: about 20 s more for a large program.
 
 ### dotnet
 

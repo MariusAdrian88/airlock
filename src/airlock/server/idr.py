@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 4                      # bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 5                      # bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -79,6 +79,7 @@ class KbFile:
     size: int
     sig: bool = False    # signature database built from a local Delphi install (``year`` = compiler version)
     rtti: bool = False   # RTTI consensus database (``delphirtti``), a sigdb file named ``rtti-<compiler>-<bits>``
+    warp: bool = False   # Binary Ninja WARP library of delphinja (``delphi-rtl-<stem>.warp``, 32-bit only)
 
 
 def kb_folders(root: Path, psize: int) -> list[Path]:
@@ -113,11 +114,31 @@ def sig_files(sig_dir: Path | None, psize: int) -> list[KbFile]:
     return sorted(out, key=lambda f: (int(f.year), f.rtti))
 
 
-def kb_files(root: Path | None, psize: int, sig_dir: Path | None = None) -> list[KbFile]:
-    """Knowledge base files for the pointer size, then the signature databases. For a year with both kb
-    and syskb only the kb is listed (it holds the system units too). IDR files are sorted by year, 4-digit
-    years after 1-digit ones."""
-    sigs = sig_files(sig_dir, psize)
+def warp_files(warp_dir: Path | None, psize: int) -> list[KbFile]:
+    """WARP libraries (``delphi-rtl-*.warp``) for 32-bit programs; none for 64-bit."""
+    from airlock.server import warp
+    out: list[KbFile] = []
+    try:
+        names = sorted(warp_dir.iterdir()) if warp_dir is not None and psize == 4 else []
+    except OSError:
+        return []
+    for p in names:
+        stem = warp.warp_stem(p)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if stem and p.is_file() and size > 64:
+            out.append(KbFile(p, f"warp-{stem}", stem, False, size, warp=True))
+    return out
+
+
+def kb_files(root: Path | None, psize: int, sig_dir: Path | None = None,
+             warp_dir: Path | None = None) -> list[KbFile]:
+    """Knowledge base files for the pointer size, then the signature databases and WARP libraries. For a
+    year with both kb and syskb only the kb is listed (it holds the system units too). IDR files are sorted
+    by year, 4-digit years after 1-digit ones."""
+    sigs = sig_files(sig_dir, psize) + warp_files(warp_dir, psize)
     if root is None:
         return sigs
     by_year: dict[str, KbFile] = {}
@@ -399,10 +420,11 @@ def expected(files: list[KbFile], ncand: int) -> str:
     return f"{IDR_VERSION}:{kb_signature(files)}:{ncand}"
 
 
-def stale(store: Store, binary: Binary, kb_dir: Path | None, sig_dir: Path | None = None) -> bool:
+def stale(store: Store, binary: Binary, kb_dir: Path | None, sig_dir: Path | None = None,
+          warp_dir: Path | None = None) -> bool:
     """True when the hits were computed by another IDR_VERSION, from other knowledge base files or for
     another number of unnamed functions (the function list changed)."""
-    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir)
+    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
     cur = store.get_meta(_key(VERSION_META, binary.id))
     if not files:                      # nothing configured: only a former result has to be cleared
         return cur is not None and not cur.startswith(f"{IDR_VERSION}:none:")
@@ -429,6 +451,11 @@ def compiler_version(img: Image) -> int | None:
     return None
 
 
+def _warp_stems(comp: int) -> list[str]:
+    from airlock.server import warp
+    return warp.library_stems(comp)
+
+
 def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
           ) -> tuple[str, dict[int, list[str]], list[str]]:
     """Names for the functions. The signature database of the binary's exact compiler version goes first;
@@ -437,7 +464,8 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
     comp = compiler_version(img)
     exact = [f for f in files if f.sig and not f.rtti and comp is not None and int(f.year) == comp]
     rtti = [f for f in files if f.rtti and comp is not None and int(f.year) == comp]
-    pool = [f for f in files if f not in exact and f not in rtti]
+    warps = [f for f in files if f.warp]
+    pool = [f for f in files if f not in exact and f not in rtti and not f.warp]
     hits: dict[int, list[str]] = {}
     labels: list[str] = []
     notes: list[str] = []
@@ -453,9 +481,24 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
             notes.append(f"{tier[0].label} {len(got)}/{len(rest)}")
         except KbError as e:
             notes.append(f"{tier[0].label}: {e}")
+    score = [x for x in funcs if x[0] not in hits] if hits else funcs   # the IDR file is chosen on these,
+    if warps and comp is not None:               # whatever WARP names; then the WARP libraries of the compiler version
+        stems = _warp_stems(comp)
+        use = [f for f in warps if f.year in stems]
+        rest = score
+        if use and rest:
+            try:
+                from airlock.server import warp
+                got = warp.match_functions([warp.load_lib(f.path) for f in use], img, rest)
+                for entry, names in got.items():
+                    hits.setdefault(entry, names)
+                labels.append("warp")
+                notes.append(f"warp {len(got)}/{len(rest)}")
+            except Exception as e:  # noqa: BLE001  WarpError, capstone missing, unreadable file
+                notes.append(f"warp: {e}")
     if pool:
         rest = [x for x in funcs if x[0] not in hits] if hits else funcs
-        f, more, n2 = _pick_idr(pool, img, rest, comp)
+        f, more, n2 = _pick_idr(pool, img, rest, comp, score)
         notes.extend(n2)
         if f is not None and more:
             labels.append(f.label)
@@ -466,7 +509,8 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
     return "+".join(labels), hits, notes
 
 
-def _pick_idr(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]], comp: int | None
+def _pick_idr(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]], comp: int | None,
+              score: list[tuple[int, int | None]] | None = None
               ) -> tuple[KbFile | None, dict[int, list[str]], list[str]]:
     """The knowledge base of the binary's compiler version when there is one, else the one with the most
     matching functions, judged on a sample of the functions; the winner then runs over all of them.
@@ -478,8 +522,9 @@ def _pick_idr(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None
             return exact[0], match_all(load_kb(exact[0]), img, funcs), note0
         except KbError as e:
             note0.append(f"{exact[0].label}: {e}")
-    step = max(1, len(funcs) // SAMPLE)
-    sample = funcs[::step]
+    pool = score if score is not None else funcs      # choose on the functions no earlier tier named
+    step = max(1, len(pool) // SAMPLE)
+    sample = pool[::step]
     best: tuple[KbFile, Kb, int] | None = None
     notes: list[str] = note0
     for f in files:
@@ -498,10 +543,10 @@ def _pick_idr(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None
 
 
 def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
-           sig_dir: Path | None = None) -> tuple[str, int, int]:
+           sig_dir: Path | None = None, warp_dir: Path | None = None) -> tuple[str, int, int]:
     """Match the unnamed functions of a Delphi binary against the knowledge bases and store the result.
     Returns (knowledge base label or '', matched functions, candidates)."""
-    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir)
+    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
     funcs = candidates(store, binary.id)
     sig = expected(files, len(funcs))
     label, hits, info = "", {}, "no knowledge base configured" if kb_dir is None else "no knowledge base files found"
@@ -533,14 +578,14 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
 
 
 def ensure(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
-           sig_dir: Path | None = None) -> bool:
+           sig_dir: Path | None = None, warp_dir: Path | None = None) -> bool:
     """Derive the hits of a Delphi binary when missing or stale. Never raises; True when rewritten."""
     if binary.toolchain != "delphi" or not artifact.is_file():
         return False
     try:
-        if not stale(store, binary, kb_dir, sig_dir):
+        if not stale(store, binary, kb_dir, sig_dir, warp_dir):
             return False
-        derive(store, binary, artifact, kb_dir, sig_dir)
+        derive(store, binary, artifact, kb_dir, sig_dir, warp_dir)
         return True
     except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
         log.warning("IDR names of %s failed: %s", binary.name, e)

@@ -742,10 +742,10 @@ def stale(store: Store, binary_id: int) -> bool:
 
 
 def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = None,
-           sig_dir: Path | None = None) -> bool:
+           sig_dir: Path | None = None, warp_dir: Path | None = None) -> bool:
     """Derive the Delphi rows of a Delphi binary when missing or from an older DELPHI_VERSION, then the
     IDR names (``idr.ensure``; ``idr_dir`` is the knowledge base folder or None, ``sig_dir`` the folder of
-    the signature databases). Never raises; True
+    the signature databases, ``warp_dir`` the WARP libraries). Never raises; True
     when anything was (re)written. Other toolchains are not parsed."""
     if not is_delphi(binary) or not artifact.is_file():
         return False
@@ -758,13 +758,14 @@ def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = 
             log.warning("Delphi analysis of %s failed: %s", binary.name, e)
             return False
     from airlock.server import idr
-    return idr.ensure(store, binary, artifact, idr_dir, sig_dir) or done
+    return idr.ensure(store, binary, artifact, idr_dir, sig_dir, warp_dir) or done
 
 
-def ensure_project(store: Store, artifacts: Path, idr_dir: Path | None = None, sig_dir: Path | None = None) -> int:
+def ensure_project(store: Store, artifacts: Path, idr_dir: Path | None = None, sig_dir: Path | None = None,
+                   warp_dir: Path | None = None) -> int:
     n = 0
     for b in store.list_binaries():
-        if store.get_meta(f"status:{b.id}") == "ready" and ensure(store, b, artifacts / b.sha256, idr_dir, sig_dir):
+        if store.get_meta(f"status:{b.id}") == "ready" and ensure(store, b, artifacts / b.sha256, idr_dir, sig_dir, warp_dir):
             n += 1
     return n
 

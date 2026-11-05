@@ -31,7 +31,7 @@ from airlock.config.keys import (
 
 CLEAN_ROLE = "clean"
 DIRTY_ROLE = "dirty"
-_LOCATION_KEYS = ("ghidra_dir", "jdk_dir", "ilspycmd", "idr_kb_dir", "delphi_sigdb_dir", "index_dir", "projects_root")
+_LOCATION_KEYS = ("ghidra_dir", "jdk_dir", "ilspycmd", "idr_kb_dir", "delphi_sigdb_dir", "warp_dir", "index_dir", "projects_root")
 _NOT_DEFAULTS = set(_LOCATION_KEYS) | {"config_version", "disabled_tools", "disabled_sets"}
 
 
@@ -67,6 +67,7 @@ class Config:
     raw: dict[str, Any] = field(default_factory=dict)
     idr_kb_dir: Path | None = None
     delphi_sigdb_dir: Path | None = None   # folder of the Delphi signature databases; None: <data_dir>/sigdb
+    warp_dir: Path | None = None           # folder of the WARP libraries; None: <data_dir>/warp
     file_version: int | None = None   # config_version of the global file; None: no file
 
     @property
@@ -223,6 +224,8 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
         idr_kb_dir=_opt_path(eff.get("idr_kb_dir"), "idr_kb_dir"),
         delphi_sigdb_dir=(_opt_path(eff.get("delphi_sigdb_dir"), "delphi_sigdb_dir")
                           or (_opt_path(eff.get("index_dir"), "index_dir") or paths.default_data_dir()) / "sigdb"),
+        warp_dir=(_opt_path(eff.get("warp_dir"), "warp_dir")
+                  or (_opt_path(eff.get("index_dir"), "index_dir") or paths.default_data_dir()) / "warp"),
         projects_root=_projects_root(eff.get("projects_root")),
         data_dir=_opt_path(eff.get("index_dir"), "index_dir") or paths.default_data_dir(),
         defaults=defaults,

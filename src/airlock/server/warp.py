@@ -284,7 +284,7 @@ def image_blocks(img, entry: int, size: int, regions: list[tuple[int, int]], too
     while work:
         a = work.pop()
         while entry <= a < end and a not in insn:
-            code = img.read(a, 15)
+            code = img.read(a, 15) or img.read(a, max(1, min(15, end - a)))
             if not code:
                 break
             ii = next(cs.disasm(code, a, 1), None)
@@ -324,11 +324,81 @@ def image_regions(img) -> list[tuple[int, int]]:
     return [(s.va, s.end) for s in img.sections]
 
 
-def match_functions(lib: WarpLib, img, funcs: list[tuple[int, int | None]], *, min_size: int = 16,
-                    max_names: int = 3) -> dict[int, list[str]]:
-    """{entry: names} for functions whose WARP GUID is in `lib`. Ambiguous GUIDs (more than `max_names`
+# delphinja library per compiler version (stem of ``delphi-rtl-<stem>.warp``), best first
+_YEAR_COMPILER = {"2": 9, "3": 10, "4": 12, "5": 13, "6": 14, "7": 15, "2005": 17, "2006": 18, "2007": 19,
+                  "2009": 20, "2010": 21, "2011": 22, "2012": 23, "2013": 24, "2014": 25}
+
+
+def library_stems(comp: int | None) -> list[str]:
+    """Stems of the delphinja libraries that can name a binary of compiler version `comp`
+    (34 = 10.4, 35 = 11); empty when the compiler is unknown."""
+    if comp is None:
+        return []
+    if comp >= 34:
+        return (["10.4-only"] if comp == 34 else []) + ["core-11"]
+    if comp >= 26:
+        return ["core-11", "xe2plus-only"]
+    out = [y + "-only" for y, c in _YEAR_COMPILER.items() if c == comp]
+    return out + ["core-8"] + (["xe2plus-only"] if comp >= 22 else [])
+
+
+def warp_stem(path: Path) -> str | None:
+    n = path.name
+    if n.startswith("delphi-rtl-") and n.endswith(".warp"):
+        return n[len("delphi-rtl-"):-len(".warp")]
+    return None
+
+
+_CACHE: dict[tuple[str, int, int], WarpLib] = {}
+
+
+def load_lib(path: Path) -> WarpLib:
+    """`read_warp_file` with a small per-process cache."""
+    st = path.stat()
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    lib = _CACHE.get(key)
+    if lib is None:
+        lib = read_warp_file(path)
+        while len(_CACHE) >= 3:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = lib
+    return lib
+
+
+# units that the libraries of old compilers name without the namespace of later releases
+_SYSTEM_UNITS = {"SysUtils", "Classes", "Types", "Variants", "Math", "StrUtils", "DateUtils", "TypInfo", "Contnrs",
+                 "IniFiles", "Rtti", "ZLib", "Character", "SyncObjs", "Masks", "UITypes", "Generics.Collections",
+                 "Generics.Defaults", "AnsiStrings", "Hash", "IOUtils", "Zip", "JSON", "Threading", "WideStrUtils",
+                 "VarUtils", "Actions", "Win.Registry", "Win.ComObj", "StdConvs", "ConvUtils", "MaskUtils"}
+_VCL_UNITS = {"Graphics", "Controls", "Forms", "StdCtrls", "ExtCtrls", "ComCtrls", "Dialogs", "Menus", "Grids",
+              "Buttons", "ActnList", "ActnMan", "Themes", "Clipbrd", "CheckLst", "Consts", "ImgList", "Mask",
+              "Tabs", "Printers", "ToolWin", "ExtDlgs", "ValEdit", "Imaging.jpeg"}
+_WINAPI_UNITS = {"Windows", "Messages", "ShlObj", "ActiveX", "CommCtrl", "ShellAPI", "RichEdit", "MultiMon",
+                 "UxTheme", "ComObj"}
+
+
+def dotted(name: str) -> str:
+    """WARP `Unit::Class::Member` as the other tiers write it (`Unit.Class.Member`). A leading unit that
+    only old compilers wrote without its namespace (`SysUtils`, `Graphics`, `Windows`) gets it back."""
+    parts = name.split("::")
+    unit = parts[0]
+    for ns, units in (("System", _SYSTEM_UNITS), ("Vcl", _VCL_UNITS), ("Winapi", _WINAPI_UNITS)):
+        if unit in units:
+            parts[0] = f"{ns}.{unit}"
+            break
+    else:
+        if unit == "DB":
+            parts[0] = "Data.DB"
+    out = ".".join(parts)
+    return out + "." if parts[-1] == "_DF_" else out      # the IDR spelling of the unit finalizer
+
+
+def match_functions(libs: "WarpLib | list[WarpLib]", img, funcs: list[tuple[int, int | None]], *,
+                    min_size: int = 16, max_names: int = 3) -> dict[int, list[str]]:
+    """{entry: names} for functions whose WARP GUID is in a library. Ambiguous GUIDs (more than `max_names`
     different names) and small functions are skipped. 32-bit images only."""
-    if img.psize != 4 or not lib.functions:
+    libs = [libs] if isinstance(libs, WarpLib) else libs
+    if img.psize != 4 or not any(l.functions for l in libs):
         return {}
     tools = _capstone()
     regions = image_regions(img)
@@ -337,9 +407,9 @@ def match_functions(lib: WarpLib, img, funcs: list[tuple[int, int | None]], *, m
         if not size or size < min_size:
             continue
         g = guid_from_blocks(image_blocks(img, entry, size, regions, tools))
-        hit = lib.functions.get(g) if g else None
-        if hit:
-            names = sorted({w.name for w in hit})
-            if len(names) <= max_names:
-                out[entry] = names
+        if not g:
+            continue
+        names = sorted({dotted(w.name) for l in libs for w in l.functions.get(g, ())})
+        if names and len(names) <= max_names:
+            out[entry] = names
     return out

@@ -452,7 +452,8 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
-            delphi.ensure_project(store, paths.artifacts, self.config.idr_kb_dir, self.config.delphi_sigdb_dir)  # Delphi tables and IDR names missing or stale: no re-analysis
+            delphi.ensure_project(store, paths.artifacts, self.config.idr_kb_dir, self.config.delphi_sigdb_dir,
+                                  self.config.warp_dir)  # Delphi tables and IDR names missing or stale: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the Delphi tables of %s: %s", slug, e)
         try:
@@ -1020,14 +1021,14 @@ class Indexer:
             self._plog(job).warning("resources of %s: %s", me.name, e)
         cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
         delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
-                         self.config.delphi_sigdb_dir)   # VMTs, published methods, DFM, IDR names
+                         self.config.delphi_sigdb_dir, self.config.warp_dir)   # VMTs, published methods, DFM, IDR names
         qt.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # QMetaObjects, string connects
         try:
             self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
             self._plog(job).warning("missing functions of %s: %s", me.name, e)
         delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
-                         self.config.delphi_sigdb_dir)   # IDR names: the function list may have grown
+                         self.config.delphi_sigdb_dir, self.config.warp_dir)   # IDR names: the function list may have grown
         try:
             qt.resolve(self, job.project, st, me)   # Qt method addresses, imported parents
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready

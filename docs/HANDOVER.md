@@ -2,7 +2,9 @@
 
 Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
-the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`), M6 (`delphi`) M7 (`dotnet`) and M8 (`qt_metaobjects`, `dataflow`) are done.
+the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`), M6 (`delphi`), M7 (`dotnet`) and M8 (`qt_metaobjects`,
+`dataflow`) are done. Delphi RTL/VCL naming has 5 sources (exact sigdb from
+installed packages, extended RTTI, RTTI consensus database, WARP, IDR).
 
 ## State
 
@@ -13,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 838 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 925 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -257,13 +259,11 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
 - Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file), published
   properties, dynamic/message method tables, interface tables, virtual method names, renaming.
 
-- WARP spike (`server/warp.py`, `worker/ghidra_ops/warp.py`, `tests/test_warp.py`; DESIGN section 11): reads Binary Ninja
-  `.warp` libraries (delphinja Delphi RTL) and computes the WARP function GUID from capstone blocks or from the worker op
-  `warp_blocks`. Verdict: feasible, approximate (a Binary Ninja analysis detail changes about 20% of the blocks).
-  Not wired into `idr.py`: it needs a `warp_dir` key (`config/keys.py`, `loader.py`) and a parameter through
-  `indexer` -> `delphi.ensure` -> `idr.derive/stale`, then one tier in `_pick` after the exact sigdb (library by
-  compiler: 34 -> `delphi-rtl-10.4-only` + `core-11`, 35 -> `core-11`; older compilers `core-8`, `<year>-only`,
-  `xe2plus-only`), `IDR_VERSION` bump and the file list in the stale signature. The `.warp` files are not in the repo.
+- WARP names (`server/warp.py`, `worker/ghidra_ops/warp.py`, `tests/test_warp.py`; DESIGN section 11): reads Binary Ninja
+  `.warp` libraries (delphinja Delphi RTL) and computes the WARP function GUID from capstone blocks (used by
+  `idr._pick`, tier after the RTTI database, before IDR) or from the worker op `warp_blocks` (Ghidra blocks; 81% equal
+  to capstone, not used by the pipeline). Config key `warp_dir`; files in `%LOCALAPPDATA%\airlock\warp` (not in the repo).
+  `IDR_VERSION` 5. 32-bit only. Approximate: Binary Ninja's block recovery differs from ours on some functions.
 
 ## Qt and dataflow (M8)
 
@@ -276,6 +276,14 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 
 ## Next
 
-The `fileformat` record detectors
-(`record_guess` strides and length prefixes) are only proven on synthetic
-files; check them on real record files when one is available.
+- `ready` is published before the after-ready work (cross-binary links,
+  missing functions, decompile pass). Add a `finishing` state to
+  `index_status` so a client knows when that work is done.
+- Qt6 metaobject layout is proven only on synthetic data; check it on a
+  real Qt6 program. Qt feature seeds and pointer-to-member connects are open.
+- Delphi: private routines have no name source (`.jdbg` names use a
+  compressed form that is not decoded); property accessors are not named.
+- WARP covers compilers 34/35 and older from public libraries; it is not
+  tested on a binary of those compilers yet. 64-bit WARP has no library.
+- The `fileformat` record detectors (`record_guess` strides and length
+  prefixes) are only proven on synthetic files.
