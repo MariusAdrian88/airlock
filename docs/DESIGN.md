@@ -342,7 +342,7 @@ agent. Each feature has a stable key, a title, evidence and entry points
 |---|---|
 | `file-io` | calls to file APIs (CreateFile/ReadFile/WriteFile, fopen/fread, CFile, mapping), file-dialog filters, file-extension strings, path strings |
 | `config` | registry APIs, INI/profile APIs, XML parser imports, config-file names |
-| `ui` | window/dialog/menu creation, message maps and resources (M2), command IDs |
+| `ui-window`, `ui-controls`, `ui-dialog`, `ui-menu`, `ui-draw`, `ui-input` | `ui-window`: window creation, class registration, window procedures, message loop. `ui-controls`: control text/state and messages (SendMessage, Get/SetWindowText, ShowWindow, CWnd control methods). Dialog, menu, GDI and keyboard/mouse/timer APIs for the others. Generic calls (messages, text get/set, DC select/release, constructors and destructors of MFC classes) are weak seeds: listed, but their callers are not followed. Library code (MFC, CRT) is never a seed. A list over the cap says its true total (at least) and that it is ranked, strong seeds first. Message maps and resources: M2 |
 | `network` | socket, WinINet/WinHTTP, serial/COM port APIs |
 | `hardware` | DeviceIoControl, port I/O, driver service APIs, HID/USB |
 | `plugins` | LoadLibrary/GetProcAddress sites, exported plugin interface, plugin folders |
@@ -354,7 +354,9 @@ agent. Each feature has a stable key, a title, evidence and entry points
 - Auto-derivation runs after extraction: import categories (a fixed table
   of API name → feature) and string patterns give seed functions; the
   feature's entry points are the seeds plus their callers up to depth 2
-  inside the program's own binaries (runtime libraries excluded).
+  inside the program's own binaries (runtime libraries excluded). Weak
+  seeds do not expand. `FEATURES_VERSION` (index meta `features_version`)
+  makes a project derived by an older version derive again when opened.
 - Coverage per feature: entry points named or annotated / total, specs
   written for its topic. The map shows it, so "reverse engineer the whole
   program" means working through the features until coverage is complete.
@@ -386,6 +388,17 @@ a few calls, so it would be the whole program with no structure.
   its links to other clusters (call counts), and the features it serves.
 - Recomputed after every binary becomes ready and after renames; agent
   labels (`cluster_label`) survive recomputation by member overlap.
+- Runtime code inside program binaries (statically linked MFC/CRT/ATL/STL,
+  common in plugin DLLs) is recognised per function by name rules (also
+  `FID_conflict:` Function ID hits, `@N`/`___` decorations, `Catch@`/`Unwind@`
+  funclets), by recurrence (a plain name present in at least 3 binaries, not
+  exported, not agent-named) and by propagation (an unnamed function called
+  only from runtime functions). A cluster with at least 60% runtime members
+  is labelled `runtime: MFC|CRT|ATL/STL` and hidden, unless it contains
+  program evidence (an agent-named function or an exported entry point): it
+  then stays visible. A visible cluster with no other label and at least
+  30% runtime members is `mixed: MFC+program`. Deterministic; the cache
+  version (`ALGO_VERSION`) invalidates stored clusters when the rules change.
 - Shown in the project map as section 4b *Subsystems* (top clusters), and
   through the tool `function_map`.
 
@@ -684,10 +697,19 @@ not a project folder, goes through `project_create`:
    (Illustrative numbers.)
 
    Each option row also names its largest files. The estimate is
-   per binary `analysis_overhead_s` (config, default 20: import, extraction,
-   linking) plus `code MB × analysis_s_per_code_mb` (config, default 120;
-   acceptance run: 20-35 s for tiny DLLs, 90-120 s/MB) and is refined from the project's
-   own measured analysis times as binaries finish. The table ends with the
+   per binary `analysis_overhead_s` (config, default 6: import, extraction,
+   linking) plus `work MB × analysis_s_per_code_mb` (config, default 170).
+   Work MB is the estimated function count divided by 9000 functions per MB
+   (analysis time follows the function count better than the code size; a
+   function-dense plugin was 58% over a pure code-size estimate). The light
+   scan estimates the function count in one pass without disassembly: the
+   distinct in-code targets of `call rel32` and `push imm32`, pointers into
+   code found in data sections, and exports (about 0.1 s per 2 MB of code;
+   within about 10% of Ghidra's count on the acceptance binaries). Binaries
+   without an estimate use their code MB. The model is refined from the
+   project's own measured times as binaries finish, as a blend with the
+   prior (rate prior worth 1 work MB, overhead prior worth 2 binaries,
+   both bounded), so a single large binary cannot swing it. The table ends with the
    data-file summary and a recommendation (default: B when own plugins
    exist, else A). The user picks an option or adds/removes single files.
 5. **Create.** Write the folder structure (§4), the manifest, the deny rules

@@ -171,6 +171,7 @@ class Job:
     rel_path: str | None = None
     group: str = "core"
     code_size: int = 0
+    est_funcs: int = 0
     seq: int = 0
     analysis_started: float | None = None
     already_analysed: bool = False
@@ -387,7 +388,7 @@ class Indexer:
                 continue
             job = self._enqueue_one(paths, store, sha, Path(str(rel).replace("\\", "/")).name,
                                     rel, f.get("group") or "other", f.get("code_size"),
-                                    str(f.get("source") or rel))
+                                    str(f.get("source") or rel), int(f.get("est_funcs") or 0))
             if job is not None:
                 queued.append(rel)
         return queued
@@ -429,6 +430,13 @@ class Indexer:
                                        after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  links are an extra
             log.warning("cannot relink %s: %s", slug, e)
+        try:
+            from airlock.server import features as _fx  # features derived by an older version: derive again
+            ready = linking.ready_ids(store)
+            if ready and store.feature_stats() and _fx.stale(store) and not linking.needs_relink(store):
+                self._fire_ready(slug, ready[0])
+        except Exception as e:  # noqa: BLE001  the feature index is an extra
+            log.warning("cannot refresh the features of %s: %s", slug, e)
         try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
@@ -472,7 +480,7 @@ class Indexer:
 
     def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
                      rel_path: str | None, group: str, code_size: int | None,
-                     original_path: str | None) -> Job | None:
+                     original_path: str | None, est_funcs: int = 0) -> Job | None:
         """Register the binary (status queued) and put a job on the queue. None when the binary
         is ready, already queued/running, or not analysable."""
         slug = paths.name
@@ -500,7 +508,8 @@ class Indexer:
             or self._free_program_name(store, name, sha)
         store.set_meta(f"program:{bid}", program)
         job = Job(slug, bid, program, artifact, paths, sha256=sha, rel_path=rel_path,
-                  group=group, code_size=int(code_size or 0), seq=next(self._seq))
+                  group=group, code_size=int(code_size or 0), est_funcs=est_funcs,
+                  seq=next(self._seq))
         self.set_status(store, bid, "queued")
         self._mf_update(slug, sha, state="queued", error=None)  # before the job can advance
         with self._lock:
@@ -589,7 +598,7 @@ class Indexer:
             if secs is None and f.get("analysis_s"):
                 secs = float(f["analysis_s"]) + float(f.get("extract_s") or 0.0)
             if secs and f.get("code_size") is not None:
-                samples.append((float(f["code_size"]) / _MB, float(secs)))
+                samples.append((est.work_mb(f["code_size"], f.get("est_funcs") or 0), float(secs)))
         return est.refine(samples, prior_oh, prior_rate)
 
     def s_per_mb(self, files: list[dict[str, Any]]) -> float:
@@ -645,7 +654,8 @@ class Indexer:
             f = by_sha.get(b.sha256, {})
             job = self.job_for(project, b.id)
             code = int(f.get("code_size") or (job.code_size if job else 0) or 0)
-            est_s = est.binary_seconds(code, overhead, rate)
+            work = est.work_mb(code, f.get("est_funcs") or (job.est_funcs if job else 0) or 0)
+            est_s = est.binary_seconds(work, overhead, rate)
             secs: float | None = None
             e: float | None = est_s
             if status == "ready":
@@ -786,7 +796,7 @@ class Indexer:
                              analysed_at=_now())
             if collector is not None:
                 st.set_meta(f"collector:{bid}", str(collector))
-            extra: dict[str, Any] = {"code_size": job.code_size,
+            extra: dict[str, Any] = {"code_size": job.code_size, "est_funcs": job.est_funcs or None,
                                      "extract_s": job.timings["extract_total"]}
             if analysis_s is not None:
                 extra["analysis_s"] = analysis_s

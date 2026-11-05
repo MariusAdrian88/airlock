@@ -8,7 +8,7 @@ from airlock.projects import copy_artifact, hash_file, read_manifest, write_mani
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
 from airlock.server.registry import tool
-from airlock.server.estimate import priors
+from airlock.server.estimate import priors, work_mb
 from airlock.server.scan import ScannedFile, ScanResult, scan_program
 
 _MB = 1 << 20
@@ -88,7 +88,8 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
         sha = hash_file(path)
         copy_artifact(path, pp, sha)
         entries.append({"path": f.rel_path, "group": f.group, "kind": f.kind, "size": f.size,
-                        "code_size": f.code_size, "sha256": sha, "state": "queued"})
+                        "code_size": f.code_size, "est_funcs": f.est_funcs, "sha256": sha,
+                        "state": "queued"})
     with ix._mf_lock:
         man = read_manifest(pp.manifest)
         man.setdefault("files", []).extend(entries)
@@ -98,7 +99,8 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
     ix.enqueue(project, entries)
     code = sum(e["code_size"] for e in entries)
     q = ix.queue_status(project)
-    est = len(entries) * q.overhead_s + code / _MB * q.s_per_mb
+    work = sum(work_mb(e["code_size"], e["est_funcs"]) for e in entries)
+    est = len(entries) * q.overhead_s + work * q.s_per_mb
     names = ", ".join(Path(e["path"]).name for e in entries[:6])
     more = f", +{len(entries) - 6} more" if len(entries) > 6 else ""
     return (f"queued {len(entries)} files, {code / _MB:.1f} MB code, ~{max(1, round(est / 60))} min: "

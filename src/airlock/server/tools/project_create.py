@@ -96,7 +96,8 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
         sha = hash_file(src)
         copy_artifact(src, pp, sha)
         files.append({"path": f.rel_path, "group": f.group, "kind": f.kind, "size": f.size,
-                      "code_size": f.code_size, "sha256": sha, "state": "queued"})
+                      "code_size": f.code_size, "est_funcs": f.est_funcs, "sha256": sha,
+                      "state": "queued"})
     entry = {f["path"]: f for f in files}
     man = new_manifest(slug)
     man.update({

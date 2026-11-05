@@ -9,11 +9,14 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import struct
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 import pefile
+
+from airlock.server import estimate as est
 
 _MB = 1024 * 1024
 
@@ -53,6 +56,7 @@ class ScannedFile:
     exports: int
     subsystem: int = 0                 # PE optional header Subsystem (1 = native/driver)
     description: str | None = None     # version FileDescription
+    est_funcs: int = 0                 # estimated function count (see estimate_functions)
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,51 @@ def _is_pe_magic(path: Path) -> bool:
     except OSError:
         return False
 
+_MAX_DATA_SCAN = 32 * _MB   # data bytes scanned per file for code pointers
+_CALL_RE = re.compile(rb"[\xe8](....)", re.S)    # call rel32
+_PUSH_RE = re.compile(rb"[\x68](....)", re.S)    # push imm32
+
+
+def estimate_functions(pe: pefile.PE) -> int:
+    """Cheap estimate of the function count Ghidra will find: the distinct addresses in the code
+    sections that are the target of a `call rel32`, a `push imm32`, an export, or a pointer in a
+    data section. Costs one pass over the file; no disassembly."""
+    base = pe.OPTIONAL_HEADER.ImageBase
+    psz, fmt = (8, "Q") if pe.OPTIONAL_HEADER.Magic == 0x20B else (4, "I")
+    code, data = [], []
+    for s in pe.sections:
+        (code if s.Characteristics & 0x20000000 or s.Characteristics & 0x20 else data).append(s)
+    if not code:
+        return 0
+    lo = base + min(s.VirtualAddress for s in code)
+    hi = base + max(s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData) for s in code)
+    starts: set[int] = set()
+    for s in code:
+        blob, va = s.get_data(), base + s.VirtualAddress
+        for m in _CALL_RE.finditer(blob):
+            t = va + m.end() + struct.unpack("<i", m.group(1))[0]
+            if lo <= t < hi:
+                starts.add(t)
+        for m in _PUSH_RE.finditer(blob):
+            t = struct.unpack("<I", m.group(1))[0]
+            if lo <= t < hi:
+                starts.add(t)
+    budget = _MAX_DATA_SCAN
+    for s in data:
+        blob = s.get_data()[:budget]
+        budget -= len(blob)
+        n = len(blob) // psz
+        if n:
+            starts.update(v for v in struct.unpack(f"<{n}{fmt}", blob[:n * psz]) if lo <= v < hi)
+        if budget <= 0:
+            break
+    exp = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+    for sym in (exp.symbols if exp is not None else ()):
+        t = base + sym.address
+        if lo <= t < hi:
+            starts.add(t)
+    return len(starts)
+
 
 def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
     def unreadable() -> ScannedFile:
@@ -193,10 +242,14 @@ def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
         except Exception:
             rich = False
         company, product = extract_vendor(pe)
+        try:
+            funcs = 0 if dotnet else estimate_functions(pe)
+        except Exception:  # the estimate is an extra: the code size alone still gives a time
+            funcs = 0
         return ScannedFile(rel, "pe", "", size, code, bits,
                            bool(pe.FILE_HEADER.Characteristics & 0x2000), bool(dotnet), rich,
                            company, product, tuple(dict.fromkeys(names)), n_exports,
-                           opt.Subsystem, _description(pe))
+                           opt.Subsystem, _description(pe), funcs)
     except Exception:
         return unreadable()
     finally:
@@ -334,7 +387,7 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
 
 
 def _build_options(files: list[ScannedFile], s_per_code_mb: float,
-                   overhead_s: float = 20.0) -> tuple[ScanOption, ...]:
+                   overhead_s: float = 6.0) -> tuple[ScanOption, ...]:
     out = []
     for key, label, groups in _OPTION_DEFS:
         if not any(f.group == _ADDED_GROUP[key] for f in files):
@@ -342,13 +395,14 @@ def _build_options(files: list[ScannedFile], s_per_code_mb: float,
         sel = tuple(f for f in files if f.group in groups)
         code = sum(f.code_size for f in sel)
         n_pe = sum(1 for f in sel if f.kind == "pe")
+        work = sum(est.work_mb(f.code_size, f.est_funcs) for f in sel)
         out.append(ScanOption(key, label, groups, sel, code,
-                              n_pe * overhead_s + code / _MB * s_per_code_mb))
+                              n_pe * overhead_s + work * s_per_code_mb))
     return tuple(out)
 
 
 def scan_program(path: Path, root_exe: str | None = None,
-                 s_per_code_mb: float = 120.0, overhead_s: float = 20.0) -> ScanResult:
+                 s_per_code_mb: float = 170.0, overhead_s: float = 6.0) -> ScanResult:
     path = Path(path)
     if path.is_file():
         base, root_exe = path.parent, path.name

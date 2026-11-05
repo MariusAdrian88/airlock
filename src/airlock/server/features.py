@@ -26,7 +26,8 @@ log = logging.getLogger("airlock")
 FEATURES: dict[str, str] = {
     "file-io": "File input/output",
     "config": "Configuration and settings",
-    "ui-window": "User interface: windows and messages",
+    "ui-window": "User interface: window lifecycle and message loop",
+    "ui-controls": "User interface: control text, state and messages",
     "ui-dialog": "User interface: dialogs and message boxes",
     "ui-menu": "User interface: menus and accelerators",
     "ui-draw": "User interface: 2D drawing (GDI)",
@@ -41,7 +42,9 @@ FEATURES: dict[str, str] = {
 DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
-MAX_ENTRIES = 1500    # per feature; seeds first (strongest evidence), then callers by depth
+MAX_ENTRIES = 1500    # per feature; strong seeds first (strongest evidence), then callers by depth
+FEATURES_VERSION = 2  # meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
+FEATURES_VERSION_META = "features_version"
 DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
 _CHUNK = 400
@@ -74,12 +77,14 @@ _API: dict[str, tuple[str, ...]] = {
     "ui-window": (
         "CreateWindow CreateWindowEx RegisterClass RegisterClassEx UnregisterClass DefWindowProc "
         "DefMDIChildProc DefFrameProc CallWindowProc DestroyWindow MoveWindow SetWindowPos FindWindow "
-        "FindWindowEx EnableWindow GetClientRect GetWindowRect SetParent GetParent GetMessage PeekMessage "
-        "DispatchMessage TranslateMessage PostQuitMessage SendMessage PostMessage ShowWindow UpdateWindow "
-        "SetWindowText GetWindowText SetWindowLong SetWindowLongPtr GetWindowLong GetWindowLongPtr "
-        "CreateToolbarEx InitCommonControls InitCommonControlsEx CreateStatusWindow SetFocus "
-        "InvalidateRect RedrawWindow PropertySheet CreatePropertySheetPage LoadString LoadIcon LoadImage "
-        "SetForegroundWindow SetActiveWindow BringWindowToTop"
+        "FindWindowEx SetParent GetMessage PeekMessage DispatchMessage TranslateMessage PostQuitMessage "
+        "CreateToolbarEx InitCommonControls InitCommonControlsEx CreateStatusWindow "
+        "PropertySheet CreatePropertySheetPage LoadString LoadIcon LoadImage SetForegroundWindow"
+    ).split(),
+    "ui-controls": (
+        "SendMessage PostMessage SetWindowText GetWindowText ShowWindow EnableWindow SetFocus "
+        "SetWindowLong SetWindowLongPtr GetWindowLong GetWindowLongPtr InvalidateRect RedrawWindow "
+        "UpdateWindow GetParent GetClientRect GetWindowRect SetActiveWindow BringWindowToTop"
     ).split(),
     "ui-dialog": (
         "DialogBox DialogBoxParam DialogBoxIndirect DialogBoxIndirectParam CreateDialog CreateDialogParam "
@@ -243,6 +248,64 @@ def api_feature(name: str | None) -> str | None:
     return None
 
 
+# -- weak (ubiquitous) evidence ------------------------------------------------------------------
+# A weak seed is listed as an entry point but its callers are not followed: the call says nothing
+# about the function's role (every CWnd-derived destructor calls ~CWnd, every dialog handler calls
+# GetDlgItem or SendMessage). Strong seeds (window creation, class registration, window procedures,
+# dialog/menu/drawing calls that define the code) expand to callers as before.
+WEAK_API = frozenset(
+    "LoadString LoadIcon LoadImage GetDlgItem SetDlgItemText GetDlgItemText GetDlgItemInt SetDlgItemInt "
+    "SendDlgItemMessage CheckDlgButton IsDlgButtonChecked CheckRadioButton GetDC GetWindowDC ReleaseDC "
+    "SelectObject DeleteObject DeleteDC GetStockObject SetBkMode SetBkColor SetTextColor SetCursor "
+    "LoadCursor GetCursorPos GetKeyState GetAsyncKeyState ShowCursor SetCapture ReleaseCapture "
+    "GetCapture".split())
+# MFC methods that are plumbing for any class (weak wherever they appear)
+_WEAK_MEMBERS = frozenset(
+    "FromHandle FromHandlePermanent Default Attach Detach Delete InvokeHelper SetProperty GetProperty "
+    "SendChildNotifyLastMsg PrepareForHelp GetOwner SelectObject SelectGdiObject SetBkMode SetBkColor "
+    "SetTextColor GetSafeHwnd AssertValid Dump GetRuntimeClass".split())
+# CWnd methods that create, destroy or subclass a window: strong ui-window evidence
+_CWND_STRONG = frozenset(
+    "Create CreateEx PreCreateWindow DestroyWindow WindowProc DefWindowProc SubclassWindow SubclassDlgItem "
+    "UnsubclassWindow CreateControl CreateDlg CreateDlgIndirect PostNcDestroy OnCreate OnDestroy OnNcDestroy "
+    "OnClose MoveWindow SetWindowPos SetParent RunModalLoop ContinueModal PreSubclassWindow OnWndMsg".split())
+# CWnd methods that read or change the state of a control: ui-controls (always weak)
+_CWND_CONTROL = frozenset(
+    "ShowWindow EnableWindow SetFocus GetFocus GetWindowText GetWindowTextLength SetWindowText GetDlgItem "
+    "GetDlgCtrlID GetDlgItemText SetDlgItemText IsWindowEnabled IsWindowVisible GetWindowRect GetClientRect "
+    "ScreenToClient ClientToScreen Invalidate InvalidateRect UpdateWindow RedrawWindow GetParent "
+    "GetTopLevelParent GetTopLevelFrame GetExStyle GetStyle ModifyStyle ModifyStyleEx SetFont GetFont "
+    "SendMessage PostMessage SendDlgItemMessage GetDescendantWindow GetWindowPlacement SetWindowPlacement "
+    "IsWindow IsIconic IsZoomed CenterWindow BringWindowToTop SetActiveWindow".split())
+
+
+def api_class(name: str | None) -> tuple[str, bool] | None:
+    """(feature key, weak) for an imported/library function name, or None. ``weak``: ubiquitous
+    evidence that lists the caller but does not expand to its callers."""
+    key = api_feature(name)
+    if not key or not name:
+        return None
+    n = clean_api(name)
+    if "::" in n:
+        cls, _, meth = n.rpartition("::")
+        simple = cls.rsplit("::", 1)[-1]
+        if meth == simple or meth == "~" + simple:      # constructor / destructor
+            return key, True
+        if meth not in _CWND_STRONG | _CWND_CONTROL | _WEAK_MEMBERS and meth[-1:] in ("A", "W"):
+            meth = meth[:-1]                            # GetWindowTextA -> GetWindowText
+        if n.startswith("CWnd::"):
+            if meth in _CWND_STRONG:
+                return "ui-window", False
+            if meth in _CWND_CONTROL:
+                return "ui-controls", True
+            return key, True
+        return key, meth in _WEAK_MEMBERS
+    base = n
+    if base not in API_FEATURE:
+        base = n[:-1] if n[-1:] in ("A", "W") and n[:-1] in API_FEATURE else             n[:-3] if n.endswith(("ExA", "ExW")) and n[:-3] in API_FEATURE else n
+    return key, key == "ui-controls" or base in WEAK_API
+
+
 # -- library (runtime) code recognition ---------------------------------------------------------
 # A function is library code when its name_state is 'library', its name/namespace matches a known
 # runtime family, or (propagation) it is only called from library code and calls only library code.
@@ -266,7 +329,11 @@ MFC_CLASSES = frozenset(
     "CDaoDatabase CDaoRecordset COleDispatchDriver COleControl COleDataObject COleDataSource "
     "COleVariant COleSafeArray COleDocument COleServerDoc COleClientItem CDockState CHandleMap "
     "CPlex CDumpContext CMemoryState CWaitCursor CTypedPtrList CTypedPtrArray CTypedPtrMap "
-    "CRegKey CBitmapButton CHotKeyCtrl CIPAddressCtrl CDialogEx".split())
+    "CRegKey CBitmapButton CHotKeyCtrl CIPAddressCtrl CDialogEx COleControlSite COccManager COleControlContainer "
+    "CDockContext CDockBar CMiniFrameWnd CMiniDockFrameWnd COleMessageFilter COleDropTarget COleDropSource "
+    "COleDialog COleBusyDialog CPrintDialog CPrintingDialog CPrintInfo COleResizeBar CFindReplaceDialog "
+    "COleInsertDialog COlePropertyPage COleStreamFile COleFrameHook COleIPFrameWnd CMiniDockFrameWnd "
+    "CControlBarInfo CCreateContext CBasePane CFileStatus CLongBinary CArchiveStream".split())
 _CRT_PLAIN = frozenset(
     "malloc free calloc realloc memcpy memmove memset memcmp memchr strlen strcpy strncpy strcat strncat "
     "strcmp strncmp strchr strrchr strstr strtok strtol strtoul strtod atoi atol atof sprintf snprintf "
@@ -499,33 +566,36 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
     bins = {b.id: _Bin(store, b.id) for b in store.list_binaries() if b.id not in runtime}
     # seeds[key][(bid, fid)] = list of evidence labels (calls X / refs "s")
     seeds: dict[str, dict[tuple[int, int], list[str]]] = {}
+    strong: dict[str, set[tuple[int, int]]] = {}      # seeds with at least one strong evidence item
     summary: dict[str, Counter[str]] = {}
 
-    def seed(key: str, bid: int, fid: int, reason: str, label: str) -> None:
+    def seed(key: str, bid: int, fid: int, reason: str, label: str, weak: bool = False) -> None:
         ev = seeds.setdefault(key, {}).setdefault((bid, fid), [])
         if reason not in ev:
             ev.append(reason)
+        if not weak:
+            strong.setdefault(key, set()).add((bid, fid))
         summary.setdefault(key, Counter())[label] += 1
 
     for bid, bn in bins.items():
         # API seeds: callers of import slots, thunks and recognised library functions.
-        targets: dict[int, tuple[str, str]] = {}      # address -> (feature, api name)
+        targets: dict[int, tuple[str, str, bool]] = {}      # address -> (feature, api name, weak)
         for r in store.db.execute("SELECT name, address FROM import WHERE binary_id=? AND name IS NOT NULL "
                                   "AND address IS NOT NULL", (bid,)):
-            k = api_feature(r["name"])
-            if k:
-                targets[r["address"]] = (k, clean_api(r["name"]))
+            kw = api_class(r["name"])
+            if kw:
+                targets[r["address"]] = (kw[0], clean_api(r["name"]), kw[1])
         for fid, (space, entry, q, skip) in bn.fn.items():
             if space != "ram":
                 continue
-            k = api_feature(q)
-            if k and (skip or "::" in q) and entry not in targets:
-                targets[entry] = (k, clean_api(q))
+            kw = api_class(q)
+            if kw and (skip or "::" in q) and entry not in targets:
+                targets[entry] = (kw[0], clean_api(q), kw[1])
         for addr, srcs in _edge_sources(store, bid, targets, CODE_EDGES).items():
-            key, api = targets[addr]
+            key, api, weak = targets[addr]
             for fid in srcs:
                 if fid not in bn.thunk_ids and fid not in bn.lib:
-                    seed(key, bid, fid, f"calls {api}", api)
+                    seed(key, bid, fid, f"calls {api}", api, weak)
         # string seeds
         hits: dict[int, list[tuple[str, str]]] = {}
         for r in store.db.execute("SELECT address, value FROM string WHERE binary_id=?", (bid,)):
@@ -556,11 +626,12 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
     counts: dict[str, int] = {}
     dropped: dict[str, int] = {}
     for key in sorted(seeds, key=feature_order):
-        ranked = sorted(seeds[key].items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        strong_refs = strong.get(key, set())
+        ranked = sorted(seeds[key].items(), key=lambda kv: (kv[0] not in strong_refs, -len(kv[1]), kv[0]))
         dropped_refs: set[tuple[int, int]] = {ref for ref, _ev in ranked[MAX_ENTRIES:]}
         got: dict[tuple[int, int], tuple[str, list[str], int]] = {
             ref: (ev[0], ev, 0) for ref, ev in ranked[:MAX_ENTRIES]}
-        frontier = list(got)
+        frontier = [ref for ref in got if ref in strong_refs]   # weak seeds do not expand
         for depth in range(1, MAX_DEPTH + 1):
             nxt: list[tuple[int, int]] = []
             for bid, fid in frontier:
@@ -595,7 +666,13 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
     store.replace_auto_features(feats, rows, now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     with store.db:
         store.set_meta(DROPPED_META, json.dumps(dropped, separators=(",", ":")))
+        store.set_meta(FEATURES_VERSION_META, str(FEATURES_VERSION))
     return counts
+
+
+def stale(store: Store) -> bool:
+    """True when the stored features were derived by an older FEATURES_VERSION (or never)."""
+    return store.get_meta(FEATURES_VERSION_META) != str(FEATURES_VERSION)
 
 
 def derive_project(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = None) -> dict[str, int]:
@@ -630,12 +707,11 @@ def dropped(store: Store) -> dict[str, int]:
 
 
 def size_text(r: dict[str, Any], drop: int = 0, binaries: bool = False) -> str:
-    """``seeds 41, total 688`` (+ `` in 6 binaries``, `` (+N dropped by the cap)``)."""
-    out = f"seeds {r['seeds']}, total {r['n']}"
+    """``seeds 41, total 688`` (+ `` in 6 binaries``). A capped list says the true total (a lower
+    bound) and that the listed part is ranked: ``seeds 41, total at least 2100, ranked top 1500 listed``."""
+    out = f"seeds {r['seeds']}, total {r['n']}" if not drop else         f"seeds {r['seeds']}, total at least {r['n'] + drop}, ranked top {r['n']} listed (cap {MAX_ENTRIES})"
     if binaries and r.get("binaries"):
         out += f" in {r['binaries']} binar{'y' if r['binaries'] == 1 else 'ies'}"
-    if drop:
-        out += f" (+{drop} dropped by the {MAX_ENTRIES} cap)"
     return out
 
 

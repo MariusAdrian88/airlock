@@ -293,3 +293,82 @@ def test_cap_still_applies_per_split_feature(st, monkeypatch):
     st.link_edges(b)
     assert fx.derive(st, runtime_ids=set())["ui-input"] == 3
     assert fx.dropped(st) == {"ui-input": 3}
+
+
+# -- weak (ubiquitous) seeds, ui-controls, capped lists ----------------------------------------------------
+
+@pytest.mark.parametrize("name,want", [
+    ("CreateWindowExA", ("ui-window", False)), ("DefWindowProcA", ("ui-window", False)),
+    ("RegisterClassA", ("ui-window", False)), ("LoadStringA", ("ui-window", True)),
+    ("SendMessageA", ("ui-controls", True)), ("GetWindowTextW", ("ui-controls", True)),
+    ("ShowWindow", ("ui-controls", True)), ("GetDlgItem", ("ui-dialog", True)),
+    ("DialogBoxParamA", ("ui-dialog", False)), ("GetDC", ("ui-draw", True)), ("BitBlt", ("ui-draw", False)),
+    ("CWnd::CreateEx", ("ui-window", False)), ("CWnd::DestroyWindow", ("ui-window", False)),
+    ("CWnd::~CWnd", ("ui-window", True)), ("CWnd::FromHandle", ("ui-window", True)),
+    ("CWnd::ShowWindow", ("ui-controls", True)), ("CWnd::GetWindowTextA", ("ui-controls", True)),
+    ("CDialog::~CDialog", ("ui-dialog", True)), ("CDialog::OnInitDialog", ("ui-dialog", False)),
+    ("CView::~CView", ("ui-window", True)), ("CView::OnInitialUpdate", ("ui-window", False)),
+    ("ReadFile", ("file-io", False)), ("FUN_x", None), ("CWnd", None),
+])
+def test_api_class(name, want):
+    assert fx.api_class(name) == want
+
+
+def build_weak(st: Store):
+    """strong_fn calls CreateWindowEx, weak_fn calls SendMessage; each has a caller (depth 1)."""
+    b = st.upsert_binary("aa" * 32, "app.dll", pointer_size=4)
+    st.insert_functions(b, [fn(0x1000, "strong_fn"), fn(0x1100, "weak_fn"), fn(0x1200, "strong_up"),
+                            fn(0x1300, "weak_up"), fn(0x1400, "both_fn"), fn(0x1500, "both_up")])
+    st.insert_imports(b, [("USER32.DLL", "CreateWindowExA", None, 0x8000),
+                          ("USER32.DLL", "SendMessageA", None, 0x8010)])
+    st.insert_edges(b, [(0x1004, 0x8000, "call_ind"), (0x1104, 0x8010, "call_ind"),
+                        (0x1204, 0x1000, "call"), (0x1304, 0x1100, "call"),
+                        (0x1404, 0x8000, "call_ind"), (0x1408, 0x8010, "call_ind"), (0x1504, 0x1400, "call")])
+    st.link_edges(b)
+    return b
+
+
+def test_weak_seeds_do_not_expand(st):
+    build_weak(st)
+    counts = fx.derive(st, runtime_ids=set())
+    win = {n: v for (_b, n), v in entries(st, "ui-window").items()}
+    ctl = {n: v for (_b, n), v in entries(st, "ui-controls").items()}
+    assert set(win) == {"strong_fn", "strong_up", "both_fn", "both_up"}
+    assert win["strong_fn"][1] == 0 and win["strong_up"][1] == 1 and win["both_up"][1] == 1
+    assert set(ctl) == {"weak_fn", "both_fn"}                      # weak_up is not listed
+    assert counts["ui-window"] == 4 and counts["ui-controls"] == 2
+
+
+def test_strong_seeds_rank_before_weak_when_capped(st, monkeypatch):
+    monkeypatch.setattr(fx, "MAX_ENTRIES", 2)
+    b = st.upsert_binary("aa" * 32, "app.dll", pointer_size=4)
+    st.insert_functions(b, [fn(0x1000 + i * 0x100, f"w{i}") for i in range(4)] + [fn(0x2000, "s")])
+    st.insert_imports(b, [("USER32.DLL", "LoadStringA", None, 0x8000), ("USER32.DLL", "CreateWindowExA", None, 0x8010)])
+    st.insert_edges(b, [(0x1000 + i * 0x100 + 4, 0x8000, "call_ind") for i in range(4)] + [(0x2004, 0x8010, "call_ind")])
+    st.link_edges(b)
+    assert fx.derive(st, runtime_ids=set())["ui-window"] == 2
+    assert ("app.dll", "s") in entries(st, "ui-window")             # the strong seed survives the cap
+    assert fx.dropped(st) == {"ui-window": 3}
+
+
+def test_size_text_capped_says_total_and_ranked():
+    r = {"seeds": 5, "n": 10}
+    assert fx.size_text(r) == "seeds 5, total 10"
+    t = fx.size_text(r, 7)
+    assert "total at least 17" in t and "ranked top 10 listed" in t and f"cap {fx.MAX_ENTRIES}" in t
+
+
+def test_features_version_stale_until_derived(st):
+    assert fx.stale(st)
+    build_weak(st)
+    fx.derive(st, runtime_ids=set())
+    assert not fx.stale(st)
+    with st.db:
+        st.set_meta(fx.FEATURES_VERSION_META, str(fx.FEATURES_VERSION - 1))
+    assert fx.stale(st)
+
+
+def test_extended_mfc_classes_are_library():
+    assert fx.lib_family("COleControlSite::Foo", None, "auto") is None
+    assert fx.lib_family("Foo", "COleControlSite", "auto") == "MFC"
+    assert fx.lib_family("Foo", "CMainFrame", "auto") is None

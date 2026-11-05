@@ -315,7 +315,7 @@ def test_derive_cap_counts_dropped(proj, monkeypatch):
     assert capped == 4 and full > 4
     assert fx.dropped(st)["file-io"] == full - 4
     out = mt.feature(ctx, "file-io", depth=2)
-    assert f"{full - 4} more dropped by the 4 cap" in out.splitlines()[0]
-    assert f"(+{full - 4} dropped by the 4 cap)" in mt.features(ctx)
+    assert f"true total at least {full}, list ranked and capped at 4" in out.splitlines()[0]
+    assert f"total at least {full}, ranked top 4 listed (cap 4)" in mt.features(ctx)
     seeds = [r for r in fx.stats(st) if r["key"] == "file-io"][0]["seeds"]
     assert seeds == 3                                                    # seeds are kept before callers

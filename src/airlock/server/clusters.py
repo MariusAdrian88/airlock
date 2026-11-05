@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -28,11 +29,11 @@ from airlock.server import graph as gr
 from airlock.server.graph import (  # noqa: F401  re-exported: tests and callers use them from here
     CALL_KINDS, HUB_MIN_CALLERS, HUB_PERCENT, CallGraph, _fx, api_category, build_graph, string_categories,
 )
-from airlock.server.features import lib_family, propagate_library
+from airlock.server.features import MFC_CLASSES, lib_family
 from airlock.server.selectors import fmt_addr
 
 MIN_CLUSTER = 3
-ALGO_VERSION = 3   # 2: call_imp edges (import-slot calls); 3: library recognition and runtime labels
+ALGO_VERSION = 4   # 2: call_imp edges; 3: library recognition, runtime labels; 4: static-runtime rules, mixed
 RUNTIME_SHARE = 0.6     # a cluster with at least this share of library members is a runtime cluster
 RUNTIME_PREFIX = "runtime"
 LABEL_JACCARD = 0.5
@@ -276,20 +277,118 @@ def runtime_label(fams: list[str]) -> str:
     return f"{RUNTIME_PREFIX}: {top}"
 
 
-def library_nodes(g: CallGraph) -> dict[int, str]:
-    """{node: family} for library functions: by name_state/name/namespace, then propagated to a
-    fixpoint (max 3 rounds) over functions only called from, and only calling, library functions."""
+FID_PREFIX = "FID_conflict:"      # Ghidra Function ID: the function matched a known library routine
+STATIC_BINARIES = 3               # a plain name present in at least this many binaries is static runtime
+MIXED_SHARE = 0.3                 # share of library members from which an otherwise unlabelled cluster is "mixed"
+_FUN_RE = re.compile(r"^(?:FUN|thunk_FUN|SUB|LAB|DAT|PTR|switchD|caseD)_|^FUN_|^<")
+_AT_RE = re.compile(r"@\d+$")
+_EH_RE = re.compile(r"^(?:Catch|Unwind)(?:_All)?@[0-9a-fA-F]+$")   # MSVC exception funclets
+
+
+def _norm_name(name: str) -> str:
+    """Name without the FID_conflict prefix, the ``@N`` stdcall suffix and surplus leading underscores."""
+    n = name[len(FID_PREFIX):] if name.startswith(FID_PREFIX) else name
+    n = _AT_RE.sub("", n)
+    if n.startswith("___"):
+        n = "__" + n.lstrip("_")
+    return n
+
+
+def unnamed(name: str) -> bool:
+    return bool(_FUN_RE.match(name))
+
+
+def runtime_family(name: str, ns: str | None, state: str) -> str | None:
+    """Like ``lib_family`` plus the decorations of statically linked code: FID_conflict names (a
+    Function ID hit is library code by definition), ``@N`` suffixes, ``___`` prefixes, ``~CClass``."""
+    if state == "user":
+        return None
+    if not ns and "::" in name:                      # qualified name stored without a namespace
+        ns, name = name.rsplit("::", 1) if "<" not in name.split("::")[0] else (None, name)
+        if not name:
+            return None
+    fam = lib_family(name, ns, state)
+    if fam and fam != "lib":
+        return fam
+    if _EH_RE.match(name):
+        return "CRT"
+    n = _norm_name(name)
+    if n != name:
+        fam2 = lib_family(n, ns, state)
+        if fam2 and fam2 != "lib":
+            return fam2
+    if n.startswith("~") and not ns and n[1:] in MFC_CLASSES:
+        return "MFC"
+    if name.startswith(FID_PREFIX):
+        return "lib"
+    return fam
+
+
+def mixed_label(fams: list[str]) -> str:
+    """``mixed: MFC+program``: a cluster with a sizeable library share and program code."""
+    top = runtime_label(fams)
+    return "mixed: program" if top == RUNTIME_PREFIX else f"mixed: {top.split(': ', 1)[1]}+program"
+
+
+def _program_evidence(g: CallGraph, own: list[int], exported: set[int]) -> bool:
+    """A non-library member that is program-specific: agent-named or an exported entry point."""
+    return any(i in exported or g.info[i][1] == "user" for i in own)
+
+
+def library_nodes(g: CallGraph, exported: set[int] | None = None) -> dict[int, str]:
+    """{node: family} for library functions. Three signals, all deterministic:
+    1. the name (``runtime_family``) or name_state=library;
+    2. a plain name that occurs in at least ``STATIC_BINARIES`` binaries (statically linked runtime
+       is the same in every plugin; exports and agent names are excluded);
+    3. propagation over the call graph, up to 4 rounds: a function that has callers and only library
+       callers joins when it is unnamed (FUN_...), or when it also calls only library functions.
+    ``exported`` holds the nodes that are exported entry points: they never join by 2 or 3."""
+    exported = exported or set()
+    n = len(g.nodes)
     base: dict[int, str] = {}
     for i, (nm, state, ns) in enumerate(g.info):
-        fam = lib_family(nm, ns, state)
+        fam = runtime_family(nm, ns, state)
         if fam:
             base[i] = fam
+    where: dict[str, set[int]] = {}
+    for i, (nm, state, ns) in enumerate(g.info):
+        if i in base or i in exported or state == "user" or unnamed(nm):
+            continue
+        where.setdefault(f"{ns}::{nm}" if ns else nm, set()).add(g.nodes[i][0])
+    for i, (nm, state, ns) in enumerate(g.info):
+        if i not in base and i not in exported and state != "user" and not unnamed(nm)                 and len(where.get(f"{ns}::{nm}" if ns else nm, ())) >= STATIC_BINARIES:
+            base[i] = "static"
     callers: dict[int, set[int]] = {}
     callees: dict[int, set[int]] = {}
     for (a, b) in g.directed:
-        callees.setdefault(a, set()).add(b)
-        callers.setdefault(b, set()).add(a)
-    return propagate_library(base, range(len(g.nodes)), callers, callees)
+        if a != b:
+            callees.setdefault(a, set()).add(b)
+            callers.setdefault(b, set()).add(a)
+    lib = dict(base)
+    for _ in range(4):
+        new: dict[int, str] = {}
+        for v in range(n):
+            if v in lib or v in exported or g.info[v][1] == "user":
+                continue
+            cs = callers.get(v)
+            if not cs or not all(c in lib for c in cs):
+                continue
+            if unnamed(g.info[v][0]) or all(c in lib for c in callees.get(v, ())):
+                new[v] = "prop"
+        if not new:
+            break
+        lib.update(new)
+    return lib
+
+
+def exported_nodes(st: Store, g: CallGraph) -> set[int]:
+    """Nodes that are exported entry points of their binary."""
+    try:
+        rows = st.db.execute("SELECT binary_id, address FROM export").fetchall()
+    except Exception:  # noqa: BLE001
+        return set()
+    ex = {(r[0], r[1]) for r in rows}
+    return {i for i, nd in enumerate(g.nodes) if (nd[0], nd[2]) in ex}
 
 
 def compute(st: Store, bids: list[int], names: dict[int, tuple[str, int]], project: str,
@@ -297,7 +396,8 @@ def compute(st: Store, bids: list[int], names: dict[int, tuple[str, int]], proje
     g = build_graph(st, bids)
     n = len(g.nodes)
     comms, hubs = partition(g)
-    lib = library_nodes(g)
+    exported = exported_nodes(st, g)
+    lib = library_nodes(g, exported)
     callers = [0] * n
     callees = [0] * n
     for (a, b) in g.directed:
@@ -343,12 +443,14 @@ def compute(st: Store, bids: list[int], names: dict[int, tuple[str, int]], proje
             label = ""
         elif kind == "misc":
             label = f"misc {names.get(bid, ('?', 4))[0]}"
-        elif len(mem) - len(own) >= RUNTIME_SHARE * len(mem):
+        elif len(mem) - len(own) >= RUNTIME_SHARE * len(mem) and not _program_evidence(g, own, exported):
             label = runtime_label([lib[i] for i in mem if i in lib])
         else:
             label = _auto_label(cnt, len(own))
             if label == "unclassified":
                 label = name_label([g.info[i][0] for i in own if g.info[i][1] != "auto"]) or label
+            if label == "unclassified" and len(mem) - len(own) >= MIXED_SHARE * len(mem):
+                label = mixed_label([lib[i] for i in mem if i in lib])
         members = [Member((g.nodes[i][0], g.nodes[i][1], g.nodes[i][2]), g.info[i][0], g.info[i][1],
                           g.info[i][2], g.nodes[i][3], internal[i], callers[i], callees[i]) for i in mem]
         clusters.append(Cluster(gid, kind, label, members,

@@ -95,7 +95,7 @@ def features(ctx: ServerContext, refresh: bool = False, cursor: str = "", budget
     if isinstance(s, str):
         return s
     pp, st = s
-    if refresh or not st.feature_stats():
+    if refresh or not st.feature_stats() or fx.stale(st):
         if any(st.get_meta(f"status:{b.id}") == "ready" for b in st.list_binaries()):
             refresh_maps(ctx, pp, st, derive=True)
     rows = fx.stats(st)
@@ -170,7 +170,8 @@ def feature(ctx: ServerContext, key: str = "", depth: int = 0, binary: str = "",
     head = [f"feature {key}{' [agent]' if row['source'] == 'agent' else ''}: {row['title']} | "
             f"{pm.plural(len(ents), 'entry point')} (seeds {seeds}, callers {len(ents) - seeds}) in "
             f"{pm.plural(len(per_bin), 'binary').replace('binarys', 'binaries')}; "
-            f"{fx.coverage(len(ents), named)}" + (f"; {drop} more dropped by the {fx.MAX_ENTRIES} cap" if drop else "")]
+            f"{fx.coverage(len(ents), named)}" + (f"; true total at least {len(ents) + drop}, list ranked and capped at {fx.MAX_ENTRIES}"
+                                             if drop else "")]
     if len(per_bin) > 1 or only is not None:
         top = sorted(per_bin.items(), key=lambda kv: (-kv[1][0], names.get(kv[0], ("?",))[0]))
         head.append("by binary: " + ", ".join(

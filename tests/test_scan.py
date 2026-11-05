@@ -210,8 +210,8 @@ def test_option_math_and_cumulation(prog):
     assert c.code_size == 0x6000 + 0x1000 + 0x600
     assert {f.rel_path for f in d.files} == {"main.exe", "lib.dll", "plugins/p.dll", "helper.exe"}
     n_pe = lambda o: sum(1 for f in o.files if f.kind == "pe")   # noqa: E731
-    assert a.est_seconds == pytest.approx(20.0 + 0x6000 / (1024 * 1024) * 100.0)
-    assert d.est_seconds == pytest.approx(n_pe(d) * 20.0 + d.code_size / (1024 * 1024) * 100.0)
+    assert a.est_seconds == pytest.approx(6.0 + 0x6000 / (1024 * 1024) * 100.0)
+    assert d.est_seconds == pytest.approx(n_pe(d) * 6.0 + d.code_size / (1024 * 1024) * 100.0)
     r2 = scan_program(prog, root_exe="main.exe", s_per_code_mb=100.0, overhead_s=0.0)
     assert r2.options[0].est_seconds == pytest.approx(0x6000 / (1024 * 1024) * 100.0)
     assert not any(f.group == "runtime" for o in r.options for f in o.files)
@@ -280,3 +280,76 @@ def test_real_system_pes(tmp_path):
     assert byp["notepad.exe"].code_size > 0 and byp["notepad.exe"].bits == 64
     assert "microsoft" in (byp["notepad.exe"].company or "").lower()
     assert byp["notepad.exe"].imports and r.system_dlls
+
+
+def _pe_with_sections(path: Path, text: bytes, data: bytes, plus: bool = False) -> Path:
+    """Minimal PE with a code section at RVA 0x1000 and a data section at 0x2000."""
+    opt_size = 0xF0 if plus else 0xE0
+    base = 0x140000000 if plus else 0x400000
+    dos = bytearray(0x40)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    fh = struct.pack("<HHIIIHH", 0x8664 if plus else 0x14C, 2, 0, 0, 0, opt_size, 0x22)
+    opt = bytearray(opt_size)
+    struct.pack_into("<H", opt, 0, 0x20B if plus else 0x10B)
+    if plus:
+        struct.pack_into("<Q", opt, 24, base)
+    else:
+        struct.pack_into("<I", opt, 28, base)
+    struct.pack_into("<I", opt, 32, 0x1000)
+    struct.pack_into("<I", opt, 36, 0x200)
+    struct.pack_into("<I", opt, 56, 0x3000)
+    struct.pack_into("<I", opt, 60, 0x200)
+    struct.pack_into("<I", opt, 108 if plus else 92, 16)
+    text = text.ljust(0x200, b"\x90")
+    data = data.ljust(0x200, b"\0")
+
+    def sec(name, va, raw_off, chars):
+        return struct.pack("<8sIIIIIIHHI", name, 0x200, va, 0x200, raw_off, 0, 0, 0, 0, chars)
+
+    hdr = bytes(dos) + b"PE\0\0" + fh + bytes(opt)
+    hdr += sec(b".text", 0x1000, 0x400, 0x60000020) + sec(b".data", 0x2000, 0x600, 0xC0000040)
+    path.write_bytes(hdr.ljust(0x400, b"\0") + text + data)
+    return path
+
+
+@pytest.mark.parametrize("plus", [False, True])
+def test_estimate_functions_counts_distinct_code_targets(tmp_path, plus):
+    import pefile
+    base = 0x140000000 if plus else 0x400000
+    # call at 0x1000 -> 0x1100, call at 0x1010 -> 0x1100 (same), call at 0x1020 -> 0x1180,
+    # call to a target outside the code (0x2000) is not a function start
+    def call(at, target):
+        return b"\xe8" + struct.pack("<i", target - (at + 5))
+    text = bytearray(b"\x90" * 0x200)
+    text[0x00:0x05] = call(0x1000, 0x1100)
+    text[0x10:0x15] = call(0x1010, 0x1100)
+    text[0x20:0x25] = call(0x1020, 0x1180)
+    text[0x30:0x35] = call(0x1030, 0x2000)
+    # data: two pointers into code (one new, one a repeat) and one outside
+    fmt = "<Q" if plus else "<I"
+    data = b"".join(struct.pack(fmt, v) for v in (base + 0x1140, base + 0x1100, base + 0x9000))
+    p = _pe_with_sections(tmp_path / "t.dll", bytes(text), data, plus)
+    pe = pefile.PE(str(p), fast_load=True)
+    try:
+        assert S.estimate_functions(pe) == 3      # 0x1100, 0x1180, 0x1140
+    finally:
+        pe.close()
+    f = scan_program(tmp_path, root_exe="t.dll").files[0]
+    assert f.est_funcs == 3 and f.code_size == 0x200
+
+
+def test_estimate_functions_empty_pe_is_zero(tmp_path):
+    from test_projects import make_pe
+    f = [x for x in scan_program(make_pe(tmp_path / "e.exe").parent, root_exe="e.exe").files][0]
+    assert f.est_funcs == 0
+
+
+def test_option_time_uses_function_estimate():
+    from airlock.server.estimate import FUNCS_PER_MB
+    dense = ScannedFile("a.exe", "pe", "core", 2000, 1 << 20, 32, False, False, True,
+                        None, None, (), 0, est_funcs=int(2 * FUNCS_PER_MB))
+    plain = ScannedFile("b.dll", "pe", "core", 2000, 1 << 20, 32, True, False, True,
+                        None, None, (), 0)
+    (opt,) = S._build_options([dense, plain], 100.0, 10.0)
+    assert opt.est_seconds == pytest.approx(2 * 10.0 + (2.0 + 1.0) * 100.0)

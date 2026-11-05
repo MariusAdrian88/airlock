@@ -462,3 +462,75 @@ def test_function_map_hides_runtime_by_default(rtproj):
     assert not any(ln.startswith(cid + " ") for ln in lines)
     assert any(ln.startswith("runtime: 1 clusters, 8 fns (MFC 1)") for ln in lines)
     print("\n" + out)
+
+
+# -- statically linked runtime inside plugin dlls --------------------------------------------------
+
+@pytest.mark.parametrize("name,ns,state,want", [
+    ("FID_conflict:ModifyMenuW", None, "auto", "lib"), ("FID_conflict:~CHotKeyCtrl", None, "auto", "MFC"),
+    ("___CxxFrameHandler", None, "auto", "CRT"), ("_malloc@4", None, "auto", "CRT"),
+    ("CArchive::operator<<", None, "auto", "MFC"), ("Catch@1000ff16", None, "auto", "CRT"),
+    ("Unwind@1002ca40", None, "auto", "CRT"), ("~CFile", None, "auto", "MFC"),
+    ("CWnd::OnWndMsg", "CWnd", "user", None),                  # agent names are never matched
+    ("FUN_10001000", None, "auto", None), ("DoStuff", None, "auto", None),
+])
+def test_runtime_family_decorations(name, ns, state, want):
+    assert cl.runtime_family(name, ns, state) == want
+
+
+def static_project(tmp_path, own_names=("DllGetThing",), export_own=True, user_own=False):
+    """Three dlls; each has a 12-function community: 8 recurring plain names (static CRT-like code
+    that lib_family does not know), 2 unnamed callees only called from them, and own functions."""
+    ctx = make_ctx(tmp_path)
+    st = ctx.indexer.store("proj")
+    bids = []
+    for k in range(3):
+        b = st.upsert_binary(f"{k:02x}" * 32, f"p{k}.dll", pointer_size=4, analysis_profile="p1")
+        bids.append(b)
+        names = [f"zrecur{i}" for i in range(8)] + ["FUN_10009000", "FUN_10009100"] + \
+            [f"{n}{k}" for n in own_names]
+        st.insert_functions(b, [fn(0x1000 + i * 0x100, nm, "user" if user_own and i >= 10 else "auto")
+                                for i, nm in enumerate(names)])
+        n = len(names)
+        st.insert_edges(b, [(0x1000 + i * 0x100 + 4 + 4 * j, 0x1000 + j * 0x100, "call")
+                            for i in range(n) for j in range(n) if i < j])
+        if export_own:
+            st.insert_exports(b, [(names[-1], 1, 0x1000 + (n - 1) * 0x100)])
+        st.link_edges(b)
+        ctx.indexer.set_status(st, b, "ready")
+    return ctx, st, bids
+
+
+def test_recurring_names_and_propagation_make_a_runtime_cluster(tmp_path):
+    ctx, st, bids = static_project(tmp_path, own_names=(), export_own=False)
+    cs = cl.get_clusters(ctx, "proj")
+    c = cs.of((bids[0], "ram", 0x1000))
+    assert c.total == 10 and c.runtime and c.auto_label == "runtime"      # 8 static + 2 propagated
+
+
+def test_exported_program_function_keeps_cluster_visible_as_mixed(tmp_path):
+    ctx, st, bids = static_project(tmp_path)
+    cs = cl.get_clusters(ctx, "proj")
+    c = cs.of((bids[0], "ram", 0x1000))
+    assert c.total == 11 and not c.runtime and c.auto_label == "mixed: program"
+    assert cl.mixed_label(["MFC", "MFC", "CRT"]) == "mixed: MFC+program"
+
+
+def test_user_named_function_keeps_cluster_visible(tmp_path):
+    ctx, st, bids = static_project(tmp_path, export_own=False, user_own=True)
+    c = cl.get_clusters(ctx, "proj").of((bids[1], "ram", 0x1000))
+    assert not c.runtime
+
+
+def test_recurrence_needs_three_binaries(tmp_path):
+    ctx, st, bids = static_project(tmp_path, own_names=(), export_own=False)
+    st.db.execute("UPDATE function SET name='unique' || binary_id || entry WHERE binary_id IN (?, ?)",
+                  (bids[1], bids[2]))
+    st.db.commit()
+    ctx.indexer.set_status(st, bids[1], "ready")
+    cs = cl.compute(st, bids, {b: (f"p{i}.dll", 4) for i, b in enumerate(bids)}, "proj", "x")
+    assert not any(c.runtime for c in cs.clusters)
+
+
+def test_algo_version_bumped():
+    assert cl.ALGO_VERSION >= 4

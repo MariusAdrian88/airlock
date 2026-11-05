@@ -129,10 +129,10 @@ def test_priority_order_states_and_manifest(tmp_path):
                                          "other.dll"]
     assert q.current.name == "first.dll" and q.current.state == "importing"
     total = sum(e["code_size"] for e in entries) / _MB
-    assert q.s_per_mb == pytest.approx(120.0) and q.overhead_s == pytest.approx(20.0)
+    assert q.s_per_mb == pytest.approx(170.0) and q.overhead_s == pytest.approx(6.0)
     # queued: 5 binaries; current (first.dll, 1 MB) is floored at 25% of its estimate
-    queued_est = 5 * 20 + (total - 1.0) * 120
-    cur_est = 20 + 120.0
+    queued_est = 5 * 6 + (total - 1.0) * 170
+    cur_est = 6 + 170.0
     assert queued_est + 0.25 * cur_est <= q.remaining_s <= queued_est + cur_est
 
     out = admin.index_status(ctx)
@@ -156,42 +156,60 @@ def test_priority_order_states_and_manifest(tmp_path):
 
 def test_model_priors_and_blend():
     from airlock.server import estimate as est
-    assert est.refine([], 20, 120) == (20, 120)
+    assert est.refine([], 6, 170) == (6, 170)
     # one tiny binary: the fixed cost rises towards what was measured, the rate barely moves
-    oh, rate = est.refine([(0.01, 30.0)], 20, 120)
-    assert 20 < oh < 30 and rate == pytest.approx(120.0, rel=0.1)
-    # a big binary: the rate rises, the overhead stays near its prior
-    oh, rate = est.refine([(2.0, 280.0)], 20, 120)
-    assert oh == pytest.approx(30.0) and rate > 120
+    oh, rate = est.refine([(0.01, 30.0)], 6, 170)
+    assert 6 < oh < 30 and rate == pytest.approx(170.0, rel=0.1)
+    # a big binary: the rate rises, but only part of the way (blend with the prior)
+    oh, rate = est.refine([(2.0, 480.0)], 6, 170)
+    assert 170 < rate < (480 - oh) / 2.0 and oh < 12
 
 
-def test_model_least_squares_with_three_samples():
+def test_model_stable_and_monotonic():
     from airlock.server import estimate as est
-    pts = [(0.0, 25.0), (1.0, 145.0), (2.0, 265.0), (0.5, 85.0)]   # 25 s + 120 s/MB
-    oh, rate = est.refine(pts, 99, 999)
-    assert oh == pytest.approx(25.0) and rate == pytest.approx(120.0)
-    # equal sizes cannot be fitted: falls back to the blend instead of dividing by zero
-    oh, rate = est.refine([(0.1, 30.0)] * 3, 20, 120)
-    assert 15 <= oh <= 30 and rate > 0
-    # a negative intercept is clamped to a fit through the origin
-    oh, rate = est.refine([(1.0, 50.0), (2.0, 120.0), (3.0, 170.0)], 20, 120)
-    assert oh == 0.0 and rate > 0
+    # real behaviour 8 s + 200 s/MB; the first (biggest) binary alone must not overshoot
+    truth = lambda w: 8 + 200 * w   # noqa: E731
+    seq = [2.0, 0.05, 0.1, 0.12, 0.2, 0.7]
+    samples, rates = [], []
+    for w in seq:
+        samples.append((w, truth(w)))
+        oh, rate = est.refine(samples, 6, 170)
+        rates.append(rate)
+        assert 0.4 * 170 <= rate <= 2.5 * 170 and 0 < oh <= 4 * 6
+        # predictions grow with the work
+        assert est.binary_seconds(1.0, oh, rate) < est.binary_seconds(1.5, oh, rate)
+    assert all(abs(r - 200) < 35 for r in rates)        # never far from the truth
+    assert abs(rates[0] - rates[-1]) < 20               # one binary does not swing the model
+    # absurd samples are bounded
+    oh, rate = est.refine([(0.001, 5000.0), (0.002, 9000.0)], 6, 170)
+    assert oh <= 24 and rate <= 2.5 * 170
+    oh, rate = est.refine([(3.0, 0.5)], 6, 170)
+    assert rate >= 0.4 * 170
+
+
+def test_work_mb_uses_function_estimate():
+    from airlock.server import estimate as est
+    assert est.work_mb(2 * 1024 * 1024) == pytest.approx(2.0)
+    assert est.work_mb(2 * 1024 * 1024, 0) == pytest.approx(2.0)
+    assert est.work_mb(1024 * 1024, 18000) == pytest.approx(18000 / est.FUNCS_PER_MB)
+    # a function-dense binary of the same size gets a longer estimate
+    assert est.work_mb(1 << 20, 12000) > est.work_mb(1 << 20, 6000)
 
 
 def test_remaining_estimate_uses_measured_rate(tmp_path):
     ctx, entries = make_project(tmp_path, [("a.dll", "core", 1.0), ("b.dll", "core", 2.0),
                                            ("c.dll", "core", 4.0)])
     ix = ctx.indexer
-    assert ix.s_per_mb([]) == pytest.approx(120.0)
+    assert ix.s_per_mb([]) == pytest.approx(170.0)
     ctx.worker.gate.clear()
     ix.enqueue("proj", entries[:1])
     wait_for(lambda: states(ctx)["a.dll"] == "importing")
     ix.enqueue("proj", entries[1:])
-    # as if measured: 1 MB took 320 s in total (20 + 300)
-    ix._mf_update("proj", entries[0]["sha256"], total_s=320.0)
+    # as if measured: 1 MB took 520 s in total
+    ix._mf_update("proj", entries[0]["sha256"], total_s=520.0)
     q = ix.queue_status("proj")
     oh, rate = ix.model(read_manifest(ix.paths("proj").manifest)["files"])
-    assert rate > 120.0 and q.s_per_mb == pytest.approx(rate) and q.overhead_s == pytest.approx(oh)
+    assert rate > 170.0 and q.s_per_mb == pytest.approx(rate) and q.overhead_s == pytest.approx(oh)
     cur_est = oh + rate * 1
     assert 2 * oh + rate * 6 + 0.75 * cur_est <= q.remaining_s <= 2 * oh + rate * 6 + cur_est
     ctx.worker.gate.set()
@@ -206,7 +224,7 @@ def test_running_binary_never_shows_zero_and_overrun(tmp_path):
     wait_for(lambda: states(ctx)["a.dll"] == "importing")
     ix._running.started -= 1000.0     # far past the estimate (~32 s)
     q = ix.queue_status("proj")
-    est_a = 20 + 0.1 * 120
+    est_a = 6 + 0.1 * 170
     assert q.over_s == pytest.approx(1000.0 - est_a, abs=5)
     assert q.remaining_s >= 0.25 * est_a + est_a - 0.1   # a.dll floor + b.dll
     out = admin.index_status(ctx)
