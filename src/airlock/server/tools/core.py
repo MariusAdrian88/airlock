@@ -23,7 +23,7 @@ from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, forma
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr
-from airlock.server import cpp, dotnet, notes, uijoin
+from airlock.server import cpp, delphi, dotnet, notes, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
     Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
@@ -342,9 +342,8 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
     A timeout row from the background pass (short timeout) gets one decompile with the full
     timeout; a timeout from a full-timeout attempt is not repeated unless retry is set."""
     st, b = bd.store, bd.binary
-    if dotnet.is_stub(b, fn):
-        return None, (f"error managed: {fn.qualified_name} is a P/Invoke declaration with no machine "
-                      "code. Use dotnet_decompile on its type, or xrefs for the native target.")
+    if dotnet.is_managed(b, fn):
+        return None, dotnet.managed_error(b, fn, st)
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
     if cached is not None and cached.status == "ok" and cached.c_text is not None:
@@ -392,9 +391,13 @@ def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | N
     """(asm lines, error line). JSON file cache keyed by fn_version and analysis_profile
     (derived data, safe to delete)."""
     st, b = bd.store, bd.binary
-    if dotnet.is_stub(b, fn):
-        return None, (f"error managed: {fn.qualified_name} is a P/Invoke declaration with no machine "
-                      "code. Use dotnet_decompile on its type, or xrefs for the native target.")
+    if dotnet.is_managed(b, fn):
+        if fn.is_thunk:
+            return None, dotnet.managed_error(b, fn, st)
+        lines, why = dotnet.il_listing(ctx.indexer.paths(bd.project).artifacts / b.sha256, fn.entry)
+        if lines is None:
+            return None, f"error managed: {fn.qualified_name}: {why}. Use dotnet_decompile on its type."
+        return ["; IL (MSIL), not machine code", *lines], None
     profile = b.analysis_profile or "unknown"
     path = _asm_cache_file(ctx, bd, fn)
     try:
@@ -482,7 +485,8 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             hint = "table string " + ", ".join(preview(t.value, 40) for t in ts[:2])
             hint += f" +{len(ts) - 2}" if len(ts) > 2 else ""
             note = f"{note}; {hint}" if note else hint
-    for h in cpp.hints_for(st, b.id, fn.entry) + uijoin.function_hints(st, b.id, fn.entry):
+    for h in cpp.hints_for(st, b.id, fn.entry) + uijoin.function_hints(st, b.id, fn.entry) \
+            + delphi.hints_for(st, b.id, fn.entry):
         note = f"{note}; {h}" if note else h        # RTTI / message map / menu / dialog names: hints only
     nl = notes.function_lines(st, fn)       # agent notes: "// note #id ..." above the code
     if nl:

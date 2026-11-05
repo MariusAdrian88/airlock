@@ -106,3 +106,4 @@ def load_tool_modules() -> None:
     from airlock.server.tools import fileformat as fileformat_tools  # noqa: F401
     from airlock.server.tools import cpp as cpp_tools  # noqa: F401
     from airlock.server.tools import dotnet as dotnet_tools  # noqa: F401
+    from airlock.server.tools import delphi as delphi_tools  # noqa: F401

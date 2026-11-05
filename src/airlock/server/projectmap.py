@@ -19,11 +19,12 @@ from typing import Any
 import json5
 
 from airlock import logs
-from airlock.index.store import CODE_SQL, Store
+from airlock.index.store import CODE_SQL, DN_METHOD_HI, DN_METHOD_LO, Store
 from airlock.projects import ProjectPaths, atomic_write_text, read_manifest
 from airlock.server import clusters as cl
 from airlock.server import features as fx
 from airlock.server.selectors import fmt_addr
+from airlock.server.delphi import ui_line as delphi_ui_line
 from airlock.server.uijoin import ui_line
 
 log = logging.getLogger("airlock")
@@ -156,7 +157,7 @@ def binaries_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[
             f"code {code / _MB:.1f} MB" if code else "code ?",
             f"functions {named}/{total} named" if total else "functions -",
             tool, roles[b.id]]))
-        ui = ui_line(store, b.id)
+        ui = ui_line(store, b.id) or delphi_ui_line(store, b.id)
         if ui:
             out.append(f"  {ui}")
     out.append("Detail: outline(binary=<name>), search(query), strings(pattern), list_binaries.")
@@ -282,7 +283,8 @@ def frontier_rows(store: Store, runtime_ids: set[int], top: int = FRONTIER_TOP) 
                 "FROM edge e JOIN function f ON f.id=e.dst_fn WHERE e.binary_id=? AND e.dst_fn IS NOT NULL "
                 f"AND e.src_fn IS NOT NULL AND e.src_fn<>e.dst_fn AND e.kind IN ({CODE_SQL}) "
                 "AND f.name_state='auto' AND f.is_thunk=0 AND f.is_external=0 AND f.space='ram' "
-                "GROUP BY f.id ORDER BY c DESC, f.entry LIMIT 30", (b.id,)):
+                "AND f.entry NOT BETWEEN ? AND ? "         # managed methods carry real names
+                "GROUP BY f.id ORDER BY c DESC, f.entry LIMIT 30", (b.id, DN_METHOD_LO, DN_METHOD_HI - 1)):
             pool.append({"binary": b, "id": r["id"], "space": r["space"], "entry": r["entry"],
                          "name": r["name"], "ns": r["namespace"], "callers": r["c"]})
     pool.sort(key=lambda p: (-p["callers"], p["binary"].id, p["entry"]))

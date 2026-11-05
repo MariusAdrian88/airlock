@@ -313,3 +313,71 @@ CREATE TABLE dn_pinvoke (
   flags         TEXT NOT NULL DEFAULT '',   -- charset, calling convention, lasterror
   PRIMARY KEY (binary_id, token)
 );
+
+-- Delphi (schema v12): classes from VMTs, published methods, DFM forms and events. Derived, filled by
+-- server/delphi.py; events carry the resolved handler address (NULL when the method is not published).
+CREATE TABLE dl_class (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  vmt           INTEGER NOT NULL,        -- class reference (address of the first virtual slot)
+  name          TEXT NOT NULL,
+  parent_vmt    INTEGER,
+  parent        TEXT NOT NULL DEFAULT '',
+  size          INTEGER NOT NULL,        -- instance size
+  unit          TEXT NOT NULL DEFAULT '',
+  typeinfo      INTEGER,
+  nvirtual      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (binary_id, vmt)
+);
+CREATE INDEX dl_class_by_name ON dl_class(binary_id, name);
+CREATE TABLE dl_method (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  vmt           INTEGER NOT NULL,
+  kind          TEXT NOT NULL,           -- published | virtual
+  slot          INTEGER NOT NULL,
+  name          TEXT NOT NULL DEFAULT '',   -- empty for virtual methods
+  addr          INTEGER NOT NULL
+);
+CREATE INDEX dl_method_by_class ON dl_method(binary_id, vmt, kind, slot);
+CREATE INDEX dl_method_by_addr ON dl_method(binary_id, addr);
+CREATE TABLE dl_field (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  vmt           INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  offset        INTEGER NOT NULL,
+  type          TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX dl_field_by_class ON dl_field(binary_id, vmt);
+CREATE TABLE dl_form (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  res_name      TEXT NOT NULL,           -- RCDATA resource name (the form class, upper case)
+  class         TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  caption       TEXT NOT NULL DEFAULT '',
+  ncomp         INTEGER NOT NULL,
+  nevents       INTEGER NOT NULL,
+  flags         TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (binary_id, res_name)
+);
+CREATE TABLE dl_component (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  form          TEXT NOT NULL,           -- dl_form.res_name
+  seq           INTEGER NOT NULL,        -- document order, 0 = the form
+  parent        INTEGER NOT NULL,
+  depth         INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  class         TEXT NOT NULL,
+  flags         TEXT NOT NULL DEFAULT '',   -- inherited, inline
+  caption       TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (binary_id, form, seq)
+);
+CREATE TABLE dl_event (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  form          TEXT NOT NULL,
+  seq           INTEGER NOT NULL,        -- dl_component.seq
+  prop          TEXT NOT NULL,           -- OnClick, Columns[0].OnClick
+  handler       TEXT NOT NULL,           -- method name from the DFM
+  owner         TEXT NOT NULL,           -- class that should declare the method
+  addr          INTEGER                  -- code address from the published method table
+);
+CREATE INDEX dl_event_by_form ON dl_event(binary_id, form, seq);
+CREATE INDEX dl_event_by_addr ON dl_event(binary_id, addr);

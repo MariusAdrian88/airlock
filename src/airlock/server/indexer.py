@@ -30,7 +30,7 @@ from airlock import logs
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, dotnet, fnfix, linking, peres
+from airlock.server import cpp, delphi, dotnet, fnfix, linking, peres
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
@@ -452,6 +452,10 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
+            delphi.ensure_project(store, paths.artifacts)  # Delphi tables missing or stale: no re-analysis
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot refresh the Delphi tables of %s: %s", slug, e)
+        try:
             if self.refresh_missing_functions(slug, store):   # C++ entry points without a function
                 ready = linking.ready_ids(store)
                 linking.relink_project(store, paths.artifacts,
@@ -504,7 +508,7 @@ class Indexer:
         (needs the C++ tables), then re-read the binary's functions and edges. Once per
         ``fnfix.FIX_VERSION`` and binary (meta). Returns the number of functions created."""
         program = store.get_meta(f"program:{b.id}")
-        if not program or not fnfix.stale(store, b.id) or cpp.stale(store, b.id):
+        if not program or not fnfix.stale(store, b.id) or cpp.stale(store, b.id)                 or (delphi.is_delphi(b) and delphi.stale(store, b.id)):
             return 0
         if not fnfix.candidates(store, b.id):
             fnfix.record(store, b.id, {"requested": 0, "created": 0, "skipped": 0, "failed": 0,
@@ -513,7 +517,9 @@ class Indexer:
         self.ensure_open(project)
         t0 = time.monotonic()
         res = fnfix.run(store, b.id, self.worker, program)
-        if res["created"]:
+        # "exists" for an address the index has no function for: an earlier run created it, then the worker
+        # died before the index was refreshed (seen once on a Delphi DLL) - read the functions back too
+        if res["created"] or (res.get("reasons") or {}).get("exists"):
             self.reextract_code(store, b, program)
         fnfix.record(store, b.id, res)
         logs.project_log(self.paths(project).logs).info(
@@ -992,6 +998,7 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  resources are an extra
             self._plog(job).warning("resources of %s: %s", me.name, e)
         cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
+        delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # VMTs, published methods, DFM
         try:
             self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready

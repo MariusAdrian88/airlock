@@ -16,7 +16,7 @@ copyright notice and license, reproduced here when the code lands.
 
 | Project | License | Planned use |
 |---|---|---|
-| [DelphiReSym](https://github.com/WenzWenzWenz/DelphiReSym) | BSD-3-Clause | Delphi metadata recovery (M6) |
+| [DelphiReSym](https://github.com/WenzWenzWenz/DelphiReSym) | BSD-3-Clause | format reference for the Delphi metadata parser (M6); no code copied |
 | [REA](https://github.com/morluto/rea) | MIT | design ideas: selectors, artifact identity, analysis profiles, bounded output |
 | [IDA-Ghidra-bridge](https://github.com/oscarsantanaarias/IDA-Ghidra-bridge) | MIT | MSVC RTTI / vtable / xref handler logic (M2) |
 | pefile, dnfile, olefile | MIT / BSD | PE, .NET metadata and OLE parsing |

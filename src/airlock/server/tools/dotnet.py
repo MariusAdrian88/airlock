@@ -146,10 +146,11 @@ def dotnet_decompile(ctx: ServerContext, type: str, member: str = "", binary: st
 
 
 def _decompiled(ctx: ServerContext, bd: Bound, full: str, exe: Path) -> str:
-    """C# of one type: the cached file, else ilspycmd output written to the cache (or an error line)."""
+    """C# of one type: the cached file, else ilspycmd output written to the cache (or an error line).
+    The cache folder is keyed by the assembly and the ilspycmd version."""
     b: Binary = bd.binary
     paths = ctx.indexer.paths(bd.project, create=True)
-    folder = paths.cache / "dotnet" / b.sha256[:16]
+    folder = paths.cache / "dotnet" / f"{b.sha256[:16]}-{_SAFE.sub('_', dn.ilspy_version(exe))}"
     cached = folder / (_SAFE.sub("_", full) + ".cs")
     try:
         return cached.read_text(encoding="utf-8")

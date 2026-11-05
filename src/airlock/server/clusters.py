@@ -29,6 +29,7 @@ from airlock.server import graph as gr
 from airlock.server.graph import (  # noqa: F401  re-exported: tests and callers use them from here
     CALL_KINDS, HUB_MIN_CALLERS, HUB_PERCENT, CallGraph, _fx, api_category, build_graph, string_categories,
 )
+from airlock.server.delphi import runtime_name as delphi_runtime_name
 from airlock.server.features import MFC_CLASSES, lib_family
 from airlock.server.selectors import fmt_addr
 
@@ -270,7 +271,7 @@ def name_label(names: list[str]) -> str:
 
 def runtime_label(fams: list[str]) -> str:
     """``runtime: MFC`` by the majority of the identified families, else plain ``runtime``."""
-    cnt = Counter(f for f in fams if f in ("MFC", "CRT", "ATL/STL"))
+    cnt = Counter(f for f in fams if f in ("MFC", "CRT", "ATL/STL", "Delphi"))
     if not cnt:
         return RUNTIME_PREFIX
     top = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
@@ -312,6 +313,8 @@ def runtime_family(name: str, ns: str | None, state: str) -> str | None:
         return fam
     if _EH_RE.match(name):
         return "CRT"
+    if delphi_runtime_name(name, ns):
+        return "Delphi"
     n = _norm_name(name)
     if n != name:
         fam2 = lib_family(n, ns, state)
@@ -349,6 +352,9 @@ def library_nodes(g: CallGraph, exported: set[int] | None = None) -> dict[int, s
     for i, (nm, state, ns) in enumerate(g.info):
         fam = runtime_family(nm, ns, state)
         if fam:
+            base[i] = fam
+    for i, fam in g.lib_hint.items():              # metadata: methods of RTL / VCL classes (Delphi units)
+        if i not in base and i not in exported and g.info[i][1] != "user":
             base[i] = fam
     where: dict[str, set[int]] = {}
     for i, (nm, state, ns) in enumerate(g.info):

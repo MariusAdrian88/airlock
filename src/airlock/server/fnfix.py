@@ -17,7 +17,7 @@ from typing import Any
 
 from airlock.index.store import Store
 
-FIX_VERSION = 1
+FIX_VERSION = 2          # 2: Delphi method and event addresses
 BATCH = 4000          # addresses per worker call (the op accepts 20000)
 
 
@@ -34,12 +34,13 @@ def stale(store: Store, binary_id: int) -> bool:
 
 
 def candidates(store: Store, binary_id: int) -> list[int]:
-    """Sorted addresses of message map handlers and vtable slot targets that are no function
-    entry of the binary."""
+    """Sorted addresses of message map handlers, vtable slot targets and Delphi methods (published and
+    virtual) and DFM event handlers that are no function entry of the binary."""
     sql = ("SELECT DISTINCT {col} FROM {tab} WHERE binary_id=?1 AND {col} IS NOT NULL AND {col} NOT IN "
            "(SELECT entry FROM function WHERE binary_id=?1 AND space='ram')")
     out: set[int] = set()
-    for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target")):
+    for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target"), ("dl_method", "addr"),
+                     ("dl_event", "addr")):
         out.update(r[0] for r in store.db.execute(sql.format(tab=tab, col=col), (binary_id,)))
     return sorted(out)
 

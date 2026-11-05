@@ -20,6 +20,7 @@ from typing import Any
 
 from airlock import logs
 from airlock.index.store import Function, Store
+from airlock.server import dotnet as dn
 from airlock.server import notes as nt
 from airlock.server import roles
 from airlock.server import targets as tg
@@ -85,12 +86,36 @@ def _worker(ctx: ServerContext, bd: Bound, op: str, args: dict[str, Any]) -> tup
     return r, None
 
 
-def _function_target(ctx: ServerContext, binary: str, text: str, external_ok: bool = False
-                     ) -> tuple[Bound, Function, str | None] | str:
+def _managed_fn(bd: Bound, fn: Function) -> bool:
+    return dn.is_managed_site(bd.binary, fn.space, fn.entry)
+
+
+def _managed_refusal(fn: Function, what: str) -> str:
+    """One line for a write that has no target: a .NET method has no Ghidra function."""
+    return (f"error managed: {fn.qualified_name} is a .NET method; {what} "
+            "Use annotate with a note only.")
+
+
+_NAME_FACT = "its name comes from metadata."
+_VAR_FACT = "its variables and types come from metadata, not from Ghidra."
+_CMT_FACT = "it has no Ghidra function to hold a comment."
+
+
+def _managed_only_refusal(bd: Bound, what: str) -> str:
+    return (f"error managed: {bd.binary.name} is a managed-only .NET assembly with no Ghidra program; "
+            f"{what} Use annotate with a note on a method.")
+
+
+def _function_target(ctx: ServerContext, binary: str, text: str, external_ok: bool = False,
+                     managed_what: str = "") -> tuple[Bound, Function, str | None] | str:
+    """Resolve a function. ``managed_what`` set: a .NET method (or external callee) is refused with
+    ``error managed``; empty: the caller handles managed targets itself."""
     ft = tg.resolve_target(ctx, binary, text, (tg.FUNCTION, tg.IMPORT_FN))
     if isinstance(ft, str):
         return ft
     assert isinstance(ft, tg.FunctionTarget)
+    if managed_what and _managed_fn(ft.bound, ft.fn):
+        return _managed_refusal(ft.fn, managed_what)
     if ft.fn.is_external and not external_ok:
         return tg.err("external", f"{ft.fn.qualified_name} is an imported function with no code",
                       "Rename or annotate a function that calls it, or use annotate for a note")
@@ -160,7 +185,7 @@ def rename(ctx: ServerContext, target: str, new_name: str, kind: str = "function
 
 
 def _rename_function(ctx: ServerContext, target: str, new_name: str, binary: str) -> str:
-    r = _function_target(ctx, binary, target)
+    r = _function_target(ctx, binary, target, managed_what=_NAME_FACT)
     if isinstance(r, str):
         return r
     bd, fn, note = r
@@ -186,7 +211,7 @@ def _rename_local(ctx: ServerContext, variable: str, new_name: str, function: st
     if not function.strip():
         return ("error bad_args: kind=local needs function=<name or address>; target is the "
                 "variable's current name. Fix and retry.")
-    r = _function_target(ctx, binary, function)
+    r = _function_target(ctx, binary, function, managed_what=_VAR_FACT)
     if isinstance(r, str):
         return r
     bd, fn, _note = r
@@ -211,9 +236,14 @@ def _rename_label(ctx: ServerContext, target: str, new_name: str, kind: str, bin
                 "Pass binary=<name> or binary!0xaddress.")
     bd = sc.bounds[0]
     st = bd.store
+    if dn.is_managed_only(bd.binary):
+        return _managed_only_refusal(bd, "labels and names come from metadata.")
     parsed = parse_address(sc.bare)
     if parsed is not None:
         space, value = parsed
+        if dn.is_managed_site(bd.binary, space, value):
+            return (f"error managed: {fmt_addr(value, bd.psize, space)} is a .NET metadata token, not "
+                    "Ghidra code; its name comes from metadata. Use annotate with a note only.")
         if kind == "label" and st.function_containing(bd.binary.id, value, space) is None:
             return tg.err("bad_target", f"{fmt_addr(value, bd.psize, space)} is not inside a function",
                           "Use kind=global for a data label")
@@ -245,7 +275,7 @@ def retype(ctx: ServerContext, function: str, variable: str, type: str, binary: 
     variable, type_ = variable.strip(), type.strip()
     if not variable or not type_:
         return "error bad_args: variable and type are required. Fix and retry."
-    r = _function_target(ctx, binary, function)
+    r = _function_target(ctx, binary, function, managed_what=_VAR_FACT)
     if isinstance(r, str):
         return r
     bd, fn, _note = r
@@ -298,8 +328,18 @@ def comment(ctx: ServerContext, address: str, text: str, kind: str = "plate", bi
         return "error bad_target: address is empty. Pass an address like 0x00401000 or a function name."
     site = _site(ctx, binary, address)
     if isinstance(site, str):
+        if site.startswith("error bad_target"):      # a P/Invoke thunk or external callee by name
+            ft = tg.resolve_target(ctx, binary, address, (tg.FUNCTION, tg.IMPORT_FN))
+            if isinstance(ft, tg.FunctionTarget) and _managed_fn(ft.bound, ft.fn):
+                return _managed_refusal(ft.fn, _CMT_FACT)
         return site
     bd, space, value, fn = site
+    if dn.is_managed_only(bd.binary):
+        return _managed_only_refusal(bd, "Ghidra comments do not apply.")
+    if dn.is_managed_site(bd.binary, space, value) or (fn is not None and _managed_fn(bd, fn)):
+        what = fn.qualified_name if fn is not None else fmt_addr(value, bd.psize, space)
+        return (f"error managed: {what} is a .NET method; {_CMT_FACT} "
+                "Use annotate with a note only.")
     res, err = _worker(ctx, bd, "set_comment", {"space": space, "address": value, "text": text,
                                                 "kind": kind})
     if err:
@@ -335,15 +375,24 @@ def annotate(ctx: ServerContext, target: str, summary: str, tags: str = "", conf
         bad = _bad_name(new_name, "new_name")
         if bad:
             return bad
-    r = _function_target(ctx, binary, target, external_ok=not new_name)
+    r = _function_target(ctx, binary, target, external_ok=True)
     if isinstance(r, str):
         return r
     bd, fn, note = r
     st = bd.store
+    managed = _managed_fn(bd, fn)
     rename_to = new_name if new_name and new_name not in (fn.qualified_name, fn.name) else ""
+    refused_rename = ""
+    if rename_to and managed:              # the note is agent data and is kept; the name is a fact
+        refused_rename = _managed_refusal(fn, _NAME_FACT).replace(
+            "Use annotate with a note only.", "The rename was not applied; the note was saved.")
+        rename_to = ""
+    elif rename_to and fn.is_external:
+        return tg.err("external", f"{fn.qualified_name} is an imported function with no code",
+                      "Rename or annotate a function that calls it, or use annotate for a note")
     tag_text = nt.normalise_tags(tags)
     mirror = (bool(ctx.config.defaults.get("mirror_notes_to_ghidra"))
-              and fn.space == "ram" and not fn.is_external)
+              and fn.space == "ram" and not fn.is_external and not managed)
     rename_info: dict[str, Any] | None = None
     ids: set[int] = set()
     if rename_to or mirror:
@@ -372,6 +421,8 @@ def annotate(ctx: ServerContext, target: str, summary: str, tags: str = "", conf
         out[-1] += f"; {_invalidated(len(ids))}"
     if mirror:
         out[-1] += "; mirrored to the plate comment"
+    if refused_rename:
+        out.append(refused_rename)
     return "\n".join(out)
 
 
@@ -392,6 +443,8 @@ def struct_define(ctx: ServerContext, name: str, fields: list[dict[str, Any]], s
     bd = bind_binary(ctx, binary)
     if isinstance(bd, str):
         return bd
+    if dn.is_managed_only(bd.binary):
+        return _managed_only_refusal(bd, "structures do not apply.")
     args: dict[str, Any] = {"name": name, "fields": fields}
     if size:
         args["size"] = size

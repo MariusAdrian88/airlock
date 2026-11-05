@@ -14,7 +14,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 DN_METHOD_LO, DN_METHOD_HI = 0x06000000, 0x07000000   # MethodDef metadata tokens (P/Invoke thunks)
 
 FTS_KINDS = ("function", "string", "import", "note")
@@ -1014,6 +1014,8 @@ class Store:
             if o == binary_id:
                 continue
             n += self._link_pair(binary_id, o) + self._link_pair(o, binary_id)
+            from airlock.server import dotnet      # managed method references between assemblies
+            n += dotnet.link_managed(self, binary_id, o) + dotnet.link_managed(self, o, binary_id)
         return n
 
     @staticmethod
@@ -1082,22 +1084,24 @@ class Store:
             "(SELECT COUNT(*) FROM edge e WHERE e.dst_fn=f.id AND e.kind IN ('call','call_ind')) "
             "AS callers FROM function f WHERE f.binary_id=? AND f.is_thunk=0 AND f.is_external=0 "
             "AND f.space='ram' AND NOT EXISTS (SELECT 1 FROM decomp d WHERE d.function_id=f.id "
-            "AND d.fn_version=f.version AND d.analysis_profile=?)",
-            (binary_id, analysis_profile)).fetchall()
+            "AND d.fn_version=f.version AND d.analysis_profile=?) "
+            "AND f.entry NOT BETWEEN ? AND ?",           # managed methods have no machine code
+            (binary_id, analysis_profile, DN_METHOD_LO, DN_METHOD_HI - 1)).fetchall()
 
     def decomp_target_count(self, binary_id: int) -> int:
         """Functions the background pass covers (see decomp_candidates)."""
         return int(self.db.execute(
             "SELECT COUNT(*) FROM function WHERE binary_id=? AND is_thunk=0 AND is_external=0 "
-            "AND space='ram'", (binary_id,)).fetchone()[0])
+            "AND space='ram' AND entry NOT BETWEEN ? AND ?",
+            (binary_id, DN_METHOD_LO, DN_METHOD_HI - 1)).fetchone()[0])
 
     def decomp_current_count(self, binary_id: int, analysis_profile: str) -> int:
         """Covered functions that have a cached row valid for fn_version and the profile."""
         return int(self.db.execute(
             "SELECT COUNT(*) FROM function f JOIN decomp d ON d.function_id=f.id "
             "WHERE f.binary_id=? AND f.is_thunk=0 AND f.is_external=0 AND f.space='ram' "
-            "AND d.fn_version=f.version AND d.analysis_profile=?",
-            (binary_id, analysis_profile)).fetchone()[0])
+            "AND d.fn_version=f.version AND d.analysis_profile=? AND f.entry NOT BETWEEN ? AND ?",
+            (binary_id, analysis_profile, DN_METHOD_LO, DN_METHOD_HI - 1)).fetchone()[0])
 
     def save_decomp_batch(self, analysis_profile: str, items: Iterable[dict[str, Any]],
                           produced_at: str | None = None) -> int:

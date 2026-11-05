@@ -929,14 +929,22 @@ Details settled in M3:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `delphi_classes` | `query?`, `limit=50` | classes from VMT/RTTI: name, parent, unit, method count |
-| `delphi_forms` | `form?` | DFM component tree: name, class, caption (no addresses by default) |
-| `delphi_events` | `form` or `component` | event → handler function |
+| `delphi_classes` | `query?`, `limit=50`, `binary?`, `cursor?`, `budget?` | classes from the VMTs: `Name : Parent unit U vmt 0x.. size N published P virtual V fields F`; `query` matches the class or unit name |
+| `delphi_forms` | `form?`, `binary?`, `cursor?`, `budget?` | no form: one line per DFM form (class, name, caption, component and event counts). A form (resource name, class or form name; `binary!form` works): the component tree, indented, `Name: Class "caption" events N` (no addresses) |
+| `delphi_events` | `form?` or `component?`, `binary?`, `cursor?`, `budget?` | `Button1.OnClick -> TMainForm.Button1Click 0x.. TMainForm::Button1Click`; a handler the form class (and its ancestors) do not publish shows `(not in the published methods)` |
 
-Implementation: metadata recovery adapted from DelphiReSym (BSD-3-Clause,
-noticed in `THIRD_PARTY_NOTICES.md`), our own binary DFM (`TPF0`) parser,
-optional IDR knowledge base for RTL/VCL library naming in a later milestone.
-64-bit Delphi binaries use the standard Win64 calling convention.
+Dirty-role only. Tables `dl_class`, `dl_method`, `dl_field`, `dl_form`, `dl_component`, `dl_event`
+(schema v12, meta `delphi_version:<id>`), filled on the server from the PE bytes (`server/delphi.py`,
+no Ghidra) when a Delphi binary becomes ready and on open for older projects. Published methods, virtual
+methods and event handlers that Ghidra has no function for are created through `fnfix` (the same
+`create_functions` op as for MFC handlers). Nothing is renamed in Ghidra: `function` shows hints
+(`TMainForm.Button1Click (published)`, `handler OnClick of Button1 (TButton "Run") in form TMainForm`,
+`TFoo::vslot 3`). The project map gets a `UI:` line, handlers seed the `ui-menu` / `ui-dialog`
+features, and methods of classes from runtime units (`System`, `Vcl.*`, `Classes`...) plus `@`-prefixed
+helper names count as runtime (`runtime: Delphi`).
+
+The format code is written from the format description (no code copied; DelphiReSym and IDR were not
+used). 64-bit Delphi binaries use the standard Win64 calling convention.
 
 ### dotnet
 
@@ -946,11 +954,16 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 | `dotnet_decompile` | `type`, `member?`, `binary?`, `cursor?`, `budget?` | C# from `ilspycmd`, one type at a time, cached in `dirty\.airlock\cache\dotnet\`; first line marks it as a reconstruction. `type` is the full name, or a unique suffix. `error tool_missing` without a configured ilspycmd |
 
 Both are dirty-role only. Tables: `dn_type`, `dn_method`, `dn_pinvoke` (schema v11, meta
-`dotnet_version:<id>`). A P/Invoke method also becomes a thunk function (entry = MethodDef token) and an
-import row (address = the token, module with `.dll` added). The normal import linking binds it to an
-export of a project binary and writes an xedge of kind `pinvoke`, so `xrefs`, `callgraph` and `path`
-follow it. A module no project binary provides stays an unresolved import. `function` on such a thunk
-answers `error managed`.
+`dotnet_version:<id>`). Every managed method is a function (space ram, entry = MethodDef token, size 1,
+namespace = full type name). A P/Invoke method is a thunk plus an import row (address = the token,
+module with `.dll` added). The normal import linking binds it to an export of a project binary and
+writes an xedge of kind `pinvoke`, so `xrefs`, `callgraph` and `path` follow it. A module no project
+binary provides stays an unresolved import. `dotnet_types kind=com` shows the GUID of a type with a
+`GuidAttribute` as `{GUID}` (ComImport types and interfaces).
+
+`function` on a managed method: `view=c` answers `error managed` and names the `dotnet_decompile`
+call; `view=asm` lists the IL (`IL_0000 opcode operand`, operands named, branch targets as `IL_xxxx`).
+A P/Invoke thunk answers `error managed` for both views.
 
 ### resources
 
@@ -1598,11 +1611,38 @@ formats is the primary use case of this project.
 
 ### Delphi
 
-- Delphi 2009+ metadata format (positive-offset VMT) via DelphiReSym-derived
-  code; Delphi 2–2007 format later if needed.
-- DFM: `RT_RCDATA` resources starting with `TPF0`; parse component tree and
-  event properties; map event method names to VMT published methods →
-  functions.
+- VMT (Delphi 2009+, positive offsets from the class reference), parsed from the PE bytes in
+  `server/delphi.py`. The class reference points at the first virtual slot; the slots before it, lowest
+  address first: `vmtSelfPtr` (holds the class reference itself), `IntfTable`, `AutoTable`, `InitTable`,
+  `TypeInfo`, `FieldTable`, `MethodTable`, `DynamicTable`, `ClassName` (ShortString), `InstanceSize`,
+  `Parent` (a pointer to a cell that holds the parent class reference), then the standard `TObject`
+  virtuals (`Equals`... `Destroy`). Every slot is pointer wide, so the layout scales with the pointer size.
+  The self-pointer pattern (an aligned word equal to its own address plus 19 to 32 pointer sizes) finds
+  the classes; the longest distance that passes the name check (ShortString identifier, plausible
+  instance size, type info inside the image) wins. **[verified]** on real binaries: 22 slots before the
+  class reference in 32-bit and 25 in the 64-bit builds checked; the first 11 slots keep their positions;
+  `Parent` is always indirect. Delphi 2007 and older (19 slots) is accepted by the same scan, **[verify]**
+  not checked on a real file.
+- Type info (`TypeInfo` slot): kind `7` (class), name, class type pointer, parent info pointer, `i16`
+  property count, then the unit name (ShortString); it gives the unit of every class **[verified]**.
+- Published method table: `u16 count`, then entries `u16 size; ptr code; ShortString name` (`size` covers
+  the entry including extended RTTI that follows the name). Published field table: `u16 count; ptr
+  classTab`, then `pointer-wide offset; u16 typeIndex; ShortString name`; `classTab` is `u16 count` and
+  pointers to cells that hold class references **[verified]**, 32-bit and 64-bit.
+- Virtual methods: consecutive code pointers from the class reference, up to the start of the next
+  class's slots. Their names are unknown.
+- DFM: `RT_RCDATA` resources starting with `TPF0`. Component: optional prefix byte `0xF0 | flags`
+  (1 inherited, 2 child position + integer, 4 inline), class and name as ShortStrings, properties
+  (`ShortString name`, value) until an empty name, children until a zero byte. Values: 0 nil/end of list,
+  1 list, 2/3/4 int8/16/32, 5 extended (10 bytes), 6 string, 7 identifier, 8 false, 9 true, 10 binary
+  (`u32` length), 11 set (ShortStrings until empty), 12 long string, 13 nil, 14 collection, 15 single, 16
+  currency, 17 date, 18 wide string (`u32` char count), 19 int64, 20 UTF-8 string. A collection item
+  starts with a list marker, an old-style integer index is skipped when the item does not parse without
+  it. An event is an identifier value whose property name (last dotted part) starts with `On` and an upper
+  case letter **[verified]**: every form of the checked binaries parses.
+- Join: the handler name is looked up (case-insensitive) in the published method table of the owner
+  class and its ancestors. The owner is the form class (the root component's class), or the class of the
+  nearest `inline` ancestor (a frame). A form whose class is not linked into the binary stays unresolved.
 
 ### .NET
 
@@ -1617,9 +1657,36 @@ formats is the primary use case of this project.
   from nuget.org with `dotnet tool install ilspycmd --version 8.2.0.7535 --tool-path <folder>
   --add-source https://api.nuget.org/v3/index.json`. One type of a 6 MB assembly takes under 1 s.
 - P/Invoke declarations link managed code to the native exports of the same project (xedge kind
-  `pinvoke`). COM interop declarations (`ComImport`) are listed in `dotnet_types kind=com` only.
+  `pinvoke`). COM interop declarations (`ComImport`) are listed in `dotnet_types kind=com` only,
+  with the GUID from the `GuidAttribute` (flag `guid=<lower>` in `dn_type.flags`).
+- Managed call graph (`DOTNET_VERSION` 3). The IL body of each MethodDef is read from its RVA (tiny
+  and fat headers; exception clauses are skipped). Opcodes `call`, `callvirt`, `newobj`, `jmp` give an edge of
+  kind `call`; `ldftn`, `ldvirtftn` and `ldtoken` of a method token give a `data` edge that
+  `Store.link_fnptr` turns into `fnptr` (`ldtoken` of a type or field: no edge). `calli` has no static
+  target: no edge, but `function view=asm` prints its signature (`calli int(int, string)`, with
+  `instance` / `unmanaged stdcall` when set). Targets by token table:
+  MethodDef: an edge to that function. MethodSpec: the method behind it. MemberRef: parent TypeDef or
+  a TypeSpec of a local generic type: matched to the local method by type, name and parameter list
+  (an edge to the function); parent TypeRef: an external function (space EXTERNAL, entry =
+  `0x0A000000 | MemberRef row`, namespace = `<assembly>.dll`, name = `Ns.Type::Method(params)`) plus
+  an import row at the same address. Array TypeSpecs and field references are dropped.
+  `Store.link_cross_binary` calls `dotnet.link_managed`: a reference whose assembly name matches a
+  project assembly is bound by type name, method name and parameter list (one overload may match by
+  name alone) with an xedge of kind `mcall` (src = the reference slot, dst = the MethodDef token). The
+  graph, `xrefs`, `callgraph` and `path` follow it like an import. Call-site addresses are the caller's
+  token, so `xrefs` shows one edge per caller and callee. Managed functions are excluded from the
+  decompile queue and from the project map frontier.
+- Write tools on managed targets (method, P/Invoke thunk, external callee; also in a mixed-mode
+  binary, where the token addresses are not in Ghidra): `rename`, `retype`, `comment` and the rename
+  part of `annotate` answer `error managed: ...` before any worker call; `rename` of a label or
+  global at a token address too. In a managed-only assembly (no Ghidra program) `struct_define` and
+  label/global renames and `comment` are refused as well. `annotate` stores the note (index `note`
+  table, no plate mirror) and, when `new_name` is given, adds the `error managed` line after the
+  note line.
+- ilspycmd output is cached in `cache\dotnet\<sha16>-<ilspycmd version>\` (version from
+  `ilspycmd --version`, asked once per process; the file size stands in when it prints none).
   **[verified]** System.Windows.Forms.dll (6 MB): 2416 types, 30149 methods, 625 P/Invokes,
-  198 COM imports, indexed in 4 s.
+  227 COM types, 92977 call edges, 2535 external callees, indexed in 8 s (dnfile alone takes 6 s).
 
 ---
 
@@ -1634,7 +1701,7 @@ formats is the primary use case of this project.
 | M3 | `annotate` set + invalidation, `frontier`, notes | Renaming a callee refreshes callers' cached decompiles |
 | M4 | `spec_write`/`spec_read`/`spec_export`, clean profile, audit | Clean session can read a spec and nothing else |
 | M5 | `fileformat` set | Diff two OLE-based document files per stream |
-| M6 | `delphi` set | Delphi form → event → handler resolved |
+| M6 | `delphi` set | Delphi form → event → handler resolved. **Done 2026-11-05** |
 | M7 | `dotnet` set | Managed assemblies indexed; P/Invokes linked to native exports. **Done 2026-11-05** |
 | M8 | `qt_metaobjects`, `dataflow` set | Qt signals/slots mapped |
 
@@ -1658,7 +1725,7 @@ formats is the primary use case of this project.
 
 | Component | License | Use |
 |---|---|---|
-| DelphiReSym | BSD-3-Clause | adapted Delphi metadata recovery; notice in `THIRD_PARTY_NOTICES.md` |
+| DelphiReSym | BSD-3-Clause | format reference only; nothing copied |
 | REA (morluto/rea) | MIT | design ideas: selectors, artifact identity, analysis profiles, bounded output; any copied code keeps its notice |
 | IDA-Ghidra-bridge | MIT | handler logic ported to the worker |
 | Ghidra / PyGhidra | Apache-2.0 | runtime dependency, not redistributed |

@@ -125,6 +125,7 @@ class CallGraph:
     ptr_only: set[tuple[int, int]] = field(default_factory=set)             # hops that exist only via fnptr
     _adj: list[list[int]] | None = None
     _runtime: set[int] | None = None
+    lib_hint: dict[int, str] = field(default_factory=dict)                  # node -> runtime family from metadata (Delphi units)
     _names: dict[str, list[int]] | None = None
 
     @property
@@ -420,6 +421,15 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
     for bid in bids:
         b = st.get_binary_by_id(bid)
         g.binaries[bid] = (b.name if b else "?", (b.pointer_size if b else 4) or 4)
+    try:
+        from airlock.server import delphi      # lazy: delphi imports the index only
+        for bid in bids:
+            for addr in delphi.runtime_addrs(st, bid):
+                i = g.index.get((bid, "ram", addr))
+                if i is not None:
+                    g.lib_hint[i] = "Delphi"
+    except Exception:  # noqa: BLE001  an extra: names and propagation still apply
+        pass
     return g
 
 

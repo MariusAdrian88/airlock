@@ -20,6 +20,7 @@ from typing import Any
 
 from airlock.index.store import CODE_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
+from airlock.server import delphi
 from airlock.server.uijoin import UiIndex
 
 log = logging.getLogger("airlock")
@@ -44,7 +45,7 @@ DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
 MAX_ENTRIES = 1500    # per feature; strong seeds first (strongest evidence), then callers by depth
-FEATURES_VERSION = 5  # 5: framework range / runtime message map entries no longer seed ui features; 4: ui-menu / ui-dialog seeds from message map handlers of menu items and dialog controls; 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
+FEATURES_VERSION = 6  # 6: Delphi DFM event handlers seed ui-menu / ui-dialog; 5: framework range / runtime message map entries no longer seed ui features; 4: ui-menu / ui-dialog seeds from message map handlers of menu items and dialog controls; 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
 FEATURES_VERSION_META = "features_version"
 DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
@@ -660,6 +661,14 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
             for key, ev in (("ui-menu", d["menu"]), ("ui-dialog", d["dialog"])):
                 for e in ev[:MAX_EVIDENCE]:
                     seed(key, bid, fid, e, e)
+        # Delphi: a handler named by a DFM event (form x published methods) is a strong seed
+        try:
+            for addr, key, ev in delphi.feature_seeds(store, bid):
+                fid = bn.at.get(("ram", addr))
+                if fid is not None and fid not in bn.thunk_ids and fid not in bn.lib:
+                    seed(key, bid, fid, ev, ev)
+        except Exception as e:  # noqa: BLE001  an extra: the other seeds stay
+            log.warning("delphi seeds of binary %s failed: %s", bid, e)
         # a data-format extension that appears in strings is a feature even when no code refs it
         for addr, lst in hits.items():
             for k, lab in lst:

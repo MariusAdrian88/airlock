@@ -198,3 +198,40 @@ def _v11(db: sqlite3.Connection) -> None:
 
 MIGRATIONS[11] = _v11
 MIGRATIONS.setdefault(11, lambda db: None)   # placeholder: the real v11 (.NET tables) is registered above
+
+
+def _v12(db: sqlite3.Connection) -> None:
+    """Delphi classes, published methods, DFM forms and events; derived, filled by server/delphi.py."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS dl_class (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "vmt INTEGER NOT NULL, name TEXT NOT NULL, parent_vmt INTEGER, parent TEXT NOT NULL DEFAULT '', "
+        "size INTEGER NOT NULL, unit TEXT NOT NULL DEFAULT '', typeinfo INTEGER, "
+        "nvirtual INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (binary_id, vmt))",
+        "CREATE INDEX IF NOT EXISTS dl_class_by_name ON dl_class(binary_id, name)",
+        "CREATE TABLE IF NOT EXISTS dl_method (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "vmt INTEGER NOT NULL, kind TEXT NOT NULL, slot INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '', "
+        "addr INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS dl_method_by_class ON dl_method(binary_id, vmt, kind, slot)",
+        "CREATE INDEX IF NOT EXISTS dl_method_by_addr ON dl_method(binary_id, addr)",
+        "CREATE TABLE IF NOT EXISTS dl_field (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "vmt INTEGER NOT NULL, name TEXT NOT NULL, offset INTEGER NOT NULL, type TEXT NOT NULL DEFAULT '')",
+        "CREATE INDEX IF NOT EXISTS dl_field_by_class ON dl_field(binary_id, vmt)",
+        "CREATE TABLE IF NOT EXISTS dl_form (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "res_name TEXT NOT NULL, class TEXT NOT NULL, name TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '', "
+        "ncomp INTEGER NOT NULL, nevents INTEGER NOT NULL, flags TEXT NOT NULL DEFAULT '', "
+        "PRIMARY KEY (binary_id, res_name))",
+        "CREATE TABLE IF NOT EXISTS dl_component (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "form TEXT NOT NULL, seq INTEGER NOT NULL, parent INTEGER NOT NULL, depth INTEGER NOT NULL, "
+        "name TEXT NOT NULL, class TEXT NOT NULL, flags TEXT NOT NULL DEFAULT '', "
+        "caption TEXT NOT NULL DEFAULT '', PRIMARY KEY (binary_id, form, seq))",
+        "CREATE TABLE IF NOT EXISTS dl_event (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "form TEXT NOT NULL, seq INTEGER NOT NULL, prop TEXT NOT NULL, handler TEXT NOT NULL, "
+        "owner TEXT NOT NULL, addr INTEGER)",
+        "CREATE INDEX IF NOT EXISTS dl_event_by_form ON dl_event(binary_id, form, seq)",
+        "CREATE INDEX IF NOT EXISTS dl_event_by_addr ON dl_event(binary_id, addr)",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[12] = _v12
+MIGRATIONS.setdefault(12, lambda db: None)   # placeholder: the real v12 (Delphi tables) is registered above
