@@ -232,3 +232,36 @@ def test_notification_names():
     assert n("Edit", WM_COMMAND, 0) == "COMMAND"
     assert n("Button", WM_COMMAND, 0x77) == "code 0x77"
     assert cpp.entry_label(WM_NOTIFY, NM_CLICK) == "WM_NOTIFY NM_CLICK"
+
+
+def test_framework_range_entries_are_not_shown_on_controls(proj):
+    """ON_NOTIFY_EX_RANGE over 0..0xFFFF (tooltips) and runtime range handlers match every control id:
+    hidden from control / menu lines and handler hints, still listed by mfc_message_maps."""
+    ctx, st, bid, h = proj
+    tip, chev, user_wide = 0x1900, 0x1910, 0x1920
+    st.insert_functions(bid, [
+        {"entry": tip, "name": "OnToolTipText", "name_state": "library", "namespace": "CFrameWnd", "size": 3},
+        {"entry": chev, "name": "OnChevronPushed", "name_state": "library", "namespace": "CFrameWnd", "size": 3},
+        {"entry": user_wide, "name": "OnAnyNotify", "name_state": "auto", "namespace": "CMainFrame", "size": 3}])
+    rows = [("CFrameWnd", 0x9000, WM_NOTIFY, 0xFFFFFDEE, 0, 0xFFFF, tip),       # whole id space
+            ("CFrameWnd", 0x9000, WM_NOTIFY, 0xFFFFFCB7, 1000, 1010, chev),     # narrow, but runtime handler
+            ("CMainFrame", 0x9100, WM_NOTIFY, 0xFFFFFFFE, 0, 0xFFFF, user_wide),  # wide range, program code
+            ("CMainFrame", 0x9100, WM_COMMAND, 0, 0, 0xFFFF, user_wide)]
+    st.db.executemany("INSERT INTO msgmap_entry(binary_id, class, map_addr, message, code, ctrl_id, last_id, "
+                      "sig, handler, seq) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      [(bid, c, m, msg, code, i, la, 0, hd, 50 + k) for k, (c, m, msg, code, i, la, hd) in
+                       enumerate(rows)])
+    st.db.commit()
+    ui = uijoin.UiIndex(st, bid)
+    assert [ui.name_of(x) for x in ui.ctrl_handlers(1000, "")] == ["CSettingsDlg::OnBrowse"]
+    assert {x.addr for x in ui.handlers_for(1000)} >= {tip, chev, user_wide}      # the raw join still has them
+    names = [ui.name_of(x) for x in ui.ctrl_handlers(1000, "101")]
+    assert names == ["CSettingsDlg::OnBrowse"]
+    dlg = rt.dialogs(ctx, "101")
+    assert "OnToolTipText" not in dlg and "OnChevronPushed" not in dlg and "OnAnyNotify" not in dlg
+    assert "CSettingsDlg::OnBrowse" in dlg
+    menus = rt.menus(ctx, "128")
+    assert "OnAnyNotify" not in menus and "OnToolTipText" not in menus
+    assert 'handler for' not in " ".join(ui.handler_hints(tip) + ui.handler_hints(chev) + ui.handler_hints(user_wide))
+    maps = cpp_tools.mfc_message_maps(ctx, "CFrameWnd")
+    assert "OnToolTipText" in maps and "OnChevronPushed" in maps

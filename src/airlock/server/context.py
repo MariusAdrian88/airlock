@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 import threading
 
+from airlock import logs
 from airlock.config import Config
 from airlock.projects import ProjectPaths
 from airlock.server import roles
@@ -54,7 +55,8 @@ class ServerContext:
             try:
                 self.refresh_maps(project)
             except Exception as e:  # noqa: BLE001  the map is an extra
-                log.warning("feature derivation failed for %s: %s", project, e)
+                logs.project_log(self.indexer.paths(project).logs).warning(
+                    "feature derivation / map refresh failed for %s: %s", project, e)
 
     def refresh_maps(self, project: str) -> None:
         """Derive the feature index and rewrite both PROJECT.md files now (this thread)."""
@@ -101,5 +103,5 @@ class ServerContext:
             try:
                 self.indexer.resume_project(pp.name)
             except Exception as e:  # noqa: BLE001  resuming is an extra; the session stays bound
-                log.warning("resume_project(%s) failed: %s", pp.name, e)
+                logs.project_log(pp.logs).warning("resume_project(%s) failed: %s", pp.name, e)
         return None

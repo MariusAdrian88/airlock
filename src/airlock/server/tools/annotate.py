@@ -18,6 +18,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from airlock import logs
 from airlock.index.store import Function, Store
 from airlock.server import notes as nt
 from airlock.server import roles
@@ -122,7 +123,7 @@ def _refresh_map(ctx: ServerContext, bd: Bound) -> None:
     try:
         ctx._on_ready(bd.project, bd.binary.id)   # coalesced background rewrite of the project map
     except Exception as e:  # noqa: BLE001  the map is an extra
-        log.warning("map refresh after annotate failed: %s", e)
+        logs.project_log(ctx.indexer.paths(bd.project).logs).warning("map refresh after annotate failed: %s", e)
 
 
 def _sig_line(bd: Bound, fn: Function) -> str:

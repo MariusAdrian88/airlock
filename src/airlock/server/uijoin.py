@@ -23,6 +23,7 @@ STATIC_IDS = frozenset({0, 0xFFFF, 0xFFFFFFFF})
 MAX_RANGE_SCAN = 4096                         # ids of one range entry looked at
 MAX_LIST = 3                                  # items listed before "+N"
 MAX_DIALOG_CANDIDATES = 3
+WIDE_RANGE = 0xF000                           # id range this wide (of 0..0xFFFF) matches every control: noise
 
 _BN = {0: "BN_CLICKED", 1: "BN_PAINT", 2: "BN_HILITE", 3: "BN_UNHILITE", 4: "BN_DISABLE",
        5: "BN_DOUBLECLICKED", 6: "BN_SETFOCUS", 7: "BN_KILLFOCUS"}
@@ -166,6 +167,7 @@ class UiIndex:
         self._menu_keys = sorted(self.menu_refs)
         self._ctrl_keys = sorted(self.ctrl_refs)
         self._fn: dict[int, Any] = {}
+        self._noise: dict[tuple, bool] = {}
         self._class_dialogs: dict[str, list[str]] = {}
         self._dialog_classes: dict[str, list[str]] | None = None
 
@@ -179,6 +181,34 @@ class UiIndex:
         out = list(self._single.get(ident, ()))
         out += [h for h in self._ranges if h.id <= ident <= h.last]
         return out
+
+    def is_noise(self, h: Handler) -> bool:
+        """Framework entry that matches (almost) every control: a range over (nearly) the whole id space
+        (``ON_NOTIFY_EX_RANGE(.., 0, 0xFFFF)`` tooltip handlers), or a range / WM_NOTIFY entry whose
+        handler is runtime code (framework class or runtime function). Hidden from control / menu lines
+        by default; ``mfc_message_maps`` still lists it."""
+        key = (h.cls, h.addr, h.message, h.code, h.id, h.last)
+        hit = self._noise.get(key)
+        if hit is None:
+            lo, hi = h.span
+            hit = hi - lo >= WIDE_RANGE
+            if not hit and (hi > lo or h.message == WM_NOTIFY):
+                hit = self._runtime_handler(h)
+            self._noise[key] = hit
+        return hit
+
+    def _runtime_handler(self, h: Handler) -> bool:
+        from airlock.server.clusters import runtime_family       # lazy: clusters imports features -> uijoin
+        from airlock.server.features import MFC_CLASSES
+        if h.cls in MFC_CLASSES:
+            return True
+        if h.addr not in self._fn:
+            self._fn[h.addr] = self.store.function_at(self.bid, h.addr)
+        fn = self._fn[h.addr]
+        return fn is not None and runtime_family(fn.name, fn.namespace, fn.name_state) is not None
+
+    def shown_handlers(self, ident: int) -> list[Handler]:
+        return [h for h in self.handlers_for(ident) if not self.is_noise(h)]
 
     def name_of(self, h: Handler, addr_fmt=lambda a: f"0x{a:08x}") -> str:
         """``Class::OnOpen``; the plain function name (or the address) for an ``anon_`` class."""
@@ -201,7 +231,7 @@ class UiIndex:
 
     def menu_handlers(self, item_id: int) -> tuple[list[Handler], list[Handler]]:
         """(command handlers, update-UI handlers) of a menu item id."""
-        hs = self.handlers_for(item_id)
+        hs = self.shown_handlers(item_id)
         return ([h for h in hs if h.is_command and h.message == WM_COMMAND],
                 [h for h in hs if h.is_update])
 
@@ -219,7 +249,7 @@ class UiIndex:
     def _handled_ids(self, cls: str) -> set[int]:
         out: set[int] = set()
         for h in self.handlers:
-            if h.cls != cls:
+            if h.cls != cls or self.is_noise(h):
                 continue
             lo, hi = h.span
             if hi == lo:
@@ -269,7 +299,7 @@ class UiIndex:
         """Handlers of a dialog control id. With a dialog that has linked classes, only theirs (when they
         handle the id). A shared id (IDOK..IDHELP) that no linked class handles, or that more than
         MAX_LIST unlinked classes handle, gets none: it cannot be told apart."""
-        hs = self.handlers_for(ctrl_id)
+        hs = self.shown_handlers(ctrl_id)
         if dialog:
             mine = set(self.dialog_classes(dialog))
             own = [h for h in hs if h.cls in mine]
@@ -318,6 +348,8 @@ class UiIndex:
         lists hold evidence strings (``menu "File > Open..."``, ``dialog 101 button "OK"``)."""
         out: dict[int, dict[str, list[str]]] = {}
         for h in self.handlers:
+            if self.is_noise(h):
+                continue
             menus, ctrls = self.refs_of(*h.span)
             if h.message == WM_NOTIFY:
                 menus = []
@@ -341,7 +373,7 @@ class UiIndex:
         updates: list[str] = []
         ctrls: list[str] = []
         for h in self.handlers:
-            if h.addr != entry:
+            if h.addr != entry or self.is_noise(h):
                 continue
             m, c = self.refs_of(*h.span)
             if h.message == WM_NOTIFY:
@@ -369,7 +401,7 @@ class UiIndex:
         n_dlg = q("SELECT COUNT(DISTINCT dialog_id) FROM res_dialog WHERE binary_id=?", (self.bid,)).fetchone()[0]
         n_menu = q("SELECT COUNT(DISTINCT menu_id) FROM res_menu_item WHERE binary_id=?", (self.bid,)).fetchone()[0]
         items = {i for i in self.menu_refs if any(h.message == WM_COMMAND and not h.is_update
-                                                  for h in self.handlers_for(i))}
+                                                  for h in self.shown_handlers(i))}
         ctrls = {(r.dialog, r.ctrl_id, r.cls, r.caption) for refs in self.ctrl_refs.values() for r in refs
                  if self.ctrl_handlers(r.ctrl_id, r.dialog)}
         buttons = sum(1 for c in ctrls if c[2].lower() == "button")

@@ -53,10 +53,16 @@ def _step(g: gr.CallGraph, p: list[int], i: int) -> str:
     return line
 
 
+def _via(res: gr.PathResult, n: int) -> str:
+    util = res.via_util[n]
+    rt = n < len(res.via_runtime) and res.via_runtime[n]
+    return f" [via {'util+runtime' if util and rt else 'util' if util else 'runtime'}]" if util or rt else ""
+
+
 def _blocks(g: gr.CallGraph, res: gr.PathResult) -> list[list[str]]:
     out = []
-    for n, (p, util) in enumerate(zip(res.paths, res.via_util)):
-        head = [] if n == 0 else [f"also {len(p) - 1} hops" + (" [via util]" if util else "")]
+    for n, p in enumerate(res.paths):
+        head = [] if n == 0 else [f"also {len(p) - 1} hops" + _via(res, n)]
         out.append(head + [_step(g, p, i) for i in range(len(p))])
     return out
 
@@ -103,7 +109,7 @@ def path(ctx: ServerContext, from_: Annotated[str, Field(alias="from")] = "", to
     first = len(res.paths[0]) - 1
     fd = f" ({a.desc})" if a.desc else ""
     td = f" ({b.desc})" if b.desc else ""
-    head = f"path {frm}{fd} → {dst}{td}, {first} hops" + (" [via util]" if res.via_util[0] else "")
+    head = f"path {frm}{fd} → {dst}{td}, {first} hops" + _via(res, 0)
     lines = [head] + [ln for blk in blocks for ln in blk]
     upto = 1 + sum(len(blk) for blk in blocks[:shown])
     need = (sum(_cost(x) for x in lines[:upto]) + _cost(footer(99999, "c_0000")))

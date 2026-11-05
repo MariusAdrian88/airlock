@@ -147,6 +147,7 @@ def function_map(ctx: ServerContext, scope: str = "", cluster: str = "", limit: 
     hidden = [] if include_runtime else [c for c in rows if c.runtime]
     if hidden:
         rows = [c for c in rows if not c.runtime]
+    head = [cl.coverage_line(cs)] + head
     lines = head + [cl.cluster_line(cs, c) for c in rows]
     if hidden:
         lines.append(f"{len(hidden)} runtime clusters ({sum(c.total for c in hidden)} fns) hidden: "

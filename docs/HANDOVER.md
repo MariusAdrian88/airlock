@@ -2,8 +2,7 @@
 
 Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
-the UI join), M3 (annotate) and M4 (specs) are done. Next: **a fresh full
-analysis of the target to check M2 end to end, then M5**.
+the UI join), M3 (annotate) and M4 (specs) are done. Next: **M5**.
 
 ## State
 
@@ -14,7 +13,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 725 passed, 37 skipped (~2 min). Ghidra suites:
+Tests: `pytest -q` → 732 passed, 37 skipped (~2 min). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -95,22 +94,24 @@ disabled. The user's global config was upgraded to `config_version` 1
 
 ## Open issues
 
-1. Not checked end to end on a fresh analysis: missing-function creation at
-   handler/vtable targets (`server/fnfix.py`, worker `create_functions`), the
-   resource and C++ tables filled at analysis time, the UI join counts.
-2. Most MFC message maps in the target belong to classes built without RTTI
-   (`anon_<map>`), so handler hints show `FUN_` names. Shared tooltip
-   `WM_NOTIFY` handlers add noise to control lines.
-3. About 30% of visible cluster functions stay `unclassified` (mostly unnamed
-   program code). Hidden runtime clusters in the main executable were not
-   audited for program code.
-4. `xrefs`/`callgraph` return `ambiguous` for same-named functions in several
+M2 was checked end to end on a fresh analysis of the acceptance target
+(2026-11-05): resource and C++ tables, missing-function creation and the UI
+join all run at analysis time; estimate within 20% of the real time.
+
+1. Most MFC message maps in the target belong to classes built without RTTI
+   (`anon_<map>`), so handler hints show `FUN_` names.
+2. About 27% of visible functions are in `unclassified` clusters (mostly
+   unnamed program code); `function_map` prints the coverage line.
+3. `xrefs`/`callgraph` return `ambiguous` for same-named functions in several
    binaries (imports aggregate; DESIGN §7.3 rule 8).
+4. `path` treats runtime wrappers just before an import as clean through a
+   length cap and a CRT plumbing name list (heuristic).
 5. Some very large functions hit `decompile_timeout`; `view=asm` still works.
 6. `patch_bytes` and `qt_metaobjects` are not implemented.
 7. MFC dispatch/automation (OLE) tables are not decoded.
 
-Fixed on 2026-11-05: `path` uses `server/targets.py` (via
+Fixed on 2026-11-05: framework range handlers (tooltips) hidden on control
+and menu lines; rotating logs and a per-project `project.log`; `path` uses `server/targets.py` (via
 `server/endpoints.py`); `fnptr` tables only in data sections; stricter CRT
 underscore rule; `Store.set_meta` commits outside a transaction and
 `atomic_write_text` gives each writer its own temp file (the PROJECT.md and
@@ -135,5 +136,4 @@ Acceptance test: `tests/test_ui_join.py` (synthetic PE with RTTI, a message map,
 
 ## Next
 
-A fresh full analysis of the target (option B, new scratch projects_root)
-to check open issue 1, then M5 (`fileformat` set, DESIGN.md §12).
+M5 (`fileformat` set, DESIGN.md §12).

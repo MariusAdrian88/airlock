@@ -715,8 +715,22 @@ def ordered(cs: ClusterSet) -> list[Cluster]:
     return sorted(cs.clusters, key=lambda c: (rank[c.kind], len(c.id), c.id))
 
 
+def coverage_line(cs: ClusterSet) -> str:
+    """One summary line, one denominator: visible functions are the members of every cluster that is not
+    runtime (regular, misc and util groups); unclassified are the visible members of clusters whose
+    label is ``unclassified``."""
+    visible = [c for c in cs.clusters if not c.runtime]
+    hidden = [c for c in cs.clusters if c.runtime]
+    total = sum(c.total for c in visible)
+    unc = sum(c.total for c in visible if c.label == "unclassified")
+    pct = f"{100 * unc / total:.0f}%" if total else "0%"
+    return (f"coverage: {total} visible functions (runtime excluded: {sum(c.total for c in hidden)} in "
+            f"{len(hidden)} clusters); unclassified {unc} = {pct} of the {total} visible functions "
+            f"(misc and util count in the total)")
+
+
 def cluster_summary_lines(cs: ClusterSet, limit: int = 8) -> list[str]:
-    """Lines for the project map section "Subsystems": top clusters by size, then util/misc."""
+    """Lines for the project map section "Subsystems": coverage, top clusters by size, then util/misc."""
     regular = [c for c in ordered(cs) if c.kind == "c" and not c.runtime]
     lines = [cluster_line(cs, c, key_limit=MAP_KEY_FUNCTIONS) for c in regular[:max(0, limit)]]
     if len(regular) > limit:
@@ -731,5 +745,6 @@ def cluster_summary_lines(cs: ClusterSet, limit: int = 8) -> list[str]:
         if c.kind != "c":
             lines.append(cluster_line(cs, c, link_limit=3, key_limit=MAP_KEY_FUNCTIONS))
     if lines:
+        lines.insert(0, coverage_line(cs))
         lines.append('function_map(cluster="C1") lists the functions of a subsystem.')
     return lines

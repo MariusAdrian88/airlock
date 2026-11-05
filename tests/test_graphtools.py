@@ -475,3 +475,89 @@ def test_path_endpoint_forms_use_the_shared_resolver(proj):
     assert head(out).startswith("path Boot → plug.dll!ReadFile") and lines(out)[-1].startswith("→ import")
     assert gt.path(ctx, "Boot", "no_such_name_zz").startswith(
         "error not_found: no function, import, feature, cluster or string 'no_such_name_zz'")
+
+
+@pytest.fixture
+def crt_proj(tmp_path):
+    """app.exe: Save -> Prep -> Flush -> Emit -> KERNEL32!WriteFile (clean, 4 hops); Save -> _free ->
+    __amsg_exit -> __NMSG_WRITE -> WriteFile (CRT error exit, shorter); Quit -> __amsg_exit only."""
+    ctx = make_ctx(tmp_path)
+    pp = ctx.indexer.paths("proj", create=True)
+    st = ctx.indexer.store("proj")
+    app = st.upsert_binary("aa" * 32, "app.exe", pointer_size=4, analysis_profile="p1")
+    names = ["Save", "Prep", "Flush", "Emit", "_free", "__amsg_exit", "__NMSG_WRITE", "Quit"]
+    b = {n: 0x1000 + i * 0x100 for i, n in enumerate(names)}
+    st.insert_functions(app, [fn(a_, n) for n, a_ in b.items()])
+    st.insert_edges(app, [call(b["Save"], b["Prep"]), call(b["Prep"], b["Flush"]), call(b["Flush"], b["Emit"]),
+                          (b["Emit"] + 0x20, 0x30010, "call_ind"),
+                          call(b["Save"], b["_free"]), call(b["_free"], b["__amsg_exit"]),
+                          call(b["__amsg_exit"], b["__NMSG_WRITE"]),
+                          (b["__NMSG_WRITE"] + 0x20, 0x30010, "call_ind"),
+                          call(b["Quit"], b["__amsg_exit"])])
+    st.insert_imports(app, [("KERNEL32.DLL", "WriteFile", None, 0x30010)])
+    st.link_edges(app)
+    ctx.indexer.set_status(st, app, "ready")
+    man = P.read_manifest(pp.manifest)
+    man["files"] = [{"path": "app.exe", "group": "core", "sha256": "aa" * 32}]
+    P.write_manifest(pp.manifest, man)
+    st.set_meta("link_version", str(linking.LINK_VERSION))
+    st.set_meta(fx.FEATURES_VERSION_META, str(fx.FEATURES_VERSION))
+    assert ctx.bind_session("dirty", pp) is None
+    assert ctx.wait_maps()
+    return ctx, pp, st, app, b
+
+
+def test_path_prefers_chains_without_runtime_functions(crt_proj):
+    ctx, pp, st, app, b = crt_proj
+    g = gr.get_graph(pp, st)
+    rt = gr.runtime_nodes(g)
+    assert {g.info[v][0] for v in rt} >= {"_free", "__amsg_exit", "__NMSG_WRITE"}
+    out = gt.path(ctx, "Save", "WriteFile", k=3)
+    assert lines(out)[0].startswith("path Save → WriteFile, 4 hops") and "via" not in lines(out)[0]
+    assert "Prep" in out and "Flush" in out and "Emit" in out
+    assert "__amsg_exit" not in out and "_free" not in out and "[via runtime]" not in out
+    # no clean chain: the runtime chain is shown and flagged
+    out = gt.path(ctx, "Quit", "WriteFile")
+    assert lines(out)[0].endswith("[via runtime]") and "__NMSG_WRITE" in out
+
+
+def test_path_runtime_wrapper_at_the_end_is_clean(tmp_path):
+    """handler -> helper -> CFile::Write -> WriteFile is the normal route (unflagged); runtime in the middle
+    (program -> runtime -> program) and a CRT chain at the end are flagged."""
+    ctx = make_ctx(tmp_path)
+    pp = ctx.indexer.paths("proj", create=True)
+    st = ctx.indexer.store("proj")
+    app = st.upsert_binary("aa" * 32, "app.exe", pointer_size=4, analysis_profile="p1")
+    names = ["Save", "Helper", "Export", "Helper2", "Helper3", "Quit", "Helper4", "__amsg_exit", "__NMSG_WRITE",
+             "Other"]
+    b = {n: 0x1000 + i * 0x100 for i, n in enumerate(names)}
+    b["Write"], b["Seek"] = 0x2000, 0x2100
+    st.insert_functions(app, [fn(a_, n) for n, a_ in b.items() if n not in ("Write", "Seek")])
+    st.insert_functions(app, [{**fn(b["Write"], "Write", state="library"), "namespace": "CFile"},
+                              {**fn(b["Seek"], "Seek", state="library"), "namespace": "CFile"}])
+    st.insert_edges(app, [call(b["Save"], b["Helper"]), call(b["Helper"], b["Write"]),
+                          (b["Write"] + 0x20, 0x30010, "call_ind"),
+                          call(b["Export"], b["Helper2"]), call(b["Helper2"], b["Seek"]),
+                          call(b["Seek"], b["Helper3"]), call(b["Other"], b["Helper3"]),
+                          (b["Helper3"] + 0x20, 0x30010, "call_ind"),   # Helper3 is program code
+                          call(b["Quit"], b["Helper4"]), call(b["Helper4"], b["__amsg_exit"]),
+                          call(b["__amsg_exit"], b["__NMSG_WRITE"]),
+                          (b["__NMSG_WRITE"] + 0x20, 0x30010, "call_ind")])
+    st.insert_imports(app, [("KERNEL32.DLL", "WriteFile", None, 0x30010)])
+    st.link_edges(app)
+    ctx.indexer.set_status(st, app, "ready")
+    man = P.read_manifest(pp.manifest)
+    man["files"] = [{"path": "app.exe", "group": "core", "sha256": "aa" * 32}]
+    P.write_manifest(pp.manifest, man)
+    st.set_meta("link_version", str(linking.LINK_VERSION))
+    st.set_meta(fx.FEATURES_VERSION_META, str(fx.FEATURES_VERSION))
+    assert ctx.bind_session("dirty", pp) is None
+    assert ctx.wait_maps()
+    g = gr.get_graph(pp, st)
+    assert {g.qname(v) for v in gr.runtime_nodes(g)} >= {"CFile::Write", "CFile::Seek", "__amsg_exit"}
+    head = lines(gt.path(ctx, "Save", "WriteFile"))[0]
+    assert head.startswith("path Save → WriteFile, 3 hops") and "[via" not in head
+    mid = lines(gt.path(ctx, "Export", "WriteFile"))[0]
+    assert mid.endswith("[via runtime]")
+    crt = lines(gt.path(ctx, "Quit", "WriteFile"))[0]
+    assert crt.endswith("[via runtime]")

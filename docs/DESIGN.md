@@ -400,7 +400,13 @@ a few calls, so it would be the whole program with no structure.
   30% runtime members is `mixed: MFC+program`. Deterministic; the cache
   version (`ALGO_VERSION`) invalidates stored clusters when the rules change.
 - Shown in the project map as section 4b *Subsystems* (top clusters), and
-  through the tool `function_map`.
+  through the tool `function_map`. Both start with one coverage line with one
+  denominator: `coverage: N visible functions (runtime excluded: R in K
+  clusters); unclassified U = P% of the N visible functions (misc and util count
+  in the total)`. Visible functions are the members of every cluster that is not
+  runtime (regular, `misc` and `util`); unclassified are the members of visible
+  clusters whose label is `unclassified` (an agent label classifies it). The
+  clustering itself is unchanged (`ALGO_VERSION` stays).
 
 **Graph view: paths and export.** Functions, clusters, features, strings and
 imports form one graph (call/reference edges from `edge`/`xedge`, membership
@@ -412,9 +418,15 @@ module (the one the clusters use) answers graph questions:
   functions (`binary!name`, address), an import (`KERNEL32!ReadFile`), a
   string (`"*.cfg"`: every function that references it), a feature key or a
   cluster id (any member). Returns up to `k=3` shortest paths (more by
-  cursor), `max_depth=8`; chains without `util` hubs are preferred, a chain
-  through a hub is returned only when no other chain exists and is marked
-  `[via util]`. A bare name resolves to a function first, then an import,
+  cursor), `max_depth=8`; chains that avoid `util` hubs and runtime library
+  functions (CRT error-exit helpers, locks, allocators: `graph.runtime_nodes`,
+  the same rules as the runtime clusters) are preferred. A chain through a
+  hub or a runtime function is returned only when no clean chain exists and is
+  marked `[via util]`, `[via runtime]` or `[via util+runtime]`. Runtime wrappers at the end of a
+  chain (a short run of at most 3 runtime functions just before an import or runtime target, e.g.
+  `... -> CFile::Write -> WriteFile`; likewise at the start when the source is runtime) are the
+  normal route and count as clean. CRT plumbing (`_free`, `__lock`, `__amsg_exit`,
+  `__NMSG_WRITE`, ...), hubs and runtime functions in the middle of a chain still flag it. A bare name resolves to a function first, then an import,
   then a feature key. Output: header `path A → B, N hops (M more paths:
   cursor=…)`, one step per line `→ [bin] Name 0xentry   call at 0xsite`; a
   call to an import no project binary provides ends in `→ import DLL!Name`.
@@ -1401,6 +1413,13 @@ formats is the primary use case of this project.
   -save`, which picks and remembers a JDK. Ghidra 12.1.4 requires Java 21+
   (`application.java.min=21`). PyGhidra sets `JAVA_HOME` inside the worker
   process itself; the user never sets it.
+- **Logs.** Rotating by size (`logging.handlers.RotatingFileHandler`, 2 MB, 3 backups; constants
+  in `airlock/logs.py`, no config keys). Machine logs in `%LOCALAPPDATA%\airlock\logs`:
+  `server.log` (the `airlock` logger of the server process) and `worker.log` (the worker's stderr,
+  piped through the server so it rotates too). Per-project events (analysis queue state changes,
+  missing-function creation, relink, map and feature refresh errors) also go to the project's
+  `dirty\.airlock\logs\project.log`. `project_info` and `index_status` name the paths. Nothing is
+  written to the worker's stdout (the protocol stream).
 - **Protocol isolation.** Before anything else runs, the worker duplicates its
   stdout for the protocol and points fd 1 (and, on Windows, `STD_OUTPUT_HANDLE`)
   at stderr, so output from Ghidra or the JVM can never corrupt the JSON
@@ -1525,6 +1544,13 @@ formats is the primary use case of this project.
   class (`BN_CLICKED`, `EN_CHANGE`, `CBN_SELCHANGE`, `NM_CLICK`, ...). A handler shows as `Class::name`;
   for an `anon_` class as the function name (or the address). Ids that occur in several menus or
   dialogs list every place, compact (3, then `+N`). Ids 0, 0xFFFF and -1 (static text) never join.
+- **Framework noise**: an entry whose id range spans (almost) the whole id space
+  (width >= 0xF000, e.g. `ON_NOTIFY_EX_RANGE(.., 0, 0xFFFF)` tooltip / chevron handlers of
+  `CFrameWnd`) matches every control. It is also noise when it is a range or a `WM_NOTIFY` entry
+  whose handler is runtime code (an MFC framework class, or a function the runtime rules recognise).
+  Noise entries are not shown on `menus` / `dialogs` lines, in function hints, in the class-dialog
+  link or as feature seeds (`UiIndex.is_noise`); `mfc_message_maps` still lists them. Single-id
+  `WM_COMMAND` entries of framework classes (`CWinApp::OnFileNew`) are kept.
 - **Dialog of a class**: a class's dialog is the dialog that contains every control id its map handles.
   At least one of the ids must be specific (not IDOK..IDHELP = 1..9), a class whose ids include menu
   ids is a frame/view and gets none, and more than 3 candidate dialogs give none. A dialog shows its
@@ -1532,7 +1558,7 @@ formats is the primary use case of this project.
 - **Consumers**: `menus`, `dialogs`, `mfc_message_maps` (above); `function` adds `// handler for menu
   "File > Open..."` or `// handler for button "OK" in dialog 101` (`update handler for ...` for
   `UPDATE_COMMAND_UI`); the features `ui-menu` and `ui-dialog` get the handlers as strong seeds with
-  evidence `menu "File > Open..."` / `dialog 101 button "OK"` (`FEATURES_VERSION` 4); the project map
+  evidence `menu "File > Open..."` / `dialog 101 button "OK"` (`FEATURES_VERSION` 4, 5 without framework noise); the project map
   adds a line `UI: N dialogs, M menus; handlers mapped: ...` under each binary that has resources.
 - **Missing functions** (`server/fnfix.py`, worker op `create_functions`): handlers and vtable slot targets
   (slots exist only for vtables of RTTI classes) that are no function entry in the index are code proven

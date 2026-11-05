@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from airlock import logs
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
@@ -409,6 +410,7 @@ class Indexer:
         if slug not in self.projects():
             return 0
         paths = self.paths(slug)
+        plog = logs.project_log(paths.logs)
         n = 0
         try:
             man = read_manifest(paths.manifest)
@@ -427,36 +429,36 @@ class Indexer:
         try:
             self.refresh_fixups(slug, store)  # older post-analysis fixups: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra; the binaries stay usable
-            log.warning("cannot refresh the fixups of %s: %s", slug, e)
+            plog.warning("cannot refresh the fixups of %s: %s", slug, e)
         try:
             if linking.needs_relink(store):  # links built by an older version: no re-analysis
                 ready = linking.ready_ids(store)
                 linking.relink_project(store, paths.artifacts,
                                        after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  links are an extra
-            log.warning("cannot relink %s: %s", slug, e)
+            plog.warning("cannot relink %s: %s", slug, e)
         try:
             from airlock.server import features as _fx  # features derived by an older version: derive again
             ready = linking.ready_ids(store)
             if ready and store.feature_stats() and _fx.stale(store) and not linking.needs_relink(store):
                 self._fire_ready(slug, ready[0])
         except Exception as e:  # noqa: BLE001  the feature index is an extra
-            log.warning("cannot refresh the features of %s: %s", slug, e)
+            plog.warning("cannot refresh the features of %s: %s", slug, e)
         try:
             cpp.ensure_project(store, paths.artifacts)  # C++ tables missing or stale: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra
-            log.warning("cannot refresh the C++ tables of %s: %s", slug, e)
+            plog.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
             if self.refresh_missing_functions(slug, store):   # C++ entry points without a function
                 ready = linking.ready_ids(store)
                 linking.relink_project(store, paths.artifacts,
                                        after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  an extra
-            log.warning("cannot create the missing functions of %s: %s", slug, e)
+            plog.warning("cannot create the missing functions of %s: %s", slug, e)
         try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
-            log.warning("cannot resume the decompile pass of %s: %s", slug, e)
+            plog.warning("cannot resume the decompile pass of %s: %s", slug, e)
         return n
 
     def refresh_fixups(self, project: str, store: Store) -> int:
@@ -511,8 +513,9 @@ class Indexer:
         if res["created"]:
             self.reextract_code(store, b, program)
         fnfix.record(store, b.id, res)
-        log.info("missing functions of %s: %s of %s created, %s failed (%.0fs)", b.name,
-                 res["created"], res["requested"], res["failed"], time.monotonic() - t0)
+        logs.project_log(self.paths(project).logs).info(
+            "missing functions of %s: %s of %s created, %s failed (%.0fs)", b.name,
+            res["created"], res["requested"], res["failed"], time.monotonic() - t0)
         return int(res["created"])
 
     def refresh_missing_functions(self, project: str, store: Store) -> int:
@@ -525,7 +528,7 @@ class Indexer:
             try:
                 n += self.create_missing_functions(project, store, b)
             except Exception as e:  # noqa: BLE001  one binary must not stop the others
-                log.warning("missing functions of %s: %s", b.name, e)
+                logs.project_log(self.paths(project).logs).warning("missing functions of %s: %s", b.name, e)
         return n
 
     def reextract_code(self, store: Store, b: Binary, program: str) -> None:
@@ -659,7 +662,12 @@ class Indexer:
     def _state(self, job: Job, status: str, error: str | None = None, **manifest: Any) -> None:
         """Binary status in the index and the manifest entry state, together."""
         self.set_status(self.store(job.project), job.binary_id, status, error)
+        self._plog(job).log(logging.WARNING if error else logging.INFO, "queue: %s -> %s%s", job.program,
+                            status, f" ({error})" if error else "")
         self._mf_update(job.project, job.sha256, state=status, error=error or None, **manifest)
+
+    def _plog(self, job: Job) -> logging.LoggerAdapter:
+        return logs.project_log(self.paths(job.project).logs)
 
     def model(self, files: list[dict[str, Any]]) -> tuple[float, float]:
         """(overhead_s, s_per_mb): the configured priors refined by the measured entries."""
@@ -885,11 +893,11 @@ class Indexer:
         try:
             self._after_ready(job)
         except Exception as e:  # links are an extra; the binary stays ready
-            log.warning("cross-binary linking failed for %s: %s", job.program, e)
+            self._plog(job).warning("cross-binary linking failed for %s: %s", job.program, e)
         try:
             self.bulk.schedule(job.project, job.binary_id, job.group)
         except Exception as e:  # the pass is an extra; the binary stays ready
-            log.warning("cannot schedule the decompile pass for %s: %s", job.program, e)
+            self._plog(job).warning("cannot schedule the decompile pass for %s: %s", job.program, e)
         job.finished.set()
 
     def _after_ready(self, job: Job) -> None:
@@ -914,21 +922,21 @@ class Indexer:
         try:
             linking.fix_export_ordinals(st, me, self.paths(job.project).artifacts / me.sha256)
         except Exception as e:  # noqa: BLE001  ordinals are an extra
-            log.warning("export ordinals of %s: %s", me.name, e)
+            self._plog(job).warning("export ordinals of %s: %s", me.name, e)
         try:
             peres.ensure(st, me, self.paths(job.project).artifacts / me.sha256)
         except Exception as e:  # noqa: BLE001  resources are an extra
-            log.warning("resources of %s: %s", me.name, e)
+            self._plog(job).warning("resources of %s: %s", me.name, e)
         cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
         try:
             self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
-            log.warning("missing functions of %s: %s", me.name, e)
+            self._plog(job).warning("missing functions of %s: %s", me.name, e)
         st.link_cross_binary(bid, [b.id for b in others])
         try:
             linking.link_dynamic_for(st, bid, [b.id for b in others])
         except Exception as e:  # noqa: BLE001  dynamic links are an extra
-            log.warning("dynamic links of %s: %s", me.name, e)
+            self._plog(job).warning("dynamic links of %s: %s", me.name, e)
         links = []
         for o in others:
             if any(True for _ in st.db.execute(
@@ -944,7 +952,7 @@ class Indexer:
             try:
                 hook(project, bid)
             except Exception as e:  # a hook is an extra; the binary stays ready
-                log.warning("ready hook failed for %s: %s", what or project, e)
+                logs.project_log(self.paths(project).logs).warning("ready hook failed for %s: %s", what or project, e)
 
     # -- worker session for decompile --------------------------------------
 

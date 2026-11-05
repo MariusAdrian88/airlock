@@ -228,7 +228,8 @@ def test_function_map_listing(proj):
     assert ctx.bind_session("dirty", pp) is None
     out = fmap.function_map(ctx)
     lines = out.splitlines()
-    assert lines[0].startswith("C1 ") and "fns (" in lines[0] and "named)" in lines[0]
+    assert lines[0].startswith("coverage: ")
+    assert lines[1].startswith("C1 ") and "fns (" in lines[1] and "named)" in lines[1]
     assert any("key: " in ln and "app.exe!alpha" in ln for ln in lines)   # multi-binary: bin! prefix
     assert any("→ C" in ln for ln in lines)
     assert lines[-1].startswith("M") or lines[-1].startswith("C") or lines[-1].startswith("util")
@@ -261,18 +262,19 @@ def test_function_map_scopes(proj):
     by_bin = fmap.function_map(ctx, scope="lib.dll")
     assert "libfn" in by_bin and "beta0" not in by_bin
     out = fmap.function_map(ctx, scope="app.exe!beta0")
-    assert out.splitlines()[0].startswith("beta0 (0x00009000) is in ")
-    assert f"is in {beta.id}" in out.splitlines()[0] and f"neighbours: {alpha.id} " in out.splitlines()[0]
-    assert {ln.split()[0] for ln in out.splitlines()[1:]} == {alpha.id, beta.id}
+    assert out.splitlines()[0].startswith("coverage: ")
+    assert out.splitlines()[1].startswith("beta0 (0x00009000) is in ")
+    assert f"is in {beta.id}" in out.splitlines()[1] and f"neighbours: {alpha.id} " in out.splitlines()[1]
+    assert {ln.split()[0] for ln in out.splitlines()[2:]} == {alpha.id, beta.id}
     imp = fmap.function_map(ctx, scope="app.exe!LibFn").splitlines()      # import-like: clusters of its callers
-    assert " is called from " in imp[0] and imp[0].endswith(" callers)") and len(imp) > 1
+    assert " is called from " in imp[1] and imp[1].endswith(" callers)") and len(imp) > 2
     assert fmap.function_map(ctx, scope="nosuchthing").startswith("error")
     # feature scope
     st.define_feature("cfg", "Config", "", "now")
     st.add_feature_entries("cfg", app, [("ram", e(0x9000, 0), "agent: Config")])
     feat = fmap.function_map(ctx, scope="cfg")
-    assert feat.splitlines()[0].startswith(beta.id + " ") and "features: cfg" in feat
-    assert len(feat.splitlines()) == 1
+    assert feat.splitlines()[1].startswith(beta.id + " ") and "features: cfg" in feat
+    assert len(feat.splitlines()) == 2
 
 
 def test_function_map_budget_and_cursor(proj):
@@ -301,7 +303,8 @@ def test_summary_lines(proj):
     ctx, pp, st, _ = proj
     cs = cl.get_clusters(ctx, "proj")
     lines = cl.cluster_summary_lines(cs, 2)
-    assert lines[0].startswith("C1 ") and any("more subsystems" in ln for ln in lines) or len(
+    assert lines[0].startswith("coverage: ")
+    assert lines[1].startswith("C1 ") and any("more subsystems" in ln for ln in lines) or len(
         [c for c in cs.clusters if c.kind == "c"]) <= 2
     assert lines[-1].startswith("function_map(")
     assert cl.cluster_summary_lines(cl.ClusterSet("x", "f", [], {}), 5) == []
@@ -455,7 +458,7 @@ def test_function_map_hides_runtime_by_default(rtproj):
     assert "runtime: MFC" not in out and "plugin interface" in out
     assert "1 runtime clusters (8 fns) hidden" in out and "include_runtime=true" in out
     full = fmap.function_map(ctx, include_runtime=True)
-    assert "runtime: MFC" in full and "hidden" not in full
+    assert "runtime: MFC" in full and "hidden" not in full.replace("coverage:", "")
     cid = cl.get_clusters(ctx, "proj").of((b, "ram", 0x1000)).id
     assert "runtime: MFC" in fmap.function_map(ctx, cluster=cid)          # explicit cluster still works
     lines = cl.cluster_summary_lines(cl.get_clusters(ctx, "proj"), 8)
@@ -534,3 +537,21 @@ def test_recurrence_needs_three_binaries(tmp_path):
 
 def test_algo_version_bumped():
     assert cl.ALGO_VERSION >= 4
+
+
+def test_coverage_line_has_one_denominator():
+    def mem(k, state="auto"):
+        return cl.Member((1, "ram", k), f"f{k}", state)
+    cs = cl.ClusterSet("x", "f", [
+        cl.Cluster("C1", "c", "unclassified", [mem(i) for i in range(6)]),
+        cl.Cluster("C2", "c", "file-io", [mem(i) for i in range(10, 14)]),
+        cl.Cluster("C3", "c", "runtime: CRT", [mem(i) for i in range(20, 30)]),
+        cl.Cluster("M1", "misc", "misc app.exe", [mem(40), mem(41)], binary=1),
+        cl.Cluster("util", "util", "", [mem(50)]),
+    ], {1: ("app.exe", 4)})
+    # visible = every non-runtime cluster (6+4+2+1 = 13); unclassified = clusters labelled so (6)
+    assert cl.coverage_line(cs) == ("coverage: 13 visible functions (runtime excluded: 10 in 1 clusters); "
+                                    "unclassified 6 = 46% of the 13 visible functions (misc and util count in the total)")
+    cs.clusters[0].agent_label = "startup"                 # an agent label classifies the cluster
+    assert "unclassified 0 = 0% of the 13" in cl.coverage_line(cs)
+    assert cl.cluster_summary_lines(cs)[0] == cl.coverage_line(cs)

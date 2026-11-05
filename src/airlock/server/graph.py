@@ -124,6 +124,7 @@ class CallGraph:
     node_of_fid: dict[tuple[int, int], int] = field(default_factory=dict)
     ptr_only: set[tuple[int, int]] = field(default_factory=set)             # hops that exist only via fnptr
     _adj: list[list[int]] | None = None
+    _runtime: set[int] | None = None
     _names: dict[str, list[int]] | None = None
 
     @property
@@ -513,6 +514,7 @@ class PathResult:
     via_util: list[bool]
     max_hops: int
     reach: int | None = None        # hops of the shortest path without depth limit (when none found)
+    via_runtime: list[bool] = field(default_factory=list)   # a path function is runtime library code
 
 
 def _yen(g: CallGraph, sources: list[int], targets: set[int], want: int, max_depth: int,
@@ -594,20 +596,99 @@ def _reach_hops(g: CallGraph, sources: list[int], targets: set[int]) -> int | No
     return None
 
 
+def runtime_nodes(g: CallGraph) -> set[int]:
+    """Runtime library functions of the graph (``clusters.library_nodes``: names, recurrence in several
+    binaries, propagation), computed once per graph."""
+    if g._runtime is None:
+        from airlock.server.clusters import library_nodes      # lazy: clusters imports this module
+        g._runtime = set(library_nodes(g))
+    return g._runtime
+
+
+WRAPPER_MAX = 3         # runtime functions at the end (start) of a chain that still count as a wrapper
+PLUMBING = frozenset({"lock", "unlock", "getptd", "amsg_exit", "nmsg_write", "ff_msgbanner", "free", "malloc",
+                      "abort", "exit", "cexit", "doexit", "initterm"})   # CRT infrastructure: never a wrapper
+
+
+def _plumbing(name: str) -> bool:
+    return name.strip("_").lower() in PLUMBING
+
+
+def _wrapper_zone(g: CallGraph, seeds: set[int], eligible: set[int], forward: bool) -> set[int]:
+    """Eligible runtime functions within WRAPPER_MAX hops of ``seeds`` (callers of the seeds when
+    ``forward`` is false, callees when true), through eligible functions only."""
+    adj = g.adj
+    nxt: dict[int, list[int]] = {}
+    if forward:
+        for v in range(len(adj)):
+            nxt[v] = adj[v]
+    else:
+        for v in eligible:
+            for w in adj[v]:
+                nxt.setdefault(w, []).append(v)
+    zone: set[int] = set()
+    frontier = list(seeds)
+    for _ in range(WRAPPER_MAX):
+        step: list[int] = []
+        for u in frontier:
+            for v in nxt.get(u, ()):
+                if v in eligible and v not in zone:
+                    zone.add(v)
+                    step.append(v)
+        frontier = step
+    return zone
+
+
+def _unwrapped_runtime(p: list[int], rt: set[int], eligible: set[int], head: bool, tail: bool,
+                       ends: set[int]) -> bool:
+    """True when the interior of chain ``p`` holds runtime functions that are not an end wrapper: the
+    contiguous runtime run just before the final endpoint (just after the first, when it is runtime
+    itself) does not count when it is short and made of eligible functions."""
+    mid = [v for v in p[1:-1]]
+    lo, hi = 0, len(mid)
+    if tail:
+        k = hi
+        while k > 0 and mid[k - 1] in rt:
+            k -= 1
+        run = mid[k:]
+        if len(run) <= WRAPPER_MAX and all(v in eligible for v in run):
+            hi = k
+    if head:
+        k = lo
+        while k < hi and mid[k] in rt:
+            k += 1
+        run = mid[lo:k]
+        if len(run) <= WRAPPER_MAX and all(v in eligible for v in run):
+            lo = k
+    return any(v in rt and v not in ends for v in mid[lo:hi])
+
+
 def find_paths(g: CallGraph, sources: list[int], targets: list[int], want: int, max_depth: int,
-               hubs: list[int] | None = None, budget_s: float = 8.0) -> PathResult:
-    """Up to ``want`` shortest simple call chains, preferring chains without util hubs; hub chains
-    only when no other chain exists (flagged in ``via_util``)."""
+               hubs: list[int] | None = None, budget_s: float = 8.0,
+               runtime: set[int] | None = None) -> PathResult:
+    """Up to ``want`` shortest simple call chains that avoid util hubs and runtime library functions
+    (CRT error-exit helpers, locks, allocators); chains through them only when no clean chain exists,
+    flagged in ``via_util`` / ``via_runtime``."""
     tset = set(targets)
     hub_set = set(find_hubs(g) if hubs is None else hubs)
+    rt_set = runtime_nodes(g) if runtime is None else runtime
     deadline = time.monotonic() + budget_s
-    paths = _yen(g, sources, tset, want, max_depth, hub_set, deadline)
-    flags = [False] * len(paths)
-    if not paths and hub_set:
+    ends = set(sources) | tset
+    eligible = {v for v in rt_set if v not in hub_set and not _plumbing(g.info[v][0]) and v < g.n}
+    tail = all(g.is_import(t) or t in rt_set for t in tset)        # target is an import / runtime function
+    head = all(s in rt_set for s in sources)                       # source is itself runtime code
+    allowed: set[int] = set()
+    if tail:
+        allowed |= _wrapper_zone(g, tset, eligible, False)
+    if head:
+        allowed |= _wrapper_zone(g, set(sources), eligible, True)
+    avoid = (hub_set | rt_set) - allowed
+    paths = _yen(g, sources, tset, want, max_depth, avoid, deadline)
+    if not paths and avoid:
         paths = _yen(g, sources, tset, want, max_depth, set(), deadline)
-        ends = set(sources) | tset
-        flags = [any(v in hub_set and v not in ends for v in p) for p in paths]
+    flags = [any(v in hub_set and v not in ends for v in p) for p in paths]
+    rflags = [_unwrapped_runtime(p, rt_set, eligible, head, tail, ends) for p in paths]
     reach = None
     if not paths:
         reach = _reach_hops(g, sources, tset)
-    return PathResult(paths, flags, max_depth, reach)
+    return PathResult(paths, flags, max_depth, reach, rflags)

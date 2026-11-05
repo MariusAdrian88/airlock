@@ -21,6 +21,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     except ConfigError as e:
         print(f"airlock: {e}", file=sys.stderr)
         return 2
+    from airlock import logs
+    logs.setup_server_logging(cfg.data_dir)         # rotating logs\server.log next to worker.log
     serve(cfg, profile_explicit=args.profile is not None)
     return 0
 

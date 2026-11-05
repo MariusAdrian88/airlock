@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pefile
 
+from airlock import logs
 from airlock.index.store import CODE_EDGES, Binary, Store
 
 log = logging.getLogger(__name__)
@@ -403,6 +404,8 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
     ``after`` runs last (the feature re-derivation hook); the cluster/graph caches re-key on the
     edge normalisation state and ``link_version``. Returns the number of xedge rows afterwards."""
     ids = ready_ids(store)
+    plog = logs.project_log(artifacts.parent / "logs")
+    plog.info("relink: %s binaries", len(ids))
     for i in ids:
         b = store.get_binary_by_id(i)
         if b is None:
@@ -410,7 +413,7 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
         try:
             fix_export_ordinals(store, b, artifacts / b.sha256)
         except Exception as e:  # noqa: BLE001  a broken PE must not stop the others
-            log.warning("export ordinals of %s: %s", b.name, e)
+            plog.warning("export ordinals of %s: %s", b.name, e)
     for i in ids:
         store.normalise_import_edges(i)
     for k, i in enumerate(ids):
@@ -422,20 +425,20 @@ def relink_project(store: Store, artifacts: Path, after: Callable[[], None] | No
             if b is not None:
                 record_sections(store, i, artifacts / b.sha256)
         except Exception as e:  # noqa: BLE001
-            log.warning("sections of binary %s: %s", i, e)
+            plog.warning("sections of binary %s: %s", i, e)
         try:
             store.link_fnptr(i)
         except Exception as e:  # noqa: BLE001
-            log.warning("function-pointer edges of binary %s: %s", i, e)
+            plog.warning("function-pointer edges of binary %s: %s", i, e)
         try:
             store.link_string_tables(i)
         except Exception as e:  # noqa: BLE001
-            log.warning("string tables of binary %s: %s", i, e)
+            plog.warning("string tables of binary %s: %s", i, e)
     with store.db:
         store.set_meta("link_version", str(LINK_VERSION))
     if after is not None:
         try:
             after()
         except Exception as e:  # noqa: BLE001  features are an extra
-            log.warning("feature re-derivation after relink failed: %s", e)
+            plog.warning("feature re-derivation after relink failed: %s", e)
     return int(store.db.execute("SELECT COUNT(*) FROM xedge").fetchone()[0])

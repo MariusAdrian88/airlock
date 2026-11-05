@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import threading
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from airlock import logs
 from airlock.config import Config
 from airlock.win import jobobject
 from airlock.worker.protocol import WorkerError, decode, encode
@@ -33,6 +35,7 @@ class WorkerClient:
         self._pending: dict[int, tuple[threading.Event, list[dict[str, Any]]]] = {}
         self._reader: threading.Thread | None = None
         self._log_file = None
+        self._log_pump: threading.Thread | None = None
         # Latest progress event per program ("" when the event names none).
         self._progress: dict[str, dict[str, Any]] = {}
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
@@ -74,7 +77,7 @@ class WorkerClient:
 
     @property
     def log_path(self) -> Path:
-        return self.config.data_dir / "logs" / "worker.log"
+        return self.config.data_dir / "logs" / logs.WORKER_LOG
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -84,7 +87,7 @@ class WorkerClient:
             if self.running():
                 return
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = open(self.log_path, "ab")
+            self._log_file = logs.rotating(self.log_path, "%(message)s")   # size-rotated worker.log
             flags = 0
             if sys.platform == "win32":
                 flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
@@ -92,9 +95,12 @@ class WorkerClient:
                 [self.python, "-I", "-m", "airlock.worker"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=self._log_file,
+                stderr=subprocess.PIPE,
                 creationflags=flags,
             )
+            self._log_pump = threading.Thread(target=self._pump_log, args=(self.proc.stderr, self._log_file),
+                                              name="airlock-worker-log", daemon=True)
+            self._log_pump.start()
             if sys.platform == "win32":
                 self.in_job = jobobject.assign(int(self.proc._handle))  # type: ignore[attr-defined]
             self.ghidra = None
@@ -102,6 +108,16 @@ class WorkerClient:
             self._reader = threading.Thread(target=self._read_loop, name="airlock-worker-reader",
                                             daemon=True)
             self._reader.start()
+
+    @staticmethod
+    def _pump_log(stream: Any, handler: Any) -> None:
+        """Copy the worker's stderr into the rotating log, line by line."""
+        try:
+            for raw in iter(stream.readline, b""):
+                text = raw.decode("utf-8", "replace").rstrip("\r\n")
+                handler.handle(logging.makeLogRecord({"msg": text, "levelno": logging.INFO}))
+        except (OSError, ValueError):
+            pass
 
     def _read_loop(self) -> None:
         assert self.proc is not None and self.proc.stdout is not None
@@ -141,6 +157,10 @@ class WorkerClient:
                 proc.wait(timeout=timeout)
         self.proc = None
         self.ghidra = None
+        pump = getattr(self, "_log_pump", None)
+        if pump is not None:
+            pump.join(timeout=5)
+            self._log_pump = None
         if self._log_file:
             self._log_file.close()
             self._log_file = None

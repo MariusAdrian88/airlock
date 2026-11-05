@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from airlock import __version__, ghidra_install
+from airlock import __version__, ghidra_install, logs
 from airlock.server import roles
 from airlock.config.catalog import CATALOG
 from airlock.server.context import ServerContext
@@ -56,6 +56,10 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
             g = f"{cfg.ghidra_dir} (invalid: {e})"
     out.append(f"ghidra  {g}")
     out.append(f"jdk     {cfg.jdk_dir or 'auto'}")
+    if not cfg.is_clean:
+        out.append(f"logs    worker {cfg.data_dir / "logs" / logs.WORKER_LOG}; server {cfg.data_dir / "logs" / logs.SERVER_LOG}")
+        if se.project is not None:
+            out.append(f"        project {logs.project_log_path(se.project.logs)}")
     out += _wrap_list("tools", usable, more=more)
     for issue in cfg.issues:
         if issue.level != "info":
@@ -82,7 +86,8 @@ def index_status(ctx: ServerContext, project: str = "") -> str:
     ix = ctx.indexer
     w = ctx.worker
     out = [f"worker {'running' if w.running() else 'not started'}, "
-           f"ghidra {'started' if w.ghidra is not None and w.running() else 'not started'}"]
+           f"ghidra {'started' if w.ghidra is not None and w.running() else 'not started'}",
+           f"logs worker {ctx.config.data_dir / 'logs' / logs.WORKER_LOG}; server {ctx.config.data_dir / 'logs' / logs.SERVER_LOG}"]
     try:
         names = [ix.resolve_project(project)] if project else ix.projects()
     except IndexerError as e:
@@ -132,7 +137,7 @@ def _project_lines(ix, p: str, st) -> list[str]:
     counts: dict[str, int] = {}
     for r in q.rows:
         counts[r.state] = counts.get(r.state, 0) + 1
-    out = [f"project {p}: {len(q.rows)} binaries"]
+    out = [f"project {p}: {len(q.rows)} binaries | log {logs.project_log_path(ix.paths(p).logs)}"]
     open_ = [r for r in q.rows if r.state not in ("ready", "error")]
     if open_:
         parts = [f"{counts[s]} {s}" for s in ("ready", "importing", "analysing", "extracting",

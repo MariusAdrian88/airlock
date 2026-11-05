@@ -18,6 +18,7 @@ from typing import Any
 
 import json5
 
+from airlock import logs
 from airlock.index.store import CODE_SQL, Store
 from airlock.projects import ProjectPaths, atomic_write_text, read_manifest
 from airlock.server import clusters as cl
@@ -234,7 +235,7 @@ def subsystems_lines(pp: ProjectPaths, store: Store, runtime: set[int] | None = 
     try:
         lines = cl.cluster_summary_lines(cl.clusters_for(pp, store, runtime=runtime), limit=SUBSYSTEMS_TOP)
     except Exception as e:  # noqa: BLE001  the map is an extra
-        log.warning("subsystems section failed for %s: %s", pp.name, e)
+        logs.project_log(pp.logs).warning("subsystems section failed for %s: %s", pp.name, e)
         return ["(subsystems unavailable.)"]
     return lines or ["(no subsystem map yet: needs a ready binary outside the runtime group.)"]
 
@@ -436,4 +437,4 @@ def write_maps(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = None
                 from airlock.server import diagrams
                 diagrams.write_mermaid_set(pp, store)
     except Exception as e:  # noqa: BLE001
-        log.warning("could not write PROJECT.md for %s: %s", pp.name, e)
+        logs.project_log(pp.logs).warning("could not write PROJECT.md for %s: %s", pp.name, e)
