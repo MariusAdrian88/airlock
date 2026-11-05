@@ -326,7 +326,10 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 - Qt: pointer-to-member connects are only checked on Qt6 / MSVC x64; try Qt5 and MinGW (Itanium
   `_ZN7QObject11connectImpl...` import, different argument order), 32-bit, and `QObject::connect`
   string form through import slots. Unresolved call sites could be chased through function pointers.
-- Delphi: property accessors are not named; routines under 10 compared bytes cannot be named by code
+- Delphi: `delphi-sigs kit` makes a small rebuild kit of an install, `delphi-sigs oracle` is the supported
+  oracle measurement (DESIGN §11); the sigdb no longer stores records the matcher drops (import stubs), and a
+  `--units` run locks its work folder (a second run on the same folder used to delete the maps of the first).
+  Property accessors are not named; routines under 10 compared bytes cannot be named by code
   signatures (a call-context pass could); the map build skips the FMX / TeeChart / REST-backend units.
 - WARP is tested on compilers 30, 33, 35 and 36 (no compiler 34 binary was
   available). 64-bit WARP has no library: 64-bit relies on extended RTTI and IDR.

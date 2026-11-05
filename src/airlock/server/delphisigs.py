@@ -598,7 +598,8 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
             merged.update(dict.fromkeys(recs))
             done += 1
             say(f"{pkgs[i].name}: {len(recs)} routines")
-    records = list(merged)
+    records = [r for r in merged if idr.usable(r[2])]       # import stubs and the like: ``Kb.add`` drops them
+    say(f"{len(merged) - len(records)} unusable records dropped")
     n_export = len(records)
     if pairs:
         records += _map_records(records, pairs, say)
@@ -619,10 +620,13 @@ def _map_records(exported: list[tuple[str, bytes, bytes]], pairs: list[tuple[Pat
     have = {(d, m) for _n, d, m in exported}
     out: dict[tuple[str, bytes, bytes], None] = {}
     for binary, mp in pairs:
+        for f in (binary, mp):
+            if not f.is_file():
+                raise SigError(f"{f} is gone (was the work folder used by another run?)")
         _ps, recs = delphimap.scan_pair(str(binary), str(mp))
         fresh = 0
         for r in recs:
-            if (r[1], r[2]) in have:
+            if (r[1], r[2]) in have or not idr.usable(r[2]):
                 continue
             if r not in out:
                 out[r] = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import shutil
 import sys
@@ -54,6 +55,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return run(args.config, args.profile, fix=args.fix, start=args.start)
 
 
+def _cmd_delphi_oracle(args: argparse.Namespace, sigdir: Path) -> int:
+    from airlock.server import delphioracle
+    if len(args.install) != 2:
+        print("airlock: oracle needs <binary> <map file>", file=sys.stderr)
+        return 2
+    try:
+        print(delphioracle.format_result(delphioracle.measure(args.install[0], args.install[1], sigdir, args.own)))
+    except (delphioracle.OracleError, OSError, ValueError) as e:
+        print(f"airlock: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
     from airlock.config import ConfigError, load_config
     from airlock.server import delphisigs
@@ -97,6 +111,20 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
     if not args.install:
         print("airlock: give the Delphi install folder (the one with bin and Redist)", file=sys.stderr)
         return 2
+    if args.action == "kit":
+        from airlock.server import delphikit
+        if len(args.install) != 2:
+            print("airlock: kit needs <install folder> <destination folder>", file=sys.stderr)
+            return 2
+        try:
+            size = delphikit.make_kit(args.install[0], args.install[1], print if args.verbose else None)
+        except (delphikit.KitError, OSError) as e:
+            print(f"airlock: {e}", file=sys.stderr)
+            return 2
+        print(f"{args.install[1]}: kit of {size / 1048576:.0f} MB; use it like the install: delphi-sigs build")
+        return 0
+    if args.action == "oracle":
+        return _cmd_delphi_oracle(args, out)
     from airlock.server import delphimap, delphimega
     bits = [4, 8] if args.bits == "both" else [int(args.bits) // 8]
     say = print if args.verbose else None
@@ -104,9 +132,16 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
     for psize in bits:
         pairs = [(Path(b), Path(m)) for b, m in args.map or [] if delphimap.pair_psize(Path(b)) == psize]
         work = None
+        lock = contextlib.ExitStack()
+        if args.units:
+            work = args.work or (out / "work")
+            try:
+                lock.enter_context(delphimega.work_lock(work / f"win{psize * 8}"))
+            except delphimega.MegaError as e:
+                print(f"{psize * 8}-bit: {e}")
+                continue
         try:
             if args.units:
-                work = args.work or (out / "work")
                 try:
                     mega = delphimega.build(args.install[0], work / f"win{psize * 8}", psize, say, jobs=args.jobs)
                 except delphimega.MegaError as e:
@@ -126,6 +161,7 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
         finally:
             if work is not None and not args.keep_work:
                 shutil.rmtree(work / f"win{psize * 8}", ignore_errors=True)
+            lock.close()
         built += 1
         extra = f", {r.mapped} from maps" if pairs else ""
         print(f"{r.path}: compiler {r.compiler}, {r.psize * 8}-bit, {r.packages} packages, {r.names} names{extra}, "
@@ -167,10 +203,13 @@ def main(argv: list[str] | None = None) -> int:
     d.set_defaults(fn=_cmd_doctor)
 
     g = sub.add_parser("delphi-sigs", help="build or list Delphi RTL / VCL signature databases")
-    g.add_argument("action", choices=["build", "rtti-build", "list"])
+    g.add_argument("action", choices=["build", "rtti-build", "list", "kit", "oracle"])
     g.add_argument("install", nargs="*", type=Path,
-                   help="build: Delphi install folder (the one with bin and Redist); rtti-build: folders with "
+                   help="build: Delphi install folder (the one with bin and Redist); kit: install folder and "
+                        "destination; oracle: binary and its map file; rtti-build: folders with "
                         "Delphi programs, one product per folder")
+    g.add_argument("--own", type=Path, default=None,
+                   help="oracle: folder of the program's own .dcu files (their units are not library code)")
     g.add_argument("--min-binaries", type=int, default=3, help="rtti-build: distinct files that must agree (3)")
     g.add_argument("--min-products", type=int, default=1, help="rtti-build: distinct products that must agree (1)")
     g.add_argument("--exclude", type=Path, action="append", help="rtti-build: a file to leave out (repeatable)")

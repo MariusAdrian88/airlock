@@ -25,6 +25,8 @@ leftovers are listed in the result.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shutil
 import struct
@@ -65,6 +67,42 @@ class Part:
     name: str
     units: list[str]
     requires: list[str] = field(default_factory=list)
+
+
+@contextlib.contextmanager
+def work_lock(work: Path):
+    """Own a work folder for the length of a run. Two runs on one folder wipe each other's packages (a run
+    deletes the folder when it starts and again when it ends; the maps are read long after the compiler wrote
+    them), which surfaces as a ``FileNotFoundError`` on a map. The lock is an OS file lock on ``<work>.lock``:
+    it goes away with a crashed process. Raises MegaError when another run holds it."""
+    work.parent.mkdir(parents=True, exist_ok=True)
+    path = work.with_name(work.name + ".lock")
+    f = open(path, "a+b")
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        f.close()
+        raise MegaError(f"the work folder {work} is in use by another run (lock {path.name}); "
+                        f"wait for it or use another --work folder") from e
+    try:
+        yield
+    finally:
+        try:
+            f.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        f.close()
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def compiler_exe(install: Path, psize: int) -> Path:

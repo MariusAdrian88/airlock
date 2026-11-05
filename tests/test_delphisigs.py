@@ -618,3 +618,107 @@ def test_command_warns_and_writes_the_database_when_the_units_step_fails(tmp_pat
                  "--bits", "32", "--units", "--work", str(tmp_path / "w")]) == 0
     text = capsys.readouterr().out
     assert "warning: the units step failed" in text and "1 names" in text
+
+
+# ── import stubs, kit, oracle ─────────────────────────────────────────────────
+
+def test_build_drops_records_the_matcher_would_drop(tmp_path):
+    pytest.importorskip("capstone")
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code),
+                                       ("@Winapi@Windows@CloseHandle$qqrv", b"\xff\x25\0\0\0\0")],
+             rel + [-(-len(code) // 16) * 16 + 2], tail=COMPILER)
+    res = delphisigs.build(_install(tmp_path), tmp_path / "sig", 4, jobs=1)
+    kb = delphisigs.read_sigdb(res.path)
+    assert delphisigs.read_sigdb_header(res.path)["count"] == len(kb.procs) == res.names
+    assert [p.name for p in kb.procs] == ["System.Classes.TThing.Run"]
+    assert idr.usable(b"\0" * 12) and not idr.usable(b"\0\0\xff\xff\xff\xff")
+
+
+def test_kit_copies_only_what_a_rebuild_needs(tmp_path):
+    from airlock.cli import main
+    from airlock.server import delphikit
+    inst = tmp_path / "Studio" / "99.0"
+    for rel in ("bin/dcc32.exe", "bin/dcc64.exe", "bin/dcc32990.dll", "bin/dcc64990.dll", "bin/dcc649900N.dll",
+                "bin/lnkdfm990.dll", "bin/borlndmm.dll", "bin/rlink32.dll", "bin/cgrc.exe", "bin/rtl990.bpl",
+                "bin/bcc32.exe", "bin/dcc32990.jdbg", "bin64/rtl990.bpl", "lib/win32/release/System.dcu",
+                "lib/win32/debug/System.dcu", "lib/win64/release/System.dcu", "Redist/win32/x.bpl",
+                "Redist/win64/x.bpl", "source/vcl/Vcl.res", "source/vcl/Vcl.pas", "source/other/a.dfm"):
+        f = inst / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"x" * 10)
+    sep = chr(92)
+    (inst / "bin" / "dcc32.cfg").write_text(f'-u"{inst}{sep}lib{sep}win32{sep}release"\n', encoding="latin-1")
+    (inst / "bin" / "dcc64.cfg").write_text(f'-u"{str(inst).lower()}{sep}lib{sep}win64{sep}release"\n', encoding="latin-1")
+    dest = tmp_path / "kit"
+    cfg = tmp_path / "config.jsonc"
+    cfg.write_text('{"ghidra_dir": "%s"}' % str(tmp_path).replace("\\", "/"))
+    assert main(["--config", str(cfg), "delphi-sigs", "kit", str(inst), str(dest)]) == 0
+    got = {p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()}
+    assert got == {"bin/dcc32.exe", "bin/dcc64.exe", "bin/dcc32990.dll", "bin/dcc64990.dll", "bin/dcc649900N.dll",
+                   "bin/lnkdfm990.dll", "bin/borlndmm.dll", "bin/rlink32.dll", "bin/cgrc.exe", "bin/rtl990.bpl",
+                   "bin/dcc32.cfg", "bin/dcc64.cfg", "bin64/rtl990.bpl", "lib/win32/release/System.dcu",
+                   "lib/win64/release/System.dcu", "Redist/win32/x.bpl", "Redist/win64/x.bpl",
+                   "source/vcl/Vcl.res", "source/other/a.dfm"}
+    assert str(dest) in (dest / "bin" / "dcc64.cfg").read_text(encoding="latin-1")
+    assert str(dest) in (dest / "bin" / "dcc32.cfg").read_text(encoding="latin-1")
+    assert str(inst) not in (dest / "bin" / "dcc32.cfg").read_text(encoding="latin-1")
+    with pytest.raises(delphikit.KitError):
+        delphikit.make_kit(inst, inst / "kit")
+    with pytest.raises(delphikit.KitError):
+        delphikit.make_kit(tmp_path / "empty", tmp_path / "kit2")
+
+
+def test_oracle_scores_names_against_the_map(tmp_path, capsys):
+    pytest.importorskip("capstone")
+    from airlock.cli import main
+    from airlock.server import delphioracle
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code),
+                                       ("@System@Classes@%TList__1$pv%@Add$qqrv", OTHER32)], rel, tail=COMPILER)
+    res = delphisigs.build(_install(tmp_path), tmp_path / "sig", 4, jobs=1)
+    where = make_bpl(tmp_path / "prog.exe", [("a", code), ("b", OTHER32), ("c", OTHER32[:-1] + b"\x90\xc3"),
+                                            ("pad", COMPILER)], rel)
+    (tmp_path / "prog.map").write_text(map_text(where, {"a": "System.Classes.TThing.Run",
+                                                         "b": "System.Classes.TList<System.Integer>.Add",
+                                                         "c": "System.Classes.TThing.Other"}), encoding="latin-1")
+    r = delphioracle.measure(tmp_path / "prog.exe", tmp_path / "prog.map", res.path.parent)
+    assert r.compiler == 30 and r.library == 3 and r.all.n == 3
+    assert r.all.right == 2 and r.all.exact == 1 and r.all.wrong + r.all.none == 1
+    assert delphioracle.norm("Unit.TList<Foo<Bar>>.Add") == "unit.tlist<>.add"
+    cfg = tmp_path / "config.jsonc"
+    cfg.write_text('{"ghidra_dir": "%s"}' % str(tmp_path).replace("\\", "/"))
+    assert main(["--config", str(cfg), "delphi-sigs", "oracle", str(tmp_path / "prog.exe"),
+                 str(tmp_path / "prog.map"), "--out", str(res.path.parent)]) == 0
+    out = capsys.readouterr().out
+    assert "all: 3 routines, right 2" in out and "exact 1" in out
+
+
+def test_work_folder_is_locked_against_a_second_run(tmp_path, capsys):
+    from airlock.cli import main
+    from airlock.server import delphimega
+    work = tmp_path / "work" / "win64"
+    with delphimega.work_lock(work):
+        with pytest.raises(delphimega.MegaError, match="in use by another run"):
+            with delphimega.work_lock(work):
+                pass
+        cfg = tmp_path / "config.jsonc"
+        cfg.write_text('{"ghidra_dir": "%s"}' % str(tmp_path).replace("\\", "/"))
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "keep.txt").write_text("x")
+        assert main(["--config", str(cfg), "delphi-sigs", "build", str(tmp_path), "--out", str(tmp_path / "o"),
+                     "--bits", "64", "--units", "--work", str(tmp_path / "work")]) == 1
+        assert "in use by another run" in capsys.readouterr().out
+        assert (work / "keep.txt").exists()                                # the other run's folder is untouched
+    with delphimega.work_lock(work):                                       # released afterwards
+        pass
+    assert not (tmp_path / "work" / "win64.lock").exists()
+
+
+def test_build_reports_a_vanished_map_file(tmp_path):
+    pytest.importorskip("capstone")
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code)], rel, tail=COMPILER)
+    with pytest.raises(delphisigs.SigError, match="is gone"):
+        delphisigs.build(_install(tmp_path), tmp_path / "sig", 4, jobs=1,
+                         pairs=[(tmp_path / "x.bpl", tmp_path / "x.map")])

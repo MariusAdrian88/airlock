@@ -198,10 +198,7 @@ class Kb:
     def add(self, name: str, dump: bytes, reloc: bytes) -> None:
         n = len(dump)
         fixed = n - reloc.count(0xFF)
-        if fixed < MIN_FIXED:
-            self.skipped += 1
-            return
-        anchor = _anchor(reloc, n)
+        anchor = _anchor(reloc, n) if fixed >= MIN_FIXED else None
         if anchor is None:
             self.skipped += 1
             return
@@ -212,6 +209,13 @@ class Kb:
 
     def finish(self) -> None:
         self.combos = sorted({(a0, len(k)) for a0, k in self.table})
+
+
+def usable(reloc: bytes) -> bool:
+    """True when a proc with this mask is kept by ``Kb.add`` (enough compared bytes and an anchor window).
+    Import stubs (``jmp [mem]``, 2 compared bytes) are not."""
+    n = len(reloc)
+    return n - reloc.count(0xFF) >= MIN_FIXED and _anchor(reloc, n) is not None
 
 
 def _anchor(reloc: bytes, n: int) -> tuple[int, int] | None:

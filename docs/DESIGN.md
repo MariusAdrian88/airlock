@@ -1063,7 +1063,26 @@ masks are the ones of the export path (`delphisigs.scan_named`: `.pdata` for 64-
 masked code equals an exported one gets no second name from the map (an exported name wins). CLI: `airlock delphi-sigs
 build <install> --units` runs the package build in a work folder (`--work`, deleted unless `--keep-work`) and merges
 it; `--map BINARY MAP` (repeatable) merges a pair that was built another way (a program or package of your own; any
-Delphi that writes a `-GD` map). The sigdb header keeps `mapped` (names from maps).
+Delphi that writes a `-GD` map). The sigdb header keeps `mapped` (names from maps). Records the matcher would drop anyway (`idr.usable`: fewer than
+`MIN_FIXED` compared bytes, such as the 6-byte `jmp [mem]` import stubs that the maps name after their targets) are not
+written. A `--units` run holds an OS lock on its work folder (`<work>\win64.lock`): two runs on one folder delete each
+other's packages and maps.
+
+`airlock delphi-sigs kit <install> <dest>` copies the minimal rebuild kit (`server/delphikit.py`): `dcc32` / `dcc64` with
+their `dccNNN` libraries, `borlndmm`, `rlink32`, `lnkdfmNNN` (units with a form file fail with E2161 without it), `cgrc`,
+the compiler `.cfg` files rewritten to name the kit, `bin*\*.bpl`, `lib\win32|win64\release`, `Redist\win32|win64`, and
+the resource files under `source` that `delphimega.resource_folders` lists. The libraries are found by name pattern.
+`delphi-sigs build <kit>` works on it like on the install, so the install can be removed.
+
+**Oracle measurement** (`airlock delphi-sigs oracle <binary> <map> [--own DIR]`, `server/delphioracle.py`). Method: a
+Delphi program built with `-GD` has a map that gives the true name and bounds of every routine, so the map is the truth
+and the installed database is the subject. The routines of the map are named with the same matcher the analysis uses
+(`idr.match_all` with the exact-compiler database). A routine is *library* when its module is not one of the program's
+own units (`.dcu` files in `--own`, default next to the binary, plus the program name); only library routines are
+scored, since no database can know the program's own code. Each is counted `right` (a returned name equals a map name,
+generic arguments ignored: `TList<X>.Add` equals `TList<T>.Add`), `exact` (the same without that tolerance), `wrong`
+(a name that differs) or `none`, over all routines and over those of at least 24 bytes (the short ones carry too few
+compared bytes to be named by code). Wrong names are code aliases: different routines with the same machine code.
 
 **[verified]** Measured on the own test program (map as truth; routines = map publics that are not type tables or
 thunks): named with a right name, 32-bit 58.0% -> 70.9% of all routines and 77.0% -> 94.6% of the routines of at least 24
