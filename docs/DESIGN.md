@@ -966,29 +966,50 @@ clusters), so they and the functions that only they call leave the unclassified 
 `idr_kb_dir` nothing is computed. Knowledge bases exist for Delphi 2 to XE4 (32-bit) and system units
 only for XE2 to XE4 (64-bit); newer compilers match in part (the code of the RTL changed).
 
-**Signature databases from a local Delphi install** (`server/delphisigs.py`, optional). The IDR files end
-at XE4; newer compilers match in part. A Delphi install ships the RTL and VCL as packages
-(`Redist\win32\*.bpl`, `Redist\win64\*.bpl`), and each package exports every interface routine under its
-C++ Builder style mangled name (`@System@Classes@TList@Add$qqrpv`). `airlock delphi-sigs build <install>`
-reads the export table itself (pefile stops at 8192 names), demangles the names (`System.@LStrAsg`,
-`System.Classes.TList.Add`; `$bctr` is `Create`, template arguments are left out: `TList<T>.Add`; exports
-without a parameter list are type info, class tables or strings and are skipped) and masks the position
-dependent bytes of each routine: relocation entries (`HIGHLOW`, `DIR64`), `rel32` operands of
-`call` / `jmp` / `jcc` whose target is outside the routine, and RIP-relative `disp32` outside the routine
-in 64-bit code. **Decision: capstone** (BSD-3-Clause, optional `sigs` extra, needed by the build only) decodes
-the instructions; a hand-written length decoder would need the x87, SSE and VEX tables. **Bounds:** a linear
-sweep from the export to the first `ret` or unconditional jump that no earlier forward branch reaches past,
-at most 2048 bytes kept; a jump table in the code stream is followed through its relocated slots; a routine
-that cannot be swept to its end keeps the swept prefix (a prefix still matches the start of the static
-copy). **[verified]** with Delphi 10 Seattle Update 1: a program built with `dcc32 -GD` and no runtime
-packages (map file as oracle) is named by the database for 99% of its routines that the packages export;
-the other bytes differ only in the masked operands. The database is derived data of a licensed install,
-cached outside the repo as `<compiler>-<bits>.sigdb` in `delphi_sigdb_dir` (null: `sigdb\` in the data
-directory), zlib packed, and is never committed. It loads into the same matcher as an IDR file. Selection:
-the database of the binary's exact compiler version names the functions first; the IDR file (or a database
-of another version) that matches most then names the rest, so a name from the database wins. `IDR_VERSION`
-2 makes projects compute again on open. Routines the packages do not export (private helpers, nested
-routines, generic instances nobody exports) stay unnamed. `airlock doctor` lists the databases.
+**Signature databases from a local Delphi install** (`server/delphisigs.py`, `server/itanium.py`, optional). The IDR
+files end at XE4; newer compilers match in part. A Delphi install ships the RTL and VCL as packages
+(`Redist\win32\*.bpl`, `Redist\win64\*.bpl`). `airlock delphi-sigs build <install>` reads the export table itself
+(pefile stops at 8192 names), turns each export into a name (`System.@LStrAsg`, `System.Classes.TList.Add`;
+`Create` / `Destroy` for constructors and destructors, `ClassCreate` / `ClassDestroy` for class constructors,
+`op_Implicit` for operators; template arguments are left out: `TList<T>.Add`) and masks the position dependent bytes
+of each routine: relocation entries (`HIGHLOW`, `DIR64`), `rel32` operands of `call` / `jmp` / `jcc` whose target is
+outside the routine, and RIP-relative `disp32` outside the routine in 64-bit code. **Decision: capstone**
+(BSD-3-Clause, optional `sigs` extra, needed by the build only) decodes the instructions; a hand-written length
+decoder would need the x87, SSE and VEX tables.
+
+*32-bit packages* export C++ Builder style names (`@System@Classes@TList@Add$qqrpv`). Exports without a parameter
+list are type info, class tables or strings and are skipped. **Bounds:** a linear sweep from the export to the first
+`ret` or unconditional jump that no earlier forward branch reaches past, at most 2048 bytes kept; a jump table in the
+code stream is followed through its relocated slots; a routine that cannot be swept to its end keeps the swept prefix
+(a prefix still matches the start of the static copy).
+
+*64-bit packages* export Itanium C++ ABI names (`_ZN6System7Classes5TList3AddEPv`; `_ZTV` / `_ZTR` are class and type
+info and are skipped). `server/itanium.py` parses the nested name, the template arguments (`I...E`, literals
+`Lt0E`) and the substitutions (`S_`, `S0_`), because the arguments can refer to the prefixes of the name; the
+parameter types are not kept. Delphi extras: `v04cctr` is a class constructor, `v18explicit` / `cv` are conversion
+operators (a target type follows inside the name), `_op_Add` is `op_Add`, and a unit level `_LStrAsg` is
+`@LStrAsg` as in the 32-bit style. Checked on all 114 Win64 packages of Seattle: every `_ZN` export parses (176,000 names, 0 failures). **The bounds come from `.pdata`**
+(`RUNTIME_FUNCTION` begin / end / unwind info): an export that starts a `.pdata` routine is a routine with its exact
+size, so no sweep is needed. Unwind info that is chained to a parent (`UNW_FLAG_CHAININFO`) is a piece of the parent:
+a piece that starts where the routine ends extends it, a piece elsewhere (cold code) is ignored. The table is not
+sorted. A few leaf routines have no unwind info (zlib); an export without `.pdata` entry that has a parameter list is
+swept as in 32-bit, one without a parameter list is data and skipped.
+
+**[verified]** with Delphi 10 Seattle Update 1: a program built with `dcc32 -B -GD` / `dcc64 -B -GD` and no runtime
+packages (map file as oracle; the Win64 map lists the same routines) is named by the database. Over the routines whose
+name the packages export and that are not generic instances: 32-bit 93.1%, 64-bit 89.6% named with the right name,
+and 98.4% / 99.0% when the matcher's `MAX_COPIES` rule is lifted (the rest is dropped because the same code shape
+occurs in more than 3 functions). Generic instances for types the RTL never instantiates (`TList<TFoo>`) have other
+code and are not found. Wrong names (2 to 3% of the matched functions) are routines with identical code
+(`Exception.Create` and `CreateFmt`). The database is derived data of a licensed install, cached outside the repo as
+`<compiler>-<bits>.sigdb` in `delphi_sigdb_dir` (null: `sigdb\` in the data directory), zlib packed, and is never
+committed. It loads into the same matcher as an IDR file. Selection: the database of the binary's exact compiler
+version names the functions first; the IDR file (or a database of another version) that matches most then names the
+rest, so a name from the database wins. `IDR_VERSION` 3 makes projects compute again on open (version 2 databases stay
+loadable: the file layout did not change). Routines the packages do not export (private helpers, nested routines,
+generic instances nobody exports) stay unnamed: 32-bit exports cover about 60% of the routines of a static program,
+64-bit about 79%. The `.jdbg` files next to the 32-bit packages hold them (see HANDOVER), but the name table is
+compressed and the reader is not written. `airlock doctor` lists the databases.
 
 ### dotnet
 

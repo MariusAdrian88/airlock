@@ -20,9 +20,12 @@ COMPILER = b"Embarcadero Delphi for Win32 compiler version 30.0 (22858)\0"
 # ── a synthetic package: .text + export directory + relocations ──────────────
 
 def make_bpl(path: Path, routines: list[tuple[str, bytes]], relocs: list[int] = (), psize: int = 4,
-             extra_exports: list[tuple[str, int]] = (), tail: bytes = b"") -> dict[str, int]:
+             extra_exports: list[tuple[str, int]] = (), tail: bytes = b"", pdata: set[str] | None = None,
+             pdata_extra: list[tuple[int, int, int]] = ()) -> dict[str, int]:
     """Write a PE with ``routines`` (mangled name, code) in .text, 16-byte aligned, one export each.
-    ``relocs`` are offsets inside .text of relocated 4/8 byte slots. Returns {name: rva}."""
+    ``relocs`` are offsets inside .text of relocated 4/8 byte slots. ``pdata``: names of the routines that get
+    a ``RUNTIME_FUNCTION`` (64-bit; exact bounds), ``pdata_extra`` more raw (begin, end, unwind) entries.
+    Returns {name: rva}."""
     text = bytearray()
     where = {}
     for name, code in routines:
@@ -55,8 +58,16 @@ def make_bpl(path: Path, routines: list[tuple[str, bytes]], relocs: list[int] = 
         reloc += struct.pack("<II", 0x1000, 8 + len(body_) + (len(body_) % 4)) + body_ + b"\0" * (len(body_) % 4)
     secs = [(b".text", 0x1000, bytes(text), 0x60000020), (b".edata", 0x2000, bytes(edata), 0x40000040),
             (b".reloc", 0x3000, bytes(reloc) or b"\0" * 8, 0x42000040)]
+    pd = bytearray()
+    if pdata is not None:
+        lens = dict(routines)
+        ents = [(where[n], where[n] + len(lens[n]), 0x5000) for n, _c in routines if n in pdata]
+        ents = sorted(ents + list(pdata_extra), reverse=True)           # the table need not be sorted
+        pd = bytearray(b"".join(struct.pack("<III", *e) for e in ents))
+        secs.append((b".pdata", 0x4000, bytes(pd), 0x40000040))
+        secs.append((b".xdata", 0x5000, bytes([1, 0, 0, 0]) + b"\0" * 12, 0x40000040))
     opt_size = 0xE0 if psize == 4 else 0xF0
-    hdr = bytearray(0x200)
+    hdr = bytearray(0x400)
     hdr[0:2] = b"MZ"
     struct.pack_into("<I", hdr, 0x3C, 0x40)
     hdr[0x40:0x44] = b"PE\0\0"
@@ -72,19 +83,21 @@ def make_bpl(path: Path, routines: list[tuple[str, bytes]], relocs: list[int] = 
         struct.pack_into("<Q", hdr, o + 24, base)
         dd = o + 112
     struct.pack_into("<II", hdr, o + 32, 0x1000, 0x200)             # SectionAlignment, FileAlignment
-    struct.pack_into("<II", hdr, o + 56, 0x4000, 0x200)             # SizeOfImage, SizeOfHeaders
+    struct.pack_into("<II", hdr, o + 56, 0x6000, 0x400)             # SizeOfImage, SizeOfHeaders
     struct.pack_into("<I", hdr, dd - 4, 16)                         # NumberOfRvaAndSizes
     struct.pack_into("<II", hdr, dd, 0x2000, len(edata))            # export directory
     struct.pack_into("<II", hdr, dd + 5 * 8, 0x3000, len(reloc))    # base relocations
+    if pd:
+        struct.pack_into("<II", hdr, dd + 3 * 8, 0x4000, len(pd))   # exception directory
     sh = 0x44 + 20 + opt_size
     raw = bytearray(hdr)
-    pos = 0x200
+    pos = 0x400
     for i, (nm, va, data, ch) in enumerate(secs):
         padded = data + b"\0" * (-len(data) % 0x200)
         struct.pack_into("<8sIIIIIIHHI", hdr, sh + 40 * i, nm, len(data), va, len(padded), pos, 0, 0, 0, 0, ch)
         pos += len(padded)
         raw += padded
-    raw[:0x200] = hdr
+    raw[:0x400] = hdr
     path.write_bytes(bytes(raw) + tail)
     return where
 
@@ -119,9 +132,9 @@ def table_routine(call_rel: int, ja_rel_target_gap: int = 0) -> tuple[bytes, lis
     return code, [15, 19, 23], off_d + len(dflt)
 
 
-def sweep_one(tmp_path, routines, relocs=(), psize=4):
+def sweep_one(tmp_path, routines, relocs=(), psize=4, pdata=None):
     capstone = pytest.importorskip("capstone")                              # noqa: F841
-    make_bpl(tmp_path / "t.bpl", routines, list(relocs), psize)
+    make_bpl(tmp_path / "t.bpl", routines, list(relocs), psize, pdata=pdata)
     _ps, recs = delphisigs.scan_bpl(str(tmp_path / "t.bpl"))
     return {n: (d, m) for n, d, m in recs}
 
@@ -192,11 +205,104 @@ def test_sixty_four_bit_masks_rip_relative_and_qwords(tmp_path):
     code = (b"\x48\x83\xec\x28" + mov_out + lea_in + b"\x90\x90\x90" + movabs
             + b"\xe8" + i32(0x300) + b"\x48\x83\xc4\x28\xc3")
     rel = [23]
-    out = sweep_one(tmp_path, [("@Unit@Wide$qqrv", code)], rel, psize=8)
+    out = sweep_one(tmp_path, [("_ZN4Unit4WideEv", code)], rel, psize=8, pdata={"_ZN4Unit4WideEv"})
     dump, mask = out["Unit.Wide"]
     masked = {i for i, m in enumerate(mask) if m}
     want = set(range(7, 11)) | set(range(23, 31)) | set(range(32, 36))        # rip disp, qword, call rel32
     assert masked == want and len(dump) == len(code)
+
+
+# ── Itanium names and .pdata (64-bit packages) ───────────────────────────────
+
+@pytest.mark.parametrize("mangled,want", [
+    ("_ZN6System8_LStrAsgERNS_11AnsiStringTILt0EEES1_", "System.@LStrAsg"),
+    ("_ZN6System7Classes5TList3AddEPv", "System.Classes.TList.Add"),
+    ("_ZN6System7Classes10TComponentC3EPNS0_10TComponentE", "System.Classes.TComponent.Create"),
+    ("_ZN6System7Classes10TComponentC1Ev", "System.Classes.TComponent.Create"),
+    ("_ZN6System7Classes10TComponentD0Ev", "System.Classes.TComponent.Destroy"),
+    ("_ZN6System7Classes10TComponentD2Ev", "System.Classes.TComponent.Destroy"),
+    ("_ZN6System11Netencoding12TNetEncodingv04cctrEv", "System.Netencoding.TNetEncoding.ClassCreate"),
+    ("_ZN6System11Netencoding12TNetEncodingv04cdtrEv", "System.Netencoding.TNetEncoding.ClassDestroy"),
+    ("_ZN6System8Generics11Collections8TList__1IPNS_7Classes10TComponentEE3AddES4_",
+     "System.Generics.Collections.TList<T>.Add"),
+    ("_ZN6System8Generics11Collections14TDictionary__2INS_13UnicodeStringEPNS_7Classes10TComponentEE3AddERKS3_S6_",
+     "System.Generics.Collections.TDictionary<T>.Add"),
+    ("_ZN6System8Generics11Collections8TList__1IiE11TEnumerator8MoveNextEv",
+     "System.Generics.Collections.TList<T>.TEnumerator.MoveNext"),
+    ("_ZN6System4Math7Vectors9TVector3DcvNS1_8TPoint3DEEv", "System.Math.Vectors.TVector3D.op_Implicit"),
+    ("_ZN6System4Math7Vectors7TVectorv18explicitNS_5Types7TPointFEEv", "System.Math.Vectors.TVector.op_Explicit"),
+    ("_ZN6System5Types6TPoint12_op_AdditionERKS1_S3_", "System.Types.TPoint.op_Addition"),
+    ("_ZN6System8Variants11_VarFromIntEPNS_7VariantEi", "System.Variants.@VarFromInt"),
+    ("_ZN6System7TObject7_AddRefEv", "System.TObject._AddRef"),
+    ("_ZN3Vcl5Forms13GetParentFormEPNS_8Controls8TControlEb", "Vcl.Forms.GetParentForm"),
+    ("_ZN6System4Json7Writers11TJsonWriterC2ENS_7Classes7TStreamEb", "System.Json.Writers.TJsonWriter.Create"),
+    ("_Z3Fooi", "Foo"),
+])
+def test_demangle_itanium(mangled, want):
+    from airlock.server import itanium
+    assert itanium.demangle(mangled) == want
+
+
+@pytest.mark.parametrize("mangled", ["_ZTVN6System7Classes11TStringListE", "_ZTRN6System5Types6TPointE", "Finalize",
+                                     "@System@Classes@TList@Add$qqrpv", "_ZN6System3", "_ZNE", "_ZN6System5TList",
+                                     "_ZN6SystemE", "_ZN99System3AddEv", "", "_Z", "_ZN6System8Generics8TList__1I"])
+def test_itanium_rejects_what_is_not_a_routine(mangled):
+    from airlock.server import itanium
+    assert itanium.demangle(mangled, need_params=True) is None
+
+
+def test_itanium_data_names_have_no_parameter_list():
+    from airlock.server import itanium
+    data = "_ZN6System10Jsonconsts15_SFieldExpectedE"
+    assert itanium.demangle(data) == "System.Jsonconsts._SFieldExpected"      # resource string: not renamed
+    assert itanium.demangle(data, need_params=True) is None
+    assert itanium.demangle("_ZN6System10Jsonconsts12FinalizationEv", need_params=True) == \
+        "System.Jsonconsts.Finalization"
+
+
+def _pdata_img(entries: list[tuple[int, int, int]], infos: dict[int, bytes]) -> delphisigs._Pe:
+    data = bytearray(0x4000)
+    for i, e in enumerate(entries):
+        struct.pack_into("<III", data, 0x100 + 12 * i, *e)
+    for off, blob in infos.items():
+        data[off:off + len(blob)] = blob
+    return delphisigs._Pe(bytes(data), 8, BASE64, [(0, 0x4000, 0, 0x4000, False)], {}, [])
+
+
+def test_pdata_routine_bounds_chains_and_unsorted_tables():
+    plain = bytes([1, 0, 0, 0])
+
+    def chain(parent):
+        return bytes([0x21, 0, 0, 0]) + struct.pack("<III", *parent)
+
+    entries = [
+        (0x3000, 0x3040, 0x2000),                    # a plain routine
+        (0x1000, 0x1020, 0x2000),                    # routine with pieces: contiguous, then contiguous
+        (0x1020, 0x1050, 0x2010),
+        (0x1050, 0x1060, 0x2030),                    # a piece chained to the first piece
+        (0x2800, 0x2810, 0x2020),                    # a cold piece elsewhere: ignored
+    ]
+    infos = {0x2000: plain, 0x2010: chain((0x1000, 0x1020, 0x2000)), 0x2020: chain((0x1000, 0x1020, 0x2000)),
+             0x2030: chain((0x1020, 0x1050, 0x2010))}
+    img = _pdata_img(sorted(entries, reverse=True), infos)
+    assert delphisigs.read_pdata(img, 0x100, 12 * len(entries)) == {0x1000: 0x1060, 0x3000: 0x3040}
+    assert delphisigs.read_pdata(img, 0, 0) == {} and delphisigs.read_pdata(img, 0x100000, 12) == {}
+
+
+def test_pdata_gives_exact_bounds_and_the_names_of_routines(tmp_path):
+    ret_early = (b"\x48\x83\xec\x28" + b"\x84\xc9\x74\x08" + b"\xe8" + i32(0x400) + b"\x48\x83\xc4\x28\xc3"
+                 + b"\xb8\x01\x00\x00\x00\x48\x83\xc4\x28\xc3")      # a ret in the middle, the jz target after it
+    leaf = b"\x8b\x01\x03\x41\x04\xc3"                                 # no unwind info: found by the sweep
+    junk = b"\x90\x90\x90\x90\x90\x90"
+    names = {"_ZN4Unit5EarlyEv": ret_early, "_ZN4Unit4LeafEPi": leaf, "_ZN4Unit5Data1E": junk,
+             "_ZN4Unit7NoPdataEv": junk}
+    out = sweep_one(tmp_path, list(names.items()), psize=8, pdata={"_ZN4Unit5EarlyEv", "_ZN4Unit5Data1E"})
+    assert len(out["Unit.Early"][0]) == len(ret_early)                          # past the first ret
+    assert out["Unit.Leaf"][0] == leaf                                            # parameter list: a routine
+    assert "Unit.NoPdata" in out                                                  # a routine without unwind info
+    assert "Unit.Data1" in out                                                    # at a .pdata start: named
+    out2 = sweep_one(tmp_path, [("_ZN4Unit5Data2E", junk)], psize=8, pdata=set())
+    assert out2 == {}                                                             # no params, no unwind info: data
 
 
 # ── file format and loading ──────────────────────────────────────────────────

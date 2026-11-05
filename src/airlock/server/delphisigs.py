@@ -1,8 +1,9 @@
 """Exact-version Delphi RTL / VCL signatures built from the runtime packages of a local Delphi install
 (DESIGN 11 "Delphi", "Signature databases").
 
-A Delphi install ships the RTL and VCL as packages (``rtl230.bpl``, ``vcl230.bpl``, ...). A package exports
-every interface routine under its C++ Builder style mangled name (``@System@Classes@TList@Add$qqrpv``).
+A Delphi install ships the RTL and VCL as packages (``rtl230.bpl``, ``vcl230.bpl``, ...). A 32-bit package
+exports every interface routine under its C++ Builder style mangled name (``@System@Classes@TList@Add$qqrpv``),
+a 64-bit package under an Itanium ABI name (``_ZN6System7Classes5TList3AddEPv``, see ``itanium``).
 For each exported routine this module takes the code bytes and masks what depends on the position:
 
 * relocation table entries (32-bit absolute addresses, 64-bit ``DIR64``),
@@ -11,7 +12,8 @@ For each exported routine this module takes the code bytes and masks what depend
 
 Code that is linked statically into a program is the same machine code with the same operands changed, so
 the masked bytes match it (``idr.match_all`` does the matching; a database loads into an ``idr.Kb``).
-Routine bounds: the next export, or earlier at the end found by a linear sweep (a ``ret`` or an
+Routine bounds: in 64-bit packages the ``.pdata`` table (exact start and size; chained pieces are joined). In
+32-bit packages the next export, or earlier at the end found by a linear sweep (a ``ret`` or an
 unconditional jump once no forward branch reaches past it). A routine that cannot be swept to its end (a
 jump table in the code stream that is not relocated, undecodable bytes) keeps the swept prefix; a prefix
 still matches the start of the statically linked routine.
@@ -34,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from airlock.server import idr
+from airlock.server import idr, itanium
 
 log = logging.getLogger("airlock")
 
@@ -136,6 +138,7 @@ class _Pe:
     relocs: dict[int, int]                              # rva -> bytes covered (4 or 8)
     exports: list[tuple[int, str]]                      # (rva, mangled name)
     reloc_rvas: list[int] | None = None                 # sorted keys of ``relocs``
+    funcs: dict[int, int] | None = None                 # 64-bit: .pdata routine start rva -> end rva
 
 
 def _read_pe(path: Path) -> _Pe:
@@ -155,7 +158,41 @@ def _read_pe(path: Path) -> _Pe:
                 relocs[e.rva] = 8
     img = _Pe(data, psize, pe.OPTIONAL_HEADER.ImageBase, secs, relocs, [])
     img.exports = _exports(pe, img)
+    if psize == 8:
+        d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]                 # IMAGE_DIRECTORY_ENTRY_EXCEPTION
+        img.funcs = read_pdata(img, d.VirtualAddress, d.Size)
     return img
+
+
+def read_pdata(img: _Pe, rva: int, size: int) -> dict[int, int]:
+    """Routines of a 64-bit image from the exception directory (``RUNTIME_FUNCTION``: begin, end, unwind
+    info). Returns {start rva: end rva}. An entry whose unwind info is chained to a parent is a piece of the
+    parent: a piece that starts where the routine ends extends it, any other piece (cold code elsewhere) is
+    ignored. The table is not necessarily sorted."""
+    o = _rva_off(img, rva) if rva and size else None
+    if o is None:
+        return {}
+    n = min(size, len(img.data) - o) // 12
+    ents = sorted(struct.unpack_from("<III", img.data, o + 12 * i) for i in range(n))
+    parent: dict[int, int] = {}                  # begin of a chained piece -> begin of its parent
+    for b, _e, u in ents:
+        uo = _rva_off(img, u & ~1)
+        if uo is None or uo + 4 > len(img.data) or not (img.data[uo] >> 3) & 4:
+            continue
+        po = uo + 4 + ((img.data[uo + 2] + 1) & ~1) * 2
+        if po + 4 <= len(img.data):
+            parent[b] = struct.unpack_from("<I", img.data, po)[0]
+    ends = {b: e for b, e, _u in ents}
+    funcs = {b: e for b, e, _u in ents if b not in parent and e > b}
+    for b, _e, _u in ents:                       # sorted: a piece follows the entry it extends
+        if b not in parent:
+            continue
+        root, hops = parent[b], 0
+        while root in parent and hops < 8:
+            root, hops = parent[root], hops + 1
+        if root in funcs and funcs[root] == b:
+            funcs[root] = max(funcs[root], ends[b])
+    return funcs
 
 
 def _rva_off(img: _Pe, rva: int) -> int | None:
@@ -265,17 +302,39 @@ def _direct_target(ops: str) -> int | None:
         return None
 
 
-def _scan_routine(md, img: _Pe, rva: int, limit: int) -> tuple[bytes, bytes] | None:
+def _decode_exact(md, code: bytes, rva: int) -> list[tuple[int, int, str, str]]:
+    """Linear decode of known routine bytes; an undecodable byte (data in the code stream) is skipped."""
+    out: list[tuple[int, int, str, str]] = []
+    pos, n = 0, len(code)
+    while pos < n:
+        last = pos
+        for ins in md.disasm(code[pos:], rva + pos):
+            out.append((ins.address - rva, ins.size, ins.mnemonic, ins.op_str))
+            last = ins.address - rva + ins.size
+        pos = last + 1
+    return out
+
+
+def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None) -> tuple[bytes, bytes] | None:
+    """Dump and mask of the routine at ``rva``. ``exact``: its known size (``.pdata``); otherwise the end is
+    found by a sweep, at most ``limit`` bytes."""
     off = _rva_off(img, rva)
     if off is None:
         return None
-    code = img.data[off:off + min(limit, MAX_SWEEP)]
-    if len(code) < MIN_LEN:
-        return None
-    ins_list, end = _sweep(md, img, code, rva)
-    if end < MIN_LEN:
-        return None
-    n = min(end, MAX_LEN)
+    if exact is not None:
+        end = exact
+        code = img.data[off:off + min(end, MAX_LEN + 16)]
+        if end < MIN_LEN or len(code) < MIN_LEN:
+            return None
+        ins_list = _decode_exact(md, code, rva)
+    else:
+        code = img.data[off:off + min(limit, MAX_SWEEP)]
+        if len(code) < MIN_LEN:
+            return None
+        ins_list, end = _sweep(md, img, code, rva)
+        if end < MIN_LEN:
+            return None
+    n = min(end, MAX_LEN, len(code))
     dump = bytearray(code[:n])
     mask = bytearray(n)
     for off_i, size, mn, ops in ins_list:
@@ -295,8 +354,9 @@ def _scan_routine(md, img: _Pe, rva: int, limit: int) -> tuple[bytes, bytes] | N
             _mask_rip(md, b, rva + off_i, rva, end, mask, off_i, n)
     if img.reloc_rvas is None:
         img.reloc_rvas = sorted(img.relocs)
-    i0 = bisect.bisect_left(img.reloc_rvas, rva - 7)
-    for r in img.reloc_rvas[i0:]:
+    rr = img.reloc_rvas
+    for j in range(bisect.bisect_left(rr, rva - 7), len(rr)):
+        r = rr[j]
         if r >= rva + n:
             break
         for k in range(img.relocs[r]):
@@ -340,10 +400,19 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
     md.detail = True
     md.skipdata = False
     xsecs = [(va, va + max(vs, rs)) for va, vs, _r, rs, x in img.sections if x]
-    bounds = sorted({r for r, _n in img.exports} | {e for _s, e in xsecs})
+    funcs = img.funcs
+    starts = {r for r, _n in img.exports} | {e for _s, e in xsecs}
+    if funcs:
+        starts |= set(funcs)
+    bounds = sorted(starts)
     seen: dict[int, list[str]] = {}
     for rva, mangled in img.exports:
-        name = demangle(mangled)
+        if funcs is None:
+            name = demangle(mangled)
+        elif rva in funcs:
+            name = itanium.demangle(mangled)
+        else:                                   # 64-bit routine without unwind info (a leaf routine)
+            name = itanium.demangle(mangled, need_params=True)
         if name is None or not any(s <= rva < e for s, e in xsecs):
             continue
         seen.setdefault(rva, []).append(name)
@@ -351,7 +420,8 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
     for rva, names in seen.items():
         i = bisect.bisect_right(bounds, rva)
         limit = (bounds[i] if i < len(bounds) else rva + MAX_SWEEP) - rva
-        got = _scan_routine(md, img, rva, limit)
+        exact = funcs[rva] - rva if funcs and rva in funcs else None
+        got = _scan_routine(md, img, rva, limit, exact)
         if got is None:
             continue
         for nm in sorted(set(names)):
@@ -490,6 +560,6 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{comp}-{psize * 8}.sigdb"
     write_sigdb(path, comp, psize, records,
-                {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d")})
+                {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d"), "format": 2})
     return BuildResult(path, comp, psize, done, len({(d, m) for _n, d, m in records}), len(records),
                        time.time() - t0)

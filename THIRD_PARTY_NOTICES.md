@@ -18,6 +18,8 @@ copyright notice and license, reproduced here when the code lands.
 | Project | License | Planned use |
 |---|---|---|
 | [DelphiReSym](https://github.com/WenzWenzWenz/DelphiReSym) | BSD-3-Clause | format reference for the Delphi metadata parser (M6); no code copied |
+| [JCL](https://github.com/project-jedi/jcl) (`.jdbg` debug info) | MPL-1.1 | format reference only; the layout of the files next to the Delphi packages was studied for a reader that is not part of airlock; no code copied |
+| Itanium C++ ABI | public specification | format reference for `server/itanium.py` (written from the description) |
 | [IDR](https://github.com/crypto2011/IDR) and [IDR64](https://github.com/crypto2011/IDR64) | MIT | optional knowledge bases (`kb*.bin`) that name Delphi RTL / VCL functions; file format reference only, the files are supplied by the user and never committed |
 | [REA](https://github.com/morluto/rea) | MIT | design ideas: selectors, artifact identity, analysis profiles, bounded output |
 | [IDA-Ghidra-bridge](https://github.com/oscarsantanaarias/IDA-Ghidra-bridge) | MIT | MSVC RTTI / vtable / xref handler logic (M2) |

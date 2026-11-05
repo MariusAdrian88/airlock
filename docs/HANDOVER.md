@@ -211,16 +211,33 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   number of unnamed functions change. Open: files for newer compilers (Delphi 10 Seattle and later only match in
   part, 64-bit much less), no 64-bit full KB (only system units), fixup
   names (calls between procs) are not used to confirm a match.
-- Signature databases (`server/delphisigs.py`, `tests/test_delphisigs.py`, DESIGN §11 "Delphi"): exact-version
-  names built from the packages of a local Delphi (`airlock delphi-sigs build <install folder>`, `list`;
-  needs capstone, extra `sigs`; config key `delphi_sigdb_dir`, default `<data dir>\sigdb`; files
+- Signature databases (`server/delphisigs.py`, `server/itanium.py`, `tests/test_delphisigs.py`, DESIGN §11 "Delphi"):
+  exact-version names built from the packages of a local Delphi (`airlock delphi-sigs build <install folder>`,
+  `list`; needs capstone, extra `sigs`; config key `delphi_sigdb_dir`, default `<data dir>\sigdb`; files
   `<compiler>-<32|64>.sigdb`). Derived from licensed files: never commit them. `idr.kb_files(root, psize,
   sig_dir)` lists them after the IDR files; `idr._pick` runs the exact-compiler database first, then the best
-  IDR file on the functions left (merged, the database wins). `IDR_VERSION` 2. 32-bit Seattle Update 1 built
-  (119 packages, about 1 minute, 5 MB). 64-bit: the install has no Win64 platform; add "Windows 64-bit" in
-  the installer feature list (Modify mode; Delphi > Windows 64-bit), then rerun the build (the x64 masking is only tested on
-  synthetic code). Open: routines the packages do not export (use `.jdbg` JCL debug info next to the BPLs, or a
-  `-GD` map of a program that uses every unit), signatures for FMX-only or older installs.
+  IDR file on the functions left (merged, the database wins). `IDR_VERSION` 3.
+  32-bit: export names are Borland style (`@Unit@Class@Name$q...`), bounds by a linear sweep. 64-bit: exports are
+  Itanium names (`_ZN6System7Classes5TList3AddEPv`, parsed by `itanium.demangle`), bounds from `.pdata`
+  (`delphisigs.read_pdata`, chained unwind info handled, unsorted table); leaf routines without unwind info are
+  swept. Built from Seattle Update 1: 32-bit 123 packages, 129,545 names, 5.6 MB, 8 s with 8 jobs; 64-bit
+  (`Redist\win64`, 114 packages) 118,370 names, 6.5 MB, 9 s. The build was 65 s before a quadratic slice of the
+  relocation list was removed.
+  Oracle (not in the repo): a program with most RTL and VCL units built with `dcc32` / `dcc64 -B -GD`, map file
+  as truth, routines at map publics. Named with the right name, routines whose name the packages export and that are
+  not generic instances: 32-bit 93.1% (98.4% without the `MAX_COPIES` drop), 64-bit 89.6% (99.0%). Generic
+  instances of the RTL's own types are found (`TList<T>` shapes); instances for other types are not. Wrong names are
+  2 to 3% of the matched routines and are code aliases. Exported names cover 62% (32-bit) and 79% (64-bit) of the
+  routines of the program, so 36% / 43% of all routines are named.
+  Open: routines the packages do not export. The `.jdbg` files next to the 32-bit packages (`bin\rtl230.jdbg`
+  and 314 more; none exist for Win64) hold them. **Not usable yet:** the container is clear (header `JDBG`,
+  version 1, offsets of units, source names, symbols, line numbers and words; LEB128 style integers with 32-bit
+  wraparound for negatives; symbols are triples of deltas: address, first word, second word; words are `0x01`
+  + text xor `0xAA` + `0x00`), but about 97% of the symbol names are not plain words. They are short binary
+  records (8 to 20 bytes for a 10 to 25 character name) that look like lists of references into the text of
+  other words. I could not decode them without the JCL source or a known pair of name and record, and no
+  oracle (a `.map` of the package) exists. Other ways: a `-GD` map of a program that uses every unit (no
+  packages needed, gives the private routines of the units it links), or reading the `.dcu` files.
 - Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file), published
   properties, dynamic/message method tables, interface tables, virtual method names, renaming.
 
