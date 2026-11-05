@@ -28,6 +28,7 @@ class ServerContext:
         self.indexer = Indexer(self.config, self.worker)
         self._bind_lock = threading.Lock()
         self._maps_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()   # one derivation + map rewrite at a time
         self._maps_pending: set[str] = set()
         self._maps_thread: threading.Thread | None = None
         self.indexer.ready_hooks.append(self._on_ready)
@@ -57,6 +58,10 @@ class ServerContext:
 
     def refresh_maps(self, project: str) -> None:
         """Derive the feature index and rewrite both PROJECT.md files now (this thread)."""
+        with self._refresh_lock:
+            self._refresh_maps(project)
+
+    def _refresh_maps(self, project: str) -> None:
         from airlock.server import features, projectmap
 
         st = self.indexer.store(project)

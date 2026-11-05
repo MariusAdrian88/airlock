@@ -110,9 +110,8 @@ def version_blob() -> bytes:
     return pad(block("VS_VERSION_INFO", ffi, 52, 0, pad(sfi, 4)), 4)
 
 
-def make_rsrc_pe(path: Path, res: dict[tuple[int, int | str, int], bytes]) -> None:
-    """A PE32 file whose .rsrc holds ``res``: (type, id or name, lang) -> data."""
-    sect_rva, raw = 0x1000, 0x400
+def rsrc_blob(res: dict[tuple[int, int | str, int], bytes], sect_rva: int = 0x1000) -> bytes:
+    """The bytes of a .rsrc section placed at ``sect_rva``: (type, id or name, lang) -> data."""
     types: dict[int, dict[int | str, dict[int, bytes]]] = {}
     for (t, i, lg), data in res.items():
         types.setdefault(t, {}).setdefault(i, {})[lg] = data
@@ -177,7 +176,13 @@ def make_rsrc_pe(path: Path, res: dict[tuple[int, int | str, int], bytes]) -> No
         struct.pack_into("<H", out, off, len(k))
         out[off + 2:off + 2 + 2 * len(k)] = k.encode("utf-16-le")
     del dpos, blob, dirs, strings_off
-    rsrc = bytes(out) + bytes(data_chunks)
+    return bytes(out) + bytes(data_chunks)
+
+
+def make_rsrc_pe(path: Path, res: dict[tuple[int, int | str, int], bytes]) -> None:
+    """A PE32 file whose .rsrc holds ``res``: (type, id or name, lang) -> data."""
+    sect_rva = 0x1000
+    rsrc = rsrc_blob(res, sect_rva)
     vsize = len(rsrc)
     raw = (vsize + 0x1FF) & ~0x1FF
     opt_size = 0xE0

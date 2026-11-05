@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import os
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +115,30 @@ def read_manifest(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"{path}: manifest must be an object")
     return data
+
+
+_tmp_seq = itertools.count()
+
+
+def atomic_write_text(path: Path, text: str, newline: str | None = None) -> None:
+    """Write ``text`` to ``path`` via a temp file that is unique per process, thread and call
+    (two writers never share one), then replace. Windows refuses the replace while a reader has
+    the target open (PermissionError), so retry briefly."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{next(_tmp_seq)}.part")
+    try:
+        tmp.write_text(text, "utf-8", newline=newline)
+        for attempt in range(25):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 24:
+                    raise
+                time.sleep(0.04)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def write_manifest(path: Path, data: dict) -> None:

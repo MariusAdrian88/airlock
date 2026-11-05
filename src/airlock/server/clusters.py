@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from airlock.index.store import Store
-from airlock.projects import ProjectPaths
+from airlock.projects import ProjectPaths, atomic_write_text
 from airlock.server import graph as gr
 from airlock.server.graph import (  # noqa: F401  re-exported: tests and callers use them from here
     CALL_KINDS, HUB_MIN_CALLERS, HUB_PERCENT, CallGraph, _fx, api_category, build_graph, string_categories,
@@ -469,10 +469,7 @@ def _labels_path(pp: ProjectPaths) -> Path:
 
 
 def _atomic_write(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text(json.dumps(data, separators=(",", ":")), "utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(data, separators=(",", ":")))
 
 
 def _dump(cs: ClusterSet) -> dict[str, Any]:

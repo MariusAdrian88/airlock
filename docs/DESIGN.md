@@ -908,7 +908,7 @@ Details settled in M3:
 |---|---|---|
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
 | `vtable` | `target` (class name or address) | slots: index, address, function name |
-| `mfc_message_maps` | `target?` (class) | no class: the classes that have a map; a class: message, control id, handler function per entry (a class without a map of its own shows the nearest base class that has one) |
+| `mfc_message_maps` | `target?` (class) | no class: the classes that have a map (with the class's dialog); a class: message, control id, handler function per entry, `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one) |
 | `qt_metaobjects` | `class?` | signals, slots, properties with method indices → functions |
 
 ### delphi
@@ -944,8 +944,8 @@ MFC message map entries.
 | Tool | Parameters | Returns |
 |---|---|---|
 | `pe_resources` | `type?` | resource inventory: type, id/name, language, size |
-| `dialogs` | `id?` | no id: one line per dialog (caption, control count, size, languages). With id: DLGTEMPLATE/DLGTEMPLATEEX controls with id, class (predefined atoms by name), caption, short style words (`BS_DEFPUSHBUTTON,tabstop,hidden`); handler if a message map links it |
-| `menus` | `id?` | no id: one line per menu (item and popup counts, top-level captions). With id: MENU/MENUEX tree, one line per item: `id=<n> <popup path>`, popups as `<caption> >` |
+| `dialogs` | `id?` | no id: one line per dialog (caption, control count, size, languages). With id: DLGTEMPLATE/DLGTEMPLATEEX controls with id, class (predefined atoms by name), caption, short style words (`BS_DEFPUSHBUTTON,tabstop,hidden`); each control line ends with `-> BN_CLICKED Class::Handler, EN_CHANGE Class::Other` when a message map handles its id (the handlers of the dialog's own class win over other classes that share the id); the dialog line names its class |
+| `menus` | `id?` | no id: one line per menu (item and popup counts, top-level captions). With id: MENU/MENUEX tree, one line per item: `id=<n> <popup path>`, popups as `<caption> >`; an item with handlers ends with `-> Class::OnOpen; update -> Class::OnUpdateOpen` |
 | `string_tables` | `query?`, `limit=50` | id → string (RT_STRING id = (block-1)*16 + index); query is an id or a substring |
 | `version_info` | | product name, version, company, file description |
 
@@ -1518,8 +1518,33 @@ formats is the primary use case of this project.
   slot (same getter) is not listed (the base, an ancestor of the others, is). Maps of classes
   without RTTI are named `anon_<map address>`. The tool `mfc_message_maps <class>` follows the
   recorded base classes to the nearest class with a map.
-- Join `nID` (`msgmap_entry.ctrl_id`, indexed) with dialog templates and menus (`res_control.ctrl_id`,
-  `res_menu_item.item_id`) → "menu item 'Open…' → `CMainFrame::OnFileOpen`" (later step).
+- **Join** (`server/uijoin.py`, computed per binary on demand, nothing stored): `msgmap_entry.ctrl_id ..
+  last_id` (ranges included) x `res_control.ctrl_id` / `res_menu_item.item_id`, `WM_COMMAND` and
+  `WM_NOTIFY` entries only. `ON_COMMAND` (code 0) is the menu command, `UPDATE_COMMAND_UI` (code
+  0xFFFFFFFF) the update handler; for a dialog control every code counts and is named by the control
+  class (`BN_CLICKED`, `EN_CHANGE`, `CBN_SELCHANGE`, `NM_CLICK`, ...). A handler shows as `Class::name`;
+  for an `anon_` class as the function name (or the address). Ids that occur in several menus or
+  dialogs list every place, compact (3, then `+N`). Ids 0, 0xFFFF and -1 (static text) never join.
+- **Dialog of a class**: a class's dialog is the dialog that contains every control id its map handles.
+  At least one of the ids must be specific (not IDOK..IDHELP = 1..9), a class whose ids include menu
+  ids is a frame/view and gets none, and more than 3 candidate dialogs give none. A dialog shows its
+  classes (`dialogs`), a class its dialog (`mfc_message_maps`). Best effort.
+- **Consumers**: `menus`, `dialogs`, `mfc_message_maps` (above); `function` adds `// handler for menu
+  "File > Open..."` or `// handler for button "OK" in dialog 101` (`update handler for ...` for
+  `UPDATE_COMMAND_UI`); the features `ui-menu` and `ui-dialog` get the handlers as strong seeds with
+  evidence `menu "File > Open..."` / `dialog 101 button "OK"` (`FEATURES_VERSION` 4); the project map
+  adds a line `UI: N dialogs, M menus; handlers mapped: ...` under each binary that has resources.
+- **Missing functions** (`server/fnfix.py`, worker op `create_functions`): handlers and vtable slot targets
+  (slots exist only for vtables of RTTI classes) that are no function entry in the index are code proven
+  by a static table that Ghidra's flow never reached. After `cpp.ensure` (when a binary becomes ready, and
+  on project open for old projects) the server sends them to `create_functions`: per address, in one
+  transaction under the write lock, it checks an initialised executable block, skips an address inside
+  another function's body (`inside_function`, never split) or in the middle of an instruction, clears a
+  defined data unit that starts exactly there, disassembles, runs `CreateFunctionCmd`, then sets the
+  conventions of the new functions (`fixups.apply_conventions`) and saves. The server re-reads the binary's
+  functions (upsert: ids and decompiles of unchanged rows stay) and replaces its edges, relinks, and records
+  meta `fnfix_version:<id>` and `fnfix_info:<id>` (counts and reasons). Failed addresses are not retried
+  until `FIX_VERSION` is bumped. **[verified]** on notepad (gap address, existing entry, non-code address).
 
 ### Qt metaobjects
 

@@ -13,6 +13,7 @@ from airlock.config.catalog import CATALOG
 from airlock.config.loader import ConfigError, deep_merge, default_config_text, parse_jsonc, resolve
 from airlock.server import clusters as cl
 from airlock.server import diagrams as dg
+from airlock.server import features as fx
 from airlock.server import graph as gr
 from airlock.server import linking
 from airlock.server import projectmap as pm
@@ -92,7 +93,9 @@ def proj(tmp_path):
                     {"path": "plug.dll", "group": "own_plugin", "sha256": "bb" * 32}]
     P.write_manifest(pp.manifest, man)
     st.set_meta("link_version", str(linking.LINK_VERSION))     # a current project: no relink on bind
+    st.set_meta(fx.FEATURES_VERSION_META, str(fx.FEATURES_VERSION))   # features current: no derive on bind
     assert ctx.bind_session("dirty", pp) is None
+    assert ctx.wait_maps()                      # bind may start a background map refresh: let it finish
     return ctx, pp, st, (app, plug), base
 
 

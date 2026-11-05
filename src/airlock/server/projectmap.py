@@ -12,16 +12,18 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import json5
 
 from airlock.index.store import CODE_SQL, Store
-from airlock.projects import ProjectPaths, read_manifest
+from airlock.projects import ProjectPaths, atomic_write_text, read_manifest
 from airlock.server import clusters as cl
 from airlock.server import features as fx
 from airlock.server.selectors import fmt_addr
+from airlock.server.uijoin import ui_line
 
 log = logging.getLogger("airlock")
 
@@ -153,6 +155,9 @@ def binaries_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[
             f"code {code / _MB:.1f} MB" if code else "code ?",
             f"functions {named}/{total} named" if total else "functions -",
             tool, roles[b.id]]))
+        ui = ui_line(store, b.id)
+        if ui:
+            out.append(f"  {ui}")
     out.append("Detail: outline(binary=<name>), search(query), strings(pattern), list_binaries.")
     return out
 
@@ -411,11 +416,11 @@ def render_clean(pp: ProjectPaths, store: Store | None, man: dict[str, Any] | No
 
 # -- files ----------------------------------------------------------------------------------
 
+_write_lock = threading.Lock()     # one map write at a time per process
+
+
 def _write_atomic(path: Path, lines: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text("\n".join(lines) + "\n", "utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def write_maps(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = None,
@@ -423,11 +428,12 @@ def write_maps(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = None
     """Regenerate dirty\\PROJECT.md and clean\\PROJECT.md; with ``mermaid`` (defaults.mermaid) also the
     charts in dirty\\diagrams\\. Never raises (a map is an extra)."""
     try:
-        man = load_manifest(pp) if man is None else man
-        _write_atomic(pp.dirty / "PROJECT.md", render_dirty(pp, store, man=man))
-        _write_atomic(pp.clean / "PROJECT.md", render_clean(pp, store, man))
-        if mermaid:
-            from airlock.server import diagrams
-            diagrams.write_mermaid_set(pp, store)
+        with _write_lock:
+            man = load_manifest(pp) if man is None else man
+            _write_atomic(pp.dirty / "PROJECT.md", render_dirty(pp, store, man=man))
+            _write_atomic(pp.clean / "PROJECT.md", render_clean(pp, store, man))
+            if mermaid:
+                from airlock.server import diagrams
+                diagrams.write_mermaid_set(pp, store)
     except Exception as e:  # noqa: BLE001
         log.warning("could not write PROJECT.md for %s: %s", pp.name, e)

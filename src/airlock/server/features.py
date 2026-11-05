@@ -20,6 +20,7 @@ from typing import Any
 
 from airlock.index.store import CODE_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
+from airlock.server.uijoin import UiIndex
 
 log = logging.getLogger("airlock")
 
@@ -43,7 +44,7 @@ DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
 MAX_ENTRIES = 1500    # per feature; strong seeds first (strongest evidence), then callers by depth
-FEATURES_VERSION = 3  # 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
+FEATURES_VERSION = 4  # 4: ui-menu / ui-dialog seeds from message map handlers of menu items and dialog controls; 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
 FEATURES_VERSION_META = "features_version"
 DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
@@ -645,6 +646,20 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
                 for k, lab in hits.get(r["string_addr"], ()):
                     if r["fid"] not in bn.thunk_ids and r["fid"] not in bn.lib:
                         seed(k, bid, r["fid"], f"table string {lab}", lab)
+        # MFC: a handler mapped from a menu item / dialog control (message map x resources) is a strong seed
+        try:
+            ui = UiIndex(store, bid)
+            by_addr = ui.ui_of_handlers() if ui.has_ui else {}
+        except Exception as e:  # noqa: BLE001  an extra: the other seeds stay
+            log.warning("ui seeds of binary %s failed: %s", bid, e)
+            by_addr = {}
+        for addr, d in by_addr.items():
+            fid = bn.at.get(("ram", addr))
+            if fid is None or fid in bn.thunk_ids or fid in bn.lib:
+                continue
+            for key, ev in (("ui-menu", d["menu"]), ("ui-dialog", d["dialog"])):
+                for e in ev[:MAX_EVIDENCE]:
+                    seed(key, bid, fid, e, e)
         # a data-format extension that appears in strings is a feature even when no code refs it
         for addr, lst in hits.items():
             for k, lab in lst:

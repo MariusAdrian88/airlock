@@ -29,7 +29,7 @@ from typing import Any, Callable
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, linking, peres
+from airlock.server import cpp, fnfix, linking, peres
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
@@ -447,6 +447,13 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  an extra
             log.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
+            if self.refresh_missing_functions(slug, store):   # C++ entry points without a function
+                ready = linking.ready_ids(store)
+                linking.relink_project(store, paths.artifacts,
+                                       after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
+        except Exception as e:  # noqa: BLE001  an extra
+            log.warning("cannot create the missing functions of %s: %s", slug, e)
+        try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
             log.warning("cannot resume the decompile pass of %s: %s", slug, e)
@@ -486,6 +493,62 @@ class Indexer:
             store.set_meta(f"collector:{b.id}", str(res.get("collector")))
             n += 1
         return n
+
+    def create_missing_functions(self, project: str, store: Store, b: Binary) -> int:
+        """Create the functions Ghidra missed at message map handlers and vtable targets of ``b``
+        (needs the C++ tables), then re-read the binary's functions and edges. Once per
+        ``fnfix.FIX_VERSION`` and binary (meta). Returns the number of functions created."""
+        program = store.get_meta(f"program:{b.id}")
+        if not program or not fnfix.stale(store, b.id) or cpp.stale(store, b.id):
+            return 0
+        if not fnfix.candidates(store, b.id):
+            fnfix.record(store, b.id, {"requested": 0, "created": 0, "skipped": 0, "failed": 0,
+                                       "reasons": {}})
+            return 0
+        self.ensure_open(project)
+        t0 = time.monotonic()
+        res = fnfix.run(store, b.id, self.worker, program)
+        if res["created"]:
+            self.reextract_code(store, b, program)
+        fnfix.record(store, b.id, res)
+        log.info("missing functions of %s: %s of %s created, %s failed (%.0fs)", b.name,
+                 res["created"], res["requested"], res["failed"], time.monotonic() - t0)
+        return int(res["created"])
+
+    def refresh_missing_functions(self, project: str, store: Store) -> int:
+        """``create_missing_functions`` for the ready binaries not done at this version. Returns
+        the number of functions created (the caller relinks when above zero)."""
+        n = 0
+        for b in store.list_binaries():
+            if self.get_status(store, b.id)[0] != "ready" or self.job_for(project, b.id) is not None:
+                continue
+            try:
+                n += self.create_missing_functions(project, store, b)
+            except Exception as e:  # noqa: BLE001  one binary must not stop the others
+                log.warning("missing functions of %s: %s", b.name, e)
+        return n
+
+    def reextract_code(self, store: Store, b: Binary, program: str) -> None:
+        """Re-read the functions (upsert: ids and decompiles of unchanged rows stay) and replace
+        the edges of one binary, then rebuild the links derived from them. Strings, imports and
+        exports do not depend on new functions."""
+        for kind in ("functions", "edges"):
+            offset = 0
+            while True:
+                r = self.worker.request("extract", {"program": program, "kind": kind, "offset": offset,
+                                                    "limit": PAGE_SIZE[kind]}, timeout=900)
+                if kind == "functions":
+                    store.insert_functions(b.id, map_function_rows(r["columns"], r["rows"]))
+                else:
+                    if offset == 0:
+                        with store.db:
+                            store.db.execute("DELETE FROM edge WHERE binary_id=?", (b.id,))
+                    store.insert_edges(b.id, map_edge_rows(r["columns"], r["rows"]))
+                if r.get("done") or r.get("next_offset") is None:
+                    break
+                offset = r["next_offset"]
+        store.link_edges(b.id)
+        store.rebuild_fts(b.id)
 
     def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
                      rel_path: str | None, group: str, code_size: int | None,
@@ -857,6 +920,10 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  resources are an extra
             log.warning("resources of %s: %s", me.name, e)
         cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
+        try:
+            self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
+        except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
+            log.warning("missing functions of %s: %s", me.name, e)
         st.link_cross_binary(bid, [b.id for b in others])
         try:
             linking.link_dynamic_for(st, bid, [b.id for b in others])

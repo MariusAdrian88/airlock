@@ -175,7 +175,7 @@ class Store:
         self.path = Path(path)
         if str(path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path))
+        self.db = sqlite3.connect(str(path), timeout=30.0)  # busy timeout: wait for other threads' writes
         self.db.row_factory = sqlite3.Row
         self.db.create_function("camel_words", 1, _camel_words, deterministic=True)
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -226,11 +226,16 @@ class Store:
         return r["value"] if r else None
 
     def set_meta(self, key: str, value: str) -> None:
-        self.db.execute(
-            "INSERT INTO meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+        """Upsert one meta row. Outside a transaction it commits at once (a bare write would
+        leave the implicit transaction open and lock every other thread out); inside one the
+        caller's ``with store.db`` commits."""
+        sql = ("INSERT INTO meta(key, value) VALUES (?, ?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        if self.db.in_transaction:
+            self.db.execute(sql, (key, value))
+        else:
+            with self.db:
+                self.db.execute(sql, (key, value))
 
     # -- binaries ----------------------------------------------------------
 

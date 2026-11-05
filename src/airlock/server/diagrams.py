@@ -15,7 +15,7 @@ from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
 
 from airlock.index.store import Store
-from airlock.projects import ProjectPaths
+from airlock.projects import ProjectPaths, atomic_write_text
 from airlock.server import clusters as cl
 from airlock.server import endpoints as ep
 from airlock.server import graph as gr
@@ -154,10 +154,7 @@ def diagram_path(pp: ProjectPaths, scope: str, fmt: str) -> Path:
 
 def write_diagram(pp: ProjectPaths, scope: str, fmt: str, d: Diagram, name: str | None = None) -> Path:
     path = diagram_path(pp, name or scope, fmt)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text(render(d, fmt), "utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, render(d, fmt))
     return path
 
 

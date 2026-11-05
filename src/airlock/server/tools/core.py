@@ -23,7 +23,7 @@ from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, forma
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr
-from airlock.server import cpp, notes
+from airlock.server import cpp, notes, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
     Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
@@ -476,8 +476,8 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             hint = "table string " + ", ".join(preview(t.value, 40) for t in ts[:2])
             hint += f" +{len(ts) - 2}" if len(ts) > 2 else ""
             note = f"{note}; {hint}" if note else hint
-    for h in cpp.hints_for(st, b.id, fn.entry):     # RTTI / message map names: hints, nothing renamed
-        note = f"{note}; {h}" if note else h
+    for h in cpp.hints_for(st, b.id, fn.entry) + uijoin.function_hints(st, b.id, fn.entry):
+        note = f"{note}; {h}" if note else h        # RTTI / message map / menu / dialog names: hints only
     nl = notes.function_lines(st, fn)       # agent notes: "// note #id ..." above the code
     if nl:
         note = chr(10).join(([note] + nl) if note else [nl[0][3:], *nl[1:]])

@@ -1,8 +1,9 @@
 # Handover
 
-Last updated: 2026-11-05. The 10 open issues of M1.5 are fixed and verified on
-a fresh analysis of the acceptance target; M3 (annotate) and M4 (specs) are
-done. Next: **M2**.
+Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
+of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
+the UI join), M3 (annotate) and M4 (specs) are done. Next: **a fresh full
+analysis of the target to check M2 end to end, then M5**.
 
 ## State
 
@@ -13,7 +14,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 644 passed, 35 skipped (~2 min). Ghidra suites:
+Tests: `pytest -q` → 725 passed, 37 skipped (~2 min). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -53,7 +54,7 @@ Project folder: `<projects_root>\<name>\` with `airlock-project.jsonc`,
 | Specs (M4) | `tools/spec.py`, `server/specs.py`, `server/specfilter.py` |
 | Targets | `server/targets.py` (shared resolver) |
 | Decompile | `server/bulk.py`, `worker/pool.py`, `worker/rwlock.py`, `worker/ghidra_ops/bulk.py` |
-| Index | schema v8: `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8) |
+| Index | schema v10: `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8), `res_dialog`/`res_control`/`res_menu_item`/`res_string` (v9), `rtti_class`/`vtable_slot`/`msgmap_entry` (v10) |
 
 ## Config
 
@@ -94,20 +95,26 @@ disabled. The user's global config was upgraded to `config_version` 1
 
 ## Open issues
 
-All 10 M1.5 issues are fixed (wave commits on 2026-11-05). Small debts:
-
-1. `path` still uses its own resolver in `server/graph.py`; merge it into
-   `server/targets.py`. `function ReadFile` without `binary=` is `ambiguous`
-   while `xrefs`/`callgraph` aggregate across binaries.
-2. About 30% of visible cluster functions stay `unclassified`: mostly unnamed
-   program code. Hidden runtime clusters in the main executable were not
+1. Not checked end to end on a fresh analysis: missing-function creation at
+   handler/vtable targets (`server/fnfix.py`, worker `create_functions`), the
+   resource and C++ tables filled at analysis time, the UI join counts.
+2. Most MFC message maps in the target belong to classes built without RTTI
+   (`anon_<map>`), so handler hints show `FUN_` names. Shared tooltip
+   `WM_NOTIFY` handlers add noise to control lines.
+3. About 30% of visible cluster functions stay `unclassified` (mostly unnamed
+   program code). Hidden runtime clusters in the main executable were not
    audited for program code.
-3. The `fnptr` table rule has no section check; the CRT underscore rule may
-   catch the program's own functions.
-4. Some very large functions hit `decompile_timeout`; `view=asm` still works.
-5. `patch_bytes` is not implemented.
-6. Named strings in MFC dispatch/automation tables without a code reference
-   still need the M2 MFC/OLE analysers (generic string tables are linked).
+4. `xrefs`/`callgraph` return `ambiguous` for same-named functions in several
+   binaries (imports aggregate; DESIGN §7.3 rule 8).
+5. Some very large functions hit `decompile_timeout`; `view=asm` still works.
+6. `patch_bytes` and `qt_metaobjects` are not implemented.
+7. MFC dispatch/automation (OLE) tables are not decoded.
+
+Fixed on 2026-11-05: `path` uses `server/targets.py` (via
+`server/endpoints.py`); `fnptr` tables only in data sections; stricter CRT
+underscore rule; `Store.set_meta` commits outside a transaction and
+`atomic_write_text` gives each writer its own temp file (the PROJECT.md and
+`database is locked` races).
 
 ## Working rules for this project
 
@@ -118,7 +125,15 @@ All 10 M1.5 issues are fixed (wave commits on 2026-11-05). Small debts:
   before a rerun.
 - Before each push: scan commit messages and tracked files for target data.
 
+## M2 join (menus, dialogs, message maps)
+
+`server/uijoin.py` joins `msgmap_entry` with `res_menu_item` / `res_control` on demand (nothing
+stored). Used by `menus`, `dialogs`, `mfc_message_maps`, `function` hints, the `ui-menu` / `ui-dialog`
+feature seeds (`FEATURES_VERSION` 4) and the `UI:` line per binary in the project map. DESIGN §11
+"MFC message maps" has the rules (dialog of a class, shared ids IDOK..IDHELP never decide alone).
+Acceptance test: `tests/test_ui_join.py` (synthetic PE with RTTI, a message map, a MENU and DIALOGs).
+
 ## Next
 
-M2 (DESIGN.md §12: resources, RTTI/vtables, MFC message maps), then the
-small debts above.
+A fresh full analysis of the target (option B, new scratch projects_root)
+to check open issue 1, then M5 (`fileformat` set, DESIGN.md §12).

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from airlock.index.store import Store
-from airlock.projects import ProjectPaths
+from airlock.projects import ProjectPaths, atomic_write_text
 from airlock.server import specfilter
 from airlock.server.selectors import resolve_function, split_binary_target
 
@@ -189,10 +189,7 @@ def strip_front_matter(text: str) -> str:
 
 
 def _atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text(text, "utf-8", newline="\n")
-    os.replace(tmp, path)
+    atomic_write_text(path, text, newline="\n")
 
 
 def render_file(s: dict) -> str:

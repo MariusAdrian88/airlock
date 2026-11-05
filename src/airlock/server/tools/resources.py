@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
-from airlock.server import peres
+from airlock.server import peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
@@ -188,6 +188,7 @@ def dialogs(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, 
         db = bd.store.db
         bid = bd.binary.id
         tag = _tag(bd, multi)
+        ui = uijoin.UiIndex(bd.store, bid)
         rows = db.execute("SELECT dialog_id, lang, caption, x, y, cx, cy FROM res_dialog WHERE binary_id=?",
                           (bid,)).fetchall()
         by: dict[str, dict[int, object]] = {}
@@ -203,9 +204,11 @@ def dialogs(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, 
                 n = db.execute("SELECT COUNT(*) FROM res_control WHERE binary_id=? AND dialog_id=? AND lang=?",
                                (bid, k, lg)).fetchone()[0]
                 others = [_lang(x) for x in sorted(by[k]) if x != lg]
+                owners = ui.dialog_classes(k)
                 lines.append(f"{tag}{k} | {preview(r['caption'] or '', 50)} | {n} controls | "
                              f"{r['x']},{r['y']},{r['cx']},{r['cy']} | lang {_lang(lg)}"
-                             + (f" (also {' '.join(others)})" if others else ""))
+                             + (f" (also {' '.join(others)})" if others else "")
+                             + (f" | class {', '.join(owners[:3])}" if owners else ""))
             continue
         k = next((x for x in ids if x == ident or x.lower() == ident.lower()), None)
         if k is None:
@@ -220,13 +223,18 @@ def dialogs(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, 
                     f"(have: {' '.join(_lang(x) for x in sorted(by[k]))}). Omit lang.")
         r = by[k][lg]
         others = [_lang(x) for x in sorted(by[k]) if x != lg]
+        owners = ui.dialog_classes(k)
         lines.append(f"{tag}dialog {k} {preview(r['caption'] or '', 80)} {r['x']},{r['y']},{r['cx']},{r['cy']} "
-                     f"lang {_lang(lg)}" + (f" (also {' '.join(others)})" if others else ""))
+                     f"lang {_lang(lg)}" + (f" (also {' '.join(others)})" if others else "")
+                     + (f" class {', '.join(owners[:3])}" if owners else ""))
         for c in db.execute("SELECT ctrl_id, class, caption, style FROM res_control "
                             "WHERE binary_id=? AND dialog_id=? AND lang=? ORDER BY seq", (bid, k, lg)):
+            cid = c["ctrl_id"]
+            ref = uijoin.CtrlRef(k, c["class"] or "", "", cid if cid is not None else 0)
+            hs = ui.ctrl_suffix(ref) if cid and cid > 0 and cid not in uijoin.STATIC_IDS else ""
             lines.append(f"{tag}  id={c['ctrl_id']} {c['class']}"
                          + (f" {preview(c['caption'], 60)}" if c["caption"] else "")
-                         + (f" {c['style']}" if c["style"] else ""))
+                         + (f" {c['style']}" if c["style"] else "") + (f" {hs}" if hs else ""))
     if not lines:
         if ident:
             return f"error not_found: no dialog '{ident}' in any binary. Call dialogs binary=* without id."
@@ -252,6 +260,7 @@ def menus(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, cu
         db = bd.store.db
         bid = bd.binary.id
         tag = _tag(bd, multi)
+        ui = uijoin.UiIndex(bd.store, bid)
         langs: dict[str, set[int]] = {}
         for r in db.execute("SELECT DISTINCT menu_id, lang FROM res_menu_item WHERE binary_id=?", (bid,)):
             langs.setdefault(r["menu_id"], set()).add(r["lang"])
@@ -288,7 +297,8 @@ def menus(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, cu
             if m["item_id"] is None:
                 lines.append(f"{tag}{'  ' * depth}{m['caption']} >")
             else:
-                lines.append(f"{tag}{'  ' * depth}id={m['item_id']} {m['path']}")
+                hs = ui.menu_suffix(m["item_id"]) if m["item_id"] > 0 else ""
+                lines.append(f"{tag}{'  ' * depth}id={m['item_id']} {m['path']}" + (f" {hs}" if hs else ""))
     if not lines:
         if ident:
             return f"error not_found: no menu '{ident}' in any binary. Call menus binary=* without id."

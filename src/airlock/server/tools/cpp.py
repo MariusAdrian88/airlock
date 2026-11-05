@@ -7,7 +7,7 @@ cut to the token budget with a cursor. Names are hints: nothing is renamed in Gh
 
 from __future__ import annotations
 
-from airlock.server import cpp
+from airlock.server import cpp, peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
@@ -19,7 +19,12 @@ MAX_VTABLES = 8                 # vtables listed for one class name
 
 
 def _ready(ctx: ServerContext, bd: Bound) -> None:
-    cpp.ensure(bd.store, bd.binary, ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256)
+    art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
+    cpp.ensure(bd.store, bd.binary, art)
+    try:
+        peres.ensure(bd.store, bd.binary, art)          # resource ids for the menu / dialog join
+    except Exception:  # noqa: BLE001  an extra
+        pass
 
 
 def _scope(ctx: ServerContext, binary: str) -> tuple[list[Bound], bool] | str:
@@ -174,7 +179,7 @@ def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", 
 
 # ── mfc_message_maps ───────────────────────────────────────────────────────
 
-def _entry_line(bd: Bound, r) -> str:
+def _entry_line(bd: Bound, r, ui: uijoin.UiIndex | None = None) -> str:
     label = cpp.entry_label(r["message"], r["code"])
     ident = ""
     if r["ctrl_id"] or r["last_id"]:
@@ -182,7 +187,13 @@ def _entry_line(bd: Bound, r) -> str:
         if r["last_id"] and r["last_id"] != r["ctrl_id"]:
             ident += f"-{r['last_id']}"
     fn = _fn_name(bd, r["handler"])
-    return f"{label}{ident} -> {bd.addr(r['handler'])}{' ' + fn if fn else ''}"
+    line = f"{label}{ident} -> {bd.addr(r['handler'])}{' ' + fn if fn else ''}"
+    if ui is not None and ui.has_ui:
+        h = uijoin.Handler(r["class"], 0, r["message"], r["code"], r["ctrl_id"], r["last_id"], r["handler"])
+        note = ui.entry_note(h)
+        if note:
+            line += f"  // {note}"
+    return line
 
 
 def _bases_of(bd: Bound, name: str) -> list[str]:
@@ -210,16 +221,20 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
     lines: list[str] = []
     if not t:
         for bd in bounds:
+            ui = uijoin.UiIndex(bd.store, bd.binary.id)
             for r in bd.store.db.execute(
                     "SELECT class, map_addr, COUNT(*) AS n FROM msgmap_entry WHERE binary_id=? "
                     "GROUP BY class, map_addr ORDER BY class, map_addr", (bd.binary.id,)):
-                lines.append(f"{_prefix(bd, several)}{r['class']} map {bd.addr(r['map_addr'])} entries {r['n']}")
+                dlg = ui.class_dialog_text(r["class"])
+                lines.append(f"{_prefix(bd, several)}{r['class']} map {bd.addr(r['map_addr'])} entries {r['n']}"
+                             + (f" {dlg}" if dlg else ""))
         if not lines:
             return "no MFC message maps found in the binary."
         return fit_lines(lines, bud, "code", tool="mfc_message_maps", args=args)[0]
     want = t.lower()
     found = False
     for bd in bounds:
+        ui = uijoin.UiIndex(bd.store, bd.binary.id)
         maps = bd.store.db.execute(
             "SELECT DISTINCT class, map_addr FROM msgmap_entry WHERE binary_id=? AND lower(class)=? "
             "ORDER BY map_addr", (bd.binary.id, want)).fetchall()
@@ -262,11 +277,13 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                 lines.append(inherited)
                 inherited = ""
             rows = bd.store.db.execute(
-                "SELECT message, code, ctrl_id, last_id, handler FROM msgmap_entry "
+                "SELECT class, message, code, ctrl_id, last_id, handler FROM msgmap_entry "
                 "WHERE binary_id=? AND class=? AND map_addr=? ORDER BY seq",
                 (bd.binary.id, m["class"], m["map_addr"])).fetchall()
-            lines.append(f"{_prefix(bd, several)}{m['class']} map {bd.addr(m['map_addr'])} entries {len(rows)}")
-            lines += [_entry_line(bd, r) for r in rows]
+            dlg = ui.class_dialog_text(m["class"])
+            lines.append(f"{_prefix(bd, several)}{m['class']} map {bd.addr(m['map_addr'])} entries {len(rows)}"
+                         + (f" {dlg}" if dlg else ""))
+            lines += [_entry_line(bd, r, ui) for r in rows]
     if not found:
         return (f"error not_found: no message map for '{t}'. Call mfc_message_maps without a class for "
                 "the classes that have one.")
