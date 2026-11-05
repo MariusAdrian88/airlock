@@ -47,6 +47,33 @@ airlock doctor --start    # also starts the worker and Ghidra once
 your PATH, set `"jdk_dir"` in that file (e.g. `"C:/Program Files/Eclipse
 Adoptium/jdk-21..."`).
 
+### Install without a clone (uv)
+
+With [uv](https://docs.astral.sh/uv/) you do not need a clone or a venv. PyGhidra
+is not a dependency of airlock because its version must match Ghidra, and a uv
+environment has no `pip` for `doctor --fix`. So give it with `--with`, and point
+`--find-links` at the wheels that Ghidra bundles (PyGhidra and JPype then come
+from there). Use the PyGhidra version that is in that folder (`pyghidra-3.1.0`
+for Ghidra 12.1.4).
+
+```powershell
+$dist = "C:/Tools/ghidra_12.1.4_PUBLIC/Ghidra/Features/PyGhidra/pypkg/dist"
+$src  = "git+https://github.com/MariusAdrian88/airlock"
+
+uvx --from $src airlock init --ghidra C:/Tools/ghidra_12.1.4_PUBLIC
+uvx --python 3.13 --from $src --find-links $dist --with pyghidra==3.1.0 airlock doctor --start
+```
+
+A permanent install puts `airlock.exe` on the PATH (`%USERPROFILE%\.local\bin`):
+
+```powershell
+uv tool install --python 3.13 --find-links $dist --with pyghidra==3.1.0 $src
+```
+
+To use one fixed version, add a commit or tag to the URL:
+`git+https://github.com/MariusAdrian88/airlock@<commit>`. For `airlock delphi-sigs
+build`, also add `--with capstone`.
+
 ## Register with an MCP client
 
 Claude Code:
@@ -54,6 +81,24 @@ Claude Code:
 ```powershell
 claude mcp add airlock -- C:\path\to\airlock\.venv\Scripts\airlock.exe serve --profile dirty
 ```
+
+OpenCode (`opencode.json`), with uvx and no clone (see the uv install above):
+
+```jsonc
+"mcp": {
+  "airlock": {
+    "type": "local",
+    "command": ["uvx", "--python", "3.13",
+                "--from", "git+https://github.com/MariusAdrian88/airlock",
+                "--find-links", "C:/Tools/ghidra_12.1.4_PUBLIC/Ghidra/Features/PyGhidra/pypkg/dist",
+                "--with", "pyghidra==3.1.0",
+                "airlock", "serve", "--profile", "dirty"],
+    "enabled": true
+  }
+}
+```
+
+After `uv tool install`, the command is only `["airlock", "serve", "--profile", "dirty"]`.
 
 For clean-room work, register a second server with `--profile clean` in a
 **separate** session. The clean side only ever sees specifications.
