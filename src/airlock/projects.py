@@ -310,6 +310,23 @@ class BinaryInfo:
     image_base: int | None
     entry_point: int | None  # RVA
     toolchain: str  # msvc | delphi | qt | dotnet | unknown
+    managed_only: bool = False  # CLI header with the IL-only flag: no native code, Ghidra not needed
+
+
+COR_ILONLY = 0x1
+
+
+def cor_flags(pe: pefile.PE) -> int | None:
+    """Flags of the CLI header (``IMAGE_COR20_HEADER``), None without one."""
+    try:
+        com = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+        dds = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        if len(dds) <= com or not (dds[com].VirtualAddress and dds[com].Size):
+            return None
+        data = pe.get_data(dds[com].VirtualAddress, 20)
+        return int.from_bytes(data[16:20], "little") if len(data) >= 20 else None
+    except Exception:  # noqa: BLE001  damaged header: treated as not managed-only by the caller
+        return None
 
 
 def classify_toolchain(
@@ -381,6 +398,7 @@ def detect(path: Path) -> BinaryInfo:
             pe.OPTIONAL_HEADER.ImageBase,
             pe.OPTIONAL_HEADER.AddressOfEntryPoint,
             classify_toolchain(imports, rtypes, has_cli, pe.parse_rich_header() is not None),
+            has_cli and bool((cor_flags(pe) or 0) & COR_ILONLY),
         )
     finally:
         pe.close()

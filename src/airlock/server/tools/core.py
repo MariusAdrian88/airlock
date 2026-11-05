@@ -23,7 +23,7 @@ from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, forma
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr
-from airlock.server import cpp, notes, uijoin
+from airlock.server import cpp, dotnet, notes, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
     Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
@@ -342,6 +342,9 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
     A timeout row from the background pass (short timeout) gets one decompile with the full
     timeout; a timeout from a full-timeout attempt is not repeated unless retry is set."""
     st, b = bd.store, bd.binary
+    if dotnet.is_stub(b, fn):
+        return None, (f"error managed: {fn.qualified_name} is a P/Invoke declaration with no machine "
+                      "code. Use dotnet_decompile on its type, or xrefs for the native target.")
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
     if cached is not None and cached.status == "ok" and cached.c_text is not None:
@@ -389,6 +392,9 @@ def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | N
     """(asm lines, error line). JSON file cache keyed by fn_version and analysis_profile
     (derived data, safe to delete)."""
     st, b = bd.store, bd.binary
+    if dotnet.is_stub(b, fn):
+        return None, (f"error managed: {fn.qualified_name} is a P/Invoke declaration with no machine "
+                      "code. Use dotnet_decompile on its type, or xrefs for the native target.")
     profile = b.analysis_profile or "unknown"
     path = _asm_cache_file(ctx, bd, fn)
     try:

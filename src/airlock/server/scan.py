@@ -16,9 +16,11 @@ from pathlib import Path
 
 import pefile
 
+from airlock.projects import COR_ILONLY, cor_flags
 from airlock.server import estimate as est
 
 _MB = 1024 * 1024
+MANAGED_S = 1.0          # indexing one IL-only assembly with dnfile (seconds)
 
 RUNTIME_PREFIXES = ("msvcr", "msvcp", "msvcm", "mfc", "atl", "vcruntime", "ucrtbase",
                     "api-ms-", "msvbvm", "mscoree", "concrt", "vcomp")
@@ -57,6 +59,7 @@ class ScannedFile:
     subsystem: int = 0                 # PE optional header Subsystem (1 = native/driver)
     description: str | None = None     # version FileDescription
     est_funcs: int = 0                 # estimated function count (see estimate_functions)
+    managed: bool = False              # IL-only assembly: indexed with dnfile, never sent to Ghidra
 
 
 @dataclass(frozen=True)
@@ -242,6 +245,9 @@ def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
         except Exception:
             rich = False
         company, product = extract_vendor(pe)
+        managed = bool(dotnet and (cor_flags(pe) or 0) & COR_ILONLY)
+        if managed:
+            code = 0       # IL is not code for Ghidra: the assembly costs seconds, not analysis time
         try:
             funcs = 0 if dotnet else estimate_functions(pe)
         except Exception:  # the estimate is an extra: the code size alone still gives a time
@@ -249,7 +255,7 @@ def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
         return ScannedFile(rel, "pe", "", size, code, bits,
                            bool(pe.FILE_HEADER.Characteristics & 0x2000), bool(dotnet), rich,
                            company, product, tuple(dict.fromkeys(names)), n_exports,
-                           opt.Subsystem, _description(pe), funcs)
+                           opt.Subsystem, _description(pe), funcs, managed)
     except Exception:
         return unreadable()
     finally:
@@ -394,10 +400,11 @@ def _build_options(files: list[ScannedFile], s_per_code_mb: float,
             continue
         sel = tuple(f for f in files if f.group in groups)
         code = sum(f.code_size for f in sel)
-        n_pe = sum(1 for f in sel if f.kind == "pe")
+        n_pe = sum(1 for f in sel if f.kind == "pe" and not f.managed)
+        n_managed = sum(1 for f in sel if f.kind == "pe" and f.managed)
         work = sum(est.work_mb(f.code_size, f.est_funcs) for f in sel)
         out.append(ScanOption(key, label, groups, sel, code,
-                              n_pe * overhead_s + work * s_per_code_mb))
+                              n_pe * overhead_s + work * s_per_code_mb + n_managed * MANAGED_S))
     return tuple(out)
 
 

@@ -756,7 +756,9 @@ not a project folder, goes through `project_create`:
    (→ .NET), Delphi markers (`TPF0` DFM resources, `Borland`/`Embarcadero`
    strings, Delphi RTTI patterns), Qt imports (`Qt5Core.dll`/`Qt6Core.dll`),
    MSVC Rich header / runtime imports.
-3. .NET-only assembly: index with `dnfile` and stop. No Ghidra.
+3. .NET-only assembly (CLI header with the IL-only flag): index with `dnfile` on the server and
+   stop. No Ghidra, no queue; the estimate is about 1 s per assembly. Mixed-mode assemblies (CLI
+   header, native code) take the Ghidra path and are also indexed with `dnfile`.
 4. Native: worker imports into the project and runs auto-analysis. Progress is
    reported through `index_status`. This is the slow step (minutes).
 5. Cheap full pass (worker): functions, thunks, imports, strings, xrefs/call
@@ -940,8 +942,15 @@ optional IDR knowledge base for RTL/VCL library naming in a later milestone.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `dotnet_types` | `query?`, `limit=50` | types/methods from `dnfile` metadata, incl. P/Invoke declarations |
-| `dotnet_decompile` | `type`, `member?` | C# from `ilspycmd`, one type at a time, cached; marked as reconstruction |
+| `dotnet_types` | `query?`, `limit=50`, `binary?`, `kind?`, `cursor?`, `budget?` | types/methods from `dnfile` metadata, incl. P/Invoke declarations (`module!entry`, `=> binary!export` when bound) and COM imports. Without `kind`: types, plus P/Invokes and methods that match `query`. `kind` = `type`, `method`, `pinvoke` or `com` |
+| `dotnet_decompile` | `type`, `member?`, `binary?`, `cursor?`, `budget?` | C# from `ilspycmd`, one type at a time, cached in `dirty\.airlock\cache\dotnet\`; first line marks it as a reconstruction. `type` is the full name, or a unique suffix. `error tool_missing` without a configured ilspycmd |
+
+Both are dirty-role only. Tables: `dn_type`, `dn_method`, `dn_pinvoke` (schema v11, meta
+`dotnet_version:<id>`). A P/Invoke method also becomes a thunk function (entry = MethodDef token) and an
+import row (address = the token, module with `.dll` added). The normal import linking binds it to an
+export of a project binary and writes an xedge of kind `pinvoke`, so `xrefs`, `callgraph` and `path`
+follow it. A module no project binary provides stays an unresolved import. `function` on such a thunk
+answers `error managed`.
 
 ### resources
 
@@ -1599,10 +1608,18 @@ formats is the primary use case of this project.
 
 - `dnfile` for the index (types, methods, signatures, P/Invokes, resources).
 - `ilspycmd` per type on demand (`-t <type>`), output cached in `cache\`,
-  stored as reconstruction (never overriding metadata facts)
-  **[verify ilspycmd 11.x flags for single-type output]**.
-- P/Invoke and COM declarations link managed code to native exports in the
-  Delphi binaries of the same project.
+  stored as reconstruction (never overriding metadata facts).
+  **[verified 2026-11-05]** ilspycmd 8.2.0.7535: `-t <FullName>` prints the C# of one type to stdout
+  (nested types print with their outer type; `Outer+Inner` works); `-r <dir>` sets the reference path;
+  `--disable-updatecheck` avoids the version check. A missing type exits with code 70 and a stack
+  trace on stderr. It targets .NET 6 and needs `DOTNET_ROLL_FORWARD=LatestMajor` when only newer
+  runtimes are installed: airlock sets that for the child process only. With SDK 7 the tool installs
+  from nuget.org with `dotnet tool install ilspycmd --version 8.2.0.7535 --tool-path <folder>
+  --add-source https://api.nuget.org/v3/index.json`. One type of a 6 MB assembly takes under 1 s.
+- P/Invoke declarations link managed code to the native exports of the same project (xedge kind
+  `pinvoke`). COM interop declarations (`ComImport`) are listed in `dotnet_types kind=com` only.
+  **[verified]** System.Windows.Forms.dll (6 MB): 2416 types, 30149 methods, 625 P/Invokes,
+  198 COM imports, indexed in 4 s.
 
 ---
 
@@ -1618,7 +1635,7 @@ formats is the primary use case of this project.
 | M4 | `spec_write`/`spec_read`/`spec_export`, clean profile, audit | Clean session can read a spec and nothing else |
 | M5 | `fileformat` set | Diff two OLE-based document files per stream |
 | M6 | `delphi` set | Delphi form → event → handler resolved |
-| M7 | `dotnet` set | Managed assemblies indexed; P/Invokes linked to native exports |
+| M7 | `dotnet` set | Managed assemblies indexed; P/Invokes linked to native exports. **Done 2026-11-05** |
 | M8 | `qt_metaobjects`, `dataflow` set | Qt signals/slots mapped |
 
 ---

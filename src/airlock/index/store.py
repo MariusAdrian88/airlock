@@ -14,7 +14,8 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
+DN_METHOD_LO, DN_METHOD_HI = 0x06000000, 0x07000000   # MethodDef metadata tokens (P/Invoke thunks)
 
 FTS_KINDS = ("function", "string", "import", "note")
 # Code edges. ``call_imp`` is a call through an import slot (IAT): Ghidra reports
@@ -952,7 +953,7 @@ class Store:
         dst = self.get_binary_by_id(dst_id)
         with self.db:
             self.db.execute("DELETE FROM xedge WHERE src_binary=? AND dst_binary=? "
-                            "AND kind='import'", (src_id, dst_id))
+                            "AND kind IN ('import','pinvoke')", (src_id, dst_id))
             self.db.execute("UPDATE import SET resolved=NULL WHERE binary_id=? AND lower(dll)=? "
                             "AND resolved IS NOT NULL", (src_id, dst.name.lower() if dst else ""))
             if dst is None or src_id == dst_id:
@@ -973,6 +974,8 @@ class Store:
                     by_ord.setdefault(e["ordinal"], e["address"])
                     if named:
                         ord_name.setdefault(e["ordinal"], e["name"])
+            src = self.get_binary_by_id(src_id)
+            managed = src is not None and src.toolchain == "dotnet"
             rows: list[tuple[int, int, int, int, str]] = []
             bound = 0
             for i in imps:
@@ -988,15 +991,18 @@ class Store:
                 fn = self.function_containing(dst_id, addr)
                 entry = fn.entry if fn is not None else addr
                 bound += 1
+                # a P/Invoke declaration: import row at a metadata token (see server/dotnet.py)
+                pinv = bool(managed and i["address"] is not None
+                            and DN_METHOD_LO <= i["address"] < DN_METHOD_HI)
                 if i["address"] is not None:
-                    rows.append((src_id, i["address"], dst_id, entry, "import"))
-                for t in self.db.execute(
+                    rows.append((src_id, i["address"], dst_id, entry, "pinvoke" if pinv else "import"))
+                for t in ([] if pinv else self.db.execute(
                     "SELECT entry FROM function WHERE binary_id=? AND space='ram' AND is_thunk=1 "
-                    "AND is_external=0 AND name=?", (src_id, i["name"])).fetchall():
+                    "AND is_external=0 AND name=?", (src_id, i["name"])).fetchall()):
                     rows.append((src_id, t["entry"], dst_id, entry, "import"))
             self.db.executemany(
                 "INSERT INTO xedge(src_binary, src_addr, dst_binary, dst_entry, kind) "
-                "VALUES (?,?,?,?,?)", rows)
+                "VALUES (?,?,?,?,?)", list(dict.fromkeys(rows)))
             return bound
 
     def link_cross_binary(self, binary_id: int, others: Iterable[int]) -> int:

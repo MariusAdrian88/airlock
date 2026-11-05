@@ -2,7 +2,7 @@
 
 Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
-the UI join), M3 (annotate), M4 (specs) and M5 (`fileformat`) are done.
+the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`) and M7 (`dotnet`) are done.
 Next: **M6 (`delphi` set)**.
 
 ## State
@@ -14,7 +14,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 744 passed, 37 skipped (~2 min). Ghidra suites:
+Tests: `pytest -q` → 764 passed, 37 skipped (~2 min). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -52,10 +52,11 @@ Project folder: `<projects_root>\<name>\` with `airlock-project.jsonc`,
 | Map | `server/features.py`, `server/projectmap.py`, `server/clusters.py`, `server/graph.py`, `server/diagrams.py`, `tools/map.py`, `tools/fmap.py`, `tools/graphtools.py` |
 | Annotate and notes (M3) | `tools/annotate.py`, `server/notes.py`, `worker/ghidra_ops/annotate.py` |
 | File formats (M5) | `server/fileformat.py`, `tools/fileformat.py` (olefile; paths limited to the program source folder and `dirty\work\`) |
+| .NET (M7) | `server/dotnet.py`, `tools/dotnet.py` (dnfile metadata, P/Invoke thunks and import rows, ilspycmd runner); managed-only assemblies are indexed in `Indexer._run_managed` (own thread, no queue, no Ghidra) |
 | Specs (M4) | `tools/spec.py`, `server/specs.py`, `server/specfilter.py` |
 | Targets | `server/targets.py` (shared resolver) |
 | Decompile | `server/bulk.py`, `worker/pool.py`, `worker/rwlock.py`, `worker/ghidra_ops/bulk.py` |
-| Index | schema v10: `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8), `res_dialog`/`res_control`/`res_menu_item`/`res_string` (v9), `rtti_class`/`vtable_slot`/`msgmap_entry` (v10) |
+| Index | schema v11: `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8), `res_dialog`/`res_control`/`res_menu_item`/`res_string` (v9), `rtti_class`/`vtable_slot`/`msgmap_entry` (v10), `dn_type`/`dn_method`/`dn_pinvoke` (v11; xedge kind `pinvoke`) |
 
 ## Config
 
@@ -135,6 +136,24 @@ stored). Used by `menus`, `dialogs`, `mfc_message_maps`, `function` hints, the `
 feature seeds (`FEATURES_VERSION` 4) and the `UI:` line per binary in the project map. DESIGN §11
 "MFC message maps" has the rules (dialog of a class, shared ids IDOK..IDHELP never decide alone).
 Acceptance test: `tests/test_ui_join.py` (synthetic PE with RTTI, a message map, a MENU and DIALOGs).
+
+## .NET (M7)
+
+Design in DESIGN §6 "dotnet" and §11 ".NET". Facts:
+
+- `detect()` sets `BinaryInfo.managed_only` (CLI header with the IL-only flag). Such a file gets
+  `format='dotnet'`, is never imported into Ghidra and is ready in seconds (`MANAGED_S` = 1 s in the
+  estimate; `scan` sets `ScannedFile.managed` and `code_size` 0). Mixed-mode keeps the Ghidra path;
+  `_after_ready` also runs `dotnet.ensure` (toolchain `dotnet`, format `pe32`).
+- Each P/Invoke becomes a thunk function at the MethodDef token plus an import row (address = token).
+  `Store._link_pair` writes xedge kind `pinvoke` for those. `function view=c|asm` on such a thunk
+  returns `error managed`. Bulk decompile skips them (thunks), `_link_libs` skips managed binaries.
+- `dotnet_version:<id>` meta key (`DOTNET_VERSION`): `Indexer.resume_project` re-parses stale tables.
+- ilspycmd 8.2.0.7535 installed under `.venv\dotnet-tools` (gitignored). The config key `ilspycmd`
+  points at it; the user's own config is not changed. It runs with `DOTNET_ROLL_FORWARD=LatestMajor`
+  set for the child process only (needs .NET 6, the machine has 7 and 8).
+- Not done: IL call edges (no managed call graph), managed-to-managed references, GUIDs of COM types.
+- `dotnet_types` has an extra `kind` parameter (`type|method|pinvoke|com`).
 
 ## Next
 

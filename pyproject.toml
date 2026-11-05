@@ -16,6 +16,7 @@ dependencies = [
   "json5>=0.9",
   "pefile>=2023.2.7",
   "olefile>=0.46",
+  "dnfile>=0.15",
 ]
 # pyghidra is deliberately NOT a dependency: it must match the Ghidra install,
 # so `airlock doctor --fix` installs it from the wheels bundled with Ghidra.

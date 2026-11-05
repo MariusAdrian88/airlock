@@ -279,3 +279,37 @@ CREATE INDEX msgmap_entry_by_class ON msgmap_entry(binary_id, class, map_addr, s
 CREATE INDEX msgmap_entry_by_handler ON msgmap_entry(binary_id, handler);
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- .NET metadata (DESIGN 11), parsed server side with dnfile (server/dotnet.py). Derived: rebuilt when
+-- the index meta dotnet_version:<binary id> is older than DOTNET_VERSION. Tokens are metadata tokens
+-- (type 0x02xxxxxx, method 0x06xxxxxx). A P/Invoke method also gets a thunk function (entry = token)
+-- and an import row (address = token), so the import linking binds it to a project export.
+CREATE TABLE dn_type (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  token         INTEGER NOT NULL,
+  name          TEXT NOT NULL,           -- Namespace.Outer+Inner (the form ilspycmd -t takes)
+  kind          TEXT NOT NULL,           -- class | interface | struct | enum | delegate
+  base          TEXT,
+  flags         TEXT NOT NULL DEFAULT '',   -- public, abstract, sealed, static, com (ComImport), nested
+  PRIMARY KEY (binary_id, token)
+);
+CREATE INDEX dn_type_by_name ON dn_type(binary_id, name);
+CREATE TABLE dn_method (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  token         INTEGER NOT NULL,
+  type_token    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  sig           TEXT NOT NULL,           -- ret(params), simple type names
+  flags         TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (binary_id, token)
+);
+CREATE INDEX dn_method_by_type ON dn_method(binary_id, type_token);
+CREATE TABLE dn_pinvoke (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  token         INTEGER NOT NULL,        -- the method
+  module        TEXT NOT NULL,           -- as declared (user32, kernel32.dll)
+  entry         TEXT,                    -- entry point name; NULL for an ordinal
+  ordinal       INTEGER,
+  flags         TEXT NOT NULL DEFAULT '',   -- charset, calling convention, lasterror
+  PRIMARY KEY (binary_id, token)
+);

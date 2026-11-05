@@ -30,7 +30,7 @@ from airlock import logs
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, fnfix, linking, peres
+from airlock.server import cpp, dotnet, fnfix, linking, peres
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
@@ -47,6 +47,7 @@ DECOMPILE_FN_PER_S = 200.0  # prior of the background pass, until a rate has bee
 _MB = 1 << 20
 log = logging.getLogger("airlock")
 FINAL = ("ready", "error")
+MANAGED_S = 1.0      # estimate for indexing one IL-only assembly
 OPEN_WAIT_S = 30.0
 
 
@@ -181,6 +182,7 @@ class Job:
     seq: int = 0
     analysis_started: float | None = None
     already_analysed: bool = False
+    managed: bool = False         # IL-only assembly: metadata index only, no Ghidra
 
     @property
     def priority(self) -> tuple[int, int, int]:
@@ -354,9 +356,6 @@ class Indexer:
         if info.format == "not-pe":
             raise IndexerError("unsupported", f"'{src.name}' is not a PE file",
                                "airlock opens Windows PE executables and DLLs")
-        if info.toolchain == "dotnet":
-            raise IndexerError("unsupported", f"'{src.name}' is a .NET assembly",
-                               "The .NET path is not implemented yet")
         paths = self.paths(project, create=True)
         self.current = paths.name
         store = self.store(paths.name)
@@ -444,6 +443,10 @@ class Indexer:
                 self._fire_ready(slug, ready[0])
         except Exception as e:  # noqa: BLE001  the feature index is an extra
             plog.warning("cannot refresh the features of %s: %s", slug, e)
+        try:
+            dotnet.ensure_project(store, paths.artifacts, linking.ready_ids(store))   # .NET tables stale
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot refresh the .NET tables of %s: %s", slug, e)
         try:
             cpp.ensure_project(store, paths.artifacts)  # C++ tables missing or stale: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra
@@ -569,16 +572,32 @@ class Indexer:
                 self._mf_update(slug, sha, state="ready")
                 return None
         info = detect(artifact)
-        if info.format == "not-pe" or info.toolchain == "dotnet":
-            self._mf_update(slug, sha, state="error", error="not a native PE file")
+        if info.format == "not-pe":
+            self._mf_update(slug, sha, state="error", error="not a PE file")
             return None
-        if code_size is None:
+        managed = info.toolchain == "dotnet" and info.managed_only
+        if managed:
+            code_size = 0     # IL only: indexed with dnfile on the server, Ghidra never sees it
+        elif code_size is None:
             code_size = sum(vs for _n, _rva, vs, flags in read_sections(artifact) if "x" in flags)
         bid = store.upsert_binary(
-            sha, name, original_path=original_path, format=info.format, arch=info.arch,
-            pointer_size=info.pointer_size, image_base=info.image_base,
+            sha, name, original_path=original_path, format="dotnet" if managed else info.format,
+            arch=info.arch, pointer_size=info.pointer_size, image_base=info.image_base,
             toolchain=info.toolchain, imported_at=_now(),
         )
+        if managed:
+            program = (store.get_meta(f"program:{bid}") if existing is not None else None) \
+                or self._free_program_name(store, name, sha)
+            store.set_meta(f"program:{bid}", program)
+            job = Job(slug, bid, program, artifact, paths, sha256=sha, rel_path=rel_path, group=group,
+                      code_size=0, seq=next(self._seq), managed=True)
+            self.set_status(store, bid, "queued")
+            self._mf_update(slug, sha, state="queued", error=None)
+            with self._lock:
+                self._jobs[(slug, bid)] = job
+            threading.Thread(target=self._run_managed, args=(job,), name=f"airlock-dotnet-{name}",
+                             daemon=True).start()
+            return job
         program = (store.get_meta(f"program:{bid}") if existing is not None else None) \
             or self._free_program_name(store, name, sha)
         store.set_meta(f"program:{bid}", program)
@@ -697,7 +716,8 @@ class Indexer:
         rate = 0.0
         for b in st.list_binaries():
             f = by_sha.get(b.sha256, {})
-            if f.get("group") in SKIP_GROUPS or self.get_status(st, b.id)[0] != "ready":
+            if (f.get("group") in SKIP_GROUPS or b.format == "dotnet"
+                    or self.get_status(st, b.id)[0] != "ready"):
                 continue
             target = st.decomp_target_count(b.id)
             known_fns += target
@@ -735,7 +755,7 @@ class Indexer:
             job = self.job_for(project, b.id)
             code = int(f.get("code_size") or (job.code_size if job else 0) or 0)
             work = est.work_mb(code, f.get("est_funcs") or (job.est_funcs if job else 0) or 0)
-            est_s = est.binary_seconds(work, overhead, rate)
+            est_s = MANAGED_S if b.format == "dotnet" else est.binary_seconds(work, overhead, rate)
             secs: float | None = None
             e: float | None = est_s
             if status == "ready":
@@ -771,7 +791,7 @@ class Indexer:
         names that occur twice are left out (ambiguous)."""
         seen: dict[str, list[str]] = {}
         for b in st.list_binaries():
-            if b.id != exclude and self.get_status(st, b.id)[0] in statuses:
+            if b.id != exclude and b.format != "dotnet" and self.get_status(st, b.id)[0] in statuses:
                 seen.setdefault(b.name.lower(), []).append(self.program_of(st, b))
         return {n: p[0] for n, p in seen.items() if len(p) == 1}
 
@@ -818,6 +838,45 @@ class Indexer:
             self._fail(job, worker_error(e))
         except Exception as e:  # never leave a job silently stuck
             self._fail(job, f"{type(e).__name__}: {e}")
+
+    def _run_managed(self, job: Job) -> None:
+        """An IL-only assembly: read the metadata with dnfile (seconds), no Ghidra, no queue."""
+        st = self.store(job.project)
+        bid = job.binary_id
+        try:
+            self._state(job, "extracting")
+            t0 = time.monotonic()
+            b = st.get_binary_by_id(bid)
+            assert b is not None
+            dotnet.ensure(st, b, job.artifact, force=True)
+            if not st.db.execute("SELECT 1 FROM dn_type WHERE binary_id=? LIMIT 1", (bid,)).fetchone():
+                raise ValueError("no .NET metadata found")
+            st.upsert_binary(b.sha256, b.name, analysed_at=_now())
+            self._state(job, "ready", code_size=0, managed=True,
+                        extract_s=round(time.monotonic() - t0, 2))
+        except Exception as e:  # noqa: BLE001
+            self._fail(job, f"cannot read .NET metadata: {type(e).__name__}: {e}")
+            return
+        job.reached.set()
+        try:
+            self._after_managed(job)
+        except Exception as e:  # noqa: BLE001  links are an extra; the binary stays ready
+            self._plog(job).warning("linking failed for %s: %s", job.program, e)
+        job.finished.set()
+
+    def _after_managed(self, job: Job) -> None:
+        """Resources, then P/Invoke links to the other ready binaries (and theirs to this one)."""
+        st = self.store(job.project)
+        me = st.get_binary_by_id(job.binary_id)
+        assert me is not None
+        try:
+            peres.ensure(st, me, self.paths(job.project).artifacts / me.sha256)
+        except Exception as e:  # noqa: BLE001  an extra
+            self._plog(job).warning("resources of %s: %s", me.name, e)
+        others = [b.id for b in st.list_binaries()
+                  if b.id != me.id and self.get_status(st, b.id)[0] == "ready"]
+        st.link_cross_binary(me.id, others)
+        self._fire_ready(job.project, me.id, job.program)
 
     def _fail(self, job: Job, message: str) -> None:
         self._state(job, "error", message)
@@ -919,6 +978,11 @@ class Indexer:
         assert me is not None
         others = [b for b in st.list_binaries()
                   if b.id != bid and self.get_status(st, b.id)[0] == "ready"]
+        if me.toolchain == "dotnet":    # mixed-mode: native code through Ghidra, plus the metadata
+            try:
+                dotnet.ensure(st, me, self.paths(job.project).artifacts / me.sha256, force=True)
+            except Exception as e:  # noqa: BLE001  metadata is an extra
+                self._plog(job).warning(".NET metadata of %s: %s", me.name, e)
         try:
             linking.fix_export_ordinals(st, me, self.paths(job.project).artifacts / me.sha256)
         except Exception as e:  # noqa: BLE001  ordinals are an extra
@@ -939,6 +1003,8 @@ class Indexer:
             self._plog(job).warning("dynamic links of %s: %s", me.name, e)
         links = []
         for o in others:
+            if o.format == "dotnet":
+                continue
             if any(True for _ in st.db.execute(
                     "SELECT 1 FROM import WHERE binary_id=? AND lower(dll)=? LIMIT 1",
                     (o.id, me.name.lower()))):

@@ -176,3 +176,25 @@ def _v10(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[10] = _v10
+
+
+def _v11(db: sqlite3.Connection) -> None:
+    """.NET metadata tables (types, methods, P/Invokes); derived, filled by server/dotnet.py."""
+    for sql in (
+        "CREATE TABLE IF NOT EXISTS dn_type (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "token INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, base TEXT, "
+        "flags TEXT NOT NULL DEFAULT '', PRIMARY KEY (binary_id, token))",
+        "CREATE INDEX IF NOT EXISTS dn_type_by_name ON dn_type(binary_id, name)",
+        "CREATE TABLE IF NOT EXISTS dn_method (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "token INTEGER NOT NULL, type_token INTEGER NOT NULL, name TEXT NOT NULL, sig TEXT NOT NULL, "
+        "flags TEXT NOT NULL DEFAULT '', PRIMARY KEY (binary_id, token))",
+        "CREATE INDEX IF NOT EXISTS dn_method_by_type ON dn_method(binary_id, type_token)",
+        "CREATE TABLE IF NOT EXISTS dn_pinvoke (binary_id INTEGER NOT NULL REFERENCES binary(id), "
+        "token INTEGER NOT NULL, module TEXT NOT NULL, entry TEXT, ordinal INTEGER, "
+        "flags TEXT NOT NULL DEFAULT '', PRIMARY KEY (binary_id, token))",
+    ):
+        db.execute(sql)
+
+
+MIGRATIONS[11] = _v11
+MIGRATIONS.setdefault(11, lambda db: None)   # placeholder: the real v11 (.NET tables) is registered above
