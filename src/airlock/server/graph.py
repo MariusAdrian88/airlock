@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
-from airlock.index.store import GRAPH_EDGES, Store
+from airlock.index.store import GRAPH_EDGES, USABLE_STATES, Store
 from airlock.projects import ProjectPaths, read_manifest
 from airlock.server.selectors import fmt_addr
 
@@ -470,7 +470,7 @@ def ready_bins(pp: ProjectPaths, st: Store, runtime: set[int] | None = None) -> 
     if runtime is None:
         runtime = runtime_ids(pp, st)
     return [b for b in st.list_binaries()
-            if b.id not in runtime and st.get_meta(f"status:{b.id}") == "ready"]
+            if b.id not in runtime and st.get_meta(f"status:{b.id}") in USABLE_STATES]
 
 
 def fingerprint(st: Store, bins: list[Any], tag: str) -> str:

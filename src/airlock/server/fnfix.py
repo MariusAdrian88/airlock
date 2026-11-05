@@ -57,7 +57,8 @@ def _merge(total: dict[str, Any], r: dict[str, Any]) -> None:
 
 
 def run(store: Store, binary_id: int, worker: Any, program: str,
-        recover: Callable[[], None] | None = None, log: Callable[[str], None] | None = None) -> dict[str, Any]:
+        recover: Callable[[], None] | None = None, log: Callable[[str], None] | None = None,
+        progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
     """Call ``create_functions`` for the candidates of one binary in chunks of ``BATCH`` (one Ghidra
     transaction and save per chunk, the conventions pass only with the last); returns the merged summary
     (created, skipped, failed, reasons, requested). Does not touch the version meta.
@@ -72,6 +73,8 @@ def run(store: Store, binary_id: int, worker: Any, program: str,
     retried = False
     pending = cands
     done = 0
+    if progress:
+        progress(0, len(cands))
     while pending:
         chunk, rest = pending[:BATCH], pending[BATCH:]
         try:
@@ -89,6 +92,8 @@ def run(store: Store, binary_id: int, worker: Any, program: str,
             continue
         _merge(total, r)
         done += len(chunk)
+        if progress:
+            progress(done, len(cands))
         say(f"create_functions {done} of {len(cands)} addresses, {total['created']} created")
         pending = rest
     return total

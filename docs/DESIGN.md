@@ -736,9 +736,20 @@ not a project folder, goes through `project_create`:
    The response tells the user to open the client in `<project>\dirty` to
    continue; the creating session is not a project session.
 6. **Queue.** Binaries are imported and analysed one at a time in priority
-   order (`core`, then `own_plugin`, then the rest by size). Each binary is
-   usable as soon as it is `ready`; `index_status` shows the queue, the
-   current binary, finished times and the remaining estimate. Options can be
+   order (`core`, then `own_plugin`, then the rest by size). A binary goes
+   `queued`, `importing`, `analysing`, `extracting`, `finishing`, `ready`
+   (`error` on failure). `finishing` is the after-ready work: toolchain
+   tables, missing functions, Qt dispatch, cross-binary links, feature and
+   project-map refresh. `ready` means all index work is done; the background
+   decompile pass runs after it and has its own progress. Tools already work
+   during `finishing` (they may see partial links or functions, with no
+   extra note); a project counts a binary as ready only at `ready`. Older
+   projects keep `ready`. A server stop in `finishing` is completed at the
+   next open (the refresh steps), without re-analysis. `index_status` shows
+   the queue, the current binary, finished times and the remaining estimate;
+   a finishing binary has one line `#1 app.exe finishing: functions
+   1200/3769` (step: `tables`, `functions d/n`, `Qt dispatch`, `links`,
+   `features`). Options can be
    extended later (`program_add`), which re-runs the light scan and queues
    only the new files.
 7. **Cross-binary links.** All binaries live in one Ghidra project. After
@@ -865,7 +876,7 @@ omitted when the project has one binary. With several ready binaries,
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `open_binary` | `project`, `path` | binary id, format, toolchain, status (`queued`/`analysing`/`ready`) |
+| `open_binary` | `project`, `path` | binary id, format, toolchain, status (`queued`/`analysing`/`finishing`/`ready`) |
 | `list_binaries` | `project?` | one line per binary: id, name, format, arch, toolchain, sha256 prefix, status, then `group=` and `code=` (from the manifest, when known), `fns=` and `links=out/in` (cross-binary edges) |
 | `outline` | `binary` | sections, entry points, import DLLs with counts, `exports N`, `imports from project binaries: x.dll 12, …`, function counts by `name_state`, classes count, toolchain. ~300 tokens |
 | `search` | `query`, `kind?` (`function`/`string`/`import`/`const`/`class`/`note`/`any`), `limit=20` | ranked hits, one line each: kind, name, address, short context; ranking and dedup in §7.4 |

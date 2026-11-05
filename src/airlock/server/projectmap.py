@@ -19,7 +19,7 @@ from typing import Any
 import json5
 
 from airlock import logs
-from airlock.index.store import CODE_SQL, DN_METHOD_HI, DN_METHOD_LO, Store
+from airlock.index.store import CODE_SQL, DN_METHOD_HI, DN_METHOD_LO, USABLE_STATES, Store
 from airlock.projects import ProjectPaths, atomic_write_text, read_manifest
 from airlock.server import clusters as cl
 from airlock.server import features as fx
@@ -277,7 +277,7 @@ def frontier_rows(store: Store, runtime_ids: set[int], top: int = FRONTIER_TOP) 
     """Unnamed functions with the most distinct callers; evidence (strings, imports) raises the rank."""
     pool: list[dict[str, Any]] = []
     for b in store.list_binaries():
-        if b.id in runtime_ids or _status(store, b.id) != "ready":
+        if b.id in runtime_ids or _status(store, b.id) not in USABLE_STATES:
             continue
         for r in store.db.execute(
                 "SELECT f.id, f.space, f.entry, f.name, f.namespace, COUNT(DISTINCT e.src_fn) AS c "

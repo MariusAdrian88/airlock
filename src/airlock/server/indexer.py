@@ -10,9 +10,13 @@ sets the binary ``ready`` and links it to the project's other binaries (import s
 
 Binary status lives in the index ``meta`` table (``status:<id>``) and, mirrored, in the
 manifest file entry (``state``), with measured ``analysis_s``/``code_size`` that refine the
-remaining-time estimate: queued -> importing -> analysing -> extracting -> ready | error.
+remaining-time estimate: queued -> importing -> analysing -> extracting -> finishing -> ready | error.
+``finishing`` is the after-ready work (toolchain tables, missing functions, Qt dispatch, links,
+ready hooks); ``ready`` means all index work is done (the background decompile pass runs after it
+and has its own progress). Tools already work during ``finishing``.
 A persisted non-final status with no live job means the server stopped mid-way;
-``resume_project`` (first use of the project) queues it again.
+``resume_project`` (first use of the project) queues it again; an interrupted ``finishing`` is
+completed by the refresh steps there (no re-analysis).
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from typing import Any, Callable
 
 from airlock import logs
 from airlock.config import Config
-from airlock.index.store import Binary, Store
+from airlock.index.store import USABLE_STATES, Binary, Store
 from airlock.server import estimate as est
 from airlock.server import cpp, delphi, dotnet, fnfix, linking, peres, qt
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
@@ -42,11 +46,12 @@ GHIDRA_PROJECT_NAME = "airlock"
 EXTRACT_KINDS = ("functions", "imports", "exports", "strings", "edges")
 PAGE_SIZE = {"functions": 5000, "imports": 5000, "exports": 5000, "strings": 5000, "edges": 10000}
 GROUP_RANK = {"core": 0, "own_plugin": 1}  # every other group ranks 2
-ACTIVE = ("importing", "analysing", "extracting")
+ACTIVE = ("importing", "analysing", "extracting", "finishing")
 DECOMPILE_FN_PER_S = 200.0  # prior of the background pass, until a rate has been measured
 _MB = 1 << 20
 log = logging.getLogger("airlock")
 FINAL = ("ready", "error")
+USABLE = USABLE_STATES   # tools may read the binary: its data is extracted
 MANAGED_S = 1.0      # estimate for indexing one IL-only assembly
 OPEN_WAIT_S = 30.0
 
@@ -183,6 +188,7 @@ class Job:
     analysis_started: float | None = None
     already_analysed: bool = False
     managed: bool = False         # IL-only assembly: metadata index only, no Ghidra
+    step: str = ""                # what the after-ready work is doing (status finishing)
 
     @property
     def priority(self) -> tuple[int, int, int]:
@@ -313,6 +319,8 @@ class Indexer:
             return status, err or "unknown error"
         if status == "ready":
             return status, ""
+        if status == "finishing" and job is not None:
+            return status, job.step or "tables"
         if job is None:
             return "interrupted", (f"was {status} when the server stopped. "
                                    "Call index_status or open_binary on the file to resume")
@@ -337,7 +345,7 @@ class Indexer:
     def not_ready_error(self, project: str, store: Store, b: Binary) -> str | None:
         """One-line not_analysed error, or None when the binary is ready."""
         status, detail = self.describe(project, store, b)
-        if status == "ready":
+        if status in USABLE:
             return None
         if status == "error":
             return (f"error not_analysed: binary '{b.name}' failed to index ({detail}). "
@@ -411,6 +419,11 @@ class Indexer:
         paths = self.paths(slug)
         plog = logs.project_log(paths.logs)
         n = 0
+        store = self.store(slug)
+        for b in store.list_binaries():   # the server stopped in the after-ready work: the refresh steps below redo it
+            if self.get_status(store, b.id)[0] == "finishing" and self.job_for(slug, b.id) is None:
+                self.set_status(store, b.id, "ready")
+                self._mf_update(slug, b.sha256, state="ready")
         try:
             man = read_manifest(paths.manifest)
         except (OSError, ValueError):
@@ -418,7 +431,6 @@ class Indexer:
         todo = [f for f in man.get("files") or []
                 if f.get("kind", "pe") == "pe" and f.get("state", "queued") not in ("ready", "error")]
         n += len(self.enqueue(slug, todo))
-        store = self.store(slug)
         for b in store.list_binaries():  # opened with open_binary, no manifest entry
             status, _ = self.get_status(store, b.id)
             if status in FINAL or self.job_for(slug, b.id) is not None:
@@ -512,7 +524,8 @@ class Indexer:
             n += 1
         return n
 
-    def create_missing_functions(self, project: str, store: Store, b: Binary) -> int:
+    def create_missing_functions(self, project: str, store: Store, b: Binary,
+                                 progress: Callable[[int, int], None] | None = None) -> int:
         """Create the functions Ghidra missed at message map handlers and vtable targets of ``b``
         (needs the C++ tables), then re-read the binary's functions and edges. Once per
         ``fnfix.FIX_VERSION`` and binary (meta). Returns the number of functions created."""
@@ -532,7 +545,8 @@ class Indexer:
             self.reextract_code(store, b, program)
 
         try:
-            res = fnfix.run(store, b.id, self.worker, program, recover=recover, log=plog.info)
+            res = fnfix.run(store, b.id, self.worker, program, recover=recover, log=plog.info,
+                            progress=progress)
         except WorkerError as e:
             if e.code != "worker_stopped":
                 raise
@@ -850,7 +864,7 @@ class Indexer:
                              image_base=imp.get("image_base"))
             # imports of programs already in the project resolve to them before analysis
             self._link_externals([{"program": job.program, "libs": self._link_libs(
-                st, bid, ("analysing", "extracting", "ready"))}])
+                st, bid, ("analysing", "extracting") + USABLE)}])
             job.analysis_started = time.monotonic()
             self._state(job, "analysing")
             job.reached.set()
@@ -880,16 +894,17 @@ class Indexer:
             if not st.db.execute("SELECT 1 FROM dn_type WHERE binary_id=? LIMIT 1", (bid,)).fetchone():
                 raise ValueError("no .NET metadata found")
             st.upsert_binary(b.sha256, b.name, analysed_at=_now())
-            self._state(job, "ready", code_size=0, managed=True,
+            self._state(job, "finishing", code_size=0, managed=True,
                         extract_s=round(time.monotonic() - t0, 2))
         except Exception as e:  # noqa: BLE001
             self._fail(job, f"cannot read .NET metadata: {type(e).__name__}: {e}")
             return
-        job.reached.set()
         try:
             self._after_managed(job)
-        except Exception as e:  # noqa: BLE001  links are an extra; the binary stays ready
+        except Exception as e:  # noqa: BLE001  links are an extra; the binary becomes ready
             self._plog(job).warning("linking failed for %s: %s", job.program, e)
+        self._ready(job)
+        job.reached.set()
         job.finished.set()
 
     def _after_managed(self, job: Job) -> None:
@@ -897,13 +912,16 @@ class Indexer:
         st = self.store(job.project)
         me = st.get_binary_by_id(job.binary_id)
         assert me is not None
+        job.step = "tables"
         try:
             peres.ensure(st, me, self.paths(job.project).artifacts / me.sha256)
         except Exception as e:  # noqa: BLE001  an extra
             self._plog(job).warning("resources of %s: %s", me.name, e)
+        job.step = "links"
         others = [b.id for b in st.list_binaries()
-                  if b.id != me.id and self.get_status(st, b.id)[0] == "ready"]
+                  if b.id != me.id and self.get_status(st, b.id)[0] in USABLE]
         st.link_cross_binary(me.id, others)
+        job.step = "features"
         self._fire_ready(job.project, me.id, job.program)
 
     def _fail(self, job: Job, message: str) -> None:
@@ -969,23 +987,32 @@ class Indexer:
                 extra["analysis_s"] = analysis_s
                 if job.started is not None:
                     extra["total_s"] = round(time.monotonic() - job.started, 1)
-            self._state(job, "ready", **extra)
+            self._state(job, "finishing", **extra)
         except WorkerError as e:
             self._fail(job, worker_error(e))
             return
         except Exception as e:
             self._fail(job, f"extraction failed: {type(e).__name__}: {e}")
             return
-        job.reached.set()
         try:
             self._after_ready(job)
-        except Exception as e:  # links are an extra; the binary stays ready
+        except Exception as e:  # links are an extra; the binary becomes ready
             self._plog(job).warning("cross-binary linking failed for %s: %s", job.program, e)
+        self._ready(job)
+        job.reached.set()
         try:
             self.bulk.schedule(job.project, job.binary_id, job.group)
         except Exception as e:  # the pass is an extra; the binary stays ready
             self._plog(job).warning("cannot schedule the decompile pass for %s: %s", job.program, e)
         job.finished.set()
+
+    def _ready(self, job: Job) -> None:
+        """End of the index work (status finishing -> ready); the decompile pass comes after."""
+        job.step = ""
+        try:
+            self._state(job, "ready")
+        except Exception as e:  # noqa: BLE001
+            self._plog(job).warning("cannot publish ready for %s: %s", job.program, e)
 
     def _after_ready(self, job: Job) -> None:
         """Refine the s/MB estimate, then link this binary with the project's other ready ones:
@@ -1004,8 +1031,9 @@ class Indexer:
                 write_manifest(self.paths(job.project).manifest, man)
         me = st.get_binary_by_id(bid)
         assert me is not None
+        job.step = "tables"
         others = [b for b in st.list_binaries()
-                  if b.id != bid and self.get_status(st, b.id)[0] == "ready"]
+                  if b.id != bid and self.get_status(st, b.id)[0] in USABLE]
         if me.toolchain == "dotnet":    # mixed-mode: native code through Ghidra, plus the metadata
             try:
                 dotnet.ensure(st, me, self.paths(job.project).artifacts / me.sha256, force=True)
@@ -1023,16 +1051,19 @@ class Indexer:
         delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
                          self.config.delphi_sigdb_dir, self.config.warp_dir)   # VMTs, published methods, DFM, IDR names
         qt.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # QMetaObjects, string connects
+        job.step = "functions"
         try:
-            self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
-        except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
+            self.create_missing_functions(job.project, st, me, progress=self._fn_progress(job))   # handlers, vtable targets
+        except Exception as e:  # noqa: BLE001  an extra; the binary becomes ready
             self._plog(job).warning("missing functions of %s: %s", me.name, e)
         delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
                          self.config.delphi_sigdb_dir, self.config.warp_dir)   # IDR names: the function list may have grown
+        job.step = "Qt dispatch"
         try:
             qt.resolve(self, job.project, st, me)   # Qt method addresses, imported parents
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
             self._plog(job).warning("Qt dispatch of %s: %s", me.name, e)
+        job.step = "links"
         st.link_cross_binary(bid, [b.id for b in others])
         try:
             linking.link_dynamic_for(st, bid, [b.id for b in others])
@@ -1047,7 +1078,14 @@ class Indexer:
                     (o.id, me.name.lower()))):
                 links.append({"program": self.program_of(st, o), "libs": {me.name.lower(): job.program}})
         self._link_externals(links)
+        job.step = "features"
         self._fire_ready(job.project, bid, job.program)
+
+    @staticmethod
+    def _fn_progress(job: Job) -> Callable[[int, int], None]:
+        def say(done: int, total: int) -> None:
+            job.step = f"functions {done}/{total}"
+        return say
 
     def _fire_ready(self, project: str, bid: int, what: str = "") -> None:
         """Run the ready hooks (feature derivation + project map) for ``project``."""

@@ -430,3 +430,91 @@ def test_program_add_files_and_errors(scanned):
     assert out.startswith("nothing to add")
     ctx.worker.gate.set()
     wait_for(lambda: len(ctx.worker.imported) == 2)
+
+
+# -- finishing: ready comes after the after-ready work ------------------------------------
+
+def test_ready_follows_finishing_and_the_link_steps(tmp_path):
+    ctx, entries = make_project(tmp_path, [("app.exe", "core", 1.0), ("lib.dll", "core", 1.0)])
+    ix, w = ctx.indexer, ctx.worker
+    _xbin_data(w)
+    history: list[tuple[str, str]] = []
+    orig_state = ix._state
+
+    def state(job, status, *a, **kw):
+        history.append((job.program, status))
+        return orig_state(job, status, *a, **kw)
+
+    seen: dict[str, str] = {}
+
+    def status_of(name):
+        st = ix.store("proj")      # per thread: the hook runs on the extract thread
+        return ix.get_status(st, st.get_binary(name).id)[0]
+
+    orig_link = w.request
+
+    def request(op, args=None, timeout=0):
+        if op == "link_externals" and args["links"][0]["program"] == "app_exe":
+            seen["at_link"] = status_of("lib.dll")      # lib.dll links the earlier app.exe: still finishing
+        return orig_link(op, args, timeout)
+
+    ix._state = state
+    w.request = request
+    ix.ready_hooks.append(lambda project, bid: seen.__setitem__(f"hook{bid}", ix.get_status(
+        ix.store(project), bid)[0]))
+    ix.enqueue("proj", entries[:1])
+    wait_for(lambda: states(ctx)["app.exe"] == "ready")
+    ix.enqueue("proj", entries[1:])
+    wait_for(lambda: states(ctx)["lib.dll"] == "ready")
+    idle(ctx)
+    order = ["importing", "analysing", "extracting", "finishing", "ready"]
+    for prog in ("app_exe", "lib_dll"):
+        assert [s for p, s in history if p == prog] == order
+    assert seen["at_link"] == "finishing"
+    assert set(v for k, v in seen.items() if k.startswith("hook")) == {"finishing"}
+    assert _xedges(ctx, "app.exe") == {(0x402000, 0x1000), (0x401300, 0x1000)}
+
+
+def test_index_status_shows_finishing_step_and_tools_work(tmp_path):
+    ctx, entries = make_project(tmp_path, [("app.exe", "core", 1.0)])
+    ix = ctx.indexer
+    reached, release = threading.Event(), threading.Event()
+
+    def slow_fix(project, store, b, progress=None):
+        progress(1200, 3769)
+        reached.set()
+        assert release.wait(10)
+        return 0
+
+    ix.create_missing_functions = slow_fix
+    ix.enqueue("proj", entries)
+    assert reached.wait(20)
+    try:
+        assert states(ctx)["app.exe"] == "finishing"
+        out = admin.index_status(ctx)
+        assert "app.exe finishing: functions 1200/3769" in out
+        assert "1 finishing" in out and " ready:" not in out
+        assert ix.not_ready_error("proj", ix.store("proj"), ix.store("proj").get_binary("app.exe")) is None
+        assert " finishing " in ctx_call_list(ctx)       # list_binaries shows the status
+    finally:
+        release.set()
+    wait_for(lambda: states(ctx)["app.exe"] == "ready")
+    idle(ctx)
+    assert " ready:" in admin.index_status(ctx) and "finishing" not in admin.index_status(ctx)
+
+
+def ctx_call_list(ctx):
+    from airlock.server.tools import core
+    return core.list_binaries(ctx)
+
+
+def test_interrupted_finishing_is_completed_on_resume(tmp_path):
+    ctx, entries = make_project(tmp_path, [("app.exe", "core", 1.0)], state="finishing")
+    ix = ctx.indexer
+    st = ix.store("proj")
+    bid = st.upsert_binary(entries[0]["sha256"], "app.exe")
+    st.set_meta(f"program:{bid}", "app_exe")
+    ix.set_status(st, bid, "finishing")
+    assert ix.resume_project("proj") == 0
+    assert ix.get_status(st, bid)[0] == "ready"
+    assert states(ctx)["app.exe"] == "ready"

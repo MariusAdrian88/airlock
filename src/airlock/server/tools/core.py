@@ -69,8 +69,8 @@ def open_binary(ctx: ServerContext, project: str, path: str) -> str:
         out.append(ctx.indexer.describe(ctx.indexer.current or project,
                                         ctx.indexer.store(ctx.indexer.current or project),
                                         res.binary)[1])
-    elif res.status != "ready":
-        out.append("Analysis takes minutes. Call index_status; tools work once status is ready.")
+    elif res.status not in ("finishing", "ready"):
+        out.append("Analysis takes minutes. Call index_status; tools work from status finishing on.")
     if res.note:
         out.append(res.note)
     return "\n".join(out)

@@ -141,7 +141,7 @@ def _project_lines(ix, p: str, st) -> list[str]:
     open_ = [r for r in q.rows if r.state not in ("ready", "error")]
     if open_:
         parts = [f"{counts[s]} {s}" for s in ("ready", "importing", "analysing", "extracting",
-                                              "queued", "error") if counts.get(s)]
+                                              "finishing", "queued", "error") if counts.get(s)]
         line = (f"  queue: {', '.join(parts)} | remaining ~{_dur(q.remaining_s)} "
                 f"({q.overhead_s:.0f} s/binary + {q.s_per_mb:.0f} s/MB)")
         if q.decompile_fns:

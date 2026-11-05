@@ -130,7 +130,10 @@ def test_worker_failure_is_not_recorded(tmp_path):
 def test_chunks_and_conventions_only_with_the_last(tmp_path, monkeypatch):
     ctx, st, bid = _setup(tmp_path)
     monkeypatch.setattr(fnfix, "BATCH", 1)
-    assert ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid)) == 2
+    got: list[tuple[int, int]] = []
+    assert ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid),
+                                                progress=lambda d, n: got.append((d, n))) == 2
+    assert got == [(0, 3), (1, 3), (2, 3), (3, 3)]
     sent = [a for o, a in ctx.worker.calls if o == "create_functions"]
     assert [a["addresses"] for a in sent] == [[NEW_HANDLER], [NEW_VSLOT], [FAILING]]
     assert [a["conventions"] for a in sent] == [False, False, True]

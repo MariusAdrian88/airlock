@@ -118,6 +118,11 @@ class FtsHit:
     text: str
 
 
+# Binary statuses (meta ``status:<id>``) whose extracted data tools may read: ``finishing`` is the
+# after-ready work (tables, links), ``ready`` the end of it. Older projects only have ``ready``.
+USABLE_STATES = ("finishing", "ready")
+
+
 @dataclass(frozen=True)
 class Decomp:
     function_id: int

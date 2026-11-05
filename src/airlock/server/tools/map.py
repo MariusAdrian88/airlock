@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from airlock.index.store import Store
+from airlock.index.store import USABLE_STATES, Store
 from airlock.projects import ProjectPaths
 from airlock.server import features as fx
 from airlock.server import projectmap as pm
@@ -96,7 +96,7 @@ def features(ctx: ServerContext, refresh: bool = False, cursor: str = "", budget
         return s
     pp, st = s
     if refresh or not st.feature_stats() or fx.stale(st):
-        if any(st.get_meta(f"status:{b.id}") == "ready" for b in st.list_binaries()):
+        if any(st.get_meta(f"status:{b.id}") in USABLE_STATES for b in st.list_binaries()):
             refresh_maps(ctx, pp, st, derive=True)
     rows = fx.stats(st)
     if not rows:

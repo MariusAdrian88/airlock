@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 925 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 928 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -115,7 +115,13 @@ join all run at analysis time; estimate within 20% of the real time.
 6. `patch_bytes` is not implemented.
 7. MFC dispatch/automation (OLE) tables are not decoded.
 
-Fixed on 2026-11-05: framework range handlers (tooltips) hidden on control
+Fixed on 2026-11-05: `ready` was published before the after-ready work. Status
+sequence now `importing`, `analysing`, `extracting`, `finishing`, `ready`
+(`USABLE_STATES` in `index/store.py`: tools work from `finishing` on;
+`index_status` shows `finishing: functions 1200/3769`; the decompile pass
+starts after `ready` and is not part of `finishing`). Interrupted `finishing`
+is set to `ready` by `resume_project`, whose refresh steps redo the work.
+Framework range handlers (tooltips) hidden on control
 and menu lines; rotating logs and a per-project `project.log`; `path` uses `server/targets.py` (via
 `server/endpoints.py`); `fnptr` tables only in data sections; stricter CRT
 underscore rule; `Store.set_meta` commits outside a transaction and
@@ -197,8 +203,7 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   no memory problem). Now: requests lost to `stop()` fail as `worker_stopped` (logged at info, redone at
   the next open through the `exists` path); a real exit is logged with its exit code in `worker.log`, and
   `fnfix.run` restarts the worker once (reopen, re-read, send the rest).
-  Open: `ready` still comes before the after-ready work; a client that stops right after `ready` loses the
-  cross-binary links and the decompile pass until the next open.
+  `ready` now comes after the after-ready work (status `finishing`, see Fixed).
 - Nothing is renamed in Ghidra (as for MFC): `function` shows hints. Project map `UI:` line, `ui-menu` /
   `ui-dialog` feature seeds (`FEATURES_VERSION` 6), `runtime: Delphi` clusters (`graph.CallGraph.lib_hint`
   from units of runtime classes, plus `@`-prefixed names in `clusters.runtime_family`).
@@ -276,9 +281,6 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 
 ## Next
 
-- `ready` is published before the after-ready work (cross-binary links,
-  missing functions, decompile pass). Add a `finishing` state to
-  `index_status` so a client knows when that work is done.
 - Qt6 metaobject layout is proven only on synthetic data; check it on a
   real Qt6 program. Qt feature seeds and pointer-to-member connects are open.
 - Delphi: private routines have no name source (`.jdbg` names use a
