@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,7 +20,9 @@ from airlock.server.budget import (
     STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
 )
 from airlock.server.context import ServerContext
-from airlock.server.cview import OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, format_asm, outline_lines, reduce_c
+from airlock.server.cview import (
+    OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, block_listing, format_asm, outline_lines, reduce_c,
+)
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr
@@ -196,6 +199,43 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     return _page([head, *merged], "search", args, bud)
 
 
+def _qt_method_hits(bd: Bound, query: str, fetch: int,
+                    groups: dict[str, list[tuple[tuple[int, ...], str]]], seq: int, pfx: str) -> int:
+    """Qt signals, slots and methods and published Delphi methods by name: such a method often sits
+    in a FUN_ function, so the function name index cannot find it. Adds
+    `function Class::name addr (Qt slot)` / `function TClass.name addr (Delphi published)` lines."""
+    q = query.strip().lower()
+    if not q or " " in q:
+        return seq
+    rows: list[tuple[str, str, str, int]] = []
+    for sql, sep in (
+            ("SELECT c.name, m.name, m.kind, m.addr FROM qt_method m JOIN qt_class c "
+             "ON c.binary_id=m.binary_id AND c.meta_addr=m.meta_addr "
+             "WHERE m.binary_id=? AND m.addr IS NOT NULL AND instr(lower(m.name), ?) > 0 "
+             "ORDER BY m.name LIMIT ?", "::"),
+            ("SELECT c.name, m.name, 'Delphi ' || m.kind, m.addr FROM dl_method m JOIN dl_class c "
+             "ON c.binary_id=m.binary_id AND c.vmt=m.vmt "
+             "WHERE m.binary_id=? AND m.name<>'' AND instr(lower(m.name), ?) > 0 "
+             "ORDER BY m.name LIMIT ?", ".")):
+        try:
+            got = bd.store.db.execute(sql, (bd.binary.id, q, fetch)).fetchall()
+        except Exception:       # no framework tables in an older index: nothing to add
+            continue
+        rows += [(f"{r[0]}{sep}{r[1]}", r[1], r[2] if r[2].startswith("Delphi") else f"Qt {r[2]}", r[3])
+                 for r in got]
+    for full, name, kind, addr in rows:
+        at = f" {bd.addr(addr)} "
+        line = f"{pfx}function {full}{at}({kind})"
+        fns = groups.setdefault("function", [])
+        fun = f"{pfx}function FUN_"
+        if any(at in x + " " and not x.startswith(fun) for _, x in fns):
+            continue            # a named function hit already covers this address
+        fns[:] = [(k, x) for k, x in fns if not (at in x + " " and x.startswith(fun))]
+        seq += 1
+        fns.append(((_match_rank(query, name), 0, seq), line))
+    return seq
+
+
 def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
                    groups: dict[str, list[tuple[tuple[int, ...], str]]], seq: int,
                    pfx: str) -> int:
@@ -219,6 +259,8 @@ def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
             if item:
                 key, line = item
                 groups.setdefault(k, []).append(((*key, seq), pfx + line))
+    if kind in ("any", "function"):
+        seq = _qt_method_hits(bd, query, fetch, groups, seq, pfx)
     for value, (key, s) in strings.items():
         total = st.string_copies(b.id, value)
         enc = "" if s.encoding == "ascii" else f" {s.encoding}"
@@ -333,45 +375,122 @@ def _now() -> str:
 
 def _timeout_error(fn: Function, what: Any) -> str:
     return (f"error decompile_timeout: {fn.qualified_name}: {what}. "
-            "Try view=signature or xrefs, or raise defaults.decompile_timeout_s.")
+            "Try view=signature, view=asm or xrefs, or raise defaults.decompile_timeout_max_s.")
+
+
+SECONDS_PER_KB = 6          # extra decompile time per KB of code beyond ADAPT_FROM (measured, DESIGN 5)
+ADAPT_FROM = 8192
+RELAXED = {"max_instructions": 1_000_000, "payload_mb": 200}
+
+
+def adaptive_timeout(ctx: ServerContext, fn: Function) -> tuple[int, int]:
+    """(timeout for the first attempt, upper limit) in seconds: ``decompile_timeout_s`` for a normal
+    function, more for a large one (``SECONDS_PER_KB`` per KB beyond ``ADAPT_FROM``), never above
+    ``decompile_timeout_max_s``."""
+    d = ctx.config.defaults
+    base = int(d.get("decompile_timeout_s") or 60)
+    top = max(base, int(d.get("decompile_timeout_max_s") or 600))
+    extra = max(0, (fn.size or 0) - ADAPT_FROM) * SECONDS_PER_KB // 1024
+    return min(top, base + extra), top
+
+
+def _block_listing(ctx: ServerContext, bd: Bound, fn: Function, why: str) -> tuple[str | None, str | None]:
+    """Fallback for a function the decompiler could not finish: a one-line note and one line per
+    basic block from the disassembly (not cached, not C)."""
+    ix = ctx.indexer
+    try:
+        r = ctx.worker.request("disassemble", {"program": ix.program_of(bd.store, bd.binary),
+                                               "entry": fn.entry, "max_instructions": 20000}, timeout=300)
+    except WorkerError as e:
+        return None, worker_error(e, "Call index_status to check the worker")
+    total = r.get("total") if r.get("truncated") else None
+    lines = block_listing(r["rows"], bd.psize, total)
+    head = (f"// decompile failed: {fn.qualified_name}: {why}. Block listing from the disassembly "
+            "(not C); view=asm has the instructions, retry=true decompiles again.")
+    return head + "\n" + "\n".join(lines), None
+
+
+_INFRA_ERRORS = ("JVMNotRunning", "ClosedException", "File is closed")
+
+
+def _infra_error(text: str | None) -> bool:
+    """A worker or JVM failure, not a decompiler result: never cached, always retried."""
+    return any(x in (text or "") for x in _INFRA_ERRORS)
 
 
 def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
-                    retry: bool = False) -> tuple[str | None, str | None]:
+                    retry: bool = False, listing_ok: bool = False) -> tuple[str | None, str | None]:
     """(c_text, error line). Uses the cache when fn_version and analysis_profile match.
-    A timeout row from the background pass (short timeout) gets one decompile with the full
-    timeout; a timeout from a full-timeout attempt is not repeated unless retry is set."""
+    A timeout row from the background pass (short timeout) gets one decompile with the adaptive
+    timeout (grows with the function size); a function that times out then gets one more try with
+    the limits raised and twice the time. A timeout from such an attempt is not repeated unless
+    retry is set. ``listing_ok``: a function that still fails comes back as a block listing
+    (one `// decompile_timeout` note line, then one line per basic block) instead of an error."""
     st, b = bd.store, bd.binary
     if dotnet.is_managed(b, fn):
+        if not fn.is_thunk and "dotnet_decompile" in ctx.config.tools:
+            from airlock.server.tools import dotnet as dn_tools     # late: the tool modules import core
+            out = dn_tools.dotnet_decompile(ctx, type=fn.namespace or "", member=fn.name, binary=b.name)
+            if not out.startswith("error "):
+                return out, None
         return None, dotnet.managed_error(b, fn, st)
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
     if cached is not None and cached.status == "ok" and cached.c_text is not None:
         return cached.c_text, None
-    if (cached is not None and cached.status == "timeout" and not retry
-            and not (cached.error or "").startswith(BG_TIMEOUT)):
+    if (cached is not None and cached.status in ("timeout", "error") and not retry
+            and not (cached.error or "").startswith(BG_TIMEOUT) and not _infra_error(cached.error)):
+        if listing_ok:
+            return _block_listing(ctx, bd, fn, cached.error or "timeout")
         return None, _timeout_error(fn, cached.error or "timeout") + " Pass retry=true to try again."
     ix = ctx.indexer
-    timeout = int(ctx.config.defaults.get("decompile_timeout_s") or 60)
-    try:
-        ix.ensure_open(bd.project)
-        d = ctx.worker.request("decompile", {
-            "program": ix.program_of(st, b), "entry": fn.entry, "timeout": timeout,
-        }, timeout=timeout + 120)
-    except WorkerError as e:
-        return None, worker_error(e, "Call index_status to check the worker")
+    timeout, top = adaptive_timeout(ctx, fn)
+    d: dict[str, Any] = {}
+    args: dict[str, Any] = {"timeout": timeout}
+    for round_ in (1, 2):                   # round 2 only after a transient worker failure
+        attempts: list[dict[str, Any]] = [{"timeout": timeout}]
+        transient = False
+        try:
+            ix.ensure_open(bd.project)
+            prog = ix.program_of(st, b)
+            while attempts:
+                args = attempts.pop(0)
+                d = ctx.worker.request("decompile", {"program": prog, "entry": fn.entry, **args},
+                                       timeout=args["timeout"] + 120)
+                if d.get("status") == "timeout" and not attempts and "max_instructions" not in args:
+                    attempts.append({**RELAXED, "timeout": min(top, args["timeout"] * 2)})
+                elif d.get("status") == "error" and "limit" in str(d.get("error") or "").lower()                         and "max_instructions" not in args:
+                    attempts.append({**RELAXED, "timeout": args["timeout"]})
+                if d.get("status") == "ok":
+                    break
+            transient = d.get("status") == "error" and _infra_error(d.get("error"))
+        except WorkerError as e:
+            if round_ == 2 or e.code not in ("worker_exited", "busy") and not _infra_error(e.message):
+                return None, worker_error(e, "Call index_status to check the worker")
+            transient = True
+        if not transient:
+            break
+        time.sleep(2.0)
     if d.get("status") != "ok":
-        st.upsert_decomp(fn.id, fn.version, profile, d.get("status") or "error",
-                         error=d.get("error"), produced_at=_now())
+        if not _infra_error(d.get("error")):
+            st.upsert_decomp(fn.id, fn.version, profile, d.get("status") or "error",
+                             error=d.get("error"), produced_at=_now())
         what = d.get("error") or d.get("status")
         if d.get("status") == "timeout":
+            if listing_ok:
+                return _block_listing(ctx, bd, fn, f"{what} after {args['timeout']} s")
             return None, _timeout_error(fn, what)
+        if listing_ok:
+            return _block_listing(ctx, bd, fn, str(what))
         return None, (f"error decompile_failed: {fn.qualified_name}: {what}. "
-                      "Try view=signature or xrefs, or raise defaults.decompile_timeout_s.")
+                      "Try view=signature, view=asm or xrefs.")
     st.upsert_decomp(fn.id, fn.version, profile, "ok", c_text=d["c_text"], produced_at=_now())
     cols = d["ast_columns"]
     st.insert_ast_nodes(fn.id, [dict(zip(cols, row)) for row in d["ast"]])
-    return d["c_text"], None
+    text = d["c_text"]
+    if d.get("partial"):
+        text = text.rstrip("\n") + f"\n// partial decompile: {d['partial']}\n"
+    return text, None
 
 
 def _parse_lines(spec: str) -> tuple[int, int] | None:
@@ -434,7 +553,7 @@ def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None,
     assert asm is not None
     body: list[str] = []
     if view == "both":
-        c_text, err = _get_decompiled(ctx, bd, fn, retry)
+        c_text, err = _get_decompiled(ctx, bd, fn, retry, listing_ok=True)
         if err:
             return err
         assert c_text is not None
@@ -523,7 +642,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             offset = STORE.get(cursor, "function", args, identity).offset
         except CursorError as e:
             return e.message
-    c_text, err = _get_decompiled(ctx, bd, fn, retry)
+    c_text, err = _get_decompiled(ctx, bd, fn, retry, listing_ok=True)
     if err:
         return err
     assert c_text is not None
@@ -931,7 +1050,9 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     capped = capped or len(merged) > limit
     merged = merged[:limit]
     if not merged:
-        return f"no strings match '{pattern}'"
+        hint = (". Substring mode is on and the pattern has regex characters. Pass regex=true."
+                if not regex and re.search(r"[|\^$*+?\[\](){}]", pattern) else "")
+        return f"no strings match '{pattern}'{hint}"
     head = f"strings matching '{pattern}': {len(merged)}{'+' if capped else ''}"
     if skipped:
         head += f" ({skipped} binaries not ready, skipped)"

@@ -29,6 +29,7 @@ Layouts, all little endian, ``P`` = pointer size. See DESIGN 11 for what is veri
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 import struct
@@ -43,7 +44,7 @@ log = logging.getLogger("airlock")
 
 QT_VERSION = 3   # 3: Itanium import names, string connects with the import loaded into a register; 2: Qt6 SuperData getter layout, Qt6 notify ids, C++ import rows, connect call sites through import slots
 QT_META = "qt_version"             # meta key prefix; the full key is ``qt_version:<binary id>``
-DISPATCH_VERSION = 3   # 3: connectImpl calls through a register, 32-bit and Itanium shapes; 2: pointer-to-member connects (worker op qt_connects)
+DISPATCH_VERSION = 5   # 5: receiver classes from callers, new objects, factory returns, typed fields and library vtables; 32-bit MinGW vtable scan; 4: virtual member pointers through the class vtable, uncalled instances, longer decompile retry; 3: connectImpl calls through a register, 32-bit and Itanium shapes; 2: pointer-to-member connects (worker op qt_connects)
 DISPATCH_META = "qt_dispatch"      # set when the worker op ran (``qt_dispatch:<binary id>``)
 
 HEADER_WORDS = 14
@@ -674,14 +675,121 @@ def resolve(ix: Any, project: str, store: Store, b: Binary) -> tuple[int, int]:
             imps = {r[0]: r[1] for r in store.db.execute(
                 "SELECT address, name FROM import WHERE binary_id=? AND address IS NOT NULL AND name LIKE '%::%'",
                 (b.id,))}
-            cres = ix.worker.request("qt_connects", {"program": program, "sites": sites, "imports": imps},
-                                     timeout=3600)
+            cctx = connect_context(store, b.id, ix.paths(project).artifacts / b.sha256)
+            cres = ix.worker.request("qt_connects", {"program": program, "sites": sites, "imports": imps,
+                                                     **cctx, "timeout": 45}, timeout=3600)
             store_connects(store, b.id, cres, sites)
             if (cres.get("stats") or {}).get("signatures", 0) > 0:
                 bump_connect_callers(store, b.id)      # the signature changed the decompiler output of the callers
         except Exception as e:  # noqa: BLE001  an extra: the call sites stay listed
             log.warning("Qt pointer connects of %s failed: %s", b.name, e)
     return out
+
+
+MAX_VTABLE_SLOTS = 400
+META_FN_MAX = 160            # largest size of a ``metaObject()`` function
+META_LOOSE = 32              # largest distance from the start of a ``metaObject()`` Ghidra has no function for to its read
+
+
+def connect_context(store: Store, binary_id: int, artifact: Path) -> dict[str, dict]:
+    """Class facts for the worker op ``qt_connects``: ``vtables``, ``fnclass``, ``primary``, ``allvtables`` (also
+    the vtables of classes others derive from) and ``parents`` (class -> superclass). ``vtables`` maps the address point of a
+    vtable (the address a constructor stores into ``this``, slot 0) to a class name, ``fnclass`` maps the entry
+    of a method or virtual function to its class (functions in the vtables of several classes are left out),
+    ``primary`` maps a class to its vtable when it has exactly one. The vtables come from the Qt classes:
+    ``metaObject()`` is a small function that reads the class's ``QMetaObject`` and sits in slot 0 of its vtable,
+    so a data word that holds such a function, followed by two code pointers, is a vtable. That works without
+    RTTI (MinGW). A subclass without a ``Q_OBJECT`` of its own shares the three moc functions, so its vtable is
+    named after the parent and the parent has no ``primary`` entry. The RTTI tables (MSVC) add their vtables."""
+    img = Image.from_pe(artifact)
+    if img is None:
+        return {}
+    db = store.db
+    ps = img.psize
+    metas = {r[0]: r[1] for r in db.execute("SELECT meta_addr, name FROM qt_class WHERE binary_id=?", (binary_id,))}
+    vts: dict[int, str] = {}
+    by_fn: dict[int, set[str]] = {}
+    keys = list(metas)
+    for i in range(0, len(keys), 500):
+        chunk = keys[i:i + 500]
+        for r in db.execute(
+                f"SELECT DISTINCT f.entry, e.dst_addr FROM edge e JOIN function f ON f.id=e.src_fn "
+                f"WHERE e.binary_id=? AND e.dst_addr IN ({','.join('?' * len(chunk))}) AND e.kind<>'write' "
+                f"AND (f.size IS NULL OR f.size<=?)", (binary_id, *chunk, META_FN_MAX)):
+            by_fn.setdefault(r[0], set()).add(metas[r[1]])
+    cand = {fn: next(iter(cl)) for fn, cl in by_fn.items() if len(cl) == 1}
+    # 32-bit MinGW: Ghidra makes no function of ``metaObject()`` (only the vtable points at it), so the read of the
+    # metaobject has no function. A code word in data that starts at most META_LOOSE bytes before such a read and
+    # is no known function stands for it.
+    loose: dict[int, set[str]] = {}
+    for i in range(0, len(keys), 500):
+        chunk = keys[i:i + 500]
+        for r in db.execute(
+                f"SELECT DISTINCT src_addr, dst_addr FROM edge WHERE binary_id=? AND src_fn IS NULL AND kind<>'write' "
+                f"AND dst_addr IN ({','.join('?' * len(chunk))})", (binary_id, *chunk)):
+            loose.setdefault(r[0], set()).add(metas[r[1]])
+    loose_at = sorted(a for a, cl in loose.items() if len(cl) == 1)
+    entries = {r[0] for r in db.execute("SELECT entry FROM function WHERE binary_id=? AND space='ram'", (binary_id,))} \
+        if loose_at else set()
+
+    def loose_class(w: int) -> str | None:
+        if w in entries or not img.is_code(w):
+            return None
+        k = bisect.bisect_left(loose_at, w)
+        if k < len(loose_at) and loose_at[k] - w <= META_LOOSE:
+            return next(iter(loose[loose_at[k]]))
+        return None
+
+    if cand or loose_at:
+        lo, hi = (loose_at[0] - META_LOOSE, loose_at[-1]) if loose_at else (1, 0)
+        for sva, words in img.data_words(ps):
+            n = len(words)
+            for i in range(n - 2):
+                w = words[i]
+                cls = cand.get(w)
+                if cls is None and lo <= w <= hi:
+                    cls = loose_class(w)
+                if cls is not None and img.is_code(words[i + 1]) and img.is_code(words[i + 2]):
+                    vts.setdefault(sva + i * ps, cls)
+    for r in db.execute("SELECT vtable_addr, name FROM rtti_class WHERE binary_id=? AND vtable_addr IS NOT NULL",
+                        (binary_id,)):
+        vts.setdefault(r[0], r[1])
+    allvts = dict(vts)
+    # a class that others derive from is left out: a pointer to a virtual member connected in its constructor
+    # runs the override of the real (derived) object, which the base vtable does not show
+    superclass = {r[0]: r[1] for r in db.execute("SELECT name, parent FROM qt_class WHERE binary_id=? AND parent<>''",
+                                                 (binary_id,))}
+    parents = set(superclass.values())
+    for r in db.execute("SELECT name, bases FROM rtti_class WHERE binary_id=?", (binary_id,)):
+        bases = re.findall(r"[A-Za-z_][\w:]*", r[1] or "")
+        parents.update(bases)
+        if bases:
+            superclass.setdefault(r[0], bases[0])
+    vts = {va: cls for va, cls in vts.items() if cls not in parents}
+    own: dict[str, set[int]] = {}
+    for va, cls in vts.items():
+        own.setdefault(cls, set()).add(va)
+    primary = {cls: next(iter(vs)) for cls, vs in own.items() if len(vs) == 1}
+    owners: dict[int, set[str]] = {}
+    for va, cls in vts.items():
+        for k in range(MAX_VTABLE_SLOTS):
+            b = img.read(va + k * ps, ps)
+            w = int.from_bytes(b, "little") if b else 0
+            if not w or not img.is_code(w):
+                break
+            owners.setdefault(w, set()).add(cls)
+    fnc = {fn: next(iter(cl)) for fn, cl in owners.items() if len(cl) == 1}
+    for r in db.execute("SELECT m.addr, c.name FROM qt_method m JOIN qt_class c ON c.binary_id=m.binary_id AND "
+                        "c.meta_addr=m.meta_addr WHERE m.binary_id=? AND m.addr IS NOT NULL AND m.kind<>'constructor'",
+                        (binary_id,)):
+        fnc[r[0]] = r[1]
+    return {"vtables": vts, "fnclass": fnc, "primary": primary, "allvtables": allvts, "parents": superclass}
+
+
+def class_vtables(store: Store, binary_id: int, artifact: Path) -> tuple[dict[int, str], dict[int, str], dict[str, int]]:
+    """``(vtables, fnclass, primary)`` of ``connect_context``."""
+    c = connect_context(store, binary_id, artifact)
+    return c.get("vtables", {}), c.get("fnclass", {}), c.get("primary", {})
 
 
 def bump_connect_callers(store: Store, binary_id: int) -> int:
@@ -751,7 +859,8 @@ def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]
                                             if s["site"] in expanded else [s])]
         sites = list({(s["fn"], s["site"]): s for s in sites}.values())
     left = [s for s in sites if s["site"] not in found]
-    rows += [(binary_id, s["fn"], s["site"], "ptr", "", "", "") for s in left]
+    dead = set(result.get("uncalled") or [])
+    rows += [(binary_id, s["fn"], s["site"], "ptr", "", "", "uncalled" if s["site"] in dead else "") for s in left]
     with db:
         db.execute("DELETE FROM qt_connect WHERE binary_id=? AND kind='ptr'", (binary_id,))
         db.executemany("INSERT INTO qt_connect(binary_id, fn_entry, site, kind, signal, slot, slot_kind) "
@@ -966,8 +1075,10 @@ def ui_line(store: Store, binary_id: int) -> str:
         c = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='string'", (binary_id,)).fetchone()[0]
         g = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='string-guess'",
                              (binary_id,)).fetchone()[0]
-        pc = store.db.execute("SELECT COUNT(*), SUM(signal<>'') FROM qt_connect WHERE binary_id=? AND kind='ptr'",
-                              (binary_id,)).fetchone()
+        pc = store.db.execute("SELECT COUNT(*), SUM(signal<>'') FROM qt_connect WHERE binary_id=? AND kind='ptr' "
+                              "AND slot_kind<>'uncalled'", (binary_id,)).fetchone()
+        dead = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='ptr' "
+                                "AND slot_kind='uncalled'", (binary_id,)).fetchone()[0]
     except Exception:  # noqa: BLE001  an extra
         return ""
     extra = f", string connections {c}" if c else ""
@@ -975,6 +1086,10 @@ def ui_line(store: Store, binary_id: int) -> str:
         extra += f", {g} string pairs guessed by order"
     if pc and pc[0]:
         extra += f", pointer connects {pc[1] or 0} of {pc[0]} call sites resolved"
+        if dead:
+            extra += f" ({dead} more in functions nobody calls)"
+    elif dead:
+        extra += f", {dead} pointer connect call sites in functions nobody calls"
     return f"Qt: {n} classes, signals {r[0] or 0}, slots {r[1] or 0} ({r[2] or 0} signals and slots mapped to functions){extra}"
 
 

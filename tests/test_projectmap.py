@@ -320,3 +320,46 @@ def test_derive_cap_counts_dropped(proj, monkeypatch):
     assert f"total at least {full}, ranked top 4 listed (cap 4)" in mt.features(ctx)
     seeds = [r for r in fx.stats(st) if r["key"] == "file-io"][0]["seeds"]
     assert seeds == 3                                                    # seeds are kept before callers
+
+
+# -- overview framework lines ------------------------------------------------------------------------
+
+class _FakeStore:
+    def __init__(self, filled):
+        import sqlite3
+        self.db = sqlite3.connect(":memory:")
+        for t in ("dl_class", "qt_class", "msgmap_entry", "dn_type", "rtti_class", "res_dialog"):
+            self.db.execute(f"CREATE TABLE {t} (x)")
+            if t in filled:
+                self.db.execute(f"INSERT INTO {t} VALUES (1)")
+
+
+def test_framework_lines_names_tools_and_enable_hint():
+    from airlock.config.catalog import CATALOG
+    st = _FakeStore({"dl_class", "qt_class", "msgmap_entry"})
+    on = [t for t, i in CATALOG.items() if i.set not in ("delphi", "dotnet")]
+    out = pm.framework_lines(st, on, ["delphi", "dotnet"], ["patch_bytes"])
+    assert len(out) == 3
+    assert out[0].startswith("Delphi (1 classes): delphi_classes, delphi_forms, delphi_events | off in")
+    assert "airlock config --set disabled_sets dotnet" in out[0]
+    assert out[1] == "Qt (1 classes): qt_metaobjects"
+    assert out[2] == "MFC (1 message map entries): mfc_message_maps, dialogs, menus"
+    assert pm.framework_lines(_FakeStore(set()), on, [], []) == []
+    res = pm.framework_lines(_FakeStore({"res_dialog"}), on, [], [])
+    assert res == ["Win32 resources (1 dialogs): dialogs, menus, string_tables"]
+
+
+def test_framework_lines_tool_disabled_individually():
+    st = _FakeStore({"rtti_class"})
+    out = pm.framework_lines(st, ["rtti_classes"], [], ["vtable"])
+    assert "off in this profile: vtable" in out[0] and "disabled_tools []" in out[0]
+
+
+def test_overview_has_frameworks_section(proj):
+    ctx, pp, st = bound(proj)
+    assert "## Frameworks" not in mt.overview(ctx)
+    b = st.list_binaries()[0]
+    st.db.execute("INSERT INTO rtti_class (binary_id, name, td_addr, col_addr) VALUES (?, 'CFoo', 1, 2)", (b.id,))
+    st.db.commit()
+    out = mt.overview(ctx)
+    assert "## Frameworks\nC++ RTTI (1 classes): rtti_classes, vtable" in out

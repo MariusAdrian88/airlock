@@ -18,7 +18,10 @@ INSTRUCTIONS = (
     "session with projects, then project_open(name, role) chosen from the user's task: "
     "reverse engineering and specs are dirty, implementing from specs is clean (ask the "
     "user if unclear). To analyse a new program call project_create. The role cannot change "
-    "in a session. Responses are compact text and may end with a cursor for more."
+    "in a session. Dirty workflow: overview first (purpose, binaries, detected frameworks "
+    "with their tools); features, function_map or search find the area; function reads code; "
+    "xrefs, callgraph and path follow it; annotate records findings; spec_write is for the "
+    "clean side. Responses are compact text and may end with a cursor (pass it back) for more."
 )
 
 

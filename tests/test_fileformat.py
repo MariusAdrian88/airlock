@@ -464,3 +464,136 @@ def test_record_guess_sample_stream(env):
     assert "sample stream" not in _rg(env, "rec.dat", recs)
     assert "sample stream" not in _rg(env, "noise.raw", bytes(rnd.randrange(256) for _ in range(20000)))
     assert "sample stream" not in _rg(env, "ramp.raw", bytes(range(256)) * 80)
+
+
+# -- Java class files, tiny and wide tables, 16-bit and noisy samples --------------------------------
+
+def _class_file(extra_pool=True, cut=0):
+    def utf(s):
+        b = s.encode()
+        return b"\x01" + struct.pack(">H", len(b)) + b
+
+    pool = [utf("demo/Widget"), b"\x07\x00\x01", utf("java/lang/Object"), b"\x07\x00\x03", utf("<init>"), utf("()V"),
+            b"\x0c\x00\x05\x00\x06", b"\x0a\x00\x04\x00\x07", utf("Code")]
+    slots = 9
+    if extra_pool:      # long and double take two slots each
+        pool += [b"\x05" + struct.pack(">q", 1 << 40), b"\x06" + struct.pack(">d", 2.5), b"\x03" + struct.pack(">i", 7),
+                 utf("hello"), b"\x08\x00\x0f"]
+        slots += 2 + 2 + 1 + 1 + 1
+    body = struct.pack(">HHH", 0x21, 2, 4) + b"\x00\x00"
+    body += struct.pack(">H", 1) + struct.pack(">HHHH", 2, 5, 6, 0)                      # one field
+    code = struct.pack(">HHH", 1, 1, 0) + b"\x00" * 4 + struct.pack(">HH", 0, 0)
+    body += struct.pack(">H", 1) + struct.pack(">HHHH", 1, 5, 6, 1) + struct.pack(">HI", 9, len(code)) + code
+    body += b"\x00\x00"
+    d = b"\xca\xfe\xba\xbe" + struct.pack(">HHH", 0, 52, slots + 1) + b"".join(pool) + body
+    return d[:len(d) - cut] if cut else d
+
+
+def test_record_guess_java_class(env):
+    out = _rg(env, "W.class", _class_file())
+    assert "java class file: version 52.0 (Java 8), constant pool of 16 slots (14 entries)" in out
+    assert "class demo/Widget, super java/lang/Object" in out and "1 fields, 1 methods" in out
+    assert "the class ends exactly at" in out and "strings" not in out
+    # a class cut inside the members still gets its pool
+    out = _rg(env, "cut.class", _class_file(cut=12))
+    assert "java class file" in out and "constant pool of 16 slots" in out and "ends exactly" not in out
+    # a constant pool that runs out of tags is no class
+    bad = bytearray(_class_file())
+    bad[10 + 3 + len("demo/Widget")] = 2        # tag 2 does not exist
+    assert "java class file" not in _rg(env, "bad.class", bytes(bad))
+    # the magic inside a blob is found, random bytes behind it are not a class
+    assert "java class file" in _rg(env, "blob.bin", b"\x00" * 40 + _class_file())
+    assert "java class file" not in _rg(env, "m.bin", b"\xca\xfe\xba\xbe" + bytes(random.Random(2).randrange(256) for _ in range(900)))
+
+
+def _range_table(ents, w, endian):
+    code = {2: "H", 4: "I", 8: "Q"}[w]
+    return b"".join(struct.pack(endian + code * 2, off, ln) for off, ln in ents)
+
+
+def test_record_guess_tiny_tables_tile_the_data(env):
+    rnd = random.Random(21)
+    blob = lambda n: bytes(rnd.randrange(1, 256) for _ in range(n))
+    # two entries of 16 bytes behind a 4-byte magic; the ranges tile the rest of the data
+    data = b"TBL1" + struct.pack("<II", 36, 300) + b"\0" * 8 + struct.pack("<II", 336, 500) + b"\0" * 8
+    data += blob(800)
+    out = _rg(env, "two.bin", data)
+    assert "offset/length table: 2 entries x 16 bytes from 0x4; offset u32le at +0, length u32le at +4" in out
+    assert "tile the data exactly" in out
+    # one pair that covers the rest of the data
+    out = _rg(env, "one.bin", b"HDR\0" + struct.pack(">II", 16, 700) + b"\0" * 4 + blob(700))
+    assert "offset/length pair: u32be offset at +0 and length at +4 from 0x4" in out and "covers the rest of the data exactly" in out
+    # ranges that stop short of the end, or leave a gap, are not evidence
+    assert "offset/length" not in _rg(env, "short.bin", b"HDR\0" + struct.pack(">II", 16, 600) + b"\0" * 4 + blob(700))
+    gap = b"TBL1" + struct.pack("<II", 36, 300) + b"\0" * 8 + struct.pack("<II", 340, 400) + b"\0" * 8 + blob(800)
+    assert "offset/length" not in _rg(env, "gap.bin", gap)
+    # random data does not fit
+    for seed in range(20):
+        r = random.Random(seed)
+        assert "offset/length" not in _rg(env, "r.bin", bytes(r.randrange(256) for _ in range(r.randrange(64, 3000))))
+
+
+def test_record_guess_wide_and_narrow_tables(env):
+    rnd = random.Random(33)
+    sizes = [310, 120, 415, 77]
+    # u64 fields, 16-byte entries behind an 8-byte header
+    off, ents = 8 + 16 * 4, []
+    for s in sizes:
+        ents.append((off, s))
+        off += s
+    data = b"HEAD64\0\0" + _range_table(ents, 8, "<") + bytes(rnd.randrange(256) for _ in range(off - 8 - 64))
+    out = _rg(env, "w64.bin", data)
+    assert "offset/length table: 4 entries x 16 bytes from 0x8; offset u64le at +0, length u64le at +8" in out
+    # u16 fields (6-byte entries, big endian): accepted when the ranges tile exactly
+    off, ents = 4 + 6 * 4, []
+    for s in sizes:
+        ents.append((off, s))
+        off += s
+    ent = b"".join(struct.pack(">HHH", 0, o, s) for o, s in ents)
+    out = _rg(env, "w16.bin", b"T16\0" + ent + bytes(rnd.randrange(256) for _ in range(off - 28)))
+    assert "offset u16be at +2, length u16be at +4" in out and "tile the data exactly" in out
+    # the same table with gaps between the ranges is not trusted at 16 bits
+    off, ents = 4 + 6 * 4, []
+    for s in sizes:
+        ents.append((off, s))
+        off += s + 9
+    ent = b"".join(struct.pack(">HHH", 0, o, s) for o, s in ents)
+    assert "offset/length" not in _rg(env, "g16.bin", b"T16\0" + ent + bytes(rnd.randrange(256) for _ in range(off - 28)))
+    # random buffers: no 16-bit or 64-bit table
+    for seed in range(40):
+        r = random.Random(100 + seed)
+        assert "offset/length" not in _rg(env, "r.bin", bytes(r.randrange(256) for _ in range(r.randrange(64, 5000))))
+
+
+def _wave16(n, rnd, stereo=False, noise=0.0):
+    import math as m
+    out = []
+    for i in range(n):
+        out.append(int(8000 * m.sin(i / 9.0) + 3000 * m.sin(i / 3.1) + rnd.gauss(0, 40 + noise)))
+        if stereo:
+            out.append(int(6000 * m.sin(i / 7.0) + rnd.gauss(0, 40 + noise)))
+    return struct.pack("<%dh" % len(out), *[max(-32768, min(32767, v)) for v in out])
+
+
+def test_record_guess_pcm16_and_noisy_samples(env):
+    rnd = random.Random(12)
+    out = _rg(env, "s16.raw", _wave16(12000, rnd))
+    assert "sample stream: 16-bit little-endian PCM-like waveform" in out and "no records" in out and "fixed stride" not in out
+    out = _rg(env, "s16st.raw", _wave16(12000, rnd, stereo=True))
+    assert "16-bit little-endian PCM-like waveform" in out and "interleaved stereo" in out
+    # data that starts on an odd byte is still read
+    assert "16-bit little-endian PCM" in _rg(env, "odd.raw", b"\x01" + _wave16(12000, rnd))
+    # noisy 16-bit and noisy 8-bit audio
+    assert "16-bit little-endian PCM" in _rg(env, "n16.raw", _wave16(12000, rnd, noise=2500))
+    import math as m
+    noisy8 = bytes(max(0, min(255, int(128 + 50 * m.sin(i / 9.0) + 25 * m.sin(i / 3.1) + rnd.gauss(0, 24)))) for i in range(20000))
+    assert "sample stream: 8-bit PCM-like waveform" in _rg(env, "n8.raw", noisy8)
+    # 16-bit tables and noise are no waveform
+    assert "sample stream" not in _rg(env, "ramp16.raw", struct.pack("<8000H", *range(0, 40000, 5)))
+    assert "sample stream" not in _rg(env, "tab16.raw", struct.pack("<6000H", *[rnd.randrange(0, 700) for _ in range(6000)]))
+    assert "sample stream" not in _rg(env, "noise16.raw", bytes(rnd.randrange(256) for _ in range(24000)))
+    recs = b"".join(struct.pack("<HhHhIf", i, -i, rnd.randrange(60000), rnd.randrange(-300, 300), i * 3, i * 0.5) for i in range(1500))
+    assert "sample stream" not in _rg(env, "rec16.dat", recs)
+    text = ("Chào mừng bạn đến với trình hướng dẫn, bạn có thể lập trình %d lần\n" % 0).encode()
+    vi = b"".join(("Chào mừng bạn số %d: ứng dụng tập trung trong các vòng đời %d\n" % (i, i * 7 % 13)).encode() for i in range(300))
+    assert "sample stream" not in _rg(env, "vi.txt", vi)

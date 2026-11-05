@@ -338,6 +338,48 @@ def import_callers(t: ImportTarget, limit: int) -> list[tuple[Bound, Function]]:
 
 def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
                    aggregate: bool = False) -> Target | str:
+    """Resolve ``target`` (see ``_resolve``), then apply the session focus (DESIGN 7.3 rule 9):
+    a name that is ``error ambiguous`` across the binaries of a project resolves in the binary
+    the session looked at last when that binary has exactly one such function, and a function
+    resolved in a multi-binary project becomes the new focus."""
+    r = _resolve(ctx, binary, target, kinds, aggregate)
+    if isinstance(r, str):
+        if r.startswith("error ambiguous"):
+            fr = _focused(ctx, binary, target, kinds, aggregate)
+            if fr is not None:
+                return fr
+        return r
+    if isinstance(r, FunctionTarget):
+        _set_focus(ctx, r.bound)
+    return r
+
+
+def _set_focus(ctx: ServerContext, bd: Bound) -> None:
+    try:
+        if len(bd.store.list_binaries()) > 1:
+            ctx.focus[bd.project] = bd.binary.id
+    except Exception:  # noqa: BLE001  focus is an extra
+        pass
+
+
+def _focused(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
+             aggregate: bool) -> FunctionTarget | None:
+    """Retry an ambiguous, unqualified target in the focus binary; only a single function counts."""
+    sc = bind_scope(ctx, binary, target)
+    if isinstance(sc, str) or sc.explicit:
+        return None
+    fid = ctx.focus.get(sc.project)
+    bd = next((b for b in sc.bounds if b.binary.id == fid), None)
+    if bd is None:
+        return None
+    r = _resolve(ctx, bd.binary.name, sc.bare, kinds, aggregate)
+    if not isinstance(r, FunctionTarget):
+        return None
+    return FunctionTarget(r.bound, r.fn, r.note, f"binary {bd.binary.name} (current binary)")
+
+
+def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
+             aggregate: bool = False) -> Target | str:
     """Resolve ``target`` to a typed target the tool accepts, or return a one-line error.
 
     ``binary`` and a ``binary!`` prefix narrow the lookup; otherwise a project with several ready
@@ -360,9 +402,12 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
         return _by_address(sc, t, ks)
     cands = {bd.binary.id: _candidates(bd) for bd in sc.bounds}
     for name, stem in _attempts(t, cands):
-        r = _by_name(sc, name, stem, cands, aggregate)
+        r = _by_name(sc, name, stem, cands, aggregate, IMPORT in ks)
         if r is not None:
             return _policy(sc, r, t, ks)
+    qa = _qt_method_addr(sc, t)
+    if qa is not None:
+        return _by_address(sc, f"0x{qa:x}", ks)
     if CLUSTER in ks and _CLUSTER_ID.match(t):
         from airlock.server import clusters as cl   # late: clusters imports graph
         c = cl.get_clusters(ctx, sc.project).get(t)
@@ -424,7 +469,7 @@ def _binds_to(imp: ImportTarget, fcands: list[tuple[Bound, Function]]) -> list[t
 
 
 def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
-             aggregate: bool = False) -> Target | str | None:
+             aggregate: bool = False, prefer_def: bool = False) -> Target | str | None:
     """Function(s) and/or import for a name. None when nothing matches.
 
     DESIGN 7.3 rule 8: the single-target tools get exactly one function (several are
@@ -453,6 +498,11 @@ def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
     if fcands and hits:
         imp = _import_target(sc, hits)
         bound = _binds_to(imp, fcands)
+        if not bound and prefer_def and len(fcands) == 1:
+            # tools that list relations: the definition wins, the import is mentioned
+            bd, f = fcands[0]
+            others = ", ".join(b.bound.binary.name for b in imp.bindings)
+            return FunctionTarget(bd, f, None, f"binary {bd.binary.name}; also an import in {others}")
         if not bound:
             listed = _cands(fcands) + [_stub_cand(b, imp.label) for b in imp.bindings]
             return ambiguous(name, listed, len(listed))
@@ -462,6 +512,33 @@ def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
         return FunctionTarget(bd, f, None, f"binary {bd.binary.name}")
     if fcands:
         return ambiguous(name, _cands(fcands), len(fcands))
+    return None
+
+
+def _qt_method_addr(sc: Scope, text: str) -> int | None:
+    """Address of a Qt signal, slot or method named ``Class::name``, or of a published Delphi method
+    named ``TClass.name`` (``search`` and the form tools print these names for functions that are
+    still FUN_ ones). One address only; None when unknown or ambiguous."""
+    name = text.split("(", 1)[0].strip()
+    qcls, _, qmeth = name.rpartition("::")
+    dcls, _, dmeth = name.rpartition(".")
+    for bd in sc.bounds:
+        found: set[int] = set()
+        for sql, args in (
+                ("SELECT m.addr FROM qt_method m JOIN qt_class c ON c.binary_id=m.binary_id "
+                 "AND c.meta_addr=m.meta_addr WHERE m.binary_id=? AND c.name=? AND m.name=? "
+                 "AND m.addr IS NOT NULL", (bd.binary.id, qcls, qmeth) if qcls and qmeth else None),
+                ("SELECT m.addr FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id "
+                 "AND c.vmt=m.vmt WHERE m.binary_id=? AND lower(c.name)=lower(?) "
+                 "AND lower(m.name)=lower(?)", (bd.binary.id, dcls, dmeth) if dcls and dmeth else None)):
+            if args is None:
+                continue
+            try:
+                found |= {int(r[0]) for r in bd.store.db.execute(sql, args)}
+            except Exception:  # noqa: BLE001  no framework tables
+                continue
+        if len(found) == 1:
+            return found.pop()
     return None
 
 

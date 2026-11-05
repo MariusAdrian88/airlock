@@ -16,6 +16,7 @@ Locking rules
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import threading
 from pathlib import Path
@@ -71,6 +72,24 @@ def _analysis_running() -> bool:
 
 # Decompiler thread budget: processors are detected here, when the worker starts.
 POOL = Pool(analysis_running=_analysis_running)
+
+
+@contextlib.contextmanager
+def transaction(program: Any, label: str):
+    """A Ghidra transaction: commits when the block ends, and on an error rolls back only when the
+    block really changed the program. **[verified]** (Ghidra 12.1.4) ending an empty transaction
+    with commit=false undoes the previous committed change, so an error before any change must
+    commit the empty transaction instead. Every write site in the worker uses this helper."""
+    tx = program.startTransaction(label)
+    mod0 = int(program.getModificationNumber())
+    ok = False
+    try:
+        yield
+        ok = True
+    finally:
+        if not ok and int(program.getModificationNumber()) == mod0:
+            ok = True
+        program.endTransaction(tx, ok)
 
 
 def require_ghidra() -> None:

@@ -555,6 +555,11 @@ def test_path_runtime_wrapper_at_the_end_is_clean(tmp_path):
     assert ctx.wait_maps()
     g = gr.get_graph(pp, st)
     assert {g.qname(v) for v in gr.runtime_nodes(g)} >= {"CFile::Write", "CFile::Seek", "__amsg_exit"}
+    wr = {g.qname(v) for v in gr.wrapper_nodes(g, gr.runtime_nodes(g), set(gr.find_hubs(g)))}
+    assert "CFile::Write" in wr and "__amsg_exit" not in wr and "__NMSG_WRITE" not in wr   # structure + plumbing
+    keep, g.sizes = g.sizes, {v: 0x400 for v in g.sizes}       # a big library function is no wrapper
+    assert "CFile::Write" not in {g.qname(v) for v in gr.wrapper_nodes(g, gr.runtime_nodes(g), set())}
+    g.sizes = keep
     head = lines(gt.path(ctx, "Save", "WriteFile"))[0]
     assert head.startswith("path Save → WriteFile, 3 hops") and "[via" not in head
     mid = lines(gt.path(ctx, "Export", "WriteFile"))[0]

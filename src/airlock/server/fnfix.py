@@ -18,7 +18,7 @@ from typing import Any, Callable
 from airlock.index.store import Store
 from airlock.worker.protocol import WorkerError
 
-FIX_VERSION = 3          # 3: Delphi property accessors; 2: Delphi method and event addresses
+FIX_VERSION = 4          # 4: MFC dispatch map handlers; 3: Delphi property accessors; 2: Delphi method and event addresses
 BATCH = 500           # addresses per worker call: one transaction and one save each (the op accepts 20000)
 RESTARTED = ("worker_exited", "timeout")     # errors after which the worker process is gone
 
@@ -42,7 +42,7 @@ def candidates(store: Store, binary_id: int) -> list[int]:
            "(SELECT entry FROM function WHERE binary_id=?1 AND space='ram')")
     out: set[int] = set()
     for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target"), ("dl_method", "addr"),
-                     ("dl_event", "addr")):
+                     ("dl_event", "addr"), ("mfc_map_entry", "pfn"), ("mfc_map_entry", "pfn_set")):
         out.update(r[0] for r in store.db.execute(sql.format(tab=tab, col=col), (binary_id,)))
     return sorted(out)
 

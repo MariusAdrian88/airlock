@@ -24,6 +24,7 @@ class ServerContext:
     indexer: Indexer = field(init=False)
     session: roles.SessionState = field(default_factory=roles.SessionState)
     profile_role: str | None = None  # role of an explicit --profile, else None
+    focus: dict[str, int] = field(default_factory=dict)  # project -> binary id viewed last (7.3 rule 9)
 
     def __post_init__(self) -> None:
         self.indexer = Indexer(self.config, self.worker)

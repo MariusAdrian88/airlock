@@ -243,9 +243,7 @@ def _analysis_thread(e: Entry, timeout_min: Any, parameter_id: bool = True) -> N
                 timer.daemon = True
                 timer.start()
             tick.start()
-            tx = program.startTransaction("airlock analyze")
-            ok = False
-            try:
+            with S.transaction(program, "airlock analyze"):
                 GhidraScriptUtil.acquireBundleHostReference()
                 try:
                     mgr = AutoAnalysisManager.getAnalysisManager(program)
@@ -256,9 +254,6 @@ def _analysis_thread(e: Entry, timeout_min: Any, parameter_id: bool = True) -> N
                         fixups.apply_all(program, monitor, parameter_id)
                 finally:
                     GhidraScriptUtil.releaseBundleHostReference()
-                ok = True
-            finally:
-                program.endTransaction(tx, ok)
             cancelled = bool(monitor.isCancelled())
             if not cancelled:
                 GhidraProgramUtilities.markProgramAnalyzed(program)
@@ -319,17 +314,12 @@ def apply_fixups(args: dict[str, Any]) -> dict[str, Any]:
     monitor = TaskMonitorAdapter()
     with e.lock:
         program = e.program
-        tx = program.startTransaction("airlock fixups")
-        ok = False
-        try:
+        with S.transaction(program, "airlock fixups"):
             GhidraScriptUtil.acquireBundleHostReference()
             try:
                 stats = fixups.apply_all(program, monitor, args.get("parameter_id") is not False)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
-            ok = True
-        finally:
-            program.endTransaction(tx, ok)
         e.analysis_profile = analysis_profile(program)
         gp.save(program)
     return {"program": e.name, "collector": COLLECTOR_VERSION, "fixups_s": round(time.monotonic() - t0, 1),
@@ -366,14 +356,9 @@ def link_externals(args: dict[str, Any]) -> dict[str, Any]:
                     todo.append((lib, path))
             if not todo:
                 continue
-            tx = e.program.startTransaction("airlock link externals")
-            ok = False
-            try:
+            with S.transaction(e.program, "airlock link externals"):
                 for lib, path in todo:
                     em.setExternalPath(lib, path, True)
-                ok = True
-            finally:
-                e.program.endTransaction(tx, ok)
             gp.save(e.program)
             done += [[e.name, lib, path] for lib, path in todo]
     return {"linked": done, "skipped": skipped}

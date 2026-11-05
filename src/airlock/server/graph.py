@@ -127,6 +127,7 @@ class CallGraph:
     _runtime: set[int] | None = None
     lib_hint: dict[int, str] = field(default_factory=dict)                  # node -> runtime family from metadata (Delphi units)
     _names: dict[str, list[int]] | None = None
+    sizes: dict[int, int] = field(default_factory=dict)                     # node -> function size in bytes
 
     @property
     def n(self) -> int:
@@ -192,10 +193,11 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
     node_of: dict[tuple[int, int], int] = {}
     by_entry: dict[tuple[int, int], int] = {}
     ext_ns: dict[tuple[int, int], str | None] = {}
+    sizes: dict[int, int] = {}
     for bid in bids:
         d: dict[int, tuple[str, int, bool, bool]] = {}
         for r in st.db.execute(
-                "SELECT id, space, entry, name, name_state, namespace, is_thunk, is_external "
+                "SELECT id, space, entry, name, name_state, namespace, is_thunk, is_external, size "
                 "FROM function WHERE binary_id=? ORDER BY space, entry", (bid,)):
             d[r["id"]] = (r["space"], r["entry"], bool(r["is_thunk"]), bool(r["is_external"]))
             if r["is_external"]:
@@ -205,6 +207,7 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
                 by_entry[(bid, r["entry"])] = r["id"]
             if not r["is_thunk"] and not r["is_external"]:
                 node_of[(bid, r["id"])] = len(nodes)
+                sizes[len(nodes)] = r["size"] or 0
                 nodes.append((bid, r["space"], r["entry"], r["id"]))
                 info.append((r["name"], r["name_state"], r["namespace"]))
         fns[bid] = d
@@ -416,6 +419,7 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
     g = CallGraph(nodes, info, directed, cats, sites, imports, imp_directed, import_resolved,
                   import_table)
     g.ptr_only = ptr_pairs - call_pairs
+    g.sizes = sizes
     g.index = {(b, sp, en): i for i, (b, sp, en, _f) in enumerate(nodes)}
     g.node_of_fid = {(b, f): i for i, (b, _sp, _en, f) in enumerate(nodes)}
     for bid in bids:
@@ -624,13 +628,41 @@ def runtime_nodes(g: CallGraph) -> set[int]:
     return g._runtime
 
 
-WRAPPER_MAX = 3         # runtime functions at the end (start) of a chain that still count as a wrapper
+WRAPPER_MAX = 6         # safety cap on the hops of a wrapper chain (the structure normally ends it earlier)
+WRAPPER_BYTES = 160     # a wrapper is small: about 40 instructions (the index keeps bytes, not instructions)
+WRAPPER_FANIN = 4       # more distinct callers than this: shared infrastructure (lock, free), not a wrapper
 PLUMBING = frozenset({"lock", "unlock", "getptd", "amsg_exit", "nmsg_write", "ff_msgbanner", "free", "malloc",
                       "abort", "exit", "cexit", "doexit", "initterm"})   # CRT infrastructure: never a wrapper
 
 
 def _plumbing(name: str) -> bool:
     return name.strip("_").lower() in PLUMBING
+
+
+def wrapper_nodes(g: CallGraph, rt: set[int], hubs: set[int]) -> set[int]:
+    """Runtime library functions that are thin wrappers (DESIGN 7.4 ``path``): a library-tier function
+    (name, FLIRT/IDR/sigdb ``library`` state, recurrence, propagation: ``runtime_nodes``) whose only
+    action is one call or jump to a single other function or import (call graph: one distinct callee),
+    which is small (``WRAPPER_BYTES``), and which many functions do not share (``WRAPPER_FANIN``).
+    Known CRT plumbing names (``PLUMBING``) stay excluded: ``free`` is a perfect wrapper of an import
+    and still not a route a reader wants to see."""
+    adj = g.adj
+    callers = [0] * g.n
+    for (_a, b) in g.directed:
+        if b < g.n:
+            callers[b] += 1
+    out: set[int] = set()
+    for v in rt:
+        if v >= g.n or v in hubs or _plumbing(g.info[v][0]):
+            continue
+        callees = [w for w in adj[v] if w != v]
+        if len(callees) != 1 or callers[v] > WRAPPER_FANIN:
+            continue
+        size = g.sizes.get(v, 0)
+        if size and size > WRAPPER_BYTES:
+            continue
+        out.add(v)
+    return out
 
 
 def _wrapper_zone(g: CallGraph, seeds: set[int], eligible: set[int], forward: bool) -> set[int]:
@@ -693,7 +725,7 @@ def find_paths(g: CallGraph, sources: list[int], targets: list[int], want: int, 
     rt_set = runtime_nodes(g) if runtime is None else runtime
     deadline = time.monotonic() + budget_s
     ends = set(sources) | tset
-    eligible = {v for v in rt_set if v not in hub_set and not _plumbing(g.info[v][0]) and v < g.n}
+    eligible = wrapper_nodes(g, rt_set, hub_set)
     tail = all(g.is_import(t) or t in rt_set for t in tset)        # target is an import / runtime function
     head = all(s in rt_set for s in sources)                       # source is itself runtime code
     allowed: set[int] = set()

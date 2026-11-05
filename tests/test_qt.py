@@ -626,3 +626,518 @@ def test_worker_helpers():
     assert wq.pick_switch([{50: 1}], 3) == {}
     assert wq._signed(0xffffff70, 4) == -0x90 and wq._signed(0x10, 4) == 0x10
     assert wq._signed(0xffffffffffffff70) == -0x90
+
+
+def test_class_vtables(tmp_path):
+    """The vtable of a Qt class is found through its small ``metaObject()``; shared slots stay unassigned."""
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    pe = Pe(8, 5)
+    pe.klass("Alpha", None)
+    pe.klass("Beta", "Alpha")
+    mo_a, mo_b = pe.stub("Alpha.mo"), pe.stub("Beta.mo")
+    mc, fa, fb, fz = pe.stub("mc"), pe.stub("virt_a"), pe.stub("virt_b"), pe.stub("virt_z")
+    vt_a, vt_b, vt_z = pe.alloc(8 * 5), pe.alloc(8 * 5), pe.alloc(8 * 5)
+    pe.put(vt_a, b"".join(pe.p(x) for x in (mo_a, mc, mc, fa)))
+    pe.put(vt_b, b"".join(pe.p(x) for x in (mo_b, mc, mc, fb)))
+    pe.put(vt_z, b"".join(pe.p(x) for x in (mo_a, mc, mc, fz)))          # a subclass without Q_OBJECT shares Alpha's slots
+    sha = "ab" * 32
+    pe.write(art / sha)
+    bid = st.upsert_binary(sha, "app.exe", format="pe32+", arch="x86_64", pointer_size=8, image_base=pe.base,
+                           toolchain="qt", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert qt.ensure(st, st.get_binary_by_id(bid), art / sha)
+    st.insert_functions(bid, [{"entry": mo_a, "name": "FUN_a", "name_state": "auto", "size": 40},
+                              {"entry": mo_b, "name": "FUN_b", "name_state": "auto", "size": 40},
+                              {"entry": mc, "name": "FUN_c", "name_state": "auto", "size": 3}])
+    for fn, cls in ((mo_a, "Alpha"), (mo_b, "Beta"), (mc, "Alpha"), (mc, "Beta")):
+        fid = st.db.execute("SELECT id FROM function WHERE binary_id=? AND entry=?", (bid, fn)).fetchone()[0]
+        st.db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,NULL,?,?)",
+                      (bid, fid, fn + 4, pe.metas[cls], "data"))
+    st.db.commit()
+    vts, fnc, prim = qt.class_vtables(st, bid, art / sha)
+    assert vts == {vt_b: "Beta"}                                     # Alpha has a subclass: its vtables are left out
+    assert prim == {"Beta": vt_b}
+    assert fnc[fb] == "Beta" and fa not in fnc and fz not in fnc
+    assert mc in fnc and fnc[mc] == "Beta"
+
+
+def test_store_connects_uncalled(proj):
+    ctx, st, bid, pe = proj
+    fn = 0x140001000
+    sites = [{"fn": fn, "site": fn + 0x10}, {"fn": fn, "site": fn + 0x20}, {"fn": fn, "site": fn + 0x30}]
+    res = {"results": [{"fn": fn, "site": fn + 0x10, "signal": {"addr": 0x140008100, "ext": "QAction::triggered"},
+                        "slot": {"addr": 0x140001a00, "kind": "pmf", "virt": 0x18, "cls": "MainWindow"}}],
+           "uncalled": [fn + 0x20]}
+    assert qt.store_connects(st, bid, res, sites) == (1, 2)
+    rows = [tuple(r) for r in st.db.execute("SELECT site, signal, slot, slot_kind FROM qt_connect WHERE kind='ptr' "
+                                            "ORDER BY site")]
+    assert rows == [(fn + 0x10, "QAction::triggered", "0x140001a00", "fn"), (fn + 0x20, "", "", "uncalled"),
+                    (fn + 0x30, "", "", "")]
+    line = qt.ui_line(st, bid)
+    assert "pointer connects 1 of 2 call sites resolved (1 more in functions nobody calls)" in line
+    out = qtools.qt_metaobjects(ctx, connections=True)
+    assert "1 pointer connect call sites not resolved" in out
+    assert "1 pointer connect call sites in functions nobody calls" in out
+
+
+class _Addr:
+    def __init__(self, v):
+        self.v = v
+
+    def add(self, n):
+        return _Addr(self.v + n)
+
+    def getOffset(self):
+        return self.v
+
+    def compareTo(self, o):
+        return (self.v > o.v) - (self.v < o.v)
+
+
+class _Fn:
+    def __init__(self, a):
+        self.a = a
+
+    def isThunk(self):
+        return False
+
+    def isExternal(self):
+        return False
+
+    def getEntryPoint(self):
+        return _Addr(self.a)
+
+    def getFunctionThunkAddresses(self, _all):
+        return []
+
+
+class _Ref:
+    def __init__(self, frm, call):
+        self.frm, self.call = frm, call
+
+    def getFromAddress(self):
+        return _Addr(self.frm)
+
+    def getReferenceType(self):
+        return self
+
+    def isCall(self):
+        return self.call
+
+    def isJump(self):
+        return False
+
+
+class _Block:
+    def __init__(self, name, code=True):
+        self.name, self.code = name, code
+
+    def getName(self):
+        return self.name
+
+    def isExecute(self):
+        return self.code
+
+
+class _Prog:
+    """A duck-typed Ghidra program: bytes at addresses, functions at entries, references to entries."""
+
+    def __init__(self, mem, funcs, refs=None, psize=8):
+        self.mem, self.funcs, self.refs, self.psize = mem, funcs, refs or {}, psize
+
+    def getMemory(self):
+        return self
+
+    def getByte(self, a):
+        if a.v not in self.mem:
+            raise KeyError(a.v)
+        b = self.mem[a.v]
+        return b - 256 if b > 127 else b
+
+    def getLong(self, a):
+        return int.from_bytes(bytes(self.mem[a.v + i] for i in range(8)), "little", signed=True)
+
+    def getInt(self, a):
+        return int.from_bytes(bytes(self.mem[a.v + i] for i in range(4)), "little", signed=True)
+
+    def getBlock(self, a):
+        return _Block(".pdata" if a.v >= 0x9000 else ".text", a.v < 0x5000)
+
+    def getFunctionManager(self):
+        return self
+
+    def getFunctionAt(self, a):
+        return _Fn(a.v) if a.v in self.funcs else None
+
+    def getFunctionContaining(self, a):
+        return None
+
+    def getReferenceManager(self):
+        return self
+
+    def getReferencesTo(self, a):
+        return self.refs.get(a.v, [])
+
+    def getAddressFactory(self):
+        return self
+
+    def getDefaultAddressSpace(self):
+        return self
+
+    def getAddress(self, v):
+        return _Addr(v)
+
+    def getDefaultPointerSize(self):
+        return self.psize
+
+
+def test_worker_virtual_member_pointers():
+    from airlock.worker.ghidra_ops import qt as wq
+    code = {0x1000: bytes((0x48, 0x8B, 0x01, 0xFF, 0x60, 0x18)), 0x1010: bytes((0x8B, 0x01, 0xFF, 0xA0, 0x40, 1, 0, 0)),
+            0x1020: bytes((0x48, 0x8B, 0x01, 0xFF, 0x20)), 0x1030: bytes((0x55, 0x48, 0x89, 0xE5, 0xC3))}
+    mem = {a + i: b for a, raw in code.items() for i, b in enumerate(raw.ljust(10, bytes(1)))}
+    vt = 0x5000
+    for k, w in enumerate((0x1000, 0x1010, 0x1020, 0x1030, 0x7777)):         # slots 0..0x18 code, 0x20 not
+        mem.update({vt + 8 * k + i: b for i, b in enumerate(w.to_bytes(8, "little"))})
+    refs = {0x1030: [_Ref(0x9100, False)], 0x1040: [_Ref(0x9100, False), _Ref(0x1500, True)],
+            0x1050: [_Ref(0x2000, False)]}
+    cx = wq._Connects(_Prog(mem, {0x1000, 0x1010, 0x1020, 0x1030, 0x1040, 0x1050}, refs), None, 5,
+                      vtables={vt: "Gamma"}, fnclass={0x1030: "Gamma"}, primary={"Gamma": vt})
+    assert [cx.vcall_offset(a) for a in (0x1000, 0x1010, 0x1020, 0x1030)] == [0x18, 0x140, 0, None]
+    assert cx.target(("const", 0x1000)) == {"virtual": 0x18, "msvc": 1}       # MSVC: the address of a vcall thunk
+    assert cx.target(("const", 0x19)) == {"virtual": 0x18}                    # Itanium: vtable offset plus one
+    assert cx.target(("const", 0x1030)) == {"addr": 0x1030}
+    assert cx.virtual_target(vt, 0x18) == {"addr": 0x1030}                    # the slot of the receiver's vtable
+    assert cx.virtual_target(vt, 0x20) is None                                # not a function
+    assert cx.virtual_target(0, 0x18) is None
+    assert cx.primary[cx.fnclass[0x1030]] == vt
+    assert cx.uncalled(0x1030) is True                                        # only the unwind table refers to it
+    assert cx.uncalled(0x1040) is False                                       # called
+    assert cx.uncalled(0x1050) is False                                       # address taken
+
+
+def test_class_vtables_mingw32_loose_metaobject(tmp_path):
+    """32-bit MinGW: ``metaObject()`` has no Ghidra function, its read of the metaobject is a loose edge."""
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    pe = Pe(4, 5)
+    pe.klass("Alpha", None)
+    mo, mc, fa, far = pe.stub("Alpha.mo"), pe.stub("mc"), pe.stub("virt_a"), pe.stub("far")
+    vt, vt2 = pe.alloc(4 * 5), pe.alloc(4 * 5)
+    pe.put(vt, b"".join(pe.p(x) for x in (mo, mc, mc, fa)))
+    pe.put(vt2, b"".join(pe.p(x) for x in (far, mc, mc, fa)))              # too far from any loose read
+    sha = "cd" * 32
+    pe.write(art / sha)
+    bid = st.upsert_binary(sha, "app.exe", format="pe32", arch="x86", pointer_size=4, image_base=pe.base,
+                           toolchain="qt", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert qt.ensure(st, st.get_binary_by_id(bid), art / sha)
+    st.insert_functions(bid, [{"entry": mc, "name": "FUN_c", "name_state": "auto", "size": 3}])
+    st.db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,NULL,?,NULL,?,?)",
+                  (bid, mo + 10, pe.metas["Alpha"], "data"))
+    st.db.commit()
+    c = qt.connect_context(st, bid, art / sha)
+    assert c["vtables"] == {vt: "Alpha"} and c["primary"] == {"Alpha": vt}
+    assert c["fnclass"][fa] == "Alpha"
+    # the read lies inside a known function: no loose metaObject()
+    st.insert_functions(bid, [{"entry": mo, "name": "FUN_mo", "name_state": "auto", "size": 200}])
+    st.db.commit()
+    assert qt.class_vtables(st, bid, art / sha)[0] == {}
+
+
+def test_connect_context_parents(tmp_path):
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    pe = Pe(8, 5)
+    pe.klass("Alpha", None)
+    pe.klass("Beta", "Alpha")
+    mo_a, mo_b, mc = pe.stub("Alpha.mo"), pe.stub("Beta.mo"), pe.stub("mc")
+    vt_a, vt_b = pe.alloc(8 * 4), pe.alloc(8 * 4)
+    pe.put(vt_a, b"".join(pe.p(x) for x in (mo_a, mc, mc)))
+    pe.put(vt_b, b"".join(pe.p(x) for x in (mo_b, mc, mc)))
+    sha = "ef" * 32
+    pe.write(art / sha)
+    bid = st.upsert_binary(sha, "app.exe", format="pe32+", arch="x86_64", pointer_size=8, image_base=pe.base,
+                           toolchain="qt", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert qt.ensure(st, st.get_binary_by_id(bid), art / sha)
+    st.insert_functions(bid, [{"entry": mo_a, "name": "FUN_a", "name_state": "auto", "size": 40},
+                              {"entry": mo_b, "name": "FUN_b", "name_state": "auto", "size": 40}])
+    for fn, cls in ((mo_a, "Alpha"), (mo_b, "Beta")):
+        fid = st.db.execute("SELECT id FROM function WHERE binary_id=? AND entry=?", (bid, fn)).fetchone()[0]
+        st.db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,NULL,?,?)",
+                      (bid, fid, fn + 4, pe.metas[cls], "data"))
+    st.db.commit()
+    c = qt.connect_context(st, bid, art / sha)
+    assert c["vtables"] == {vt_b: "Beta"}
+    assert c["allvtables"] == {vt_a: "Alpha", vt_b: "Beta"}                 # the base class too, for new objects
+    assert c["parents"]["Beta"] == "Alpha"
+
+
+# -- receiver classes of virtual member pointers (duck-typed Ghidra objects) --
+
+class _NS:
+    def __init__(self, name):
+        self.name = name
+
+    def getName(self, _full=False):
+        return self.name
+
+
+class _XFn(_Fn):
+    """A function: ``ext`` = "Class::name" of an import, ``thunk`` = the function it jumps to."""
+
+    def __init__(self, a, ext=None, thunk=None):
+        super().__init__(a)
+        self.ext, self.thunk = ext, thunk
+
+    def isThunk(self):
+        return self.thunk is not None
+
+    def getThunkedFunction(self, _rec):
+        return self.thunk
+
+    def isExternal(self):
+        return self.ext is not None
+
+    def getParentNamespace(self):
+        return _NS(self.ext.rsplit("::", 1)[0] if self.ext else "Global")
+
+    def getName(self):
+        return self.ext.rsplit("::", 1)[1] if self.ext else f"FUN_{self.a:x}"
+
+
+class _Seq:
+    def __init__(self, key):
+        self.key = key
+
+    def getTarget(self):
+        return _Addr(self.key[0])
+
+    def getTime(self):
+        return self.key[1]
+
+
+class _Callee:
+    def __init__(self, a):
+        self.a = a
+
+    def getAddress(self):
+        return _Addr(self.a)
+
+
+class _Op:
+    def __init__(self, mn, key, *inputs):
+        self.mn, self.key, self.inputs = mn, key, list(inputs)
+
+    def getMnemonic(self):
+        return self.mn
+
+    def getSeqnum(self):
+        return _Seq(self.key)
+
+    def getNumInputs(self):
+        return len(self.inputs)
+
+    def getInput(self, i):
+        return self.inputs[i]
+
+
+def _store(key, ptr, val):
+    return _Op("STORE", key, None, ptr, val)
+
+
+def _call(key, target, *args):
+    return _Op("CALL", key, _Callee(target), *args)
+
+
+class _FakeFlow:
+    """A decompiled function whose varnodes are their own symbolic values."""
+
+    def __init__(self, ops, fields=None):
+        self.ops, self.fields = ops, fields or {}
+
+    def value(self, vn):
+        return None if isinstance(vn, _Callee) else vn
+
+    def calls(self):
+        return [p for p in self.ops if p.mn in ("CALL", "CALLIND")]
+
+    def call_at(self, a):
+        return next((p for p in self.calls() if p.key[0] == a.v), None)
+
+    def field_stores(self, fld):
+        return [(None, v) for v in self.fields.get(fld, [])]
+
+
+class _XProg(_Prog):
+    def __init__(self, mem, funcs, refs=None):
+        super().__init__(mem, set(funcs), refs)
+        self.fns = funcs
+
+    def getFunctionAt(self, a):
+        return self.fns.get(a.v)
+
+    def getFunctionContaining(self, a):
+        best = [f for e, f in self.fns.items() if e <= a.v and not f.isExternal()]
+        return max(best, key=lambda f: f.a) if best else None
+
+
+def _words(base, ws):
+    return {base + 8 * k + i: b for k, w in enumerate(ws) for i, b in enumerate(w.to_bytes(8, "little"))}
+
+
+def test_worker_lib_target():
+    """The slot of a library class: import slots of its program subclasses that do not override it."""
+    from airlock.worker.ghidra_ops import qt as wq
+    acc, oth, own = _XFn(0x1100, "QDialog::accept"), _XFn(0x1108, "QFrame::other"), _XFn(0x1200)
+    mem = {**_words(0x5000, (0x1000, 0x1000, 0x1100)), **_words(0x5100, (0x1000, 0x1000, 0x1100)),
+           **_words(0x5200, (0x1000, 0x1000, 0x1200)), **_words(0x5300, (0x1000, 0x1000, 0x1100)),
+           **_words(0x5400, (0x1000, 0x1000, 0x1108))}
+    prog = _XProg(mem, {0x1000: _XFn(0x1000), 0x1100: acc, 0x1108: oth, 0x1200: own})
+    cx = wq._Connects(prog, None, 5, allvts={0x5000: "Kid", 0x5100: "Kid2", 0x5200: "Over", 0x5300: "F1",
+                                             0x5400: "F2"},
+                      parents={"Kid": "QDialog", "Kid2": "Mid", "Mid": "QDialog", "Over": "QDialog",
+                               "F1": "QFrame", "F2": "QFrame"})
+    assert cx.lib_target("QDialog", 0x10) == {"addr": 0x1100, "ext": "QDialog::accept"}   # Over overrides it
+    assert cx.lib_target("QFrame", 0x10) is None                                         # two imports disagree
+    assert cx.lib_target("QWidget", 0x10) is None                                        # no subclass in the program
+    assert cx.lib_target("QDialog", 0x18) is None                                        # past the vtables
+
+
+def test_worker_receiver_classes():
+    """Receiver classes: callers that agree, new objects, returns of a factory, fields typed by their stores."""
+    from airlock.worker.ghidra_ops import qt as wq
+    vt_a, vt_b = 0x5000, 0x5100
+    mem = {**_words(vt_a, (0x1000, 0x1000)), **_words(vt_b, (0x1000, 0x1000))}
+    p0, p1 = ("param", 0, 0), ("param", 1, 0)
+    fns = {a: _XFn(a) for a in (0x1000, 0x2000, 0x3000, 0x3100, 0x4000, 0x4100, 0x4200, 0x4300, 0x4500, 0x4600,
+                                0x4700)}
+    fns[0x7000] = _XFn(0x7000, "QSpinBox::QSpinBox")
+    fns[0x7100] = _XFn(0x7100, "QWidget::show")
+    fns[0x3300] = _XFn(0x3300, thunk=fns[0x2000])                 # an incremental-link stub: its callers count
+    refs = {0x2000: [_Ref(0x3010, True), _Ref(0x3110, True), _Ref(0x3300, False)]}
+    cx = wq._Connects(_XProg(mem, fns, refs), None, 5, imports={0x8000: "QLabel::vftable"}, vtables={vt_a: "A"},
+                      allvts={vt_a: "A", vt_b: "B"})
+    cx.flows.update({
+        0x3000: _FakeFlow([_store((0x3001, 0), p0, ("const", vt_b)), _store((0x3002, 0), p0, ("const", vt_a)),
+                           _call((0x3010, 0), 0x2000, None, p0, p0)]),
+        0x3100: _FakeFlow([_store((0x3101, 0), p0, ("const", vt_a)), _call((0x3110, 0), 0x2000, None, p0, p0)])})
+    assert cx.ctor_vt(0x3000) == vt_a                             # the last vtable store: the derived class
+    assert cx.recv_vt(0x2000, p1) == vt_a                         # both callers pass ``this`` of an A constructor
+    cx._recv.clear()
+    cx._ctor.clear()
+    cx.flows[0x3100] = _FakeFlow([_store((0x3101, 0), p0, ("const", vt_b)), _call((0x3110, 0), 0x2000, None, p0, p0)])
+    assert cx.recv_vt(0x2000, p1) == 0                            # B has subclasses: ``this`` of its ctor is unknown
+    # objects new-ed in a function
+    obj = ("new", (0x4010, 0), 0)
+    cx.flows[0x4000] = _FakeFlow([_call((0x4010, 0), 0x4600, None), _call((0x4020, 0), 0x7000, obj),
+                                  _store((0x4030, 0), obj, ("mem", 0x8000)), _call((0x4040, 0), 0x7100, obj)])
+    assert cx.recv_vt(0x4000, obj) == "QLabel"                    # the vftable import store comes last
+    obj2 = ("new", (0x4110, 0), 0)
+    cx.flows[0x4100] = _FakeFlow([_call((0x4110, 0), 0x4600, None), _call((0x4120, 0), 0x7000, obj2)])
+    assert cx.recv_vt(0x4100, obj2) == "QSpinBox"                 # the library constructor import
+    obj3 = ("new", (0x4210, 0), 0)
+    cx.flows[0x4200] = _FakeFlow([_call((0x4210, 0), 0x4600, None), _call((0x4220, 0), 0x7000, obj3),
+                                  _store((0x4230, 0), obj3, ("const", vt_b))])
+    assert cx.recv_vt(0x4200, obj3) == vt_b                       # inlined constructor of a program class (exact)
+    obj4 = ("new", (0x4310, 0), 0)
+    cx.flows[0x4300] = _FakeFlow([_call((0x4310, 0), 0x4600, None), _store((0x4320, 0), obj4, ("const", vt_a)),
+                                  _store((0x4330, 0), obj4, ("const", 0x6666))])
+    assert cx.recv_vt(0x4300, obj4) == 0                          # an unknown vtable last: unknown
+    # the result of a factory: every return gives an A
+    made = ("new", (0x4510, 0), 0)
+    cx.flows[0x4600] = None
+    cx.flows[0x4500] = _FakeFlow([_call((0x4510, 0), 0x4600, None), _store((0x4520, 0), made, ("const", vt_a)),
+                                  _Op("RETURN", (0x4530, 0), None, made)])
+    cx.flows[0x4700] = _FakeFlow([_call((0x4710, 0), 0x4500, None)])
+    assert cx.recv_vt(0x4700, ("new", (0x4710, 0), 0)) == vt_a
+    # a field the function stores a new object into
+    fld = ("field", ("ld", ("p", 0), 0xf8))
+    cx.flows[0x4100].fields = {fld[1]: [obj2]}
+    assert cx.recv_vt(0x4100, fld) == "QSpinBox"
+    cx.flows[0x4100].fields = {fld[1]: [obj2, None]}
+    cx._recv.clear()
+    assert cx.recv_vt(0x4100, fld) == 0                           # a second store of something unknown
+    assert cx._lift(None, None, fld) is None                      # a field chain never moves to a caller
+
+
+class _DT:
+    def __init__(self, name):
+        self.name = name
+
+    def getDataType(self):
+        return self
+
+    def getName(self):
+        return self.name
+
+
+class _UnwindProg(_Prog):
+    """Data at 0x6000.. is a chained UNWIND_INFO in .rdata, at 0x6100 a plain pointer table."""
+
+    def getListing(self):
+        return self
+
+    def getDataContaining(self, a):
+        return _DT("PEx64_UnwindInfo" if 0x6000 <= a.v < 0x6100 else "pointer")
+
+
+def test_worker_uncalled_chained_unwind():
+    """A template instance only chained unwind data names is uncalled; a pointer in a table is a use."""
+    from airlock.worker.ghidra_ops import qt as wq
+    refs = {0x1000: [_Ref(0x9100, False), _Ref(0x6010, False)], 0x1010: [_Ref(0x9100, False), _Ref(0x6110, False)]}
+    cx = wq._Connects(_UnwindProg({}, {0x1000, 0x1010}, refs), None, 5)
+    assert cx.uncalled(0x1000) is True
+    assert cx.uncalled(0x1010) is False
+
+
+def test_worker_prefetch_parallel():
+    """The functions with call sites are decompiled on several decompilers at once, each disposed after."""
+    import threading
+    from airlock.worker.ghidra_ops import qt as wq
+    cx = wq._Connects(_Prog({}, {0x1000, 0x1010, 0x1020, 0x1030}), None, 5)
+    seen, made = set(), []
+
+    class _Di:
+        def __init__(self):
+            self.disposed = False
+            made.append(self)
+
+        def dispose(self):
+            self.disposed = True
+
+    def dec(di, f):
+        seen.add(threading.current_thread().name)
+        return None if f.a == 0x1030 else ("hf", f.a)
+
+    cx._decompile = dec
+    assert cx.prefetch([0x1000, 0x1010, 0x1010, 0x1020, 0x1030, 0x2000], 3, _Di) == 3
+    assert cx._pre == {0x1000: ("hf", 0x1000), 0x1010: ("hf", 0x1010), 0x1020: ("hf", 0x1020), 0x1030: None,
+                       0x2000: None}
+    assert made and all(d.disposed for d in made) and len(made) <= 3
+    assert all(n.startswith("airlock-qt-") for n in seen)
+    assert cx.prefetch([0x1000], 3, _Di) == 0                     # already done / too few: nothing to do
+
+
+def test_worker_receiver_stack_object():
+    """A dialog on the stack: its constructor import gives the class; a slot reused for two classes does not."""
+    from airlock.worker.ghidra_ops import qt as wq
+    fns = {0x4000: _XFn(0x4000), 0x7000: _XFn(0x7000, "QDialog::QDialog"), 0x7100: _XFn(0x7100, "QLabel::QLabel")}
+    cx = wq._Connects(_XProg({}, fns), None, 5, imports={0x8000: "QDialog::vftable"})
+    st = ("stack", -0x40)
+    cx.flows[0x4000] = _FakeFlow([_call((0x4010, 0), 0x7000, st), _store((0x4020, 0), st, ("mem", 0x8000))])
+    assert cx.recv_vt(0x4000, st) == "QDialog"
+    cx._recv.clear()
+    cx.flows[0x4000].ops.append(_call((0x4090, 0), 0x7100, st))
+    assert cx.recv_vt(0x4000, st) == 0

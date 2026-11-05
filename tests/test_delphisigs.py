@@ -556,6 +556,17 @@ def test_parse_map_reads_segments_modules_and_publics():
     assert mp.publics == [(1, 0x10, "Unit.TThing.Run"), (2, 0x10, "Unit.SomeData")]
 
 
+def test_parse_map_reads_16_digit_segment_starts():
+    """64-bit maps of Delphi 13 (compiler 37) give the segment start as 16 hex digits."""
+    from airlock.server import delphimap
+    text = map_text({"a": 0x1010}, {"a": "Unit.TThing.Run"}).replace(
+        " 0001:00401000 00000400H .text  ", " 0001:0000000140001000 00000400H .text  ").replace(
+        " 0002:00402000 00000100H .data  ", " 0002:0000000140002000 00000100H .data  ")
+    mp = delphimap.parse_map(text)
+    assert mp.segments[1] == (".text", "CODE", 0x140001000) and mp.segments[2][2] == 0x140002000
+    assert (1, 0x10, "Unit.TThing.Run") in mp.publics
+
+
 @pytest.mark.parametrize("raw, want", [
     ("System.SysUtils.TStringHelper.Split", "System.SysUtils.TStringHelper.Split"),
     ("System.@Str1Ext", "System.@Str1Ext"),
@@ -829,3 +840,47 @@ def test_build_reports_a_vanished_map_file(tmp_path):
     with pytest.raises(delphisigs.SigError, match="is gone"):
         delphisigs.build(_install(tmp_path), tmp_path / "sig", 4, jobs=1,
                          pairs=[(tmp_path / "x.bpl", tmp_path / "x.map")])
+
+
+def test_mega_stubs_missing_resource_files_instead_of_leaving_units_out(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from airlock.server import delphimega
+
+    out = ("Error: E1026 File not found: 'Ed.Picture.fmx'\nError: E1026 File not found: 'Plat.res'\n"
+           "Error: E1026 File not found: 'Gone.pas'\n")
+    done: set[str] = set()
+    new = delphimega.stub_missing(out, tmp_path / "stubs", done)
+    assert new == {"ed.picture.fmx", "plat.res"} and done == new          # a source file is never stubbed
+    assert (tmp_path / "stubs" / "Plat.res").read_bytes()[4:8] == (32).to_bytes(4, "little")
+    assert (tmp_path / "stubs" / "Ed.Picture.fmx").read_text().startswith("object Ed_Picture: TEd_Picture")
+    assert delphimega.stub_missing(out, tmp_path / "stubs", done) == set()    # once per file
+
+    # the build loop: first compile fails on the resource, the retry (stub in place) works; nothing is left out
+    calls = []
+
+    def fake_run(cmd, cwd, **kw):
+        calls.append(cmd)
+        w = Path(cwd)
+        if not (w / "stubs" / "Ed.Picture.fmx").exists():
+            return SimpleNamespace(returncode=1, stdout="Error: E1026 File not found: 'Ed.Picture.fmx'\n")
+        (w / "bpl").mkdir(exist_ok=True)
+        (w / "bpl" / "m_p.bpl").write_bytes(b"x")
+        (w / "bpl" / "m_p.map").write_bytes(b"x")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(delphimega.subprocess, "run", fake_run)
+    res = delphimega._compile(Path("dcc32.exe"), tmp_path, tmp_path / "w", "m_p", ["Ed.Picture", "B"], None, 4, [],
+                              set(), {}, lambda _m: None, "p", False)
+    assert res is not None
+    _bin, _map, kept, excl, rounds, stubbed = res
+    assert kept == 2 and excl == set() and rounds == 2 and stubbed == {"ed.picture.fmx"}
+    assert "-R" in (tmp_path / "w" / "m_p.cfg").read_text() and "stubs" in (tmp_path / "w" / "m_p.cfg").read_text()
+
+
+def test_mega_program_for_units_a_package_may_not_hold():
+    from airlock.server import delphimega
+
+    text = delphimega.dpr_text("m_program", ["Web.WebBroker", "System.Win.ComServ"])
+    assert text.startswith("program m_program;") and "Web.WebBroker,\n  System.Win.ComServ;" in text
+    assert "{$STRONGLINKTYPES ON}" in text and text.rstrip().endswith("end.")

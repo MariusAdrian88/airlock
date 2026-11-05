@@ -137,12 +137,15 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
         rows = [r for r in rows if (r["signal"] or "").startswith(short + "::")
                 or (r["slot_kind"] in ("slot", "signal") and r["slot"].startswith("0x")
                     and _slot_class(db, bid, int(r["slot"], 16)) == short)]
-    unresolved = 0
+    unresolved = dead = 0
     for r in rows:
         fn = bd.store.function_at(bid, r["fn_entry"])
         where = f"in {bd.addr(r['fn_entry'])}" + (f" {fn.qualified_name}" if fn is not None else "")
         if not r["signal"]:
-            unresolved += 1
+            if r["slot_kind"] == "uncalled":
+                dead += 1
+            else:
+                unresolved += 1
             continue
         right = r["slot"]
         if right.startswith("0x"):
@@ -154,6 +157,8 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
         lines.append(f"{_prefix(bd, several)}signal {r['signal']} -> {right} at {bd.addr(r['site'])} {where}")
     if unresolved and cls is None:
         lines.append(f"{_prefix(bd, several)}{unresolved} pointer connect call sites not resolved")
+    if dead and cls is None:
+        lines.append(f"{_prefix(bd, several)}{dead} pointer connect call sites in functions nobody calls (skipped)")
     return lines
 
 

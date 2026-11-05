@@ -480,16 +480,50 @@ def test_foreground_retries_a_background_timeout_with_the_full_timeout(pass_ctx)
     assert "timeouts" not in admin.index_status(ctx)
 
 
-def test_second_foreground_timeout_is_not_retried_without_the_flag(pass_ctx):
+def test_failed_foreground_decompile_retries_once_relaxed_then_lists_blocks(pass_ctx):
     ctx = pass_ctx
     bid, st = timed_out_in_background(pass_ctx)
     ctx.worker.decompile_reply = {"status": "timeout", "error": "took too long"}
     first = core.function(ctx, "0x401100")
-    assert first.startswith("error decompile_timeout:") and "took too long" in first
-    assert ctx.worker.count("decompile") == 1
-    again = core.function(ctx, "0x401100")
-    assert again.startswith("error decompile_timeout:") and "retry=true" in again
-    assert ctx.worker.count("decompile") == 1            # no new attempt
+    calls = [a for o, a in ctx.worker.calls if o == "decompile"]
+    assert len(calls) == 2 and calls[0]["timeout"] == 60                       # normal, then relaxed
+    assert calls[1]["timeout"] == 120 and calls[1]["max_instructions"] and calls[1]["payload_mb"]
+    lines = first.splitlines()
+    assert lines[0].startswith("// decompile failed: ") and "took too long" in lines[0]
+    assert "Block listing" in lines[0] and not first.startswith("error")
+    assert any("[" in ln and "insns]" in ln for ln in lines[1:])                # one line per basic block
+    assert st.get_decomp(st.function_at(bid, 0x401100), "prof1").status == "timeout"
+    again = core.function(ctx, "0x401100")                                      # cached: no new attempt
+    assert again.splitlines()[0].startswith("// decompile failed: ") and ctx.worker.count("decompile") == 2
     ctx.worker.decompile_reply = None
-    assert not core.function(ctx, "0x401100", retry=True).startswith("error")
-    assert ctx.worker.count("decompile") == 2
+    assert not core.function(ctx, "0x401100", retry=True).startswith("//")
+    assert ctx.worker.count("decompile") == 3
+
+
+def test_decompile_timeout_grows_with_function_size(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    st = ctx.indexer.store("proj")
+    fn = st.function_at(bid, 0x401100)
+    assert core.adaptive_timeout(ctx, fn) == (60, 600)
+    st.db.execute("UPDATE function SET size=? WHERE id=?", (8192 + 20 * 1024, fn.id))
+    assert core.adaptive_timeout(ctx, st.get_function(fn.id)) == (60 + 120, 600)
+    st.db.execute("UPDATE function SET size=? WHERE id=?", (200 * 1024, fn.id))
+    assert core.adaptive_timeout(ctx, st.get_function(fn.id)) == (600, 600)     # capped
+    ctx.config.defaults["decompile_timeout_max_s"] = 90
+    assert core.adaptive_timeout(ctx, st.get_function(fn.id)) == (90, 90)
+    ctx.worker.decompile_reply = {"status": "timeout", "error": "slow"}
+    core.function(ctx, "0x401100")
+    calls = [a for o, a in ctx.worker.calls if o == "decompile"]
+    assert [c["timeout"] for c in calls] == [90, 90]                            # never above the limit
+
+
+def test_block_listing_rows():
+    from airlock.server.cview import block_listing
+    rows = [[0x401000, 1, "PUSH EBP", "", "", 1], [0x401001, 5, "CALL 0x402000", "KERNEL32.DLL::Sleep", "", 0],
+            [0x401006, 2, "JNZ LAB_00401020", "", "", 0], [0x401008, 5, "MOV EAX,0x403000", '"hello"', "", 1],
+            [0x40100d, 1, "RET", "", "", 0], [0x401020, 1, "NOP", "", "LAB_00401020", 1]]
+    assert block_listing(rows, 4) == [
+        "0x00401000 [3 insns] calls KERNEL32.DLL::Sleep -> JNZ LAB_00401020",
+        '0x00401008 [2 insns] refs "hello" -> RET',
+        "0x00401020 [1 insns]"]

@@ -322,9 +322,13 @@ def _stride_scores(d: bytes) -> dict[int, float]:
     n = len(d)
     out = {}
     for s in range(2, min(MAX_STRIDE, n // 3) + 1):
-        eq = sum(map(operator.eq, d, d[s:]))
-        out[s] = eq / (n - s)
+        out[s] = _eq_map(d, s).count(0) / (n - s)       # XOR is zero where the bytes repeat
     return out
+
+
+def _eq_map(d: bytes, s: int) -> bytes:
+    """``d[i] ^ d[i + s]`` for every i, as bytes (0 where the byte repeats at +s)."""
+    return (int.from_bytes(d[:-s], "big") ^ int.from_bytes(d[s:], "big")).to_bytes(len(d) - s, "big")
 
 
 def _fmt_f(x: float) -> str:
@@ -513,6 +517,21 @@ def _fundamentals(strong: list[int]) -> list[int]:
     return chosen
 
 
+_EQ01 = bytes([1] + [0] * 255)      # equal -> 1
+
+
+def _block_sums(m: bytes) -> bytes:
+    """Number of ones in each full RUN_BLOCK of the 0/1 bytes ``m`` (big-integer adds, no carries)."""
+    if len(m) < RUN_BLOCK:
+        return b""
+    t = int.from_bytes(m, "big")
+    sh = 1
+    while sh < RUN_BLOCK:       # sums of 2, 4, 8, 16 neighbours
+        t += t >> (8 * sh)
+        sh *= 2
+    return t.to_bytes(len(m), "big")[RUN_BLOCK - 1::RUN_BLOCK]
+
+
 def _local_stride_guesses(d: bytes, org: int) -> list[Guess]:
     """Strides that hold only inside part of the window (header or tail around the records)."""
     sample = d[:STRIDE_SAMPLE]
@@ -527,7 +546,7 @@ def _local_stride_guesses(d: bytes, org: int) -> list[Guess]:
     ratios = []
     cands = {}
     for s in range(2, min(MAX_STRIDE, n // 3) + 1):
-        m = bytes(map(operator.eq, sample, sample[s:]))
+        m = _eq_map(sample, s).translate(_EQ01)
         k = int.from_bytes(m, "big") & (keep >> (8 * s))
         m = k.to_bytes(len(m), "big")
         ratios.append(m.count(1) / len(m))
@@ -536,11 +555,25 @@ def _local_stride_guesses(d: bytes, org: int) -> list[Guess]:
         return []
     base = sorted(ratios)[len(ratios) // 2]
     thr = max(0.30, base + 0.15)
+    up = bytes(max(0, math.ceil(c - thr * RUN_BLOCK + 1e-9)) for c in range(256))
     for s, m in cands.items():
+        sums = _block_sums(m)
+        tail = len(m) % RUN_BLOCK
+        # no run can gain more than the positive blocks add up to: most strides stop here
+        if sum(sums.translate(up)) + (m.count(1, len(m) - tail) if tail else 0) < 24:
+            continue
         cur = best = 0.0
         cs = bs = be = 0
-        for bi, i in enumerate(range(0, len(m), RUN_BLOCK)):
-            c = m.count(1, i, i + RUN_BLOCK) - thr * len(m[i:i + RUN_BLOCK])
+        for bi, c in enumerate(sums):
+            c -= thr * RUN_BLOCK
+            if cur <= 0:
+                cur, cs = 0.0, bi
+            cur += c
+            if cur > best:
+                best, bs, be = cur, cs, bi + 1
+        if tail:
+            bi = len(sums)
+            c = m.count(1, bi * RUN_BLOCK) - thr * tail
             if cur <= 0:
                 cur, cs = 0.0, bi
             cur += c
@@ -658,6 +691,35 @@ def _walk(d: bytes, n: int, start: int, cfg: tuple, budget: list[int], keep: lis
     return recs, pos, bits, len(steps), why
 
 
+def _prep(cfg: tuple) -> tuple:
+    k, w, big, hxx, tr, unit, al, incl = cfg
+    return k, _STRUCTS[(w, big)], 0 if incl else k + w + hxx + tr, k + w, unit, al
+
+
+def _quick(d: bytes, n: int, start: int, prep: tuple) -> int:
+    """Records (0, 1, or 2 for 'two or more') that ``_walk`` would count at ``start``; most starts fail in
+    the first two records, and this tells so without the bookkeeping of a full walk."""
+    k, st, a, lo, unit, al = prep
+    pos, zero = start, 0
+    for rec in (0, 1):
+        if pos + lo > n:
+            return rec
+        ln = st.unpack_from(d, pos + k)[0]
+        step = a + ln * unit
+        if al > 1:
+            step = (step + al - 1) // al * al
+        if step < lo or pos + step > n:
+            return rec
+        if ln == 0:
+            zero += 1
+            if zero > 1:
+                return rec
+        pos += step
+        if pos == n:
+            return rec + 1
+    return 2
+
+
 def _varint(d: bytes, p: int, n: int) -> tuple[int, int] | None:
     v = sh = 0
     for i in range(5):
@@ -769,6 +831,18 @@ def _chain_evidence(d: bytes, n: int, last_nz: int, full: bool, cfg: tuple, star
     return exact, pad, cut, bits + gain
 
 
+def _all_ints(b: bytes, w: int, big: bool) -> list[int]:
+    """Sorted w-byte integers at every position of ``b``."""
+    out: list[int] = []
+    code = {2: "H", 4: "I", 8: "Q"}[w]
+    for ph in range(w):
+        m = (len(b) - ph) // w
+        if m > 0:
+            out += struct.unpack_from(f"{'>' if big else '<'}{m}{code}", b, ph)
+    out.sort()
+    return out
+
+
 def _chains(d: bytes, window_full: bool, org: int = 0, entropy: float = 0.0) -> list[Guess]:
     n = len(d)
     if n < 16:
@@ -777,9 +851,7 @@ def _chains(d: bytes, window_full: bool, org: int = 0, entropy: float = 0.0) -> 
     budget = [HOP_BUDGET]
     last_nz = len(d.rstrip(b"\0"))
     probe = d[:NULL_SAMPLE]
-    nulls = {(w, big): sorted(int.from_bytes(probe[i:i + w], "big" if big else "little")
-                              for i in range(len(probe) - w + 1))
-             for w in (2, 4, 8) for big in (False, True)}
+    nulls = {(w, big): _all_ints(probe, w, big) for w in (2, 4, 8) for big in (False, True)}
     cfgs = list(_chain_configs())
 
     # null: the same data with its blocks shuffled still has the same small numbers, but no chains
@@ -790,8 +862,13 @@ def _chains(d: bytes, window_full: bool, org: int = 0, entropy: float = 0.0) -> 
     cal = 0.0
     cbudget = [HOP_BUDGET // 2]
     for cfg in cfgs:
+        prep = _prep(cfg)
         for start in _CHAIN_STARTS:
             if start + cfg[0] + cfg[1] > cn or cbudget[0] <= 0:
+                continue
+            q = _quick(sd, cn, start, prep)
+            if q < 2:
+                cbudget[0] -= q
                 continue
             recs, pos, bits, ds, why = _walk(sd, cn, start, cfg, cbudget, None, nulls[(cfg[1], cfg[2])])
             if recs >= 2:
@@ -834,12 +911,17 @@ def _chains(d: bytes, window_full: bool, org: int = 0, entropy: float = 0.0) -> 
 
     for cfg in cfgs:
         w = cfg[1]
+        prep = _prep(cfg)
         covered: set[int] = set()
         for start in _CHAIN_STARTS:
             if start + cfg[0] + w > n or start in covered:
                 continue
             if budget[0] <= 0:
                 break
+            q = _quick(d, n, start, prep)
+            if q < 2:
+                budget[0] -= q
+                continue
             keep: list[int] = []
             recs, pos, bits, ds, why = _walk(d, n, start, cfg, budget, keep, nulls[(w, cfg[2])])
             if recs >= 2:
@@ -940,12 +1022,13 @@ def _strings(d: bytes, base: int) -> list[str]:
 
 def _extra_guesses(d: bytes, offset: int, full: bool, entropy: float) -> list[Guess]:
     found = []
-    for f in (recdetect.pgp_packets(d, offset, full), recdetect.preg_records(d, offset)):
+    for f in (recdetect.pgp_packets(d, offset, full), recdetect.preg_records(d, offset),
+              recdetect.class_file(d, offset)):
         if f:
             found.append(f)
     if not found:
         found = [f for f in (recdetect.delimited_text(d, offset),
-                             recdetect.offset_tables(d, offset, _column_fields)) if f]
+                             recdetect.offset_tables(d, offset, _column_fields, full)) if f]
     return [Guess(f.score, f.lines, f.kind, f.span, True, f.recs) for f in found]
 
 
@@ -966,7 +1049,7 @@ def record_guess(src: Src, offset: int = 0) -> list[str]:
     guesses = strides + chains
     extra = _extra_guesses(d, offset, full, entropy)
     stream = recdetect.sample_stream(d) if not extra else None
-    if any(g.kind in ("pgp", "preg") for g in extra):
+    if any(g.kind in ("pgp", "preg", "class") for g in extra):
         guesses = []                      # an exact packet / record chain explains the bytes
     elif stream:                          # a waveform has no records; keep only exact chains (RIFF)
         guesses = [g for g in guesses if g.kind == "chain" and g.exact]
@@ -987,7 +1070,7 @@ def record_guess(src: Src, offset: int = 0) -> list[str]:
         out.append(stream)
     elif not guesses:
         out.append("no fixed stride or length-prefixed chain found.")
-    if entropy <= 7.5 and not stream and not any(g.kind in ("pgp", "preg") for g in extra):
+    if entropy <= 7.5 and not stream and not any(g.kind in ("pgp", "preg", "class") for g in extra):
         out += _strings(d, offset)
     out.append(f"entropy {entropy:.2f} bits/byte" + (" (looks compressed or encrypted)" if entropy > 7.5 else ""))
     return out

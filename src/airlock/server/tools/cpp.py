@@ -7,7 +7,7 @@ cut to the token budget with a cursor. Names are hints: nothing is renamed in Gh
 
 from __future__ import annotations
 
-from airlock.server import cpp, peres, uijoin
+from airlock.server import cpp, mfc, peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
@@ -188,12 +188,45 @@ def _entry_line(bd: Bound, r, ui: uijoin.UiIndex | None = None) -> str:
             ident += f"-{r['last_id']}"
     fn = _fn_name(bd, r["handler"])
     line = f"{label}{ident} -> {bd.addr(r['handler'])}{' ' + fn if fn else ''}"
-    if ui is not None and ui.has_ui:
+    if ui is not None:
         h = uijoin.Handler(r["class"], 0, r["message"], r["code"], r["ctrl_id"], r["last_id"], r["handler"])
-        note = ui.entry_note(h)
+        f = bd.store.function_at(bd.binary.id, r["handler"])
+        if uijoin.is_unnamed(f):
+            line += f" as {ui.suggest(h)}"                 # nothing better exists: a ClassWizard style name
+        note = ui.entry_note(h) if ui.has_ui else ""
         if note:
             line += f"  // {note}"
     return line
+
+
+def _dispatch_line(bd: Bound, r) -> str:
+    """One line of a dispatch / interface / event sink map entry."""
+    kind = r["kind"]
+    fn = lambda a: (f"{bd.addr(a)} {_fn_name(bd, a)}").rstrip()      # noqa: E731
+    if kind == mfc.KIND_INTERFACE:
+        return f"interface {r['name']} offset 0x{r['id']:x}"
+    did = "auto" if r["id"] == -1 else str(r["id"])
+    extra = r["extra"]
+    if kind == mfc.KIND_EVENT:
+        ctrl = f" {extra}" if extra else ""
+        return f"event dispid {did}{ctrl} -> {fn(r['pfn']) if r['pfn'] else 'none'}"
+    typ = mfc.vt_name(r["vt"])
+    if r["flags"] & 1:
+        return f"stock {mfc.STOCK_DISPIDS.get(r['id'], r['name'] or '?')} dispid {did} {typ}"
+    name = r["name"] or "?"
+    args = ""
+    rest = ""
+    for part in (p.strip() for p in extra.split(";") if p.strip()):
+        if part.startswith("args "):
+            args = part[5:].replace(",", ", ")
+        else:
+            rest = f" {part}"
+    if r["pfn"] and not r["pfn_set"]:
+        return f"method {name}({args}) -> {typ} dispid {did} -> {fn(r['pfn'])}"
+    if r["pfn"]:
+        return f"property {name} {typ} dispid {did} get {fn(r['pfn'])} set {fn(r['pfn_set'])}"
+    notify = f" notify {fn(r['pfn_set'])}" if r["pfn_set"] else ""
+    return f"property {name} {typ} dispid {did}{rest}{notify}"
 
 
 def _bases_of(bd: Bound, name: str) -> list[str]:
@@ -206,7 +239,7 @@ def _bases_of(bd: Bound, name: str) -> list[str]:
     return out
 
 
-@tool("mfc_message_maps", "List MFC message maps: per class, each message with control id and handler function.")
+@tool("mfc_message_maps", "List MFC message maps and automation (dispatch, interface, event) maps: per class, each entry with handler function.")
 def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cursor: str = "",
                      budget: int = 0) -> str:
     sc = _scope(ctx, binary)
@@ -228,8 +261,14 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                 dlg = ui.class_dialog_text(r["class"])
                 lines.append(f"{_prefix(bd, several)}{r['class']} map {bd.addr(r['map_addr'])} entries {r['n']}"
                              + (f" {dlg}" if dlg else ""))
+            for r in bd.store.db.execute(
+                    "SELECT class, kind, map_addr, COUNT(*) AS n FROM mfc_map_entry WHERE binary_id=? "
+                    "GROUP BY class, kind, map_addr ORDER BY class, kind, map_addr", (bd.binary.id,)):
+                lines.append(f"{_prefix(bd, several)}{r['class']} {r['kind']} map {bd.addr(r['map_addr'])} "
+                             f"entries {r['n']}")
         if not lines:
-            return "no MFC message maps found in the binary."
+            return ("no MFC message maps found in the binary (a layout this decoder does not know, or no MFC). "
+                    "Follow a command id with menus or dialogs, then constants(value=id) and xrefs.")
         return fit_lines(lines, bud, "code", tool="mfc_message_maps", args=args)[0]
     want = t.lower()
     found = False
@@ -271,6 +310,17 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                         inherited = f"// {cls['name']} has no message map of its own; inherited from {b}"
                     else:
                         todo += _bases_of(bd, b)
+        extra_maps = bd.store.db.execute(
+            "SELECT DISTINCT class, kind, map_addr FROM mfc_map_entry WHERE binary_id=? AND lower(class)=? "
+            "ORDER BY kind, map_addr", (bd.binary.id, want)).fetchall()
+        if not maps and not extra_maps:
+            extra_maps = bd.store.db.execute(
+                "SELECT DISTINCT class, kind, map_addr FROM mfc_map_entry WHERE binary_id=? AND "
+                "lower(class) LIKE ? ORDER BY class, kind, map_addr LIMIT 20", (bd.binary.id, f"%{want}%")
+            ).fetchall()
+            if len({r["class"] for r in extra_maps}) > 1:
+                return (f"error ambiguous: '{t}' matches classes with automation maps: "
+                        f"{', '.join(sorted({r['class'] for r in extra_maps})[:10])}. Retry with the full class name.")
         for m in maps:
             found = True
             if inherited:
@@ -284,6 +334,15 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
             lines.append(f"{_prefix(bd, several)}{m['class']} map {bd.addr(m['map_addr'])} entries {len(rows)}"
                          + (f" {dlg}" if dlg else ""))
             lines += [_entry_line(bd, r, ui) for r in rows]
+        for m in extra_maps:
+            found = True
+            rows = bd.store.db.execute(
+                "SELECT kind, name, id, vt, flags, pfn, pfn_set, extra FROM mfc_map_entry WHERE binary_id=? "
+                "AND class=? AND kind=? AND map_addr=? ORDER BY seq",
+                (bd.binary.id, m["class"], m["kind"], m["map_addr"])).fetchall()
+            lines.append(f"{_prefix(bd, several)}{m['class']} {m['kind']} map {bd.addr(m['map_addr'])} "
+                         f"entries {len(rows)}")
+            lines += [_dispatch_line(bd, r) for r in rows]
     if not found:
         return (f"error not_found: no message map for '{t}'. Call mfc_message_maps without a class for "
                 "the classes that have one.")

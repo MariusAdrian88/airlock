@@ -295,3 +295,42 @@ def format_asm(rows: list[list], psize: int, truncated_total: int | None = None)
     if truncated_total is not None:
         out.append(f"; … truncated at {len(rows)} of {truncated_total} instructions")
     return out
+
+
+_BRANCH = re.compile(r"^(J[A-Z]+|LOOP[A-Z]*)\s+(\S+)", re.I)
+
+
+def block_listing(rows: list[list], psize: int, truncated_total: int | None = None) -> list[str]:
+    """Block-level pseudo listing from worker `disassemble` rows, for a function the decompiler could
+    not finish: one line per basic block, `0xaddr [N insns] calls A, B; "string" -> JNZ LAB_x`.
+    Calls and strings come from the resolved reference notes, the branch from the block's last
+    instruction."""
+    w = psize * 2
+    blocks: list[list] = []          # [addr, count, calls, others, last text]
+    for addr, _length, text, note, label, block in rows:
+        if block or label or not blocks:
+            blocks.append([addr, 0, [], [], ""])
+        b = blocks[-1]
+        b[1] += 1
+        b[4] = text
+        if note:
+            is_call = text.upper().startswith("CALL")
+            for part in str(note).split(", "):
+                tgt = b[2] if is_call else b[3]
+                if part and part not in tgt:
+                    tgt.append(part)
+    out: list[str] = []
+    for addr, n, calls, others, last in blocks:
+        bits = []
+        if calls:
+            bits.append("calls " + ", ".join(_trunc(c, ASM_MAX_NOTE) for c in calls[:6])
+                        + (f" (+{len(calls) - 6})" if len(calls) > 6 else ""))
+        if others:
+            bits.append("refs " + ", ".join(_trunc(c, ASM_MAX_NOTE) for c in others[:3]))
+        m = _BRANCH.match(last)
+        end = f" -> {m.group(1)} {m.group(2)}" if m else (" -> RET" if last.upper().startswith("RET") else "")
+        out.append(f"0x{addr:0{w}x} [{n} insns] " + "; ".join(bits) + end if bits
+                   else f"0x{addr:0{w}x} [{n} insns]{end}")
+    if truncated_total is not None:
+        out.append(f"; … truncated at {len(rows)} of {truncated_total} instructions")
+    return out

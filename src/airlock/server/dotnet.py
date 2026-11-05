@@ -1137,6 +1137,19 @@ def run_ilspy(exe: Path, assembly: Path, type_name: str, timeout: int,
     return out, None
 
 
+def member_alias(member: str, full_type: str) -> str:
+    """The name a member has in the C# text: `.ctor` and `.cctor` are the type's own name, and a
+    compiler-generated lambda or iterator name like `<.ctor>b__37_5` or `<Run>d__3` lives inside
+    the method it came from (`<Name>` prefix)."""
+    m = re.match(r"<([^>]+)>", member)
+    name = m.group(1) if m else member
+    if re.match(r"(?:get|set|add|remove)_\w+$", name):          # property or event accessor
+        name = name.split("_", 1)[1]
+    if name in (".ctor", ".cctor"):
+        return re.split(r"[./+]", re.sub(r"`\d+.*$", "", full_type))[-1] or name
+    return name
+
+
 def member_text(code: str, member: str) -> str | None:
     """The declaration(s) named ``member`` inside the C# of one type: a line at member depth (one
     tab) that names it, the attributes above it and the body (brace matched), or None."""

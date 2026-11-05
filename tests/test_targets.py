@@ -151,6 +151,7 @@ def test_function_accepts_functions_and_import_stubs(world):
     assert core.function(ctx, "plug.dll!ReadFile") == (      # import row only, no stub
         "error external: KERNEL32!ReadFile is an imported function with no code. "
         "Use xrefs on it to see its callers.")
+    ctx.focus.clear()                                       # nothing viewed yet: nothing decides
     assert core.function(ctx, "Main").startswith("error ambiguous: 'Main'")
     assert core.function(ctx, "Nope").startswith("error not_found: no function or import named 'Nope'")
     assert core.function(ctx, "").startswith("error bad_target:")
@@ -160,6 +161,7 @@ def test_function_static_library_function(tmp_path):
     ctx = build(tmp_path, static=True)[0]
     out = core.function(ctx, "KERNEL32!ReadFile", view="signature").splitlines()
     assert out[0] == "binary lib.exe" and out[1].startswith("0x00601000 ReadFile")
+    ctx.focus.clear()
     amb = core.function(ctx, "ReadFile", view="signature")        # a real function and imports elsewhere
     assert amb.startswith("error ambiguous: 'ReadFile' matches 3 functions: ")
     assert "lib.exe!ReadFile 0x00601000" in amb and "host.exe!ReadFile 0x00401300" in amb
@@ -245,3 +247,41 @@ def test_overloads_in_one_binary_are_listed_by_address(world):
     assert "tool.exe!Dup 0x00509000" in amb                      # unique in its binary: the plain name form
     assert core.function(ctx, "host.exe!0x00409100", view="signature").startswith("0x00409100 Dup")
     assert core.function(ctx, "tool.exe!Dup", view="signature").startswith("0x00509000 Dup")
+
+
+# -- session focus, name@binary, definition over import (DESIGN 7.3 rule 9) ----------------------
+
+def test_focus_binary_decides_ambiguous_name(world):
+    ctx = world[0]
+    ctx.focus.clear()
+    assert core.function(ctx, "Main").startswith("error ambiguous: 'Main'")
+    assert core.function(ctx, "tool.exe!Main", view="signature").startswith("0x00501000 Main")
+    out = core.function(ctx, "Main", view="signature").splitlines()       # last viewed binary decides
+    assert out[0] == "binary tool.exe (current binary)" and out[1].startswith("0x00501000 Main")
+    x = core.xrefs(ctx, "host.exe!Main")                                  # focus moves with the view
+    assert _head(x).startswith("xrefs to Main (0x00401000)")
+    assert core.function(ctx, "Main", view="signature").splitlines()[1].startswith("0x00401000 Main")
+    # the focus binary has no such name: nothing decides
+    ctx.focus.clear()
+    core.function(ctx, "plug.dll!Worker", view="signature")
+    assert core.function(ctx, "Main").startswith("error ambiguous: 'Main'")
+
+
+def test_name_at_binary_qualifier(world):
+    ctx = world[0]
+    ctx.focus.clear()
+    out = core.function(ctx, "Main@tool.exe", view="signature").splitlines()
+    assert out[0].startswith("0x00501000 Main")
+    assert core.function(ctx, "Main@host.exe", view="signature").startswith("0x00401000 Main")
+    # an @ that is no binary name stays part of the name
+    assert core.function(ctx, "Main@nope.exe").startswith("error not_found")
+
+
+def test_definition_wins_over_import_for_relation_tools(tmp_path):
+    ctx, _st, _ids = build(tmp_path, static=True)
+    # lib.exe defines ReadFile; host.exe and plug.dll import it (no xedge binding)
+    x = core.xrefs(ctx, "ReadFile")
+    assert _head(x).startswith("xrefs to ReadFile (0x00601000)")
+    assert "binary lib.exe; also an import in host.exe, plug.dll" in x.splitlines()[1]
+    ctx.focus.clear()
+    assert core.function(ctx, "ReadFile", view="signature").startswith("error ambiguous: 'ReadFile'")

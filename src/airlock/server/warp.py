@@ -8,6 +8,7 @@ delphinja files). The reader is a minimal hand-written FlatBuffers walker: no de
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 import uuid
 import zlib
@@ -227,18 +228,18 @@ def in_regions(regions: list[tuple[int, int]], v: int) -> bool:
     return False
 
 
-def _capstone():  # pragma: no cover - import guard
+def _capstone(psize: int = 4):  # pragma: no cover - import guard
     try:
         import capstone
         from capstone import x86
     except ImportError as e:
         raise WarpError("capstone is needed for WARP matching (pip install airlock[sigs])") from e
-    cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+    cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if psize == 8 else capstone.CS_MODE_32)
     cs.detail = True
     return capstone, x86, cs
 
 
-def _insn_flags(i, x86, regions: list[tuple[int, int]], lo: int, hi: int) -> int:
+def _insn_flags(i, x86, regions: list[tuple[int, int]], lo: int, hi: int, wide: bool = False) -> int:
     f = 0
     g = i.groups
     ops = i.operands
@@ -263,12 +264,17 @@ def _insn_flags(i, x86, regions: list[tuple[int, int]], lo: int, hi: int) -> int
         m = ops[1].mem
         if m.base == ops[0].reg and m.index == 0 and m.disp == 0:
             f |= F_NOP
+    mask = 0xFFFFFFFFFFFFFFFF if wide else 0xFFFFFFFF
     for o in ops:
-        if o.type == x86.X86_OP_IMM and in_regions(regions, o.imm & 0xFFFFFFFF):
+        if o.type == x86.X86_OP_IMM and in_regions(regions, o.imm & mask):
             f |= F_CONST
-        elif o.type == x86.X86_OP_MEM and (o.mem.disp or o.mem.base == 0) and \
-                in_regions(regions, o.mem.disp & 0xFFFFFFFF):
-            f |= F_CONST
+        elif o.type == x86.X86_OP_MEM:
+            m = o.mem
+            if m.base == x86.X86_REG_RIP:                      # x64: displacement relative to the next instruction
+                if in_regions(regions, (i.address + i.size + m.disp) & mask):
+                    f |= F_CONST
+            elif (m.disp or m.base == 0) and in_regions(regions, m.disp & mask):
+                f |= F_CONST
     return f
 
 
@@ -276,7 +282,8 @@ def image_blocks(img, entry: int, size: int, regions: list[tuple[int, int]], too
     """Basic blocks `[start, hexbytes, meta]` of the function `[entry, entry+size)` by recursive descent.
 
     A block ends at a jump or return, or before a branch target; calls do not end blocks."""
-    _, x86, cs = tools or _capstone()
+    _, x86, cs = tools or _capstone(getattr(img, "psize", 4))
+    wide = getattr(img, "psize", 4) == 8
     end = entry + size
     insn: dict[int, object] = {}
     leaders = {entry}
@@ -310,7 +317,7 @@ def image_blocks(img, entry: int, size: int, regions: list[tuple[int, int]], too
         a = lead
         while a in insn and (a == lead or a not in leaders):
             ii = insn[a]
-            fl = _insn_flags(ii, x86, regions, entry, end)
+            fl = _insn_flags(ii, x86, regions, entry, end, wide)
             raw += bytes(ii.bytes)
             meta += [ii.size, fl]
             a += ii.size
@@ -342,11 +349,23 @@ def library_stems(comp: int | None) -> list[str]:
     return out + ["core-8"] + (["xe2plus-only"] if comp >= 22 else [])
 
 
+OWN_PREFIX = "airlock-rtl-"          # libraries made by `delphi-sigs warp-build`: ``airlock-rtl-win64.warp``
+
+
 def warp_stem(path: Path) -> str | None:
+    """Stem of a library file: ``core-11`` for delphinja's ``delphi-rtl-core-11.warp``, ``win64`` for an own
+    ``airlock-rtl-win64.warp``."""
     n = path.name
-    if n.startswith("delphi-rtl-") and n.endswith(".warp"):
-        return n[len("delphi-rtl-"):-len(".warp")]
+    if n.endswith(".warp"):
+        for pre in ("delphi-rtl-", OWN_PREFIX):
+            if n.startswith(pre):
+                return n[len(pre):-len(".warp")]
     return None
+
+
+def own_stem(stem: str, psize: int) -> bool:
+    """True for the stem of an own library of the pointer size (any compiler version)."""
+    return stem == ("win64" if psize == 8 else "win32")
 
 
 _CACHE: dict[tuple[str, int, int], WarpLib] = {}
@@ -377,10 +396,60 @@ _WINAPI_UNITS = {"Windows", "Messages", "ShlObj", "ActiveX", "CommCtrl", "ShellA
                  "UxTheme", "ComObj"}
 
 
+_GENERIC_PART = re.compile(r"^([A-Za-z]\w*?)__([1-9])$")
+
+
+def generic_part(part: str) -> str:
+    """``TDictionary__2`` -> ``TDictionary<T>``: the arity suffix of a generic instance in delphinja names, in
+    the form of the other tiers (the type arguments are program types, see ``delphirtti.normalize_class``)."""
+    m = _GENERIC_PART.match(part)
+    return f"{m.group(1)}<T>" if m else part
+
+
+def collapse_generics(name: str) -> str:
+    """``A.TDictionary<System.string,TList<X>>.Add`` -> ``A.TDictionary<T>.Add`` (balanced brackets)."""
+    out: list[str] = []
+    depth = 0
+    for ch in name:
+        if ch == "<":
+            if depth == 0:
+                out.append("<T>")
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def instance_args(class_names: list[tuple[str, str]]) -> dict[str, set[str]]:
+    """{``Unit.Base``: {type argument text}} from (unit, class name) rows such as
+    (``System.Generics.Collections``, ``TDictionary<System.string,System.Integer>``)."""
+    out: dict[str, set[str]] = {}
+    for unit, cls in class_names:
+        m = re.match(r"^(\w+)<(.+)>$", cls)
+        if m and "<" not in m.group(1):
+            out.setdefault(f"{unit}.{m.group(1)}" if unit else m.group(1), set()).add(m.group(2))
+    return out
+
+
+def refine_generics(names: list[str], instances: dict[str, set[str]]) -> list[str]:
+    """Put the real type arguments into ``Unit.TBase<T>`` when the program has exactly one instance of that
+    generic class (several instances share the code, so then the placeholder stays)."""
+    out = []
+    for n in names:
+        def sub(m: re.Match) -> str:
+            args = instances.get(m.group(1))
+            return f"{m.group(1)}<{next(iter(args))}>" if args and len(args) == 1 else m.group(0)
+        out.append(re.sub(r"([\w.]+)<T>", sub, n, count=1))
+    return out
+
+
 def dotted(name: str) -> str:
     """WARP `Unit::Class::Member` as the other tiers write it (`Unit.Class.Member`). A leading unit that
     only old compilers wrote without its namespace (`SysUtils`, `Graphics`, `Windows`) gets it back."""
     parts = name.split("::")
+    parts[1:] = [generic_part(p) for p in parts[1:]]
     unit = parts[0]
     for ns, units in (("System", _SYSTEM_UNITS), ("Vcl", _VCL_UNITS), ("Winapi", _WINAPI_UNITS)):
         if unit in units:
@@ -396,11 +465,11 @@ def dotted(name: str) -> str:
 def match_functions(libs: "WarpLib | list[WarpLib]", img, funcs: list[tuple[int, int | None]], *,
                     min_size: int = 16, max_names: int = 3) -> dict[int, list[str]]:
     """{entry: names} for functions whose WARP GUID is in a library. Ambiguous GUIDs (more than `max_names`
-    different names) and small functions are skipped. 32-bit images only."""
+    different names) and small functions are skipped."""
     libs = [libs] if isinstance(libs, WarpLib) else libs
-    if img.psize != 4 or not any(l.functions for l in libs):
+    if not any(l.functions for l in libs):
         return {}
-    tools = _capstone()
+    tools = _capstone(img.psize)
     regions = image_regions(img)
     out: dict[int, list[str]] = {}
     for entry, size in funcs:
@@ -413,3 +482,155 @@ def match_functions(libs: "WarpLib | list[WarpLib]", img, funcs: list[tuple[int,
         if names and len(names) <= max_names:
             out[entry] = names
     return out
+
+
+# ---- own libraries (`delphi-sigs warp-build`) ---------------------------------------------------
+#
+# delphinja ships no 64-bit library and none for the newest compilers. An own library holds the WARP function
+# GUID (same block rules as above, x64 operands included) of every routine that the map files of the Delphi
+# packages name. It is written in the layout the reader above understands (a FlatBuffers `File` with one
+# zlib compressed Signatures chunk), so `read_warp` loads it; names are already in the dotted form of the other
+# tiers. Whether Binary Ninja itself loads it is not checked.
+
+LIB_MIN_SIZE = 16          # smaller routines are not matched either
+LIB_MAX_NAMES = 3          # a GUID with more names is ambiguous: `match_functions` skips it, so it is not stored
+
+
+class _FbWriter:
+    """Tiny FlatBuffers writer: tables parent first, offsets patched at the end."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray(4)
+        self.patches: list[tuple[int, int]] = []
+
+    def table(self, fields: list[tuple[int, str, object]]) -> int:
+        sizes = {"u8": 1, "u16": 2, "u32": 4, "i64": 8}
+        n = max(i for i, _, _ in fields) + 1
+        vt = len(self.buf)
+        self.buf += bytes(4 + 2 * n)
+        pos = len(self.buf)
+        struct.pack_into("<HH", self.buf, vt, 4 + 2 * n, 0)
+        self.buf += struct.pack("<i", pos - vt)
+        off = 4
+        for idx, kind, val in fields:
+            struct.pack_into("<H", self.buf, vt + 4 + 2 * idx, off)
+            if kind == "ref":
+                self.buf += bytes(4)
+                off += 4
+            elif kind == "raw":
+                self.buf += val  # type: ignore[operator]
+                off += len(val)  # type: ignore[arg-type]
+            else:
+                self.buf += struct.pack({"u8": "<B", "u16": "<H", "u32": "<I", "i64": "<q"}[kind], val)
+                off += sizes[kind]
+        struct.pack_into("<H", self.buf, vt + 2, off)
+        return pos
+
+    def patch(self, at: int, target: int) -> None:
+        self.patches.append((at, target))
+
+    def string(self, s: str) -> int:
+        pos = len(self.buf)
+        raw = s.encode()
+        self.buf += struct.pack("<I", len(raw)) + raw + b"\0"
+        return pos
+
+    def vector(self, count: int) -> int:
+        """A vector of `count` offsets (to be patched); returns its position."""
+        pos = len(self.buf)
+        self.buf += struct.pack("<I", count) + bytes(4 * count)
+        return pos
+
+    def finish(self, root: int) -> bytes:
+        for at, target in self.patches:
+            struct.pack_into("<I", self.buf, at, target - at)
+        struct.pack_into("<I", self.buf, 0, root)
+        return bytes(self.buf)
+
+
+def write_warp(funcs: list[tuple[bytes, str]]) -> bytes:
+    """A `.warp` file with one zlib compressed signature chunk holding `funcs` (guid, name)."""
+    sc = _FbWriter()
+    root = sc.table([(0, "ref", 0)])
+    vec = sc.vector(len(funcs))
+    sc.patch(root + 4, vec)
+    for i, (guid, name) in enumerate(funcs):
+        f = sc.table([(0, "raw", guid), (1, "ref", 0)])
+        sc.patch(vec + 4 + 4 * i, f)
+        sym = sc.table([(0, "ref", 0)])
+        sc.patch(sym + 4, sc.string(name))
+        sc.patch(f + 4 + 16, sym)
+    chunk = zlib.compress(sc.finish(root), 6)
+    fb = _FbWriter()
+    file_root = fb.table([(0, "ref", 0), (1, "ref", 0)])
+    hdr = fb.table([(0, "u16", 1)])
+    fb.patch(file_root + 4, hdr)
+    chunks = fb.vector(1)
+    fb.patch(file_root + 8, chunks)
+    ch = fb.table([(0, "ref", 0), (1, "ref", 0)])
+    fb.patch(chunks + 4, ch)
+    fb.patch(ch + 4, fb.table([(0, "u16", 1), (1, "u8", 0), (2, "u8", 1), (3, "u32", len(chunk))]))
+    data = len(fb.buf)
+    fb.buf += struct.pack("<I", len(chunk)) + chunk
+    fb.patch(ch + 8, data)
+    return fb.finish(file_root)
+
+
+def library_pair(bin_str: str, map_str: str) -> list[tuple[bytes, str]]:
+    """(GUID, dotted name) of every routine a map file names in one rebuilt package. Runs in worker processes."""
+    from airlock.server import delphimap
+    from airlock.server.cpp import Image
+    bin_path = Path(bin_str)
+    _pe, named, starts = delphimap.map_routines(bin_path, Path(map_str))
+    img = Image.from_pe(bin_path)
+    if img is None:
+        return []
+    tools = _capstone(img.psize)
+    regions = image_regions(img)
+    srt = sorted(starts)
+    ends = {s.va: s.end for s in img.sections}
+    out: list[tuple[bytes, str]] = []
+    import bisect
+    for rva in sorted(named):
+        va = img.base + rva
+        j = bisect.bisect_right(srt, rva)
+        size = (srt[j] - rva) if j < len(srt) else 16
+        sec_end = next((e for lo, e in ends.items() if lo <= va < e), va + size)
+        size = min(size, sec_end - va)
+        if size < LIB_MIN_SIZE:
+            continue
+        g = guid_from_blocks(image_blocks(img, va, size, regions, tools))
+        if g:
+            out += [(g, collapse_generics(n)) for n in named[rva]]
+    return out
+
+
+def collect_library(pairs: list[tuple[Path, Path]], jobs: int = 4, progress=None) -> dict[bytes, set[str]]:
+    """{GUID: names} of the (binary, map) pairs, one worker process per pair."""
+    from concurrent.futures import ProcessPoolExecutor
+    by_guid: dict[bytes, set[str]] = {}
+    with ProcessPoolExecutor(max_workers=max(1, jobs)) as ex:
+        futs = [(b, ex.submit(library_pair, str(b), str(m))) for b, m in pairs]
+        for b, fut in futs:
+            got = fut.result()
+            for g, n in got:
+                by_guid.setdefault(g, set()).add(n)
+            if progress:
+                progress(f"{b.name}: {len(got)} routines")
+    return by_guid
+
+
+def write_library(by_guid: dict[bytes, set[str]], dest: Path) -> tuple[int, int]:
+    """Write `{GUID: names}` to `dest`; ambiguous GUIDs are left out. Returns (GUIDs, names) written."""
+    funcs = [(g, n) for g in sorted(by_guid) if len(by_guid[g]) <= LIB_MAX_NAMES for n in sorted(by_guid[g])]
+    if not funcs:
+        raise WarpError("no routine could be read from the packages")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(write_warp(funcs))
+    return len({g for g, _ in funcs}), len(funcs)
+
+
+def build_library(pairs: list[tuple[Path, Path]], dest: Path, jobs: int = 4,
+                  progress=None) -> tuple[int, int]:
+    """Write the library of the (binary, map) pairs to `dest`. Returns (GUIDs, names) written."""
+    return write_library(collect_library(pairs, jobs, progress), dest)

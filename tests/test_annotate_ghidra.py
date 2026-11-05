@@ -101,3 +101,43 @@ def test_struct_define_and_retype(world):
         assert bad.startswith("error bad_type"), bad
     assert an.rename(world, "nope_not_a_variable", "x", kind="local",
                      function=f"0x{caller.entry:x}").startswith("error no_variable")
+
+
+def test_patch_bytes_real_program(world):
+    """patch_bytes writes the Ghidra program only: the asm view changes, the original file does not,
+    a cut instruction and unmapped memory are refused, restore=<note> puts the old bytes back."""
+    import hashlib
+    from pathlib import Path
+
+    st, _caller, fn = _pair(world)
+    b = st.list_binaries()[0]
+    prog = world.indexer.program_of(st, b)
+    rows = world.worker.request("disassemble", {"program": prog, "entry": fn.entry,
+                                                "max_instructions": 8}, timeout=300)["rows"]
+    first = rows[0]
+    multi = next((r for r in rows[1:] if r[1] >= 2), None)
+    assert first[0] == fn.entry
+    file_hash = hashlib.sha256(Path(b.original_path).read_bytes()).hexdigest() if b.original_path else None
+    def code(view_text):
+        return [ln for ln in view_text.splitlines() if ln.startswith("0x")]
+
+    asm0 = code(core.function(world, f"0x{fn.entry:x}", view="asm"))
+    nops = "90" * first[1]
+    out = an.patch_bytes(world, f"0x{fn.entry:x}", nops, why="ghidra test")
+    assert out.startswith(f"patched {first[1]} bytes at 0x"), out
+    nid = int(out.split("note #")[1].split(";")[0])
+    asm1 = code(core.function(world, f"0x{fn.entry:x}", view="asm"))
+    assert asm1 != asm0 and "NOP" in asm1[0].upper(), asm1[:3]
+    if multi is not None:                                    # one byte inside a later multi-byte instruction
+        assert an.patch_bytes(world, f"0x{multi[0] + 1:x}", "90").startswith("error boundary")
+    assert an.patch_bytes(world, "0x7ffffff0", "90").startswith("error uninitialized")
+    def raw():
+        return world.worker.request("disassemble", {"program": prog, "entry": fn.entry, "max_instructions": 1},
+                                    timeout=300)["rows"][0][2]
+    assert raw() == "NOP", raw()
+    back = an.patch_bytes(world, restore=nid)
+    assert raw() != "NOP", (raw(), back)
+    assert back.startswith("patched ") and "(restore" not in back.split(";")[0], back
+    assert code(core.function(world, f"0x{fn.entry:x}", view="asm")) == asm0, (world.worker.request("disassemble", {"program": prog, "entry": fn.entry, "max_instructions": 3}, timeout=300)["rows"], back)
+    if file_hash:
+        assert hashlib.sha256(Path(b.original_path).read_bytes()).hexdigest() == file_hash

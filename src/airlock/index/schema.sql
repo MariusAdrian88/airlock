@@ -278,6 +278,37 @@ CREATE INDEX msgmap_entry_by_ctrl ON msgmap_entry(binary_id, ctrl_id);
 CREATE INDEX msgmap_entry_by_class ON msgmap_entry(binary_id, class, map_addr, seq);
 CREATE INDEX msgmap_entry_by_handler ON msgmap_entry(binary_id, handler);
 
+CREATE TABLE mfc_class (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  name          TEXT NOT NULL,           -- CRuntimeClass name, Dialog_<caption>, or anon_<base>_<map address>
+  vtable_addr   INTEGER NOT NULL,        -- the slot of GetRuntimeClass (first virtual function)
+  rc_addr       INTEGER NOT NULL DEFAULT 0,   -- CRuntimeClass the class declares (0: it only inherits one)
+  obj_size      INTEGER NOT NULL DEFAULT 0,   -- CRuntimeClass.m_nObjectSize
+  schema        INTEGER NOT NULL DEFAULT 0,   -- CRuntimeClass.m_wSchema
+  base          TEXT NOT NULL DEFAULT '',     -- base class: owner of the base message map, else of the base CRuntimeClass
+  map_addr      INTEGER NOT NULL DEFAULT 0,   -- its AFX_MSGMAP (0: none)
+  dialog        TEXT NOT NULL DEFAULT '',     -- dialog resource id passed to the CDialog constructor
+  source        TEXT NOT NULL,                -- rc | dialog | inherited
+  PRIMARY KEY (binary_id, vtable_addr)
+);
+CREATE INDEX mfc_class_by_name ON mfc_class(binary_id, name);
+CREATE TABLE mfc_map_entry (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  class         TEXT NOT NULL,
+  kind          TEXT NOT NULL,           -- dispatch | interface | event
+  map_addr      INTEGER NOT NULL,
+  seq           INTEGER NOT NULL,
+  name          TEXT NOT NULL,           -- dispatch: member name; interface: IID name or GUID
+  id            INTEGER NOT NULL,        -- dispatch: DISPID; interface: offset in the object; event: DISPID
+  vt            INTEGER NOT NULL,        -- dispatch: VT of the value / return
+  flags         INTEGER NOT NULL,        -- dispatch: afxDispStock = 1
+  pfn           INTEGER,                 -- method / getter / event handler
+  pfn_set       INTEGER,                 -- property setter
+  extra         TEXT NOT NULL            -- argument types, data offset, control ids
+);
+CREATE INDEX mfc_map_entry_by_class ON mfc_map_entry(binary_id, class, kind, map_addr, seq);
+CREATE INDEX mfc_map_entry_by_fn ON mfc_map_entry(binary_id, pfn);
+
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 
 -- .NET metadata (DESIGN 11), parsed server side with dnfile (server/dotnet.py). Derived: rebuilt when

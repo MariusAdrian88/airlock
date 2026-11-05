@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 8               # bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 9               # bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -80,7 +80,7 @@ class KbFile:
     size: int
     sig: bool = False    # signature database built from a local Delphi install (``year`` = compiler version)
     rtti: bool = False   # RTTI consensus database (``delphirtti``), a sigdb file named ``rtti-<compiler>-<bits>``
-    warp: bool = False   # Binary Ninja WARP library of delphinja (``delphi-rtl-<stem>.warp``, 32-bit only)
+    warp: bool = False   # WARP library: delphinja's ``delphi-rtl-<stem>.warp`` (32-bit) or an own ``airlock-rtl-win<bits>.warp``
 
 
 def kb_folders(root: Path, psize: int) -> list[Path]:
@@ -116,11 +116,12 @@ def sig_files(sig_dir: Path | None, psize: int) -> list[KbFile]:
 
 
 def warp_files(warp_dir: Path | None, psize: int) -> list[KbFile]:
-    """WARP libraries (``delphi-rtl-*.warp``) for 32-bit programs; none for 64-bit."""
+    """WARP libraries of the pointer size: delphinja's ``delphi-rtl-*.warp`` (32-bit only) and the own
+    ``airlock-rtl-win32|win64.warp`` (``delphi-sigs warp-build``)."""
     from airlock.server import warp
     out: list[KbFile] = []
     try:
-        names = sorted(warp_dir.iterdir()) if warp_dir is not None and psize == 4 else []
+        names = sorted(warp_dir.iterdir()) if warp_dir is not None else []
     except OSError:
         return []
     for p in names:
@@ -128,6 +129,9 @@ def warp_files(warp_dir: Path | None, psize: int) -> list[KbFile]:
         try:
             size = p.stat().st_size
         except OSError:
+            continue
+        own = stem is not None and stem.startswith("win")
+        if own and not warp.own_stem(stem, psize) or (psize == 8 and not own):
             continue
         if stem and p.is_file() and size > 64:
             out.append(KbFile(p, f"warp-{stem}", stem, False, size, warp=True))
@@ -510,11 +514,12 @@ def _warp_stems(comp: int) -> list[str]:
     return warp.library_stems(comp)
 
 
-def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
-          ) -> tuple[str, dict[int, list[str]], list[str]]:
+def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]],
+          instances: dict[str, set[str]] | None = None) -> tuple[str, dict[int, list[str]], list[str]]:
     """Names for the functions. The signature database of the binary's exact compiler version goes first;
     the knowledge bases (and signature databases of other versions) then name the functions it left
-    unnamed. Returns (label, matches, notes)."""
+    unnamed. ``instances``: the generic classes of the program (``warp.instance_args``), which give WARP's
+    ``TList<T>`` names their real type arguments. Returns (label, matches, notes)."""
     comp = compiler_version(img)
     exact = [f for f in files if f.sig and not f.rtti and comp is not None and int(f.year) == comp]
     rtti = [f for f in files if f.rtti and comp is not None and int(f.year) == comp]
@@ -538,16 +543,16 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
         except KbError as e:
             notes.append(f"{tier[0].label}: {e}")
     score = [x for x in funcs if x[0] not in hits] if hits else funcs   # the IDR file is chosen on these,
-    if warps and comp is not None:               # whatever WARP names; then the WARP libraries of the compiler version
-        stems = _warp_stems(comp)
-        use = [f for f in warps if f.year in stems]
+    if warps:                                    # whatever WARP names; then the WARP libraries of the compiler version
+        stems = _warp_stems(comp) if comp is not None else []
+        use = [f for f in warps if f.year in stems or f.year.startswith("win")]
         rest = score
         if use and rest:
             try:
                 from airlock.server import warp
                 got = warp.match_functions([warp.load_lib(f.path) for f in use], img, rest)
                 for entry, names in got.items():
-                    hits.setdefault(entry, names)
+                    hits.setdefault(entry, warp.refine_generics(names, instances) if instances else names)
                 labels.append("warp")
                 notes.append(f"warp {len(got)}/{len(rest)}")
             except Exception as e:  # noqa: BLE001  WarpError, capstone missing, unreadable file
@@ -563,6 +568,17 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
         elif f is not None and not labels:
             labels.append(f.label)
     return "+".join(labels), hits, notes
+
+
+def _generic_instances(store: Store, binary_id: int) -> dict[str, set[str]]:
+    """Generic classes of the program from its RTTI (``{Unit.TBase: {type arguments}}``)."""
+    from airlock.server import warp
+    try:
+        rows = store.db.execute("SELECT unit, name FROM dl_class WHERE binary_id=? AND name LIKE '%<%>'",
+                                (binary_id,)).fetchall()
+    except Exception:  # noqa: BLE001  no class table yet
+        return {}
+    return warp.instance_args([(r[0], r[1]) for r in rows])
 
 
 def _pick_idr(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]], comp: int | None,
@@ -611,7 +627,7 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
         if img is None:
             info = "not a PE file"
         else:
-            label, hits, notes = _pick(files, img, funcs)
+            label, hits, notes = _pick(files, img, funcs, _generic_instances(store, binary.id))
             info = (f"{label}: {len(hits)} of {len(funcs)} unnamed functions named; tried " + ", ".join(notes)
                     if label else "; ".join(notes))
     elif files:

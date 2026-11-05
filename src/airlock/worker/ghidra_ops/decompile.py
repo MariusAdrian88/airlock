@@ -33,15 +33,25 @@ DEFAULT_TIMEOUT_S = 60
 MAX_TOKEN_TEXT = 200
 
 
-def open_decompiler(program: Any) -> Any:
+def open_decompiler(program: Any, style: str | None = None, max_instructions: int | None = None,
+                    payload_mb: int | None = None) -> Any:
     """A new DecompInterface (one native decompiler process) on `program`. Caller holds
-    the program's read or write lock and disposes it."""
+    the program's read or write lock and disposes it. The optional arguments are for the retry of
+    a function the default settings could not finish: simplification ``style`` ("normalize",
+    "firstpass", ...), the per-function ``max_instructions`` limit (Ghidra default 100000) and the
+    ``payload_mb`` limit of one decompiler message (default 50)."""
     from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
     di = DecompInterface()
     opts = DecompileOptions()
+    if max_instructions:
+        opts.setMaxInstructions(int(max_instructions))
+    if payload_mb:
+        opts.setMaxPayloadMBytes(int(payload_mb))
     di.setOptions(opts)
     di.toggleCCode(True)
     di.toggleSyntaxTree(True)
+    if style:
+        di.setSimplificationStyle(style)
     if not di.openProgram(program):
         msg = str(di.getLastMessage())
         di.dispose()
@@ -154,10 +164,12 @@ def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
         "ast_columns": AST_COLUMNS, "ast": [], "c_text": None, "error": None,
     }
     callee_entries: list[int] = []
-    if res.isTimedOut() or not res.decompileCompleted() or res.getDecompiledFunction() is None:
+    if res.isTimedOut() or res.getDecompiledFunction() is None:
         out["status"] = "timeout" if res.isTimedOut() else "error"
         out["error"] = str(res.getErrorMessage() or "").strip() or out["status"]
     else:
+        if not res.decompileCompleted():
+            out["partial"] = str(res.getErrorMessage() or "").strip() or "incomplete"
         with _POST:
             c_text = str(res.getDecompiledFunction().getC())
             out["status"] = "ok"
@@ -191,8 +203,10 @@ def check_open(e: Entry) -> None:
 @op("decompile")
 @guarded
 def decompile(args: dict[str, Any]) -> dict[str, Any]:
-    """decompile(program, entry, timeout=60): decompile the function at/containing `entry`.
-    Uses the entry's reserved decompiler, so it never waits behind the background pass."""
+    """decompile(program, entry, timeout=60, style=None, max_instructions=None, payload_mb=None):
+    decompile the function at/containing `entry`. Uses the entry's reserved decompiler, so it
+    never waits behind the background pass. With `style`, `max_instructions` or `payload_mb` the
+    function is decompiled on a throwaway decompiler with those settings (retry of a failure)."""
     e = S.ready_entry(args.get("program"))
     from ghidra.util.task import TaskMonitor  # type: ignore
 
@@ -202,6 +216,17 @@ def decompile(args: dict[str, Any]) -> dict[str, Any]:
         func = _resolve_function(e.program, args.get("entry"))
         if func.isExternal():
             raise WorkerError("no_function", f"'{func.getName()}' is an external function")
+        retry = {k: args[k] for k in ("style", "max_instructions", "payload_mb") if args.get(k)}
+        if retry:
+            # a retry with other settings: its own throwaway decompiler, never the reserved one
+            di = open_decompiler(e.program, retry.get("style"), retry.get("max_instructions"),
+                                 retry.get("payload_mb"))
+            try:
+                out = decompile_function(e, di, func, timeout, TaskMonitor.DUMMY)
+            finally:
+                di.dispose()
+            out["retry"] = retry
+            return out
         out = decompile_function(e, _decomp(e), func, timeout, TaskMonitor.DUMMY)
         if out["status"] != "ok":
             dispose_decomp(e)  # a timed-out native decompiler is not trusted again

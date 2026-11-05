@@ -64,7 +64,12 @@ def overview(ctx: ServerContext, cursor: str = "", budget: int = 0) -> str:
     if isinstance(s, str):
         return s
     pp, st = s
-    return _page(pm.render_dirty(pp, st, heading=False), bud, "overview")
+    lines = pm.render_dirty(pp, st, heading=False)
+    fw = pm.framework_lines(st, ctx.config.tools, ctx.config.disabled_sets, ctx.config.disabled_tools)
+    if fw:
+        at = lines.index("## Features") if "## Features" in lines else len(lines)
+        lines[at:at] = ["## Frameworks", *fw]
+    return _page(lines, bud, "overview")
 
 
 @tool("project_describe", "Set the purpose paragraph of the project map (what the program does, "

@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 991 passed, 43 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1056 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -103,17 +103,38 @@ M2 was checked end to end on a fresh analysis of the acceptance target
 (2026-11-05): resource and C++ tables, missing-function creation and the UI
 join all run at analysis time; estimate within 20% of the real time.
 
-1. Most MFC message maps in the target belong to classes built without RTTI
-   (`anon_<map>`), so handler hints show `FUN_` names.
+1. MFC classes without RTTI are named from `CRuntimeClass`, the dialog id of the constructor and the
+   inherited runtime class (DESIGN "MFC classes without RTTI"). Left: a class with none of these stays
+   `anon_<map>`; `ctor_dialogs` reads 32-bit constructors only; a derived class that inherits a library
+   `CRuntimeClass` is named `anon_<Base>_<map>`, not by its own name.
 2. About 27% of visible functions are in `unclassified` clusters (mostly
    unnamed program code); `function_map` prints the coverage line.
-3. `xrefs`/`callgraph` return `ambiguous` for same-named functions in several
-   binaries (imports aggregate; DESIGN §7.3 rule 8).
-4. `path` treats runtime wrappers just before an import as clean through a
-   length cap and a CRT plumbing name list (heuristic).
-5. Some very large functions hit `decompile_timeout`; `view=asm` still works.
-6. `patch_bytes` is not implemented.
-7. MFC dispatch/automation (OLE) tables are not decoded.
+3. MFC dispatch, interface and event sink maps are decoded (`mfc_message_maps`, DESIGN "MFC dispatch,
+   interface and event sink maps"). Left: the 64-bit `AFX_DISPMAP_ENTRY` layout is not verified on a
+   real binary (unit tests only); `AFX_CONNECTIONMAP` (connection points) is not decoded.
+
+Fixed on 2026-11-05 (issues 3-6, core agent):
+- Same name in several binaries (DESIGN 7.3 rule 9): `name@binary` qualifier, the session focus
+  (binary of the function resolved last, `ServerContext.focus`) decides an ambiguous name and the
+  answer says `binary X (current binary)`; a definition beats an import elsewhere for `xrefs`,
+  `callgraph`, `function_map` (note names the importing binaries). `error ambiguous` stays when
+  nothing decides. Tests: `tests/test_targets.py` (end).
+- `path` wrappers: `graph.wrapper_nodes` (library-tier node with one callee, small, low fan-in)
+  replaces the 3-hop length cap; the CRT plumbing name list stays as a last filter (`free` is a
+  perfect wrapper of an import and still noise). Size is in bytes (the index has no instruction count).
+- Large functions: adaptive decompile timeout (`decompile_timeout_s` + 6 s/KB beyond 8 KB, cap
+  `decompile_timeout_max_s`), one relaxed retry (instruction and payload limits up, double time),
+  then a block listing with a one-line note. `normalize`/`firstpass` styles give no C (verified).
+  Worker `decompile` takes `style`, `max_instructions`, `payload_mb`. Tests in `tests/test_bulk_server.py`.
+- `patch_bytes` implemented (off by default via `disabled_tools`, dirty only): worker op in
+  `worker/ghidra_ops/annotate.py`, tool in `tools/annotate.py`, `restore=<note id>` undoes. Ghidra
+  check: `tests/test_annotate_ghidra.py::test_patch_bytes_real_program`.
+
+- Ghidra 12.1.4 data-loss bug **[verified]** (`tests/test_transaction_ghidra.py`): ending an EMPTY
+  transaction with commit=false makes the commits after it vanish from the saved program (they stay
+  visible in memory). A real rollback also returns to the last saved state, so every write op saves
+  at its end. All five transaction sites (`_write`, analyze, fixups, link externals, Qt connectImpl
+  signature) now use `session.transaction`, which commits when the modification number did not change.
 
 Fixed on 2026-11-05 (import into the wrong project): new projects ended `error no_program`
 (or `ready` with an empty Ghidra project). Cause: the worker has one open project, and
@@ -155,6 +176,16 @@ underscore rule; `Store.set_meta` commits outside a transaction and
 - Long Ghidra runs: background or `timeout: 600000`, once; read logs
   before a rerun.
 - Before each push: scan commit messages and tracked files for target data.
+
+## MFC without RTTI, automation maps, handler names
+
+`server/mfc.py` (called by `cpp.derive_binary`, `CPP_VERSION` 2, schema v14 tables `mfc_class` and
+`mfc_map_entry`). Old projects derive again on open (no re-analysis). `msgmap_entry.class` holds the
+derived name (`CFoo`, `Dialog_<caption>`, `anon_<Base>_<addr>`, `anon_<addr>`). `UiIndex.suggest` gives
+ClassWizard style names (`OnCommand_<id>_<menu leaf>`, `OnBnClicked_<caption>`, `OnSize`) that
+`menus` / `dialogs` / `mfc_message_maps` / `function` show for functions without a name of their own.
+Tests: `tests/test_mfc.py` (synthetic 32/64-bit images). `fnfix.FIX_VERSION` 4 (dispatch handlers join the
+missing-function pass).
 
 ## M2 join (menus, dialogs, message maps)
 
@@ -317,7 +348,13 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   **[verified]** on real programs of compilers 30, 33, 35 and 36 (extended RTTI names as truth): `library_stems` is
   `10.4-only` + `core-11` + `xe2plus-only` from compiler 30 on (before: `core-11` only for 35, which named a third
   as many); `10.4-only` and `xe2plus-only` are about 99% right, `core-11` 87 to 98% (small shapes). WARP names generic
-  instances as `TDictionary__2.Add` (RTTI says `TDictionary<K,V>.Add`). `projects.detect` now marks a program
+  instances as `TDictionary__2.Add`; `warp.dotted` now writes `TDictionary<T>.Add` like the sigdb and RTTI tiers, and
+  `idr._pick` puts the real type arguments in when the program has exactly one instance of that class in its RTTI.
+  Own 64-bit (and 32-bit) libraries: `airlock delphi-sigs warp-build <kit>... --bits 64` writes
+  `airlock-rtl-win64.warp` into `warp_dir` from the map builds of the kits (DESIGN section 11 "Own WARP libraries").
+  Used for any compiler version, after the exact sigdb and the RTTI database. Leave-one-out on compiler 35 samples
+  (library from 30/33/34): right 53 to 62% -> 61 to 65% (+2.8 to +7.3 points), wrong down. `IDR_VERSION` 9: old
+  projects recompute once. `projects.detect` now marks a program
   without forms (console, DLL) as Delphi by its `DVCLAL` resource; before, such a program got no Delphi tiers.
 
 ## Qt and dataflow (M8)
@@ -328,23 +365,86 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 - Worker op `qt_dispatch` (`worker/ghidra_ops/qt.py`) maps method indices to functions from the decompiled `qt_static_metacall` and finds imported parent classes; run by `qt.resolve` after the missing-function step; meta `qt_dispatch:<id>`. Tool `qt_metaobjects` (`tools/qt.py`); hints in `function`, a `Qt:` line in the project map, moc boilerplate marked runtime family `Qt`.
 - Dataflow ops (`worker/ghidra_ops/dataflow.py`) and tools (`tools/dataflow.py`): `switch_tables`, `trace_values`, `constants`. Ghidra tests: `tests/test_dataflow.py` with `-m ghidra --binary=...`.
 - Qt6 layout is verified on a real 64-bit MSVC Qt 6.10 desktop client (revision 13; see DESIGN section 11 for each fact). Two parser bugs fixed: with `QT_NO_DATA_RELOCATION` `superdata` is two words `{direct, getter}` (the metaobject starts one pointer before the scan address; parents come from the getter, local or from the import name, no worker needed); Qt6 has no Notify property flag (`notifyId` is -1 or the signal index). `QT_VERSION` 2.
-- Pointer-to-member connects work (Qt6 MSVC x64): `qt.fill_imports` adds the C++ imports Ghidra leaves out of the `import` table, `derive_connects` finds the call sites as read edges to the `connectImpl` slot, worker op `qt_connects` (`worker/ghidra_ops/qt.py`, `_Flow`) resolves signal and slot (chases forwarding wrappers up the callers). Rows are `qt_connect` kind `ptr`. `DISPATCH_VERSION` 2. Sites in template instances nobody calls (incremental-link leftovers) stay unresolved. Qt5 MSVC x64 and Qt5 MinGW 32-bit are verified too (DESIGN section 11): Itanium import names, calls through a register (a site stands for all calls of its function), a signature set on the imported `connectImpl`, stack stores read from instructions, string pairs for register-loaded `connect`. `QT_VERSION` 3, `DISPATCH_VERSION` 3. Virtual member pointers: Itanium only, as `vtable+0x..`; MSVC virtual pointers and 64-bit MinGW are not tried.
+- Pointer-to-member connects work (Qt6 MSVC x64): `qt.fill_imports` adds the C++ imports Ghidra leaves out of the `import` table, `derive_connects` finds the call sites as read edges to the `connectImpl` slot, worker op `qt_connects` (`worker/ghidra_ops/qt.py`, `_Flow`) resolves signal and slot (chases forwarding wrappers up the callers). Rows are `qt_connect` kind `ptr`. `DISPATCH_VERSION` 2. Sites in template instances nobody calls (incremental-link leftovers) stay unresolved. Qt5 MSVC x64 and Qt5 MinGW 32-bit are verified too (DESIGN section 11): Itanium import names, calls through a register (a site stands for all calls of its function), a signature set on the imported `connectImpl`, stack stores read from instructions, string pairs for register-loaded `connect`. `QT_VERSION` 3, `DISPATCH_VERSION` 3. Virtual member pointers (MSVC vcall thunks, Itanium offsets) resolve through the receiver's vtable when the class is known (DESIGN section 11 (9)); 64-bit MinGW (Qt5) is verified. `DISPATCH_VERSION` 4. Sites in functions nobody calls are `uncalled`, not counted as unresolved. `DISPATCH_VERSION` 5 (DESIGN section 11 (13) to (17)): more receiver classes (callers that agree, new or stack objects, factory returns, fields typed by a store in the same function), library-class slots from the import stubs of program subclasses (`qt.connect_context` sends `allvtables` and `parents`), the 32-bit MinGW vtable scan (loose `metaObject()` reads), functions named only by chained unwind data count as uncalled, site functions and their callers decompiled ahead in parallel.
 - Qt feature seeds (`qt.feature_seeds`, `FEATURES_VERSION` 7): slots of QAction / button / dialog signals seed ui-menu / ui-dialog; Qt library class prefixes in `features.API_PREFIX`.
 - Scratch tip: `connectImpl` returns `QMetaObject::Connection` by value, so argument 1 is the result pointer (the decompiler also shows the stack arguments shifted).
 
+## Agent evaluation (blind, 2026-11-05 and 06)
+
+Method: `claude -p` (`--tools ""`, `--allowedTools "mcp__airlock__*"`, `--strict-mcp-config`, `--max-turns 40`,
+`--output-format stream-json --verbose`) with only airlock as MCP server, once with Sonnet and once with Haiku. The server runs
+through a small launcher that points it at a copy of the analysed projects and at a config copy with the delphi and
+dotnet sets enabled (the user's config is not touched). The prompt names the program and the question and says that
+airlock tools exist, nothing else. Per run: tool calls, errors, turns, cost, answer. Solved = the answer matches the
+public source (v = yes, ~ = right but partial, x = no). Single runs, so +-30% call counts are noise.
+
+Programs (all open source, official releases, analysed with option A): DB Browser for SQLite (Qt5 MSVC x64), Raspberry Pi
+Imager (Qt5 MinGW x86), ExifToolGUI 6.2 (Delphi), Open Hardware Monitor 0.9.6 (.NET Framework), WinMerge 2.16.60
+(MFC x64), WinDirStat 2.9.3 (MFC x64, recent MFC). Sources: github sqlitebrowser, raspberrypi/rpi-imager, FrankBijnen/ExifToolGui,
+openhardwaremonitor, WinMerge, windirstat.
+
+| Task | Sonnet before | Sonnet after | Haiku before | Haiku after |
+|---|---|---|---|---|
+| t1 DB4S: File > Open Database | v 5 calls | v 5 | v 10 (1 err) | v 10 |
+| t2 DB4S: settings, geometry keys | v 9 | v 14 | v 23 (1 err) | v 16 |
+| t3 RPi: download progress signal and slot | ~ 3 | ~ 3 | ~ 9 | ~ 9 |
+| t4 RPi: cancel a write | v 6 | v 6 | v 24 | v 18 |
+| t5 ExifToolGUI: Remove Metadata, Execute | v 8 | v 8 | v 11 (1 err) | v 11 (1 err) |
+| t6 ExifToolGUI: settings file | v 16 | v 8 | v 25 | v 13 |
+| t7 OHM: Run On Windows Startup | v 11 (2 err) | v 5 | v 10 (3 err) | v 8 (r4: 9, 0 err) |
+| t8 OHM: settings file | v 6 | v 9 | v 15 (5 err) | v 11 |
+| t9 WinDirStat: Tools > Recovery | x 33 | x 45 | x 37 | x 40 |
+| t10 WinDirStat: options storage | v 15 | v 6 | v 12 | v 11 |
+| t11 WinMerge: Edit > Options | (new) | v 5 | (new) | v 10 |
+| t12 WinMerge: options storage | (new) | v 12 | (new) | v 15 |
+
+"~" in t3: the signal and the command-line slot are found; the QML handler is invisible in the binary. "Before" is the
+state after the first round (instructions, Frameworks lines, search, no auto-retry); "after" includes the round-2 fixes.
+
+Failure patterns and fixes (round 2):
+- Hints were not acted on (`retry=true`): `function` now retries once by itself after 2 s when the worker restarted,
+  the JVM was not running or the file was closed; the hint appears only if the second try fails too (`_get_decompiled`).
+- Names the tools print were not accepted as targets: `search` showed `MainWindow::fileOpen (Qt slot)` but
+  `function MainWindow::fileOpen` said not found. `function`, `xrefs` and the other target tools now resolve
+  `Class::method` of Qt `qt_method` rows and `TClass.Method` of Delphi `dl_method` rows (`targets._qt_method_addr`);
+  `search` finds both by name (`_qt_method_hits`).
+- .NET: `function` on a managed method said "use dotnet_decompile" and the agent then guessed member names that do not
+  exist in the C# (`.ctor`, `<.ctor>b__37_5`, `set_Startup`). `function` now forwards to `dotnet_decompile` and the
+  member lookup maps constructors, lambdas and accessors to the C# name (`dotnet.member_alias`).
+- `overview` has a `Win32 resources` line (dialogs, menus, string_tables) for any binary with dialogs, so an MFC binary
+  whose message maps are not decoded still points at the id route. The empty `mfc_message_maps` answer now says so.
+- Haiku wanders more than Sonnet (24 turns where Sonnet needs 6) mostly in unnamed code: it reads big FUN_ functions
+  and repeats `constants`/`xrefs`. Tools that name things (Qt, Delphi events, MFC maps, .NET) cut it to 8-18 calls.
+- Both models call `overview` rarely (Haiku sometimes, Sonnet never). It does not matter where a framework tool is
+  reached by name (qt_metaobjects, delphi_forms, dotnet_*), so the Frameworks lines were not needed in these runs.
+
+Not solved: WinDirStat 2.9.3 (t9). Its message map entries are `{msg, code, id, lastid, handler thunk, 0}` in one
+contiguous table without a zero terminator and no `AFX_MSGMAP` getter that the decoder finds (`mfc_message_maps` says
+none). Both models find the menu item (id 32876) and the dialog but not the handler. Classic MFC (WinMerge) works.
+Open: decode that layout; the QML side of Qt signals; the virtual call `this+0xf0 -> +0x34` without RTTI (t4).
+
+Files (tasks, launcher, transcripts, source copies) are in the session scratchpad, `agenteval\`.
+
 ## Next
 
-- Qt: pointer connects through function pointers or virtual MSVC member pointers are unresolved; 64-bit MinGW is untried.
-  Unresolved call sites could be chased through function pointers.
+- Qt: a few virtual member-pointer connects stay `vtable+0x..`: the receiver is a field stored by another function (`this->ui->x` set in a separate `setupUi`), the result of a getter that returns a field, or a class whose virtual lives only in another DLL. No open site needs function pointers stored in structs. Statically linked Qt is not scanned.
 - Delphi: `delphi-sigs kit` makes a small rebuild kit of an install, `delphi-sigs oracle` is the supported
   oracle measurement (DESIGN §11); the sigdb no longer stores records the matcher drops (import stubs), and a
   `--units` run locks its work folder (a second run on the same folder used to delete the maps of the first).
   Routines under 10 compared bytes are named by the call-context pass only when a named caller exists; the map
-  build skips the FMX / TeeChart / REST-backend units.
+  build brings back the FMX / TeeChart / REST-backend units: missing `.fmx` / `.res` / `.dfm` files get empty stubs
+  (`delphimega.stub_missing`), `$DENYPACKAGEUNIT` units (WebBroker, ComServ, OleAuto) are built into one console
+  program (`m_program`, `delphimega.build(programs=True)`). Left out per build 48 to 62 -> 0 to 2 (only units whose
+  own dependency the install lacks: `BDE`, `Vcl.RibbonConsts`, `DUnitX.Windows.Console`). Rebuild old sigdb files to get them.
 - WARP is tested on compilers 30, 33, 35 and 36 (no compiler 34 binary was
-  available). 64-bit WARP has no library: 64-bit relies on extended RTTI and IDR.
+  available). delphinja has no 64-bit library; build the own one with `warp-build` (it reruns the units build per
+  kit, about 2 minutes per kit and bitness; `--map BIN MAP` reuses existing builds). No compiler 36 64-bit program was
+  at hand: the 64-bit numbers are for compilers 32 and 35.
 - `record_guess` is proven on public sample files (DESIGN §6 `record_guess`).
-  OpenPGP packets, `.pol`, delimited text, small offset/length tables
-  (ICO, TrueType) and 8-bit sample streams are now found (`server/recdetect.py`).
-  Open: `.class` constant pool, tables under 3 entries, 16-bit PCM, noisy 8-bit
-  audio, tables with u16/u64 fields.
+  OpenPGP packets, `.pol`, delimited text, offset/length tables (ICO,
+  TrueType; u16, u32, u64 fields; 1 or 2 entries when they tile the data),
+  Java class constant pools and 8-bit / 16-bit sample streams (also noisy) are
+  found (`server/recdetect.py`). The table scan and the stride pass are about
+  2.5 times faster (large DLL: under 0.5 s on a quiet machine).
+  Open: 24-bit PCM, tables whose fields are not adjacent, delimited text
+  without line ends.

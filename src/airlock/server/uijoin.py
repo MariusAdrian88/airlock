@@ -8,12 +8,14 @@ does a handler serve. Names are hints: nothing is renamed in Ghidra.
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Any
 
 from airlock.index.store import Store
 from airlock.server import cpp
+from airlock.server.mfc import ident
 from airlock.server.peres import clean_caption
 
 WM_COMMAND, WM_NOTIFY = 0x111, 0x4E
@@ -40,6 +42,40 @@ _NOTIFY = {**cpp.NM_NAMES,
            0xFFFFFE3D: "TVN_SELCHANGEDW", 0xFFFFFE6F: "TVN_SELCHANGINGA", 0xFFFFFE3E: "TVN_SELCHANGINGW",
            0xFFFFFDD9: "TCN_SELCHANGE", 0xFFFFFDD8: "TCN_SELCHANGING", 0xFFFFFD2E: "UDN_DELTAPOS",
            0xFFFFFD11: "DTN_DATETIMECHANGE"}
+
+
+# Names ClassWizard gives to the handlers of window messages (everything else: ``OnMessage_WM_X``).
+STD_HANDLERS = {
+    0x01: "OnCreate", 0x110: "OnInitDialog", 0x02: "OnDestroy", 0x03: "OnMove", 0x05: "OnSize", 0x06: "OnActivate",
+    0x07: "OnSetFocus", 0x08: "OnKillFocus", 0x0A: "OnEnable", 0x0F: "OnPaint", 0x10: "OnClose",
+    0x14: "OnEraseBkgnd", 0x18: "OnShowWindow", 0x1C: "OnActivateApp", 0x20: "OnSetCursor",
+    0x24: "OnGetMinMaxInfo", 0x2B: "OnDrawItem", 0x2C: "OnMeasureItem", 0x2F: "OnDeleteItem",
+    0x30: "OnSetFont", 0x46: "OnWindowPosChanging", 0x47: "OnWindowPosChanged", 0x4A: "OnCopyData",
+    0x7B: "OnContextMenu", 0x81: "OnNcCreate", 0x82: "OnNcDestroy", 0x83: "OnNcCalcSize",
+    0x84: "OnNcHitTest", 0x85: "OnNcPaint", 0x100: "OnKeyDown", 0x101: "OnKeyUp", 0x102: "OnChar",
+    0x104: "OnSysKeyDown", 0x105: "OnSysKeyUp", 0x112: "OnSysCommand", 0x113: "OnTimer",
+    0x114: "OnHScroll", 0x115: "OnVScroll", 0x117: "OnInitMenuPopup", 0x11F: "OnMenuSelect",
+    0x132: "OnCtlColor", 0x200: "OnMouseMove", 0x201: "OnLButtonDown", 0x202: "OnLButtonUp",
+    0x203: "OnLButtonDblClk", 0x204: "OnRButtonDown", 0x205: "OnRButtonUp", 0x206: "OnRButtonDblClk",
+    0x207: "OnMButtonDown", 0x208: "OnMButtonUp", 0x20A: "OnMouseWheel", 0x211: "OnEnterMenuLoop",
+    0x212: "OnExitMenuLoop", 0x214: "OnSizing", 0x216: "OnMoving", 0x231: "OnEnterSizeMove",
+    0x232: "OnExitSizeMove", 0x233: "OnDropFiles", 0x2A3: "OnMouseLeave", 0x300: "OnCut",
+    0x301: "OnCopy", 0x302: "OnPaste", 0x31F: "OnPaletteChanged"}
+
+
+_AUTO_NAME = re.compile(r"^(?:thunk_)?(?:FUN|SUB|LAB|DAT)_[0-9a-fA-F]+$")
+
+
+def is_unnamed(fn: Any) -> bool:
+    """No function row, or a decompiler default name (``FUN_00401000``) that nobody replaced."""
+    return fn is None or (fn.name_state == "auto" and bool(_AUTO_NAME.match(fn.name)))
+
+
+def window_message_name(message: int) -> str:
+    """``OnSize`` for WM_SIZE; ``OnMessage_WM_X`` for a message ClassWizard has no name for."""
+    if message == 0xC000:
+        return "OnRegisteredMessage"
+    return STD_HANDLERS.get(message) or f"OnMessage_{ident(cpp.message_name(message), 40)}"
 
 
 def notification(cls: str, message: int, code: int) -> str:
@@ -211,16 +247,50 @@ class UiIndex:
         return [h for h in self.handlers_for(ident) if not self.is_noise(h)]
 
     def name_of(self, h: Handler, addr_fmt=lambda a: f"0x{a:08x}") -> str:
-        """``Class::OnOpen``; the plain function name (or the address) for an ``anon_`` class."""
+        """``Class::OnOpen``. A handler without a name of its own (no function, or an auto name) gets the
+        message based name of ``suggest`` and keeps the function name (or the address) in parentheses."""
         if h.addr not in self._fn:
             self._fn[h.addr] = self.store.function_at(self.bid, h.addr)
         fn = self._fn[h.addr]
-        if fn is None:
-            return addr_fmt(h.addr)
+        if is_unnamed(fn):
+            return f"{h.cls}::{self.suggest(h)} ({fn.name if fn is not None else addr_fmt(h.addr)})"
         name = fn.qualified_name
         if h.cls.startswith(cpp.ANON_PREFIX) or "::" in name:
             return name
         return f"{h.cls}::{name}"
+
+    def suggest(self, h: Handler) -> str:
+        """A ClassWizard style name from the message and the UI element: ``OnCommand_57600_Open`` for a menu
+        item, ``OnBnClicked_OK`` for a button, ``OnEnChange_Speed`` for an edit notification,
+        ``OnUpdateCommand_57600_Open`` for the update handler, ``OnSize`` for a window message."""
+        if h.message not in (WM_COMMAND, WM_NOTIFY):
+            return window_message_name(h.message)
+        lo, hi = h.span
+        menus, ctrls = self.refs_of(lo, hi)
+        if h.message == WM_NOTIFY:
+            menus = []
+        ctrls = _prefer(ctrls, self.class_dialogs(h.cls), strict=True)
+        ids = f"{lo}_{hi}" if hi != lo else str(lo)
+        text = ""
+        if menus:
+            text = ident(menus[0].rsplit(">", 1)[-1])
+        elif ctrls and hi == lo:
+            text = ident(ctrls[0].caption)
+        if h.is_update:
+            return f"OnUpdateCommand_{ids}" + (f"_{text}" if text else "")
+        cls = ctrls[0].cls if ctrls else ""
+        if h.message == WM_COMMAND and h.code == 0:
+            if menus or not ctrls:
+                return f"OnCommand_{ids}" + (f"_{text}" if menus and text else "")
+            name = notification(cls, h.message, 0)
+            if name == "COMMAND":
+                return f"OnCommand_{ids}" + (f"_{text}" if text else "")
+        else:
+            name = notification(cls, h.message, h.code)
+            if name.startswith("WM_NOTIFY "):
+                return f"OnNotify_{h.code:#x}_{text or ids}"
+        camel = "".join(p.capitalize() for p in re.split(r"[^A-Za-z0-9]+", name) if p)
+        return f"On{camel}_{text or ids}"
 
     def _ids_in(self, keys: list[int], lo: int, hi: int) -> list[int]:
         i = bisect_left(keys, lo)
@@ -435,12 +505,30 @@ def _prefer(refs: list[CtrlRef], dialogs: list[str], strict: bool = False) -> li
 
 
 def function_hints(store: Store, binary_id: int, entry: int) -> list[str]:
-    """Hints for ``function``: the UI element a message map handler serves (empty when it is none)."""
+    """Hints for ``function``: the UI element a message map handler serves, and a ClassWizard style name
+    (``Class::OnCommand_57600_Open``) when the function has no name of its own."""
     try:
-        if not store.db.execute("SELECT 1 FROM msgmap_entry WHERE binary_id=? AND handler=? AND message IN (?,?) "
-                                "LIMIT 1", (binary_id, entry, WM_COMMAND, WM_NOTIFY)).fetchone():
+        rows = store.db.execute(
+            "SELECT class, map_addr, message, code, ctrl_id, last_id FROM msgmap_entry WHERE binary_id=? "
+            "AND handler=? ORDER BY map_addr, seq LIMIT 4", (binary_id, entry)).fetchall()
+        if not rows:
             return []
-        return UiIndex(store, binary_id).handler_hints(entry)
+        out: list[str] = []
+        ui = None
+        if any(r["message"] in (WM_COMMAND, WM_NOTIFY) for r in rows):
+            ui = UiIndex(store, binary_id)
+            out = ui.handler_hints(entry)
+        fn = store.function_at(binary_id, entry)
+        if is_unnamed(fn):
+            r = rows[0]
+            if r["message"] in (WM_COMMAND, WM_NOTIFY):
+                assert ui is not None
+                nm = ui.suggest(Handler(r["class"], r["map_addr"], r["message"], r["code"], r["ctrl_id"],
+                                        r["last_id"], entry))
+            else:
+                nm = window_message_name(r["message"])
+            out.append(f"likely {r['class']}::{nm}")
+        return out
     except Exception:  # noqa: BLE001  an extra: never break the function view
         return []
 

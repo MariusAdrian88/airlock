@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
-from .decompile import _decomp, _resolve_function, check_open
+from .decompile import _decomp, _resolve_function, check_open, open_decompiler
 from .project import dispose_decomp
 from .session import guarded
 
@@ -354,7 +354,12 @@ MAX_SITES = 20000
 MAX_DEPTH = 4
 MAX_CALLERS = 12
 MAX_FLOWS = 6000
+SITE_BUDGET_S = 40           # time one connect site (with its chase up the callers) may take
+MAX_NEST = 60               # nesting of value() calls (they also recurse through stores)
+RETRY_FACTOR = 6          # a decompile that timed out is tried once more with this many times the timeout
 VTABLE_MAX = 0x4000        # an odd member pointer below this is an Itanium virtual one (vtable offset + 1)
+PREFETCH_THREADS = 4       # decompilers that decompile the functions with call sites at once (within the pool budget)
+RECV_DEPTH = 3            # steps (callers, returns, fields) to find the class of a receiver
 _PASS = frozenset({"COPY", "CAST", "INT_ZEXT", "INT_SEXT", "SUBPIECE", "INDIRECT"})
 
 
@@ -363,6 +368,16 @@ def _signed(v: int, size: int = 8) -> int:
     bits = max(1, size) * 8
     v &= (1 << bits) - 1
     return v - (1 << bits) if v >= 1 << (bits - 1) else v
+
+
+class _Budget(Exception):
+    """The time for one connect site is used up (a pathological function): the site stays unresolved."""
+
+    until = 0.0            # time.monotonic() deadline of the current site, 0 = none
+
+    @classmethod
+    def start(cls) -> None:
+        cls.until = time.monotonic() + SITE_BUDGET_S
 
 
 class _Flow:
@@ -374,12 +389,17 @@ class _Flow:
         self.hf = hf
         self._imm: dict[int, list[tuple[Any, int]]] | None = None
         self.psize = int(hf.getFunction().getProgram().getDefaultPointerSize())
+        self._nest = 0
+        self._cuts = 0
+        self._smemo: dict[tuple, tuple | None] = {}
+        self._memo: dict[int, tuple | None] = {}
+        self._heap: dict[tuple[int, int], tuple | None] = {}
         self.ops = list(hf.getPcodeOps())
         self._stack: dict[int, list[Any]] = {}      # stack offset -> ops that store there (value = input 0 / 2)
         self._late: list[Any] = []
         for p in self.ops:
             out = p.getOutput()
-            if out is not None and out.getAddress().isStackAddress()                     and p.getMnemonic() in ("COPY", "INDIRECT", "MULTIEQUAL", "PTRSUB", "CAST"):
+            if out is not None and out.getAddress().isStackAddress()                     and p.getMnemonic() in ("COPY", "INDIRECT", "MULTIEQUAL", "PTRSUB", "CAST", "PIECE"):
                 self._stack.setdefault(_signed(int(out.getAddress().getOffset())), []).append(p)
             elif p.getMnemonic() == "STORE":
                 self._late.append(p)
@@ -410,7 +430,35 @@ class _Flow:
         return None
 
     def value(self, vn: Any, depth: int = 0) -> tuple | None:
-        if vn is None or depth > 14:
+        """Symbolic value of ``vn``. ``depth`` bounds one chain of definitions; ``_nest`` bounds the whole
+        recursion, which also runs through ``deref`` and ``heap_field`` (a cycle of stores would not end)."""
+        if vn is None:
+            return None
+        if _Budget.until and time.monotonic() > _Budget.until:
+            raise _Budget("site budget used up")
+        if self._nest > MAX_NEST:
+            self._cuts += 1
+            return None
+        try:
+            key = int(vn.getUniqueId())
+        except Exception:  # noqa: BLE001
+            key = None
+        if key is not None and key in self._memo:
+            return self._memo[key]
+        self._nest += 1
+        try:
+            res = self._value(vn, depth)
+        finally:
+            self._nest -= 1
+        if key is not None:         # also a result a limit cut short: unknown stays unknown, and the walk is not repeated
+            self._memo[key] = res
+        return res
+
+    def _value(self, vn: Any, depth: int) -> tuple | None:
+        if vn is None:
+            return None
+        if depth > 14:
+            self._cuts += 1
             return None
         if vn.isConstant():
             return ("const", int(vn.getOffset()))
@@ -501,14 +549,28 @@ class _Flow:
 
     def slot_value(self, op: Any, depth: int = 0) -> tuple | None:
         """The value a store-like op leaves in a stack slot: a COPY or STORE gives its source, an INDIRECT (a call
-        that may have touched the slot) is looked through, a MULTIEQUAL needs equal inputs."""
+        that may have touched the slot) is looked through, a MULTIEQUAL needs equal inputs. Memoised: in a huge
+        function the chains of MULTIEQUAL ops would otherwise be walked again and again."""
         if depth > 14:
+            self._cuts += 1
             return None
+        sq = op.getSeqnum()
+        key = (int(sq.getTarget().getOffset()), int(sq.getTime()), str(op.getMnemonic()))
+        if key in self._smemo:
+            return self._smemo[key]
+        self._smemo[key] = None             # a cycle of phi ops ends here (unknown)
+        res = self._slot_value(op, depth)
+        self._smemo[key] = res
+        return res
+
+    def _slot_value(self, op: Any, depth: int) -> tuple | None:
         m = op.getMnemonic()
         if m == "STORE":
             return self.value(op.getInput(2), depth + 1)
         if m == "COPY":
             return self.value(op.getInput(0), depth + 1)
+        if m == "PIECE":            # a member pointer (two words) stored as one 16 byte value: the low part is at the slot
+            return self.value(op.getInput(1), depth + 1)
         if m == "INDIRECT":
             d = op.getInput(0).getDef()
             return self.slot_value(d, depth + 1) if d is not None else None
@@ -521,7 +583,58 @@ class _Flow:
             return vals.pop() if len(vals) == 1 and None not in vals else None
         return self.value(op.getOutput(), depth + 1)       # PTRSUB (a function address), CAST, ...
 
+    def field(self, vn: Any, depth: int = 0) -> tuple | None:
+        """``vn`` as a chain of field loads from a parameter: ``("p", i)`` for parameter ``i``, ``("ld", base,
+        off)`` for ``*(base + off)``. None for anything else. Used for receivers ``value`` cannot express
+        (``this->ui->button``)."""
+        if vn is None or depth > 8 or vn.isConstant():
+            return None
+        d = vn.getDef()
+        if d is None:
+            i = self.param_index(vn)
+            return ("p", i) if i is not None else None
+        m = d.getMnemonic()
+        if m in _PASS:
+            return self.field(d.getInput(0), depth + 1)
+        if m == "LOAD":
+            loc = self.location(d.getInput(1), depth + 1)
+            return ("ld", *loc) if loc is not None else None
+        return None
+
+    def location(self, vn: Any, depth: int = 0) -> tuple | None:
+        """``(base, off)`` of a pointer ``base + off`` with ``base`` a ``field`` chain, None when unknown."""
+        if vn is None or depth > 8:
+            return None
+        d = vn.getDef()
+        if d is not None and d.getMnemonic() in ("INT_ADD", "PTRSUB", "PTRADD") and d.getInput(1).isConstant():
+            b = d.getInput(1)
+            off = _signed(int(b.getOffset()), b.getSize()) * (int(d.getInput(2).getOffset()) if d.getMnemonic() == "PTRADD" else 1)
+            inner = self.location(d.getInput(0), depth + 1)
+            return (inner[0], inner[1] + off) if inner is not None else None
+        if d is not None and d.getMnemonic() in _PASS:
+            return self.location(d.getInput(0), depth + 1)
+        base = self.field(vn, depth + 1)
+        return (base, 0) if base is not None else None
+
+    def field_stores(self, fld: tuple) -> list[tuple[Any, tuple | None]]:
+        """(STORE op, stored value) for every store into the field ``fld`` (a ``("ld", base, off)`` chain)."""
+        out = []
+        for p in self.ops:
+            if p.getMnemonic() == "STORE":
+                loc = self.location(p.getInput(1))
+                if loc is not None and ("ld", *loc) == fld:
+                    out.append((p, self.value(p.getInput(2))))
+        return out
+
     def heap_field(self, new_id: int, off: int) -> tuple | None:
+        if (new_id, off) in self._heap:
+            return self._heap[(new_id, off)]
+        self._heap[(new_id, off)] = None            # a cycle through this field ends here
+        res = self._heap_field(new_id, off)
+        self._heap[(new_id, off)] = res
+        return res
+
+    def _heap_field(self, new_id: int, off: int) -> tuple | None:
         vals = set()
         for p in self.ops:
             if p.getMnemonic() != "STORE":
@@ -533,9 +646,22 @@ class _Flow:
 
 
 class _Connects:
-    def __init__(self, program: Any, di: Any, timeout: int, imports: dict[int, str] | None = None) -> None:
+    def __init__(self, program: Any, di: Any, timeout: int, imports: dict[int, str] | None = None,
+                 vtables: dict[int, str] | None = None, fnclass: dict[int, str] | None = None,
+                 primary: dict[str, int] | None = None, allvts: dict[int, str] | None = None,
+                 parents: dict[str, str] | None = None) -> None:
         self.program, self.di, self.timeout = program, di, timeout
         self.imports = imports or {}        # {import slot address: Class::name} from the PE import table
+        self.vtables = vtables or {}        # {vtable address point: class} (RTTI, or found through metaObject())
+        self.fnclass = fnclass or {}        # {function entry: class} of methods and virtual functions
+        self.primary = primary or {}        # {class: address point of its own vtable} where that is unambiguous
+        self.allvts = allvts or dict(self.vtables)   # also the vtables of classes others derive from
+        self.parents = parents or {}        # {class of the program: its superclass} (Qt metaobjects, RTTI)
+        self._ctor: dict[int, int] = {}
+        self._recv: dict[tuple, int | str] = {}
+        self._lib: dict[tuple[str, int], dict[str, Any] | None] = {}
+        self._kids: dict[str, list[int]] | None = None
+        self._pre: dict[int, Any] = {}      # HighFunctions decompiled ahead by ``prefetch``
         self.fm = program.getFunctionManager()
         self.rm = program.getReferenceManager()
         self.space = program.getAddressFactory().getDefaultAddressSpace()
@@ -547,6 +673,56 @@ class _Connects:
     def addr(self, a: int) -> Any:
         return self.space.getAddress(a)
 
+    def _decompile(self, di: Any, f: Any) -> Any:
+        """The HighFunction of ``f`` (None when the decompile fails); a timeout is tried once more, longer."""
+        from ghidra.util.task import TaskMonitor  # type: ignore
+        r = di.decompileFunction(f, self.timeout, TaskMonitor.DUMMY)
+        if not r.decompileCompleted() and r.isTimedOut():      # a huge init function: one longer try
+            r = di.decompileFunction(f, self.timeout * RETRY_FACTOR, TaskMonitor.DUMMY)
+        return r.getHighFunction() if r.decompileCompleted() else None
+
+    def prefetch(self, entries: list[int], threads: int, open_di: Callable[[], Any]) -> int:
+        """Decompile ``entries`` (the functions with call sites) on ``threads`` decompilers at once: the
+        decompiles are most of the time of the op, and the huge functions would otherwise run one after the
+        other. ``flow`` then builds on the stored results. Returns the number decompiled."""
+        todo = [e for e in dict.fromkeys(entries) if e not in self.flows and e not in self._pre][:MAX_FLOWS]
+        if threads < 2 or len(todo) < 2:
+            return 0
+        import queue
+        import threading
+        q: queue.SimpleQueue = queue.SimpleQueue()
+        for e in todo:
+            q.put(e)
+        lock = threading.Lock()
+
+        def run() -> None:
+            try:
+                di = open_di()
+            except Exception:  # noqa: BLE001  the rest is decompiled one by one by flow()
+                return
+            try:
+                while True:
+                    try:
+                        e = q.get_nowait()
+                    except queue.Empty:
+                        return
+                    f = self.fm.getFunctionAt(self.addr(e))
+                    try:
+                        hf = self._decompile(di, f) if f is not None else None
+                    except Exception:  # noqa: BLE001
+                        hf = None
+                    with lock:
+                        self._pre[e] = hf
+            finally:
+                di.dispose()
+
+        ts = [threading.Thread(target=run, daemon=True, name=f"airlock-qt-{i}") for i in range(min(threads, len(todo)))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return sum(1 for e in todo if self._pre.get(e) is not None)
+
     def flow(self, entry: int) -> _Flow | None:
         if entry in self.flows:
             return self.flows[entry]
@@ -554,10 +730,10 @@ class _Connects:
         f = self.fm.getFunctionAt(self.addr(entry))
         if f is not None and len(self.flows) < MAX_FLOWS:
             try:
-                from ghidra.util.task import TaskMonitor  # type: ignore
-                r = self.di.decompileFunction(f, self.timeout, TaskMonitor.DUMMY)
-                if r.decompileCompleted() and r.getHighFunction() is not None:
-                    fl = _Flow(r.getHighFunction())
+                hf = self._pre.pop(entry) if entry in self._pre else self._decompile(self.di, f)
+                if hf is not None:
+                    _Budget.start()
+                    fl = _Flow(hf)
                     self.stats["decompiled"] += 1
                 else:
                     self.stats["failed"] += 1
@@ -586,6 +762,33 @@ class _Connects:
                     out.append((S.addr_int(cf.getEntryPoint()), S.addr_int(frm)))
         return sorted(set(out))
 
+    def uncalled(self, entry: int) -> bool:
+        """True when nothing refers to the function but the unwind table: a template instance the linker kept
+        and nobody calls (no call, no jump, no stored address)."""
+        f = self.fm.getFunctionAt(self.addr(entry))
+        if f is None:
+            return False
+        mem = self.program.getMemory()
+        for t in [f.getEntryPoint(), *(f.getFunctionThunkAddresses(True) or [])]:
+            for ref in self.rm.getReferencesTo(t):
+                if ref.getReferenceType().isCall() or ref.getReferenceType().isJump():
+                    return False
+                blk = mem.getBlock(ref.getFromAddress())
+                if blk is None:
+                    return False
+                if str(blk.getName()).lower() != ".pdata" and not self._unwind_data(ref.getFromAddress()):
+                    return False
+        return True
+
+    def _unwind_data(self, a: Any) -> bool:
+        """True when ``a`` lies in unwind data (a chained ``UNWIND_INFO`` in ``.rdata`` names its function too)."""
+        try:
+            d = self.program.getListing().getDataContaining(a)
+            name = str(d.getDataType().getName()) if d is not None else ""
+        except Exception:  # noqa: BLE001
+            return False
+        return "UnwindInfo" in name or "RUNTIME_FUNCTION" in name
+
     def import_name(self, slot: int) -> str:
         """``Class::name`` of the import behind the pointer slot ``slot`` ("" when it holds no import)."""
         if slot in self.imports:
@@ -601,6 +804,281 @@ class _Connects:
                 return "::".join(parts)
         return ""
 
+    def vcall_offset(self, a: int) -> int | None:
+        """Vtable byte offset of an MSVC vcall thunk at ``a`` (``mov rax,[rcx]; jmp [rax+off]``, 32-bit
+        ``mov eax,[ecx]; jmp [eax+off]``), None for any other code."""
+        mem = self.program.getMemory()
+        try:
+            at = self.addr(a)
+            b = bytes(int(mem.getByte(at.add(i))) & 0xFF for i in range(10))
+        except Exception:  # noqa: BLE001  unreadable memory
+            return None
+        if b[:3] == bytes((0x48, 0x8B, 0x01)):
+            b = b[3:]
+        elif b[:2] == bytes((0x8B, 0x01)):
+            b = b[2:]
+        else:
+            return None
+        if b[:2] == bytes((0xFF, 0x60)):
+            return b[2]
+        if b[:2] == bytes((0xFF, 0xA0)):
+            return int.from_bytes(b[2:6], "little")
+        if b[:2] == bytes((0xFF, 0x20)):
+            return 0
+        return None
+
+    @staticmethod
+    def _key(p: Any) -> tuple[int, int]:
+        sq = p.getSeqnum()
+        return int(sq.getTarget().getOffset()), int(sq.getTime())
+
+    def ctor_vt(self, entry: int, exact: bool = False) -> int:
+        """Vtable the function at ``entry`` stores into its ``this`` (a constructor): the last constant stored
+        at ``*this`` in address order (the most derived class), when it is a known vtable. ``exact``: any known
+        vtable (the object is of exactly this class: ``new``), else only those of classes nobody derives from
+        (``this`` of a constructor may be a base part of a derived object). 0 when there is none."""
+        if (entry, exact) in self._ctor:
+            return self._ctor[(entry, exact)]
+        table = self.allvts if exact else self.vtables
+        vt = 0
+        fl = self.flow(entry) if table else None
+        if fl is not None:
+            best = None
+            for p in fl.ops:
+                if p.getMnemonic() != "STORE":
+                    continue
+                ptr, val = fl.value(p.getInput(1)), fl.value(p.getInput(2))
+                if ptr == ("param", 0, 0) and val is not None and val[0] == "const":
+                    key = self._key(p)
+                    if best is None or key > best[0]:
+                        best = (key, val[1])
+            vt = best[1] if best and best[1] in table else 0
+        self._ctor[(entry, exact)] = vt
+        return vt
+
+    def _resolved(self, a: Any) -> Any:
+        """The function at address ``a`` with thunks followed (None when there is none)."""
+        f = self.fm.getFunctionAt(a) if a is not None else None
+        for _ in range(3):
+            if f is None or not f.isThunk():
+                break
+            t = f.getThunkedFunction(False)
+            if t is None:
+                break
+            f = t
+        return f
+
+    def recv_vt(self, fn: int, recv: tuple | None, depth: int = 0) -> int | str:
+        """Class of the receiver ``recv`` of a connect inside ``fn``: the address point of a program vtable, or
+        the name of a library class (a str). 0 when it is not known for sure. Sources: ``this`` of a constructor
+        or of a known method; a parameter all callers give objects of one class; an object ``new``-ed here
+        (inlined constructor, constructor call, MSVC import ``Class::vftable`` stored); the result of a call
+        whose returns are all of one class; a field this function stores such an object into."""
+        if recv is None or depth > RECV_DEPTH:
+            return 0
+        key = (fn, recv)
+        if key in self._recv:
+            return self._recv[key]
+        self._recv[key] = 0             # a cycle through the callers ends here (unknown)
+        try:
+            res = self._recv_vt(fn, recv, depth)
+        except _Budget:
+            res = 0
+        self._recv[key] = res
+        return res
+
+    def _recv_vt(self, fn: int, recv: tuple, depth: int) -> int | str:
+        if recv[0] == "param" and recv[2] == 0:
+            if recv[1] == 0:
+                vt = self.ctor_vt(fn) or self.primary.get(self.fnclass.get(fn, ""), 0)
+                if vt:
+                    return vt
+            return self.caller_vt(fn, recv, depth)
+        fl = self.flow(fn)
+        if fl is None:
+            return 0
+        if (recv[0] == "new" and recv[2] == 0) or recv[0] == "stack":       # a heap or a stack object
+            return self.new_vt(fl, fn, recv, depth)
+        if recv[0] == "field":
+            got = {self.recv_vt(fn, v, depth + 1) for _p, v in fl.field_stores(recv[1])}
+            return got.pop() if len(got) == 1 else 0
+        return 0
+
+    def caller_vt(self, fn: int, recv: tuple, depth: int) -> int | str:
+        """The class every caller of ``fn`` passes in the parameter ``recv`` (thunks are looked through: their
+        callers are callers of ``fn`` too). 0 when a caller is unknown or two disagree."""
+        got: set = set()
+        cs = self.callers(fn)
+        if not cs or len(cs) > MAX_CALLERS:
+            return 0
+        for cfn, csite in cs:
+            f = self.fm.getFunctionAt(self.addr(cfn))
+            if f is not None and f.isThunk():
+                continue
+            cf = self.flow(cfn)
+            c = cf.call_at(self.addr(csite)) if cf is not None else None
+            if c is None:
+                return 0
+            got.add(self.recv_vt(cfn, self._lift(cf, c, recv), depth + 1))
+        return got.pop() if len(got) == 1 else 0
+
+    def new_vt(self, fl: Any, fn: int, recv: tuple, depth: int) -> int | str:
+        """Class of the object ``recv`` (a call result) in ``fn``: the last of the vtable stores at its start, the
+        constructors called on it and the MSVC ``Class::vftable`` import stores decides (an unknown one last:
+        unknown). Without any, the class every return of the called function gives. A stack object (``("stack",
+        off)``) needs one class from all of them."""
+        last = None
+        seen: set = set()
+        for p in fl.ops:
+            m = p.getMnemonic()
+            if m == "STORE":
+                if fl.value(p.getInput(1)) != recv:
+                    continue
+                v = fl.value(p.getInput(2))
+                if v is None or v[0] not in ("const", "mem"):
+                    continue
+                if v[0] == "const":
+                    got: int | str = v[1] if v[1] in self.allvts else 0
+                else:
+                    name = self.import_name(v[1])
+                    got = name[:-len("::vftable")] if name.endswith("::vftable") else 0
+            elif m in ("CALL", "CALLIND") and p.getNumInputs() > 1 and fl.value(p.getInput(1)) == recv:
+                f = self._resolved(p.getInput(0).getAddress() if p.getInput(0) is not None else None)
+                if f is None:
+                    continue
+                if f.isExternal():
+                    parts = [*str(f.getParentNamespace().getName(True)).split("::"), str(f.getName())]
+                    if parts and parts[0].upper().endswith(".DLL"):
+                        parts = parts[1:]
+                    if len(parts) < 2 or parts[-1] != parts[-2]:
+                        continue                # a method call, no constructor
+                    got = "::".join(parts[:-1])
+                else:
+                    got = self.ctor_vt(S.addr_int(f.getEntryPoint()), True)
+                    if not got:
+                        continue                # no constructor of a known class (a method, a setter)
+            else:
+                continue
+            k = self._key(p)
+            seen.add(got)
+            if last is None or k > last[0]:
+                last = (k, got)
+        if recv[0] == "stack":          # a stack slot may hold several objects in turn: all must agree
+            return seen.pop() if len(seen) == 1 else 0
+        if last is not None:
+            return last[1]
+        for p in fl.ops:
+            if recv[0] == "new" and p.getMnemonic() in ("CALL", "CALLIND") and self._key(p) == tuple(recv[1]):
+                return self.return_vt(fl, fn, p, depth)
+        return 0
+
+    def return_vt(self, fl: Any, fn: int, call: Any, depth: int) -> int | str:
+        """Class of what the function called by ``call`` (in ``fn``) returns: the same on every return. A return
+        of a parameter is the argument of this call."""
+        f = self._resolved(call.getInput(0).getAddress() if call.getInput(0) is not None else None)
+        if f is None or f.isExternal():
+            return 0
+        entry = S.addr_int(f.getEntryPoint())
+        cf = self.flow(entry)
+        if cf is None:
+            return 0
+        got: set = set()
+        for p in cf.ops:
+            if p.getMnemonic() != "RETURN":
+                continue
+            if p.getNumInputs() < 2:
+                return 0
+            v = cf.value(p.getInput(1))
+            if v is not None and v[0] == "param" and v[2] == 0:
+                w = fl.value(call.getInput(v[1] + 1)) if call.getNumInputs() > v[1] + 1 else None
+                got.add(self.recv_vt(fn, w, depth + 1))
+            else:
+                got.add(self.recv_vt(entry, v, depth + 1))
+        return got.pop() if len(got) == 1 else 0
+
+    def _vt_word(self, a: int) -> int | None:
+        mem = self.program.getMemory()
+        try:
+            at = self.addr(a)
+            return int(mem.getLong(at)) & 0xFFFFFFFFFFFFFFFF if self.psize == 8 else int(mem.getInt(at)) & 0xFFFFFFFF
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _is_code(self, w: int | None) -> bool:
+        if not w:
+            return False
+        try:
+            blk = self.program.getMemory().getBlock(self.addr(w))
+        except Exception:  # noqa: BLE001
+            return False
+        return blk is not None and bool(blk.isExecute())
+
+    def reaches(self, vt: int, off: int) -> bool:
+        """True when the vtable at ``vt`` holds code pointers in every slot up to byte offset ``off``."""
+        return off >= 0 and all(self._is_code(self._vt_word(vt + k)) for k in range(0, off + 1, self.psize))
+
+    def lib_target(self, cls: str, off: int) -> dict[str, Any] | None:
+        """``{"addr", "ext"}`` of the virtual at byte offset ``off`` of the library class ``cls``. A program class
+        whose chain of program superclasses ends at ``cls`` inherits that slot unless it overrides it; an
+        override is program code, an inherited slot is an import. All such import slots must agree."""
+        if (cls, off) in self._lib:
+            return self._lib[(cls, off)]
+        if self._kids is None:
+            own = set(self.allvts.values()) | set(self.parents)
+            self._kids = {}
+            for va, c in self.allvts.items():
+                seen = set()
+                while c in own and c not in seen:
+                    seen.add(c)
+                    c = self.parents.get(c, "")
+                if c and c not in own:
+                    self._kids.setdefault(c, []).append(va)
+        names: dict[str, dict[str, Any]] = {}
+        for va in self._kids.get(cls, []):
+            if not self.reaches(va, off):
+                continue
+            w = self._vt_word(va + off)
+            t = self.import_thunk(w) if w else None
+            if t is None and w:
+                f = self._resolved(self.addr(w))
+                if f is not None and f.isExternal():
+                    t = self.target(("const", w))
+            if t is not None and t.get("ext") and "purecall" not in t["ext"] and "pure_virtual" not in t["ext"]:
+                names.setdefault(t["ext"], t)
+        res = next(iter(names.values())) if len(names) == 1 else None
+        self._lib[(cls, off)] = res
+        return res
+
+    def import_thunk(self, w: int) -> dict[str, Any] | None:
+        """``{"addr", "ext"}`` when the code at ``w`` is ``jmp [import slot]`` (a vtable slot of a class that
+        inherits a library virtual keeps such a stub, Ghidra often has no function there), else None."""
+        try:
+            ins = self.program.getListing().getInstructionAt(self.addr(w))
+            if ins is None or str(ins.getMnemonicString()) != "JMP":
+                return None
+            for ref in ins.getReferencesFrom():
+                if ref.isMemoryReference():
+                    name = self.import_name(int(ref.getToAddress().getOffset()))
+                    if name:
+                        return {"addr": w, "ext": name}
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def virtual_target(self, vt: int, off: int) -> dict[str, Any] | None:
+        """The function in the vtable at ``vt`` at byte offset ``off`` (thunks followed), None when not known."""
+        if not vt or not self.reaches(vt, off):
+            return None
+        w = self._vt_word(vt + off)
+        if w is None:
+            return None
+        if self.fm.getFunctionAt(self.addr(w)) is None:
+            return self.import_thunk(w)
+        t = self.target(("const", w))          # an inherited library function comes back as an import ("ext")
+        if "virtual" in t or "pure_virtual" in t.get("ext", "") or "purecall" in t.get("ext", ""):
+            return None                         # an abstract slot: the real object overrides it
+        return t
+
     def target(self, v: tuple) -> dict[str, Any]:
         """A member pointer as a function: ``{"addr"}`` of the program function (thunks followed) or
         ``{"addr", "ext": "Class::name"}`` for an import (``("mem", slot)``: the import slot was read)."""
@@ -610,6 +1088,9 @@ class _Connects:
         a = v[1]
         if a & 1 and a < VTABLE_MAX:       # Itanium: a virtual member pointer is the vtable offset plus one
             return {"virtual": a - 1}
+        voff = self.vcall_offset(a)
+        if voff is not None:            # MSVC: a virtual member pointer is the address of a vcall thunk
+            return {"virtual": voff, "msvc": 1}
         f = self.fm.getFunctionAt(self.addr(a)) or self.fm.getFunctionContaining(self.addr(a))
         if f is None:
             return {"addr": a}
@@ -620,6 +1101,10 @@ class _Connects:
             if t is None:
                 break
             f = t
+        if not f.isExternal():
+            voff = self.vcall_offset(S.addr_int(f.getEntryPoint()))      # an incremental-link stub in front of the thunk
+            if voff is not None:
+                return {"virtual": voff, "msvc": 1}
         if f.isExternal():
             parts = str(f.getParentNamespace().getName(True)).split("::")
             if parts and parts[0].upper().endswith(".DLL"):
@@ -652,6 +1137,7 @@ class _Connects:
         """``{meta, idx}`` of a moc signal function: its call of ``QMetaObject::activate(this, &meta, idx, argv)``."""
         if entry in self.sigcache:
             return self.sigcache[entry]
+        _Budget.start()
         res: dict[str, Any] = {}
         fl = self.flow(entry)
         if fl is not None:
@@ -670,6 +1156,7 @@ class _Connects:
         return res
 
     def solve(self, fn: int, site: int) -> tuple[list[dict[str, Any]], str]:
+        _Budget.start()
         fl = self.flow(fn)
         if fl is None:
             return [], "no_decompile"
@@ -679,6 +1166,10 @@ class _Connects:
         # the function returns QMetaObject::Connection by value: input 1 is the result pointer
         sig = fl.deref(fl.value(call.getInput(3)), 0, self.addr(site))
         obj = fl.value(call.getInput(6))
+        recv = fl.value(call.getInput(4))
+        if recv is None:                # this->ui->button: a field, typed by the stores into it
+            fld = fl.field(call.getInput(4))
+            recv = ("field", fld) if fld is not None and fld[0] == "ld" else None
         impl = slot = None
         if obj is not None and obj[0] == "new":
             # QSlotObjectBase: int m_ref, then m_impl (at one pointer), then the member pointer / functor
@@ -689,13 +1180,13 @@ class _Connects:
         ncallers = len(self.callers(fn)) if sig is None or sig[0] == "param" or (slot and slot[0] == "param") else -1
         self.last = f"sig={sig} slot={slot} impl={impl} callers={ncallers}"
         out: list[dict[str, Any]] = []
-        self._chase(fn, site, sig, slot, impl, MAX_DEPTH, out, frozenset())
-        status = "ok" if out else ("no_callers" if ncallers == 0 else "unresolved")
+        self._chase(fn, site, sig, slot, impl, MAX_DEPTH, out, frozenset(), None, recv)
+        status = "ok" if out else (("uncalled" if self.uncalled(fn) else "no_callers") if ncallers == 0 else "unresolved")
         self.stats[status] = self.stats.get(status, 0) + 1
         return out, status
 
     def _chase(self, fn: int, site: int, sig, slot, impl, depth: int, out: list, seen: frozenset,
-               origin: int | None = None) -> None:
+               origin: int | None = None, recv: tuple | None = None) -> None:
         if sig is not None and sig[0] in ("const", "mem") and slot is not None and slot[0] == "param"                 and depth > 0 and fn not in seen:
             # the signal is known, the slot is a parameter (a wrapper): the callers hold the slot
             n = len(out)
@@ -704,7 +1195,7 @@ class _Connects:
                 c = cf.call_at(self.addr(csite)) if cf is not None else None
                 if c is not None:
                     self._chase(cfn, csite, self._lift(cf, c, sig), self._lift(cf, c, slot), impl, depth - 1, out,
-                                seen | {fn}, origin if origin is not None else site)
+                                seen | {fn}, origin if origin is not None else site, self._lift(cf, c, recv))
             if len(out) > n:
                 return
         if sig is not None and sig[0] in ("const", "mem"):
@@ -717,6 +1208,13 @@ class _Connects:
             if slot is not None and slot[0] in ("const", "mem"):
                 r["slot"] = self.target(slot)
                 r["slot"]["kind"] = "pmf"
+                if "virtual" in r["slot"]:
+                    off = r["slot"]["virtual"]
+                    vt = self.recv_vt(fn, recv)
+                    lib = isinstance(vt, str)
+                    t = self.lib_target(vt, off) if lib else self.virtual_target(vt, off)
+                    if t is not None:
+                        r["slot"] = {**t, "kind": "pmf", "virt": off, "cls": vt if lib else self.allvts.get(vt, "")}
             elif impl is not None:
                 r["slot"] = {"addr": impl[1], "kind": "functor"}
             out.append(r)
@@ -732,12 +1230,14 @@ class _Connects:
             if c is None:
                 continue
             self._chase(cfn, csite, self._lift(cf, c, sig), self._lift(cf, c, slot), impl, depth - 1, out, seen,
-                        origin if origin is not None else site)
+                        origin if origin is not None else site, self._lift(cf, c, recv))
 
     @staticmethod
     def _lift(cf: _Flow, call: Any, v: tuple | None) -> tuple | None:
         """The value ``v`` (in terms of the callee's parameters) in the caller ``cf``, at the call ``call``."""
-        if v is None or v[0] != "param":
+        if v is None or v[0] == "field":
+            return None                 # a field chain is in terms of the callee's parameters
+        if v[0] != "param":
             return v
         j, d = v[1], v[2]
         if call.getNumInputs() <= j + 1:
@@ -770,9 +1270,7 @@ def _fix_connect_signatures(e: Any) -> int:
     conv = "__cdecl" if program.getDefaultPointerSize() == 4 else Function.DEFAULT_CALLING_CONVENTION_STRING
     with e.fg, e.lock:
         check_open(e)
-        tx = program.startTransaction("airlock qt connectImpl signature")
-        ok = False
-        try:
+        with S.transaction(program, "airlock qt connectImpl signature"):
             for f in todo:
                 vp = PointerDataType(VoidDataType.dataType)
                 ps = ArrayList()
@@ -780,9 +1278,6 @@ def _fix_connect_signatures(e: Any) -> int:
                     ps.add(ParameterImpl(f"p{i}", vp, program))
                 f.updateFunction(conv, ReturnParameterImpl(VoidDataType.dataType, program), ps,
                                  Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, True, SourceType.ANALYSIS)
-            ok = True
-        finally:
-            program.endTransaction(tx, ok)
         dispose_decomp(e)
         e.epoch += 1
         S.require_project().save(program)
@@ -796,6 +1291,7 @@ def qt_connects(args: dict[str, Any]) -> dict[str, Any]:
     ``QObject::connectImpl`` at ``site`` (inside the function ``fn``). A site that is no call (the compiler loaded
     the import into a register once and calls it from there) stands for every ``connectImpl`` call of ``fn``.
     Result {"results": [{fn, site, signal, slot}], "expanded": {site: [call address]}, "unresolved": [site],
+    "uncalled": [site] (unresolved sites in a function nothing refers to),
     "secs", "stats"}; ``signal`` / ``slot`` are {addr, ext?, kind?, meta?, idx?, virtual?}."""
     e = S.ready_entry(args.get("program"))
     sites = args.get("sites")
@@ -811,12 +1307,25 @@ def qt_connects(args: dict[str, Any]) -> dict[str, Any]:
             fixed = -1
     results: list[dict[str, Any]] = []
     unresolved: list[int] = []
+    uncalled: list[int] = []
     expanded: dict[str, list[int]] = {}
     dbg: list[str] = []
     with S.POOL.foreground(), e.fg, e.lock.read():
         check_open(e)
         imports = {int(k): str(v) for k, v in (args.get("imports") or {}).items()}
-        cx = _Connects(e.program, _decomp(e), timeout, imports)
+        vts = {int(k): str(v) for k, v in (args.get("vtables") or {}).items()}
+        fnc = {int(k): str(v) for k, v in (args.get("fnclass") or {}).items()}
+        prim = {str(k): int(v) for k, v in (args.get("primary") or {}).items()}
+        allv = {int(k): str(v) for k, v in (args.get("allvtables") or {}).items()} or None
+        pars = {str(k): str(v) for k, v in (args.get("parents") or {}).items()}
+        cx = _Connects(e.program, _decomp(e), timeout, imports, vts, fnc, prim, allv, pars)
+        try:
+            fns = list(dict.fromkeys(int(s["fn"]) for s in sites))
+            ups = [c for fn in fns for c, _a in cx.callers(fn)[:MAX_CALLERS]]      # the chase reads the callers
+            pre = cx.prefetch(fns + ups, min(PREFETCH_THREADS, S.POOL.total()), lambda: open_decompiler(e.program))
+        except Exception:  # noqa: BLE001  flow() decompiles one by one
+            pre = -1
+        cx.stats["prefetched"] = pre
         done: set[tuple[int, int]] = set()
         for s in sites:
             fn, site = int(s["fn"]), int(s["site"])
@@ -830,17 +1339,22 @@ def qt_connects(args: dict[str, Any]) -> dict[str, Any]:
                     continue
                 done.add((fn, call))
                 try:
-                    got, _status = cx.solve(fn, call)
+                    got, status = cx.solve(fn, call)
                 except Exception:  # noqa: BLE001  one site must not stop the others
-                    got = []
+                    got, status = [], "error"
                 if not got:
                     unresolved.append(call)
+                    if status == "uncalled":
+                        uncalled.append(call)
                     if args.get("debug"):
                         dbg.append(f"{call:#x} fn {fn:#x} {getattr(cx, 'last', '')}")
                 for r in got:
                     if r["signal"].get("ext") is None and "addr" in r["signal"]:
-                        r["signal"].update(cx.signal_index(r["signal"]["addr"]))
+                        try:
+                            r["signal"].update(cx.signal_index(r["signal"]["addr"]))
+                        except Exception:  # noqa: BLE001  the signal stays a function address
+                            pass
                     results.append(r)
-    return {"results": results, "expanded": expanded, "unresolved": unresolved,
+    return {"results": results, "expanded": expanded, "unresolved": unresolved, "uncalled": uncalled,
             "secs": round(time.monotonic() - t0, 1), "stats": {**cx.stats, "signatures": fixed},
-            "debug": dbg[:80]}
+            "debug": dbg[:3000]}

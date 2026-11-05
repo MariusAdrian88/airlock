@@ -75,7 +75,7 @@ def test_unimplemented_tools_return_one_line_error(tmp_path):
     assert registry.call(ctx, "function").startswith("error wrong_role:")
     # a catalog tool without an implementation (annotate set) in a dirty session
     ctx.session = __import__("airlock.server.roles", fromlist=["x"]).SessionState("dirty", None)
-    assert registry.call(ctx, "patch_bytes") == (
-        "error not_implemented: patch_bytes is planned for M3 and not available yet.")
+    assert registry.call(ctx, "type_search") == (
+        "error not_implemented: type_search is planned for M2 and not available yet.")
     assert registry.call(ctx, "nope").startswith("error unknown_tool:")
     ctx.worker.stop()

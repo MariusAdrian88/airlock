@@ -66,6 +66,20 @@ def split_binary_target(store: Store, target: str) -> tuple[str, str]:
     return "", t
 
 
+def split_binary_suffix(store: Store, target: str) -> tuple[str, str]:
+    """``(binary, bare_target)`` for ``name@binary``, else ``("", target)``. Splits on the last
+    ``@`` only when the right part is the exact name of a binary (decorated names like
+    ``_foo@8`` stay intact). Rule 9 of 7.3."""
+    t = target.strip()
+    left, sep, right = t.rpartition("@")
+    left, right = left.strip(), right.strip()
+    if sep and left and right:
+        for b in store.list_binaries():
+            if b.name.lower() == right.lower():
+                return b.name, left
+    return "", t
+
+
 def _error(code: str, what: str, nxt: str) -> Resolved:
     return Resolved(error=f"error {code}: {what}. {nxt}.")
 

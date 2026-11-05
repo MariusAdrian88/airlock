@@ -17,7 +17,7 @@ from airlock.worker.protocol import WorkerError
 from test_tools import FakeWorker, fill, make_ctx
 
 MAIN, ONFOO, FUN2 = 0x401000, 0x401100, 0x401200
-WRITE_OPS = ("rename_variable", "retype_variable", "set_comment", "annotate_function",
+WRITE_OPS = ("patch_bytes", "rename_variable", "retype_variable", "set_comment", "annotate_function",
              "define_struct", "rename_label")
 
 
@@ -25,6 +25,7 @@ class AnnWorker(FakeWorker):
     def __init__(self) -> None:
         super().__init__()
         self.writes: list[tuple[str, dict]] = []
+        self.memory = bytes.fromhex("8bff55")
 
     def request(self, op, args=None, timeout=0):
         args = args or {}
@@ -46,6 +47,15 @@ class AnnWorker(FakeWorker):
                 raise WorkerError("bad_name", "InvalidInputException: invalid characters")
             base = {"entry": args.get("entry"), "name": "main", "namespace": None,
                     "signature": "int main(void)", "calling_conv": "__cdecl"}
+            if op == "patch_bytes":
+                if args["address"] == 0x7FFF0000:
+                    raise WorkerError("uninitialized", "0x7fff0000 is not in initialised memory")
+                if args.get("expect") and args["expect"] != self.memory.hex() and not args.get("force"):
+                    raise WorkerError("changed", "bytes differ")
+                old, self.memory = self.memory.hex(), bytes.fromhex(args["hex"])
+                return {"address": args["address"], "length": len(self.memory), "old": old,
+                        "new": args["hex"], "cleared": [args["address"], args["address"] + 2],
+                        "instructions": 3, "functions": [MAIN]}
             if op == "retype_variable":
                 self.c_text = self.c_text.replace("OnFoo();", "char *p = OnFoo();")
                 return {**base, "variable": args["variable"], "is_param": False, "type": args["type"]}
@@ -206,6 +216,59 @@ def test_gates(ctx):
 def test_writes_disabled(ctx):
     ctx.config = dataclasses.replace(ctx.config, allow_writes=False)
     assert an.annotate(ctx, "main", "x").startswith("error writes_disabled")
+
+
+def test_patch_bytes_note_invalidation_and_restore(ctx):
+    core.function(ctx, "main")
+    st, fn = _fn(ctx, MAIN)
+    out = an.patch_bytes(ctx, "0x00401001", "90 90 90", why="skip the check")
+    assert out.startswith("patched 3 bytes at 0x00401001 in main: old 8bff55, new 909090; note #1; "
+                          "invalidated 1 cached decompile"), out
+    assert "re-disassembled 3 instructions" in out and out.endswith("Undo with patch_bytes(restore=1).")
+    w = ctx.worker.writes[-1]
+    assert w[0] == "patch_bytes" and w[1]["hex"] == "909090" and w[1]["address"] == 0x401001
+    assert st.get_function(fn.id).version == fn.version + 1           # decompile and asm are recomputed
+    note = st.get_note(1)
+    assert note["tags"] == "patch" and note["author"] == "agent" and note["entry"] == MAIN
+    assert "old=8bff55 new=909090 why: skip the check" in note["summary"]
+    assert "// note #1" in core.function(ctx, "main")
+    back = an.patch_bytes(ctx, restore=1)                                # the note's old bytes come back
+    assert back.startswith("patched 3 bytes at 0x00401001") and "old 909090, new 8bff55" in back, back
+    w = ctx.worker.writes[-1][1]
+    assert w["hex"] == "8bff55" and w["expect"] == "909090"
+    assert "(restore of note #1)" in st.get_note(2)["summary"]
+    assert ctx.worker.memory == bytes.fromhex("8bff55")
+    assert an.patch_bytes(ctx, restore=1).startswith("error changed")      # bytes are not the patch any more
+    assert an.patch_bytes(ctx, restore=99).startswith("error not_found")
+
+
+def test_patch_bytes_refusals(ctx):
+    assert an.patch_bytes(ctx, "0x00401001", "9").startswith("error bad_args")
+    assert an.patch_bytes(ctx, "0x00401001", "zz").startswith("error bad_args")
+    assert an.patch_bytes(ctx, "0x00401001", "90" * 513).startswith("error bad_args")
+    assert an.patch_bytes(ctx, "", "90").startswith("error bad_target")
+    assert an.patch_bytes(ctx, "0x7fff0000", "90").startswith("error uninitialized")
+    st, _ = _fn(ctx, MAIN)
+    assert st.count_notes() == 0                                           # a refused patch leaves no note
+    ctx.session = roles.SessionState("clean", None)
+    assert registry.call(ctx, "patch_bytes", "0x00401001", "90").startswith("error wrong_role")
+    ctx.session = roles.SessionState("dirty", None)
+    ctx.config = dataclasses.replace(ctx.config, allow_writes=False)
+    assert an.patch_bytes(ctx, "0x00401001", "90").startswith("error writes_disabled")
+
+
+def test_patch_bytes_is_off_by_default():
+    from airlock.config.catalog import CATALOG
+    from airlock.config.keys import KEYS
+    assert "patch_bytes" in {k.name: k for k in KEYS}["disabled_tools"].default and not CATALOG["patch_bytes"].clean_safe
+
+
+def test_patch_hex_parsing():
+    from airlock.worker.ghidra_ops.annotate import parse_patch_hex
+    assert parse_patch_hex("8B FF,0x55") == bytes.fromhex("8bff55")
+    for bad in ("", "8", "xyz", "90" * 513):
+        with pytest.raises(WorkerError):
+            parse_patch_hex(bad)
 
 
 def test_pure_helpers():

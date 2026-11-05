@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from airlock.index.store import Binary, Function, Store
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
-from airlock.server.selectors import MAX_CANDIDATES, fmt_addr, resolve_function, split_binary_target
+from airlock.server.selectors import MAX_CANDIDATES, fmt_addr, resolve_function, split_binary_suffix, split_binary_target
 
 
 @dataclass(frozen=True)
@@ -168,6 +168,8 @@ def bind_scope(ctx: ServerContext, binary: str, target: str) -> Scope | str:
     if len(t) > 3 and t[0] == "<" and ">!" in t:          # <main.exe>!name
         t = t[1:].replace(">!", "!", 1)
     pre, bare = split_binary_target(st, t)
+    if not pre:
+        pre, bare = split_binary_suffix(st, t)
     if pre:
         if binary and not any(b.name.lower() == pre.lower() for b in st.find_binaries(binary)):
             return (f"error bad_args: target names binary '{pre}' but binary='{binary}'. "

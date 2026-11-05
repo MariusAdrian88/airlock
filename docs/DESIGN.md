@@ -168,7 +168,7 @@ every key, once, with the right default.
 
 Keys: `config_version`; locations `ghidra_dir`, `jdk_dir`, `ilspycmd`,
 `index_dir`, `projects_root`; response size `token_budget`, `function_budget`,
-`max_budget`, `detail`; decompiler `decompile_timeout_s`, `bulk_decompile`,
+`max_budget`, `detail`; decompiler `decompile_timeout_s`, `decompile_timeout_max_s`, `bulk_decompile`,
 `bulk_decompile_timeout_s`, `decompile_cpu_min`, `decompile_cpu_max`;
 analysis `analysis_timeout_min`, `analysis_s_per_code_mb`, `jvm_max_memory`;
 `mermaid`, `mirror_notes_to_ghidra`; tools `allow_writes`, `disabled_sets`,
@@ -316,6 +316,14 @@ whole program or on one feature only, without reading everything. Rules:
 **`dirty\PROJECT.md`** (and the `overview` tool, which returns the same map
 within the budget; `project_open` returns its first part):
 
+`overview` (the tool only, not `PROJECT.md`) adds a `## Frameworks` section before `## Features` with one line
+per framework found in the index: `Delphi (N classes): delphi_classes, delphi_forms, delphi_events`;
+`Qt (N classes): qt_metaobjects`; `MFC (N message map entries): mfc_message_maps, dialogs, menus`;
+`.NET (N types): dotnet_types, dotnet_decompile`; `C++ RTTI (N classes): rtti_classes, vtable`; `Win32 resources (N dialogs): dialogs, menus, string_tables`
+(rows in `dl_class`, `qt_class`, `msgmap_entry`, `dn_type`, `rtti_class`, `res_dialog`). A tool the active profile hides is
+marked `off in this profile: ...` with the exact `airlock config --set disabled_sets a,b` (or
+`disabled_tools`; `[]` for none left) command that enables it, followed by a server restart (`projectmap.framework_lines`).
+
 1. *Purpose*: one paragraph from the user or the dirty agent
    (`project_describe`), plus program source folder, root executable,
    selected option.
@@ -423,10 +431,16 @@ module (the one the clusters use) answers graph questions:
   the same rules as the runtime clusters) are preferred. A chain through a
   hub or a runtime function is returned only when no clean chain exists and is
   marked `[via util]`, `[via runtime]` or `[via util+runtime]`. Runtime wrappers at the end of a
-  chain (a short run of at most 3 runtime functions just before an import or runtime target, e.g.
-  `... -> CFile::Write -> WriteFile`; likewise at the start when the source is runtime) are the
-  normal route and count as clean. CRT plumbing (`_free`, `__lock`, `__amsg_exit`,
-  `__NMSG_WRITE`, ...), hubs and runtime functions in the middle of a chain still flag it. A bare name resolves to a function first, then an import,
+  chain (just before an import or runtime target, e.g. `... -> CFile::Write -> WriteFile`;
+  likewise at the start when the source is runtime) are the normal route and count as clean.
+  A wrapper is recognised by structure (`graph.wrapper_nodes`): a library-tier function (the
+  `runtime_nodes` rules: names, FLIRT/IDR/sigdb `library` state, recurrence, propagation) with one
+  distinct callee (call or jump to a function or import, arguments passed through), at most
+  `WRAPPER_BYTES` (160 bytes, a stand-in for about 40 instructions: the index keeps sizes only)
+  and at most `WRAPPER_FANIN` (4) distinct callers; a chain of such functions counts up to 6 hops.
+  The CRT plumbing name list (`_free`, `__lock`, `__amsg_exit`, `__NMSG_WRITE`, ...) stays as a
+  last filter, since `free` is a perfect wrapper of an import and still not a route anyone wants.
+  Hubs, plumbing and runtime functions in the middle of a chain flag it. A bare name resolves to a function first, then an import,
   then a feature key. Output: header `path A → B, N hops (M more paths:
   cursor=…)`, one step per line `→ [bin] Name 0xentry   call at 0xsite`; a
   call to an import no project binary provides ends in `→ import DLL!Name`.
@@ -849,9 +863,31 @@ not a project folder, goes through `project_create`:
 | retype a parameter | the function and its direct callers |
 | comment, plate-comment mirror of a note | the function (comments are part of the decompile text) |
 | rename a global | functions referencing it |
+| `patch_bytes` | the function(s) overlapping the patched range (a function body that changes its flow is not re-created) |
 
 A cached `decomp` row is valid only if `fn_version` and `analysis_profile`
 match. Invalid rows are recomputed on next request, not eagerly.
+
+### Large functions (decompile time limits)
+
+The background pass uses `bulk_decompile_timeout_s` (short). A function that
+timed out there, or has no row, is decompiled on its first request with an
+adaptive limit: `decompile_timeout_s` plus 6 s per KB of code beyond 8 KB,
+never above `decompile_timeout_max_s` (default 600). Time grows faster than the
+size, so the slope is a rough guide only. If that attempt times out, or fails with a
+limit message, one more attempt runs with the instruction limit
+(`maxInstructions`) and the message payload limit (`maxPayloadMBytes`)
+raised and twice the time (still capped). **[verified]** The simplification
+styles `normalize` and `firstpass` give no C text in Ghidra 12.1.4 (the
+result is an error), so they are not used as a fallback. A function that
+still fails is not an error for `function view=c|both`: the answer is one note
+line (`// decompile failed: ... Block listing ...`; also for a decompiler error, not only a timeout) and one line per basic
+block built from the disassembly (`0xaddr [N insns] calls A, B; refs "str" ->
+JNZ LAB_x`). It is not cached as C; the timeout row stays, so the next request
+shows the listing again without a new attempt, and `retry=true` decompiles
+again. A decompile that Ghidra ends early with a result ("incomplete") keeps its
+text and gets a trailing `// partial decompile` line. Tools that need C (`retype`
+excerpt, `dataflow`) still answer `error decompile_timeout`.
 
 The Ghidra project cannot be open in the GUI and the worker at the same time.
 `airlock close <project>` releases it; the next tool call reopens it. Changes
@@ -901,7 +937,7 @@ omitted when the project has one binary. With several ready binaries,
 | `comment` | `address`, `text`, `kind=plate` (`plate`/`pre`/`eol`) | Ghidra comment |
 | `annotate` | `target`, `summary`, `tags?`, `confidence?`, `new_name?` | atomic: optional rename + note row (+ plate comment if configured) |
 | `struct_define` | `name`, `fields` (list of `{offset, type, name}`), `size?` | creates or replaces a struct |
-| `patch_bytes` | `address`, `hex` | off by default |
+| `patch_bytes` | `address`, `hex`, `why?`, `force=false`, `restore?`, `binary?` | off by default; see below |
 
 Details settled in M3:
 
@@ -925,7 +961,20 @@ Details settled in M3:
   summary and tags. A failed Ghidra write stores no note.
 - `struct_define` fields may not overlap; gaps stay undefined; types are parsed by Ghidra's data type
   parser (`int`, `char *`, structs of the project).
-- `patch_bytes` stays `not_implemented`.
+- `patch_bytes` (dirty only: the catalog gives it no `clean_safe`; off by default through
+  `disabled_tools`, and `allow_writes` must be on) writes `hex` (1 to 512 bytes) at `address` into
+  the Ghidra program memory only, never the original file. One worker op, one transaction, program
+  saved before the reply. It refuses uninitialised memory (`error uninitialized`) and a patch that
+  cuts an instruction, or whose new bytes do not decode to whole instructions over the old
+  instruction range (`error boundary`), unless `force=true`. Instructions in the range are cleared
+  and disassembled again (a seed at every undefined gap, restricted to the range); data-only
+  ranges are just overwritten. A note (tag `patch`, author `agent`) is written in the same step on
+  the containing function, or at the address: `patch 0x… N bytes: old=<hex> new=<hex> [(restore of
+  note #M)] [why: text]`. The versions of the functions that overlap the range are bumped (§5), so
+  decompile and asm are recomputed. `restore=<note id>` is the unpatch: it reads the note, checks
+  that the memory still holds the note's `new` bytes (`error changed` otherwise, `force=true`
+  overrides) and writes the `old` bytes back with a new note. Not covered: function boundaries
+  (a patched `ret`) and the stored `bytes_hash` of the function are not recomputed.
 
 ### cpp
 
@@ -933,7 +982,7 @@ Details settled in M3:
 |---|---|---|
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
 | `vtable` | `target` (class name or address) | slots: index, address, function name |
-| `mfc_message_maps` | `target?` (class) | no class: the classes that have a map (with the class's dialog); a class: message, control id, handler function per entry, `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one) |
+| `mfc_message_maps` | `target?` (class) | no class: the classes that have a message map (with the class's dialog) and the dispatch / interface / event sink maps; a class: message, control id, handler function per entry (`as OnCommand_57600_Open` when the function has no name of its own), `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one), then its automation maps: `method Name(long, LPCSTR) -> void dispid 2 -> 0x... fn`, `property Name BSTR dispid 5 get 0x... set 0x...`, `stock BackColor dispid -501 long`, `interface IDispatch offset 0x10`, `event dispid 7 ctrl 1000 -> 0x...` |
 | `qt_metaobjects` | `class_?`, `limit=50`, `connections=false`, `binary?` | no class: one line per Qt class (parent, signal/slot/property counts, methods mapped); a class: signals, slots, invokable methods and constructors with index, parameter types and names, flags and the function behind each; properties (notify signal), enums, `Q_CLASSINFO`, connections that name its signals or slots. `connections=true`: all string connects and `connectImpl` call sites. Done in M8 |
 
 ### delphi
@@ -1032,11 +1081,20 @@ only, undocumented compressed names) and reading `.dcu` files (undocumented). **
 the truth, and a *package* has no smart linking. `dcc32` / `dcc64` build a package whose contains clause lists every
 `.dcu` (`System` and `SysInit` are implicit), with `-B -GD` and the unit folder as the only unit path. No source is
 read. The output is a package binary of 70 to 100 MB plus a detailed map (`-GD`: every routine with its segment
-offset, private, nested and unexported generic instances included). Units that cannot be in a package are left out and
-the build repeats: a resource file the install does not ship (`E1026`, found by searching the `.dcu` files for the file
-name), `$DENYPACKAGEUNIT` units (WebBroker, ISAPI, ComServ, IntraWeb; their users go as well), the BDE units. 62 of 1,951 units (32-bit)
-and 55 of 1,919 (64-bit) are left out, mostly FMX / TeeChart editors and REST backends. Build
-time is about 1 minute per bitness. **[verified]** The code is the shipped code: for the exports that a rebuilt `rtl`
+offset, private, nested and unexported generic instances included). Units that cannot be in a package are
+handled in this order, and the build repeats after each step: (1) a resource file the install does not ship
+(`E1026 ... .fmx|.res|.dfm`: the FMX TeeChart editors, the `.res` of the platform units) gets an **empty stub** in a
+`stubs` folder of the work folder (`-R` path; an empty text form `object X: TX end`, an empty resource record).
+**[verified]** The compiler links the stub without parsing the form, and the code of the unit comes from its `.dcu`,
+so the routines and their names are the real ones. (2) `$DENYPACKAGEUNIT` units (WebBroker, ISAPI, CGI, ComServ,
+OleAuto, IntraWeb bridge; their users go with them) cannot be in any package. They go into **one console program**
+(`m_program.dpr`: a `uses` clause, `{$STRONGLINKTYPES ON}` so that classes nobody references stay linked) built with
+`-GD`; its map is read like the packages' (smart linking still drops free routines that nothing calls, so the
+coverage of these units is partial: about 480 routines of the WebBroker group on Alexandria 32-bit). (3) What is
+still blamed by the compiler is left out: units whose own dependencies the install does not ship (`BDE`,
+`Bde.DBTables`, `Vcl.RibbonConsts`, `DUnitX.Windows.Console`). Left out per build, before -> after: compiler 30 (17.0)
+62 -> 2 (32-bit), 55 -> 2 (64-bit); 33 (20.0) 56 -> 2 / 54 -> 1; 34 (21.0) 56 -> 2 / 54 -> 1; 35 (22.0) 55 -> 1 / 48 -> 0.
+Build time is about 1 minute per bitness (programs and stubs add a few seconds). **[verified]** The code is the shipped code: for the exports that a rebuilt `rtl`
 package and `rtl230.bpl` have in common, 99.9% have the same masked bytes (the layout differs by a few hundred bytes,
 the unit order is another one).
 
@@ -1185,7 +1243,7 @@ same name under an older unit name; ambiguous GUIDs (more than 3 names) are drop
 magic. Constraints (called functions, adjacency) are read but not used. Blocks come from the capstone recursive
 descent over the PE bytes (`image_blocks`, 32-bit, same input as the IDR matcher) or from the worker op `warp_blocks`
 (Ghidra blocks plus per-instruction facts). They agree on 81% of the functions; the rest differ in no-return and
-function extent handling. 64-bit is not done (no Delphi 64-bit library exists).
+function extent handling. delphinja has no 64-bit library; see "Own libraries" below.
 Wiring: config key `warp_dir` (null: `warp\` in the data directory) holds the `delphi-rtl-*.warp` files, pinned to
 delphinja commit `b2952e99` and checked by size and git blob id; `airlock doctor` lists them. `kb_files` lists them
 as `KbFile(warp=True)` (32-bit only), so they are part of the stale signature (`IDR_VERSION` 5). `_pick` order: exact
@@ -1194,11 +1252,41 @@ sigdb, RTTI database, WARP, IDR; an earlier name wins. The libraries come from t
 compilers 30 to 36; the extended RTTI names agree with `10.4-only` and `xe2plus-only` in about 99%), 26 to 29 = `core-11` + `xe2plus-only`, older =
 `<year>-only` + `core-8`); an unknown compiler uses none. The matcher is the capstone route (`warp.match_functions`,
 functions of 16 bytes or more, at most 3 names per GUID). Names are written like the other tiers (`warp.dotted`:
-`Unit::Class::Member` becomes `Unit.Class.Member`; units that old compilers wrote without a namespace get it back,
+`Unit::Class::Member` becomes `Unit.Class.Member`; the arity suffix of a generic instance becomes the placeholder form of the
+sigdb and RTTI tiers, `TDictionary__2` -> `TDictionary<T>` (the type arguments are program types and the code is shared);
+`idr._pick` puts the real arguments in when the program's own RTTI (`dl_class`) has exactly one instance of that generic
+class, `TStack<System.Integer>.Push`, `warp.refine_generics`; units that old compilers wrote without a namespace get it back,
 `SysUtils` to `System.SysUtils`, `Graphics` to `Vcl.Graphics`, `Windows` to `Winapi.Windows`). The IDR file is chosen on
 the functions that no earlier tier named, before WARP runs, so WARP cannot change that choice. On a compiler 30 program
 (no library for it) WARP agrees with the exact sigdb name in about 98% of the functions both name (the rest are code
 aliases such as `Exception.Create` and `CreateFmt`), adds names net and loses none. Cost: about 20 s more for a large program.
+
+**Own WARP libraries, 64-bit** (`delphi-sigs warp-build <kit>... [--bits 32|64|both] [--out DIR] [--map BIN MAP]`,
+`warp.build_library`, `warp.library_pair`, `warp.write_warp`). The same function GUID, computed from the rebuilt
+packages of the units build (`delphimega`, with map file) instead of from Binary Ninja: for each named routine the
+capstone blocks of its extent (next public) give the GUID, so a library holds `GUID -> Unit.Class.Member` for every routine
+the maps name, private and nested ones included, and several compiler versions go into one file. Operand rules for x64
+(**[verified]** only by the measurements below, there is no Binary Ninja reference for Delphi x64): an immediate or an absolute
+displacement inside a section, or within 0x10000 of one, and a RIP-relative operand whose target (`next ip + disp`) is
+inside one, make the whole instruction variant; calls, jumps out of the function and indirect jumps likewise. The library
+is the layout `read_warp` reads (FlatBuffers `File`, one zlib signature chunk, names already dotted, generic arguments
+collapsed to `<T>`); whether Binary Ninja loads it is not checked. GUIDs with more than 3 names are not stored (the matcher
+skips them). The file is `airlock-rtl-win64.warp` (`win32` for `--bits 32`) in `warp_dir`; `idr.warp_files` lists it for
+the pointer size, and `_pick` uses it for **any** compiler version (also an unknown one), after the exact sigdb and the
+RTTI database, before IDR, like the delphinja files. Kits of compilers 30, 33, 34, 35 (kits 17.0, 20.0, 21.0, 22.0), 64-bit:
+183,701 GUIDs / 207,069 names, 7.0 MB, about 90 s per kit with 8 jobs. `IDR_VERSION` 9.
+
+Measured **[verified]**, 64-bit, leave-one-out (library from the kits of compilers 30, 33, 34 = 162,670 GUIDs; the
+exact compiler 35 sigdb hidden, `delphi-sigs oracle --hide-exact --warp-dir`; Embarcadero sample programs, map as truth,
+library routines; right name before -> after WARP): console 53.3% -> 60.6%, VCL 59.0% -> 62.3%, FMX 58.4% -> 61.2%,
+FireDAC 62.3% -> 65.3%; wrong 4.0 -> 2.4, 4.4 -> 3.9, 5.9 -> 5.6, 4.1 -> 3.7 %. The routines WARP names that the other
+versions' sigdbs do not: 56 / 355 / 670 / 569, 100 / 95.8 / 92.8 / 93.0 % right. The gain is small because the other
+versions' sigdbs already match by masked code (`_pick` pool); WARP's block GUID adds the routines whose bytes differ in
+immediate or layout details. On programs without a map (names of runtime classes from extended RTTI as truth), all kits
+in the library: xEdit 4.0.4 `xDump64` (compiler 32, no kit): named functions 5,410 -> 7,622 of 23,561, RTTI-truth
+routines right 2,356 -> 3,343, wrong 343 -> 330; compiler 35 programs with the library of 30, 33, 34 (exact sigdb
+hidden): `BSArch64` right 2,065 -> 2,138 (wrong 164 -> 148), `xDump64` 3,764 -> 3,860 (wrong 305 -> 284). No compiler 36 64-bit
+program was available. 32-bit own libraries work the same way and are listed beside the delphinja ones.
 
 ### dotnet
 
@@ -1267,11 +1355,12 @@ Implemented in `server/fileformat.py` (logic) and `server/tools/fileformat.py` (
   - *OpenPGP packets* (`recdetect.py`): old and new packet headers (1, 2, 4-byte and partial lengths) from start 0..8. Every tag must be a known one and the chain must end exactly at the end of the data (a cut window needs 4 packets). At least one body must parse as its tag says: key packets (version, known algorithm, MPI bit counts that fit the body), signatures (version, type, algorithm and hash in known sets, subpacket lengths inside the body), public-key encrypted and symmetric key packets, one-pass signatures, user ids as text, literal data with a printable file name. A chain from a start other than 0 needs 3 packets; one packet needs 64 bytes. A match replaces all other layouts and the strings list. Lost on purpose: lone packets without a checkable body (compressed, symmetric data, trust, marker, user attributes) and packets under 64 bytes.
   - *Registry policy* (`[key;value;type;size;data]` in UTF-16LE, `Registry.pol`): the bracket chain is parsed exactly; a match replaces all other layouts.
   - *Delimited text*: the three longest printable spans (ASCII/UTF-8, or UTF-16LE) are read as CSV with `, ; tab | :`. At least 4 rows, 90% of them with the same field count (3 or more for `:`), short cells, rows that differ. Output: row and field counts, header row, per field a type (int, number, date, bool, text) with range. Works inside a binary blob.
-  - *Offset/length tables*: 3 or more entries of 8..64 bytes with a u32 offset and a u32 length (either order and byte order) in the first 128 bytes. The ranges must lie behind the table, not overlap, and reach into the last quarter of the data. They must start right behind the table, or the table has 4 entries with unaligned values. This finds ICO and TrueType directories. A table that a longer stride explains (20 or more records) is dropped, as is a short stride over the same bytes.
-  - *Sample streams*: 8-bit PCM-like data (blocks of 1 KiB, mean step small against the deviation, at lag 1 or 2, at least 75% of the blocks, not text) gets "sample stream ... no records". Stride guesses are dropped; an exact chain (the RIFF header) stays.
+  - *Offset/length tables*: 3 or more entries of 8..64 bytes with a u32 offset and a u32 length (either order and byte order) in the first 128 bytes. The ranges must lie behind the table, not overlap, and reach into the last quarter of the data. They must start right behind the table, or the table has 4 entries with unaligned values. This finds ICO and TrueType directories. Fields of 8 bytes (u64, same rules) are tried when no u32 table fits. Fields of 2 bytes (u16) are accepted only when the ranges tile exactly (each starts where the previous one ends, the table is followed by the first range or the last range ends at the end of the data). Tables of 1 or 2 entries are accepted only when the whole data is in the window and the ranges tile it exactly (2 entries: the lowest range starts right behind the table, they follow each other, the last one ends at the end of the data; 1 entry: one pair whose range ends at the end of the data); the output says so. The scan keeps only positions where a range fits and walks entries from there (about 20 ms on a 5 MB file). A table that a longer stride explains (20 or more records) is dropped, as is a short stride over the same bytes.
+  - *Java class files* (`recdetect.py`): the `CAFEBABE` magic (also inside a blob), then the constant pool is walked with the tag-dependent entry sizes (long and double take two slots). It must end exactly at the slot count, and the this-class entry must name a class with a plausible name. Fields, methods and attributes behind it are walked too; the line says where the class ends. A match replaces all other layouts and the strings list.
+  - *Sample streams*: PCM-like data (blocks of 1 KiB, mean step small against the deviation, at least 75% of the blocks, not text) gets "sample stream ... no records". 8-bit: the step is measured at lag 1 or 2, even and odd steps apart (the low bytes of 16-bit audio are noise between smooth high bytes). 16-bit little endian, mono or interleaved stereo (reported when every second sample is smoother), either sample phase; loud blocks need noise-like low bytes, so 8-bit stereo does not pass as 16-bit. Clean streams are tried before noisy ones; noisy means the step is up to 0.88 of the deviation while neighbouring samples still correlate (0.4 or more). Stride guesses are dropped; an exact chain (the RIFF header) stays.
   - Then strings (ASCII and UTF-16LE runs of 4+, spacing, length prefix before runs) and entropy.
   - Mostly-zero files give no global stride; high-entropy data skips strings. These are hints to verify with `hexdump`, not a parser.
-  - Verified on real files (dBase `.dbf`, shapefile `.shp`/`.shx`, BIFF in `.xls`, PNG/APNG, RIFF/WAV, MIDI, DSDIFF, MCAP, TrueType `hmtx`/`loca`/directory, ICO, OpenPGP keys and messages, `.pol`, CSV/TSV, 8-bit WAV) and on synthetic layouts in `tests/test_fileformat.py`. Not found: `.class` constant pool, tables of fewer than 3 entries, 16-bit PCM, noisy 8-bit audio, delimited text without line ends.
+  - Verified on real files (dBase `.dbf`, shapefile `.shp`/`.shx`, BIFF in `.xls`, PNG/APNG, RIFF/WAV, MIDI, DSDIFF, MCAP, TrueType `hmtx`/`loca`/directory, ICO, OpenPGP keys and messages, `.pol`, CSV/TSV, 8-bit and 16-bit WAV, a Java class) and on synthetic layouts in `tests/test_fileformat.py`. Not found: tables of 1 or 2 entries that do not tile the data, 24-bit PCM, audio below the noise limit, delimited text without line ends.
 
 ### spec_write / spec_read
 
@@ -1412,6 +1501,20 @@ restart.
    and only maps the typed target to call-graph nodes (`server/endpoints.py`);
    strings accept `*`/`?` globs there. A cluster id (`C1`) is checked before a
    bare hex string.
+
+9. **Cheaper than `error ambiguous`.** Before an ambiguity is reported, three things can decide
+   (checked in this order; `error ambiguous` stays only when none does):
+   - *Qualifier* `name@binary` is the same as `binary!name` (split at the last `@`, only when
+     the right part is the exact name of a binary, so `_foo@8` is untouched).
+   - *Definition over import* (tools that list relations, i.e. the typed kind `import` is
+     accepted: `xrefs`, `callgraph`, `function_map`): a name that is one function in one binary
+     and an import in others is the function, even without an xedge binding; the note line says
+     `binary lib.exe; also an import in host.exe, plug.dll`.
+   - *Session focus*: the binary of the function resolved last in a multi-binary project
+     (`ServerContext.focus`, per project, set by every successful function target, also with an
+     explicit `binary!`) resolves an unqualified ambiguous name when that binary has exactly
+     one such function. The response says so in one line: `binary tool.exe (current binary)`.
+     An explicit `binary=`/`binary!` never uses the focus.
 
    Errors have one wording everywhere: `error not_found: no function or import
    named 'X' [in N ready binaries]. Use search …`, `error ambiguous: 'X' matches
@@ -1586,6 +1689,17 @@ dirty; implementation from specs: clean; ask the user when unclear). The
 role is fixed for the life of the process: a second `project_open` or
 `project_create` returns `error role_locked: ...`. Because a restart starts a
 new unbound session, the user starts clean work in a new conversation.
+
+The instructions also give the dirty workflow in one sentence (about 170 tokens in all, paid once per
+session): `overview` first; `features`, `function_map` or `search` find the area; `function` reads code;
+`xrefs`, `callgraph` and `path` follow it; `annotate` records findings; `spec_write` is for the clean side.
+The cursor is named: "pass it back". Framework tools are not listed there; `overview` names them (below).
+
+Agents do not act on hints, so the tools act themselves: `function` retries a decompile once after a transient worker
+failure (worker restarted, JVM not running, file closed; such errors are never cached) and prints `retry=true` only if
+that fails too; a name the tools print is accepted as a target (`Class::slot` of `qt_method`, `TClass.Method` of
+`dl_method`, found by `search` as `function Class::name addr (Qt slot)`); `function` on a managed method returns the
+`dotnet_decompile` text of that member.
 
 `projects` and `project_info` are allowed in every role and are role-aware
 (catalog flag `clean_safe`): in a clean session `projects` shows only name and
@@ -1786,7 +1900,7 @@ formats is the primary use case of this project.
 
 - Parsed server side from the PE bytes with pefile (`server/cpp.py`), no worker: sections, image
   base and pointer size come from the PE header, never constants. Rows go to `rtti_class`,
-  `vtable_slot`, `msgmap_entry` (schema v10, derived). They are filled when a binary becomes ready
+  `vtable_slot`, `msgmap_entry` (schema v10, derived; `mfc_class` and `mfc_map_entry` from schema v14, below). They are filled when a binary becomes ready
   and, for old projects, on open when meta `cpp_version:<binary id>` is older than `CPP_VERSION`
   (about 0.1 s per megabyte; no re-analysis).
 - 32-bit: Complete Object Locator holds absolute pointers (signature 0).
@@ -1830,14 +1944,15 @@ formats is the primary use case of this project.
   with `nCode` 0xFFFFFFFF; `ON_COMMAND` has `nCode` 0; `ON_CONTROL` carries the notification code.
 - A map is attributed to the class whose vtable returns it; a derived class that only inherits the
   slot (same getter) is not listed (the base, an ancestor of the others, is). Maps of classes
-  without RTTI are named `anon_<map address>`. The tool `mfc_message_maps <class>` follows the
-  recorded base classes to the nearest class with a map.
+  without RTTI start as `anon_<map address>` and get a better name from "MFC classes without RTTI" below
+  (otherwise they keep it). The tool `mfc_message_maps <class>` follows the recorded base classes to the
+  nearest class with a map.
 - **Join** (`server/uijoin.py`, computed per binary on demand, nothing stored): `msgmap_entry.ctrl_id ..
   last_id` (ranges included) x `res_control.ctrl_id` / `res_menu_item.item_id`, `WM_COMMAND` and
   `WM_NOTIFY` entries only. `ON_COMMAND` (code 0) is the menu command, `UPDATE_COMMAND_UI` (code
   0xFFFFFFFF) the update handler; for a dialog control every code counts and is named by the control
   class (`BN_CLICKED`, `EN_CHANGE`, `CBN_SELCHANGE`, `NM_CLICK`, ...). A handler shows as `Class::name`;
-  for an `anon_` class as the function name (or the address). Ids that occur in several menus or
+  a function without a name of its own (no row, or a default `FUN_` name) shows `Class::OnXxx (FUN_00401000)`, see "Handler names". Ids that occur in several menus or
   dialogs list every place, compact (3, then `+N`). Ids 0, 0xFFFF and -1 (static text) never join.
 - **Framework noise**: an entry whose id range spans (almost) the whole id space
   (width >= 0xF000, e.g. `ON_NOTIFY_EX_RANGE(.., 0, 0xFFFF)` tooltip / chevron handlers of
@@ -1867,6 +1982,91 @@ formats is the primary use case of this project.
   meta `fnfix_version:<id>` and `fnfix_info:<id>` (counts and reasons). Failed addresses are not retried
   until `FIX_VERSION` is bumped. **[verified]** on notepad (gap address, existing entry, non-code address).
 
+### MFC classes without RTTI
+
+Server side, from the PE bytes (`server/mfc.py`, called by `cpp.derive_binary`, `CPP_VERSION` 2). Most
+program classes of an MFC application are built without `/GR`, so `find_msgmaps` only knows their map as
+`anon_<map address>`. The framework offers more sources, all found without symbols:
+
+- **`CRuntimeClass`** (`DECLARE_DYNAMIC` / `DYNCREATE` / `SERIAL`): `lpszClassName`, `nObjectSize`,
+  `wSchema` (0xFFFF or the schema, bit 31 = versionable), `pfnCreateObject` (code or 0), `pBaseClass`,
+  `pNextClass`, `pClassInit`; five pointers and two u32, no padding: 28 bytes (32-bit), 48 bytes (64-bit).
+  Found by scanning the data sections for a pointer to an identifier string followed by a plausible size
+  and schema; the base pointer must be 0, another runtime class, or a function (`_AFXDLL`:
+  `pfnGetBaseClass`). **[verified]** on a static 32-bit MFC program (the base chains end in the framework
+  classes), on 32-bit MFC DLL users and on the 64-bit MFC 10..12 DLLs.
+- **`GetRuntimeClass` is slot 0** of every `CObject` vtable and a trivial getter returning `&classX`.
+  A vtable therefore starts at the slot whose getter returns a `CRuntimeClass`; `GetMessageMap`,
+  `GetDispatchMap`, `GetInterfaceMap` and `GetEventSinkMap` are later slots of the same vtable (up to the
+  next such slot). Vtables of RTTI classes are skipped here: RTTI already names them.
+- **Owner of a runtime class.** A class without `DECLARE_DYNAMIC` inherits the slot and so returns its
+  base's `CRuntimeClass`. The compiler emits a class's `CRuntimeClass` and its vtable together, so the
+  owner is the closest vtable behind the structure (at most `NEAR` = 0x4000 bytes; a control's dispatch
+  tables can sit in between). A binary that keeps them apart falls back to "the only vtable of the class".
+  Checked against RTTI as ground truth (the RTTI vtables treated as anonymous) on several programs and DLLs:
+  almost all owners were right; the misses were framework classes whose own vtable was not found.
+- **Names** (`msgmap_entry.class` is rewritten, derived data): the runtime class name for the owner;
+  `Dialog_<caption>` (`_<id>` when the caption repeats) for a class whose constructor passes a dialog
+  resource id to the base constructor; `anon_<Base>_<map address>` for a class that inherits the
+  runtime class of `<Base>` (so the base is known); `anon_<map address>` when nothing identifies it. A map
+  reachable from several vtables goes to the owner whose runtime class is an ancestor of the others, and
+  is left alone when that is not unique.
+- **Dialog id from the constructor** (32-bit only): the constructor pushes the id and calls the
+  `CDialog` constructor, then stores the vtable pointer. Found by locating the `mov [reg], imm32` with the
+  vtable address in code and reading the 96 bytes before it for `push imm; ...; call rel32` with the call at
+  most 28 bytes before the store; the id must be a dialog resource of the binary and the call target must
+  be shared by at least two classes. **[verified]** on a program with dozens of dialog classes (the captions
+  match the class purpose). 64-bit constructors (`lea rax,[rip+d]`) are not scanned.
+- **`mfc_class`** (schema v14): `name`, `vtable_addr` (the `GetRuntimeClass` slot), `rc_addr`, `obj_size`,
+  `schema`, `base` (the owner of the base message map, else the base runtime class), `map_addr`,
+  `dialog` (resource id), `source` (`rc` | `dialog` | `inherited`). Rows only for classes without RTTI.
+
+**Handler names.** Nothing is renamed in Ghidra. `UiIndex.suggest` builds a ClassWizard style name from
+the message and the UI element: `OnCommand_<id>_<menu leaf>` for a menu item, `OnUpdateCommand_<id>_<leaf>`,
+`OnBnClicked_<button caption>`, `OnEnChange_<caption or id>` (the notification name in camel case),
+`OnCommand_<lo>_<hi>` for a range, `OnNotify_<code>_<id>` for an unknown `WM_NOTIFY`, `OnSize`, `OnPaint`,
+... for window messages (table `STD_HANDLERS`), `OnMessage_<WM name>` otherwise. It is shown where a
+handler has no name of its own (`uijoin.is_unnamed`: no function row, or `name_state` auto with a `FUN_`
+style name): `menus` / `dialogs` lines as `Class::OnXxx (FUN_00401000)`, `mfc_message_maps` entry lines as
+`as OnXxx`, and `function` as the hint `likely Class::OnXxx`.
+
+### MFC dispatch, interface and event sink maps (OLE automation)
+
+Same discovery as the message maps (`mfc.kind_of`): a trivial getter that returns the address of a static
+structure of one of these shapes. `cpp` owns the message maps; the rest is tried as dispatch map, event
+sink map, interface map, and every structure must parse to its terminator, so neighbours do not
+cross-match. RTTI classes get them from their vtable slots (a map shared through an inherited slot goes
+to the ancestor, as for message maps); classes without RTTI through the vtable groups above (owner groups
+only). `GetDispatchMap` and `GetInterfaceMap` are `CCmdTarget` virtuals; `GetEventSinkMap` belongs to
+classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
+
+- `AFX_DISPMAP`: `pBaseMap` (static) or `pfnGetBaseMap` (`_AFXDLL`), `lpEntries`, `lpEntryCount` (a `UINT`
+  that MFC fills at run time, so it is not read: the table ends with the entry whose `lpszName` is NULL and
+  `nPropOffset` is -1), `lpStockPropMask`. **[verified]**
+- `AFX_DISPMAP_ENTRY` (natural alignment): `lpszName` (ptr), `lDispID` (i32), `lpszParams` (ptr, `VTS_*`
+  bytes, NULL for none), `vt` (u16), `pfn`, `pfnSet`, `nPropOffset` (ptrs), `flags` (u32, `afxDispStock` =
+  1). 32 bytes in 32-bit, 64 bytes in 64-bit (padding after `lDispID`, `vt` and `flags`). **[verified]** in
+  32-bit on a program (method names, ids 1..N, `double&` out parameters, `BSTR` returns) and on an ActiveX
+  control (`DISP_PROPERTY_NOTIFY` entries). The 64-bit layout is the same struct with 8-byte pointers
+  **[verify]**: no 64-bit binary with a non-empty dispatch map was at hand (unit tests cover the layout).
+- Kind of an entry: `flags & 1` stock property (name empty, id from the stock table `STOCK_DISPIDS`);
+  `pfn` and no `pfnSet`: method (`VTS_*` argument bytes: 2 short, 3 long, 4 float, 5 double, 8 BSTR,
+  9 IDispatch*, 11 BOOL, 12 VARIANT, 0x4E `VTS_BSTR` = LPCSTR, 0x40 or'ed = by reference; `vt` is the
+  return type); `pfn` and `pfnSet`: property with getter and setter; no `pfn`: data member at
+  `nPropOffset`, `pfnSet` then is the after-set notification (`DISP_PROPERTY_NOTIFY`). `lDispID` -1
+  (`DISPID_UNKNOWN`) is shown as `auto`.
+- `AFX_INTERFACEMAP`: base map, `pEntry` -> `{ piid (ptr to a GUID), nOffset (size_t) }` ending with
+  `{ NULL, -1 }`. Shown as `interface IDispatch offset 0x10`; known IIDs (table `_IIDS`) by name, else the
+  GUID. **[verified]** in 32-bit (IDispatch, IUnknown, OLE document interfaces) and on the 64-bit MFC DLLs.
+- `AFX_EVENTSINKMAP`: base, `lpEntries`, `lpEntryCount`; entry = `AFX_DISPMAP_ENTRY` + `nCtrlIDFirst` +
+  `nCtrlIDLast` (u32), ends like a dispatch map. Shown as `event dispid 7 ctrl 1000 -> handler`.
+  **[verified]** in 32-bit (a dialog hosting a browser control) and on the 64-bit MFC DLLs.
+- Rows: `mfc_map_entry(binary_id, class, kind, map_addr, seq, name, id, vt, flags, pfn, pfn_set, extra)`,
+  `kind` = dispatch | interface | event; `extra` holds the argument types, the data offset or the
+  control ids. `pfn` and `pfn_set` are candidates for the missing-function pass (`fnfix`, `FIX_VERSION` 4).
+- Old projects: `CPP_VERSION` 2 makes `cpp.ensure_project` derive again on open (about 0.1 s per
+  megabyte, no re-analysis); the schema migration only creates the two tables.
+
 ### Qt metaobjects
 
 - Parsed from the PE bytes in `server/qt.py` (tables `qt_class`, `qt_method`, `qt_prop`, `qt_enum`, `qt_connect`, schema v13, meta `qt_version:<id>`). Scan: every pointer-wide word in the data sections whose next two words point into the image and whose second target starts with a plausible header; the class name must decode.
@@ -1877,8 +2077,10 @@ formats is the primary use case of this project.
 - Method to function: `qt_dispatch` decompiles `d.static_metacall` and walks the tokens. The `InvokeMetaMethod` switch is the one whose case labels fit the method count best; the first call to a function of the program in each case is the method. Small classes (the compiler drops the switch) use `if (id == K)` blocks; a class with one method uses the first call. Signals the compiler inlined into the dispatcher (a call to `QMetaObject::activate` only) are taken from the `IndexOfMethod` branch (`== signalFunction` then `*result = index`). **[verified]** on both builds: about 94% of signals and 75% to 100% of slots and invokable methods are mapped. Limits: a method inlined into the dispatcher maps nothing; inherited methods are not in the switch; property accessors (ReadProperty/WriteProperty) are not mapped.
 - String connections: `QObject::connect` with `SIGNAL("2name(args)")` and `SLOT("1name(args)")` strings. Each connect call takes the two closest signal/slot strings of its function; without identifiable connect call edges adjacent strings are paired (a 32-bit cdecl call pushes the slot first, so both orders are accepted). Connected classes are looked up by normalised signature (const and & removed).
 - Pointer-to-member connects (`QObject::connectImpl`), Qt6 64-bit MSVC **[verified]**: (1) Why the call sites were missing: Ghidra files a C++ import under the class namespace of the external library, so the `import` table has no row for it and a call through the import slot is only a `read` edge to the slot (`dst_fn` NULL). `qt.fill_imports` adds the missing rows from the PE import table (`Class::method`, MSVC names only), `derive_connects` takes the `read` edges to the slots of `QObject::connect(Impl)` as call sites (kind `ptr`). (2) The function returns `QMetaObject::Connection` by value, so the first argument is the result pointer: sender, signal pointer, receiver, slot pointer, slot object are arguments 2 to 6. (3) Worker op `qt_connects` decompiles the function of each site and gives every argument a symbolic value (`_Flow`: constant, import slot read, parameter, stack slot, `new` result). The signal pointer points at a stack slot that holds the member pointer; the slot object is `new`-ed with the `impl` function at +8 and the slot (a member pointer, or the captured lambda) at +0x10. A member pointer to an imported signal is the *content of an import slot* (name from the external reference of the slot); to a signal of the binary it is the address of the moc function (or its thunk), whose `QMetaObject::activate(this, &staticMetaObject, index, argv)` call gives class and index. (4) A call site that only forwards parameters (a template instance kept as a function of its own) is chased up the callers (4 levels, 12 callers each) until the signal is a constant; the connection is filed at the call that holds the constants. Instances without any caller (kept by an incremental link, never called) stay unresolved.
-- Pointer-to-member connects on Qt5 MSVC x64 and Qt5 MinGW 32-bit (Itanium) **[verified]** on real programs checked against their sources: (1) The Qt5 call and the Qt5 `QSlotObject` have the same shape as Qt6 (result pointer, sender, signal, receiver, slot, slot object; `m_impl` at one pointer, the member pointer at two pointers), so the 64-bit MSVC code works unchanged. The offsets now come from the pointer size. (2) Itanium imports are named `_ZN7QObject11connectImplE...`; `qt.import_qualname` reads plain nested names, constructors and destructors, and `fill_imports` adds them like the MSVC names. (3) MinGW loads the import into a register once (`mov edi,[slot]`) and calls it from there, so only one `read` edge exists for many calls. A site that is no call stands for every `connectImpl` call of its function (worker result `expanded`). (4) Ghidra cannot demangle the `connectImpl` name of MinGW, so the decompiler shows the call without arguments. The worker gives the imported `connectImpl` a nine pointer signature once (`ANALYSIS` source, saved with the project) and the arguments appear. (5) The decompiler drops the stores that fill the member pointer on the stack when only the slot address goes to a call; `MOV [stack slot], imm` instructions are read as a fallback. (6) The string form has the same register problem: strings that no call site claimed are paired in order. Such pairs, and all pairs of a binary without a connect function, are guesses: `qt_connect` kind `string-guess`, shown with a `~` and counted apart. After the signature change the worker result carries `stats.signatures`, and the server bumps `function.version` of every caller of `connectImpl` (`bump_connect_callers`), so cached decompiles are recomputed. (7) Itanium member pointers have two words; an odd first word below 0x4000 is a virtual function (vtable offset plus one) and is filed as `vtable+0x..` with `slot_kind` virtual. Virtual MSVC pointers stay unresolved. (8) The import table of the server is sent to the worker (`imports`), so an imported signal is named even where Ghidra has no external reference on the slot. A wrapper with a constant signal and a slot parameter is chased up the callers; a chased result counts for the site where it started (`origin`).
-- `qt_connect` rows of kind `ptr`: `signal` = `Class::name(args)` (binary) or `Class::name` (imported), `slot` = function address `0x...` with `slot_kind` slot / signal / fn (member pointer) / functor (lambda or functor: the address is the `impl` function of the slot object, which holds or calls the body) or the name of an imported function (`ext`). Not resolved: virtual member pointers (vcall thunks are followed as thunks only), a signal or slot chosen at run time, `connect` to a `QMetaMethod`, `connectImpl` calls whose result of the stack slot analysis is ambiguous, more than 12 callers or 4 levels of forwarding.
+- Pointer-to-member connects on Qt5 MSVC x64 and Qt5 MinGW 32-bit (Itanium) **[verified]** on real programs checked against their sources: (1) The Qt5 call and the Qt5 `QSlotObject` have the same shape as Qt6 (result pointer, sender, signal, receiver, slot, slot object; `m_impl` at one pointer, the member pointer at two pointers), so the 64-bit MSVC code works unchanged. The offsets now come from the pointer size. (2) Itanium imports are named `_ZN7QObject11connectImplE...`; `qt.import_qualname` reads plain nested names, constructors and destructors, and `fill_imports` adds them like the MSVC names. (3) MinGW loads the import into a register once (`mov edi,[slot]`) and calls it from there, so only one `read` edge exists for many calls. A site that is no call stands for every `connectImpl` call of its function (worker result `expanded`). (4) Ghidra cannot demangle the `connectImpl` name of MinGW, so the decompiler shows the call without arguments. The worker gives the imported `connectImpl` a nine pointer signature once (`ANALYSIS` source, saved with the project) and the arguments appear. (5) The decompiler drops the stores that fill the member pointer on the stack when only the slot address goes to a call; `MOV [stack slot], imm` instructions are read as a fallback. (6) The string form has the same register problem: strings that no call site claimed are paired in order. Such pairs, and all pairs of a binary without a connect function, are guesses: `qt_connect` kind `string-guess`, shown with a `~` and counted apart. After the signature change the worker result carries `stats.signatures`, and the server bumps `function.version` of every caller of `connectImpl` (`bump_connect_callers`), so cached decompiles are recomputed. (7) Itanium member pointers have two words; an odd first word below 0x4000 is a virtual function (vtable offset plus one) and is filed as `vtable+0x..` with `slot_kind` virtual. Virtual pointers: see (9). (8) The import table of the server is sent to the worker (`imports`), so an imported signal is named even where Ghidra has no external reference on the slot. A wrapper with a constant signal and a slot parameter is chased up the callers; a chased result counts for the site where it started (`origin`).
+- Virtual member pointers, uncalled instances, 64-bit MinGW (Itanium names, Win64 convention) **[verified]** on real programs checked against their sources: (9) MSVC passes a pointer to a virtual member as the address of a vcall thunk (`mov rax,[rcx]; jmp [rax+off]`, 32-bit `mov eax,[ecx]; jmp [eax+off]`); Itanium has the vtable offset plus one. Both give a vtable byte offset. The receiver class comes from the connect: `this` of a constructor (a store of a vtable address into `this`) or of a known method, or an object `new`-ed in the function and passed to its constructor. The slot is then the word at that offset in the vtable (thunks followed; a stub `jmp [import]` of an inherited library virtual gives the import name, slot kind `ext`); without a class it stays `vtable+0x..`. The server sends the worker `vtables` (address point to class), `fnclass` (function to class) and `primary` (class to its only vtable): `qt.class_vtables` finds a Qt vtable without RTTI because `metaObject()` is a small function that reads the class's `QMetaObject` and sits in slot 0, and adds the RTTI vtables. A subclass without `Q_OBJECT` shares the three moc functions, so the parent then has no `primary`. (10) A member pointer stored as one 16 byte value is a `PIECE` op; its low part is the pointer. (11) `_Flow.value` and `slot_value` are memoised and bounded in depth and in time per site (`SITE_BUDGET_S`); before that a huge initialisation function made the walk exponential, and a recursion error silently dropped the site. A decompile that times out is tried once more with a longer timeout. (12) A call site in a function that nothing refers to except the unwind table (a template instance the linker kept) is not a live connection: it is filed with `slot_kind` `uncalled`, listed apart and left out of the resolved/total count. `DISPATCH_VERSION` 4. 64-bit MinGW needed no other change: sret in `rcx`, sender, signal, receiver in `rdx`, `r8`, `r9`, slot and slot object on the stack, member pointers as two words, and the Win64 `ABI` shows up in the decompiler as the same argument order.
+- Receiver classes, 32-bit MinGW vtables, unwind-only instances **[verified]** on real programs checked against their sources: (13) More sources for the class of the receiver of a virtual member pointer, each used only when the answer is unique: a parameter (also `this` of a method of unknown class) that every caller fills with objects of one class (thunks are looked through); an object `new`-ed in the function (a stack object: all of these must agree, a slot can hold several objects in turn), decided by the last of: a vtable store at its start (an inlined constructor; any known vtable, the class is exact), a call of a program constructor, a library constructor import `L::L`, an MSVC import `L::vftable` stored (an unknown vtable last means unknown); the result of a call whose returns all give one class (a returned parameter is the argument of that call); a field (`this->ui->button`, a chain of loads from a parameter) that the same function stores such an object into. A slot is read only when the vtable holds code pointers up to its offset. (14) A library class has no vtable in the program. Its slot at an offset comes from the program classes whose chain of program superclasses ends at that class: a slot they do not override is an import stub, an override is program code; all import stubs must name the same function, else the slot stays `vtable+0x..`. The server sends `allvtables` (also the vtables of classes others derive from) and `parents` (class to superclass: metaobject, else the first RTTI base), `qt.connect_context`. (15) 32-bit MinGW: Ghidra makes no function of `metaObject()` (only the vtable points to it), so its read of the metaobject is an edge without a function. A code word in data that is no known function and starts at most `META_LOOSE` bytes before such a read stands for `metaObject()`. (16) A function that only unwind data names (`.pdata`, or a chained `UNWIND_INFO` in `.rdata`) is uncalled. (17) Time: the decompiles are most of the time of `qt_connects`, and a few huge initialisation functions dominate. The functions with call sites and their callers are decompiled ahead on several decompilers at once (`PREFETCH_THREADS`, within the pool budget); the walk then uses the stored results. `DISPATCH_VERSION` 5.
+- `qt_connect` rows of kind `ptr`: `signal` = `Class::name(args)` (binary) or `Class::name` (imported), `slot` = function address `0x...` with `slot_kind` slot / signal / fn (member pointer) / functor (lambda or functor: the address is the `impl` function of the slot object, which holds or calls the body) or the name of an imported function (`ext`). Not resolved: a virtual member pointer whose receiver class is unknown, a signal or slot chosen at run time, `connect` to a `QMetaMethod`, `connectImpl` calls whose result of the stack slot analysis is ambiguous, more than 12 callers or 4 levels of forwarding.
 - Feature seeds (`qt.feature_seeds`, features version 7): the slot of a connect whose signal is `QAction::triggered/toggled`, `QMenu::triggered/aboutToShow`, `QActionGroup::triggered` seeds `ui-menu`; `QAbstractButton::clicked/toggled/pressed/released` (and the button subclasses), `QDialog::accepted/rejected/finished`, `QDialogButtonBox` and `QWizard` signals seed `ui-dialog`. A subclass in the binary counts through its parent chain. String connects have no class: the signal names `triggered`, `clicked`, `accepted`, `rejected` are enough, and the slot name must be unique in the binary. Seeds are strong (they expand to callers). Calls of Qt library classes (`QNetworkAccessManager::`, `QFile::`, `QSettings::`, `QMenu::`, `QDialog::`, `QPainter::` and others, via the added import rows) seed the API features like MFC classes do (constructors weak).
 - Runtime recognition: the dispatcher and, with RTTI, vtable slots 0 to 2 of every Qt class (`metaObject`, `qt_metacast`, `qt_metacall`) are boilerplate: `function` hints say so and the call graph marks them runtime family `Qt`. Gate: toolchain `qt` or a file named `Qt<n>*.dll`; a statically linked Qt is not scanned.
 

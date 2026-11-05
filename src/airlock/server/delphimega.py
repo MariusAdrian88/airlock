@@ -44,6 +44,9 @@ _USED_BY = re.compile(r"Unit '([^']+)' is used by '([^']+)'")
 _MISSING_FILE = re.compile(r"E1026 File not found: '([^']+)'")
 _UNIT_ERR = re.compile(r"([\w.]+)\.(?:pas|dcu)\(\d+\) (?:Fatal|Error)")
 _DENIED = re.compile(r"E2223 \$DENYPACKAGEUNIT '([^']+)'")
+STUB_EXT = {".res", ".fmx", ".dfm", ".xfm", ".nfm"}      # resource files a unit links by name (``{$R X.fmx}``)
+# an empty 32-bit resource file: the header record of a resource with no data
+_EMPTY_RES = struct.pack("<IIHHHHIHHII", 0, 32, 0xFFFF, 0, 0xFFFF, 0, 0, 0, 0, 0, 0)
 
 
 class MegaError(RuntimeError):
@@ -59,6 +62,8 @@ class MegaResult:
     rounds: int = 0
     seconds: float = 0.0
     failed: list[str] = field(default_factory=list)      # packages that could not be built, with the reason
+    stubbed: list[str] = field(default_factory=list)     # resource files the install lacks, replaced by empty stubs
+    program_units: int = 0                                # units that only a program (not a package) can hold
 
 
 @dataclass
@@ -127,14 +132,48 @@ def dpk_text(name: str, units: list[str], requires: list[str] | None = None) -> 
             + ",\n  ".join(units) + ";\nend.\n")
 
 
+def stub_missing(output: str, folder: Path, done: set[str]) -> set[str]:
+    """Write an empty stand-in into ``folder`` for each resource file the compiler could not find (``E1026``) and
+    that has no stub yet; returns the new names. The unit's code is in its ``.dcu``: the resource (a form of an
+    editor the install ships without its ``.fmx``, a platform ``.res``) is data the routines never read at build
+    time. A form stub is an empty text form, a ``.res`` stub an empty resource."""
+    new: set[str] = set()
+    for m in _MISSING_FILE.finditer(output):
+        name = os.path.basename(m.group(1))
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in STUB_EXT or name.lower() in done:
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"\W", "_", os.path.splitext(name)[0])
+        if ext == ".res":
+            (folder / name).write_bytes(_EMPTY_RES)
+        else:
+            (folder / name).write_text(f"object {stem}: T{stem}\nend\n", encoding="latin-1")
+        new.add(name.lower())
+    done |= new
+    return new
+
+
+def dpr_text(name: str, units: list[str]) -> str:
+    """A console program that uses the units; ``STRONGLINKTYPES`` keeps the classes (and their methods) that
+    nothing references."""
+    head = f"program {name};\n{{$APPTYPE CONSOLE}}\n{{$STRONGLINKTYPES ON}}\nuses\n  "
+    return head + ",\n  ".join(units) + ";\nbegin\nend.\n"
+
+
 def write_project(work: Path, lib: Path, units: list[str], psize: int, resource_dirs: list[Path],
-                  name: str = "mega", requires: list[str] | None = None) -> None:
+                  name: str = "mega", requires: list[str] | None = None, program: bool = False) -> None:
     """``<name>.dpk`` (requires and contains clauses) and ``<name>.cfg`` (compiler switches, read next to the
-    project)."""
+    project). A ``program`` is a ``.dpr`` that only uses the units (for units a package may not hold)."""
     (work / "dcu").mkdir(parents=True, exist_ok=True)
     (work / "bpl").mkdir(parents=True, exist_ok=True)
     (work / "dcp").mkdir(parents=True, exist_ok=True)
-    (work / f"{name}.dpk").write_text(dpk_text(name, units, requires), encoding="latin-1")
+    (work / "stubs").mkdir(parents=True, exist_ok=True)
+    resource_dirs = [*resource_dirs, work / "stubs"]
+    if program:
+        (work / f"{name}.dpr").write_text(dpr_text(name, units), encoding="latin-1")
+    else:
+        (work / f"{name}.dpk").write_text(dpk_text(name, units, requires), encoding="latin-1")
     ns = NAMESPACES + (";Bde" if psize == 4 else "")
     cfg = ["-B", "-GD", "-Q", "-W-", "-H-", f"-NS{ns}", f"-LE{work / 'bpl'}", f"-LN{work / 'dcp'}",
            f"-N0{work / 'dcu'}", f"-NU{work / 'dcu'}", f"-E{work / 'bpl'}",
@@ -314,39 +353,54 @@ def culprits(output: str, units: list[str], lib: Path, cache: dict[str, bytes] |
     return bad
 
 
-def _build_part(exe: Path, lib: Path, work: Path, part: Part, psize: int, resource_dirs: list[Path],
-                exclude: set[str], cache: dict[str, bytes], say: Callable[[str], None]
-                ) -> tuple[Path, Path, int, set[str], int] | None:
-    """Build one package in ``work``: compile, leave out the units the compiler blames, repeat. Returns
-    (binary, map file, units kept, units left out, rounds), or None when every unit had to go. Raises
-    MegaError."""
+def _compile(exe: Path, lib: Path, work: Path, name: str, units: list[str], requires: list[str] | None,
+             psize: int, resource_dirs: list[Path], exclude: set[str], cache: dict[str, bytes],
+             say: Callable[[str], None], label: str, program: bool
+             ) -> tuple[Path, Path, int, set[str], int, set[str]] | None:
+    """Compile one project in ``work``: compile, stub the resource files the install lacks, leave out the
+    units the compiler blames, repeat. Returns (binary, map file, units kept, units left out, rounds, stubbed
+    resource files), or None when every unit had to go. Raises MegaError."""
     shutil.rmtree(work, ignore_errors=True)
-    name = f"m_{part.name}"
-    write_project(work, lib, part.units, psize, resource_dirs, name, part.requires)
+    write_project(work, lib, units, psize, resource_dirs, name, requires, program)
     excl = {u.lower() for u in exclude}
+    stubbed: set[str] = set()
     rounds = 0
+    src = f"{name}.dpr" if program else f"{name}.dpk"
     while rounds < MAX_ROUNDS:
         rounds += 1
-        keep = [u for u in part.units if u.lower() not in excl]
+        keep = [u for u in units if u.lower() not in excl]
         if not keep:
             return None
-        (work / f"{name}.dpk").write_text(dpk_text(name, keep, part.requires), encoding="latin-1")
-        say(f"{part.name} round {rounds}: {len(keep)} units")
-        r = subprocess.run([str(exe), f"{name}.dpk"], cwd=work, capture_output=True, text=True, errors="replace")
+        text = dpr_text(name, keep) if program else dpk_text(name, keep, requires)
+        (work / src).write_text(text, encoding="latin-1")
+        say(f"{label} round {rounds}: {len(keep)} units")
+        r = subprocess.run([str(exe), src], cwd=work, capture_output=True, text=True, errors="replace")
         if r.returncode == 0:
             break
+        if stub_missing(r.stdout, work / "stubs", stubbed):
+            say(f"  {label}: {len(stubbed)} resource files stubbed")
+            continue
         bad = culprits(r.stdout, keep, lib, cache) - excl
         if not bad:
             tail = " | ".join(x.strip() for x in r.stdout.splitlines()[-3:])
             raise MegaError(f"the compiler failed and no unit can be blamed: {tail}")
-        say(f"  {part.name}: leaving out {len(bad)} units")
+        say(f"  {label}: leaving out {len(bad)} units")
         excl |= bad
     else:
         raise MegaError("too many rounds")
-    binary, mp = work / "bpl" / f"{name}.bpl", work / "bpl" / f"{name}.map"
+    binary = work / "bpl" / f"{name}.{'exe' if program else 'bpl'}"
+    mp = work / "bpl" / f"{name}.map"
     if not binary.is_file() or not mp.is_file():
-        raise MegaError("the compiler wrote no package or no map file")
-    return binary, mp, len(keep), excl, rounds
+        raise MegaError("the compiler wrote no binary or no map file")
+    return binary, mp, len(keep), excl, rounds, stubbed
+
+
+def _build_part(exe: Path, lib: Path, work: Path, part: Part, psize: int, resource_dirs: list[Path],
+                exclude: set[str], cache: dict[str, bytes], say: Callable[[str], None]
+                ) -> tuple[Path, Path, int, set[str], int, set[str]] | None:
+    """Build one package in ``work`` (see ``_compile``)."""
+    return _compile(exe, lib, work, f"m_{part.name}", part.units, part.requires, psize, resource_dirs, exclude,
+                    cache, say, part.name, False)
 
 
 def plan(install: Path, psize: int, units: list[str], lib: Path) -> list[Part]:
@@ -363,10 +417,12 @@ def plan(install: Path, psize: int, units: list[str], lib: Path) -> list[Part]:
 
 
 def build(install: Path, work: Path, psize: int, progress: Callable[[str], None] | None = None,
-          exclude: set[str] | None = None, jobs: int = 4) -> MegaResult:
+          exclude: set[str] | None = None, jobs: int = 4, programs: bool = True) -> MegaResult:
     """Build the packages of all compiled units for a platform in ``work`` (a folder per package), ``jobs`` at a
     time. A package that fails is listed in ``failed`` and the others are kept. Raises MegaError when the
-    compiler is missing, there are no units, or no package could be built."""
+    compiler is missing, there are no units, or no package could be built. Units a package may not hold
+    (``$DENYPACKAGEUNIT``: WebBroker, ComServ, OleAuto and their users) go into one program that uses them
+    (``programs=False`` skips it)."""
     say = progress or (lambda _m: None)
     t0 = time.time()
     exe, lib = compiler_exe(install, psize), lib_dir(install, psize)
@@ -393,6 +449,7 @@ def build(install: Path, work: Path, psize: int, progress: Callable[[str], None]
     pairs: list[tuple[Path, Path]] = []
     excluded: set[str] = set()
     failed: list[str] = []
+    stubbed: set[str] = set()
     kept = rounds = 0
     for part, res, err in results:
         if res is None:
@@ -402,11 +459,30 @@ def build(install: Path, work: Path, psize: int, progress: Callable[[str], None]
             else:
                 excluded |= {u.lower() for u in part.units}
             continue
-        binary, mp, n, ex_units, r = res
+        binary, mp, n, ex_units, r, stubs = res
         pairs.append((binary, mp))
         kept += n
         rounds += r
         excluded |= ex_units
+        stubbed |= stubs
     if not pairs:
         raise MegaError("no package could be built: " + "; ".join(failed))
-    return MegaResult(pairs, psize, kept, sorted(excluded), rounds, time.time() - t0, failed)
+    prog = 0
+    if excluded and programs:
+        names = {u.lower(): u for u in units}
+        left = [names[u] for u in sorted(excluded) if u in names]
+        try:
+            res = _compile(exe, lib, work / "program", "m_program", left, None, psize, resdirs, excl0, cache, say,
+                           "program", True)
+        except MegaError as e:
+            failed.append(f"program: {e}")
+            res = None
+        if res is not None:
+            binary, mp, n, ex_units, r, stubs = res
+            pairs.append((binary, mp))
+            prog = n
+            rounds += r
+            stubbed |= stubs
+            excluded = set(ex_units)
+    return MegaResult(pairs, psize, kept + prog, sorted(excluded), rounds, time.time() - t0, failed,
+                      sorted(stubbed), prog)

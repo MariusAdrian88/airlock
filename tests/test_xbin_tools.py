@@ -121,11 +121,13 @@ def test_target_prefix_parsing(xctx):
 def test_bare_name_resolution_and_ambiguity(xctx):
     one = core.function(xctx, "Render", view="signature").splitlines()
     assert one[0] == "binary engine.dll" and one[1].startswith("0x10001400 Render")
+    xctx.focus.clear()                       # the focus (7.3 rule 9) would decide: Render was just viewed
     amb = core.function(xctx, "Init", view="signature")
     assert amb.startswith("error ambiguous: 'Init' matches 2 functions: ")
     assert "engine.dll!Init 0x10001300" in amb and "util.dll!Init 0x20001000" in amb
     amb2 = core.xrefs(xctx, "LoadDoc")       # main.exe's import binds to engine.dll's definition (7.3 rule 8)
     assert amb2.splitlines()[0].startswith("xrefs to LoadDoc (0x10001000)") and "binary engine.dll" in amb2
+    xctx.focus.clear()
     assert core.callgraph(xctx, "Init").startswith("error ambiguous:")
     assert core.xrefs(xctx, "Nope").startswith("error not_found:")
     assert core.xrefs(xctx, "util.dll!Init", direction="from").startswith("xrefs from Init")

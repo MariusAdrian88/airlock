@@ -35,7 +35,8 @@ from pathlib import Path
 
 from airlock.server import delphisigs as ds
 
-_SEG = re.compile(r"^\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})H?\s+(\S+)\s+(\S+)\s*$")
+# the segment start is 8 hex digits, or 16 in 64-bit maps of Delphi 13 (compiler 37)
+_SEG = re.compile(r"^\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8}(?:[0-9A-Fa-f]{8})?)\s+([0-9A-Fa-f]{8})H?\s+(\S+)\s+(\S+)\s*$")
 _PUB = re.compile(r"^\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8})\s+(\S.*?)\s*$")
 _MOD = re.compile(r"^\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})\s+C=(\S+)\s+S=(\S+)\s+.*\bM=(\S+)")
 _GENERIC = re.compile(r"^(?P<head>.*?)\.\{(?P<owner>[^{}]+)\}(?P<rest>.+)$")

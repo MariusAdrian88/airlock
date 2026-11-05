@@ -122,9 +122,7 @@ def _write(args: dict[str, Any], label: str, body: Callable[[Entry, Any], dict[s
     with e.fg, e.lock:
         check_open(e)
         program = e.program
-        tx = program.startTransaction(f"airlock {label}")
-        ok = False
-        try:
+        with S.transaction(program, f"airlock {label}"):
             try:
                 out = body(e, program)
             except WorkerError:
@@ -134,9 +132,6 @@ def _write(args: dict[str, Any], label: str, body: Callable[[Entry, Any], dict[s
                 if err is not None:
                     raise err from ex
                 raise
-            ok = True
-        finally:
-            program.endTransaction(tx, ok)
         dispose_decomp(e)
         e.epoch += 1
         S.require_project().save(program)
@@ -440,3 +435,123 @@ def define_struct(args: dict[str, Any]) -> dict[str, Any]:
         return {"name": name, "path": str(res.getPathName()), "size": int(res.getLength()),
                 "fields": len(typed), "replaced": existing is not None}
     return _write(args, "define struct", body)
+
+
+# -- patch_bytes -----------------------------------------------------------------------------------
+
+MAX_PATCH = 512
+
+
+def parse_patch_hex(text: Any) -> bytes:
+    """Bytes from hex text (spaces, commas and a 0x prefix per byte allowed). Pure."""
+    s = re.sub(r"0x|[\s,]", "", str(text or ""), flags=re.I)
+    if not s or len(s) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", s):
+        raise WorkerError("bad_args", "hex must be an even number of hex digits, e.g. 90 90 or 8BFF55")
+    data = bytes.fromhex(s)
+    if len(data) > MAX_PATCH:
+        raise WorkerError("bad_args", f"at most {MAX_PATCH} bytes per patch")
+    return data
+
+
+def _jbytes(data: bytes) -> Any:
+    import jpype
+    return jpype.JArray(jpype.JByte)([b - 256 if b > 127 else b for b in data])
+
+
+def _read_bytes(mem: Any, addr: Any, n: int) -> bytes:
+    import jpype
+    buf = jpype.JArray(jpype.JByte)(n)
+    mem.getBytes(addr, buf)
+    return bytes(memoryview(buf).cast("B"))
+
+
+@op("patch_bytes")
+@guarded
+def patch_bytes(args: dict[str, Any]) -> dict[str, Any]:
+    """patch_bytes(program, space, address, hex, force=False, expect=None): write bytes into the
+    program memory (never into the original file) in one transaction. Refuses uninitialised memory
+    (`uninitialized`), a changed `expect` (`changed`: the bytes are not what the caller expects) and
+    a patch whose old or new instruction boundaries differ from the patched range (`boundary`)
+    unless `force`. Instructions in the range are cleared and disassembled again.
+    Result: {address, length, old, new, cleared: [start, end] | None, instructions, functions: [entry]}."""
+    data = parse_patch_hex(args.get("hex"))
+    force = bool(args.get("force"))
+    expect = parse_patch_hex(args["expect"]) if args.get("expect") else None
+    if expect is not None and len(expect) != len(data):
+        raise WorkerError("bad_args", "expect and hex must have the same length")
+
+    def body(e: Entry, program: Any) -> dict[str, Any]:
+        from ghidra.app.cmd.disassemble import DisassembleCommand  # type: ignore
+        from ghidra.program.model.address import AddressSet  # type: ignore
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        addr = _address(program, args.get("space"), args.get("address"))
+        n = len(data)
+        try:
+            end = addr.add(n - 1)
+        except Exception as ex:
+            raise WorkerError("bad_args", f"{addr} + {n} bytes is outside the address space") from ex
+        mem = program.getMemory()
+        a = addr
+        while a is not None and a.compareTo(end) <= 0:
+            blk = mem.getBlock(a)
+            if blk is None or not blk.isInitialized():
+                raise WorkerError("uninitialized", f"{a} is not in initialised memory"
+                                  + (f" (block {blk.getName()})" if blk is not None else ""))
+            a = blk.getEnd().next()
+        old = _read_bytes(mem, addr, n)
+        if expect is not None and old != expect and not force:
+            raise WorkerError("changed", f"the bytes at {addr} are {old.hex()}, not {expect.hex()}")
+        listing = program.getListing()
+        has_insn = False
+        a_start, a_end = addr, end
+        it = listing.getCodeUnits(AddressSet(addr, end), True)
+        while it.hasNext():
+            if listing.getInstructionAt(it.next().getMinAddress()) is not None:
+                has_insn = True
+        for edge in (addr, end):       # an instruction that starts before or ends after the range
+            cu = listing.getCodeUnitContaining(edge)
+            if cu is not None and listing.getInstructionAt(cu.getMinAddress()) is not None:
+                has_insn = True
+            if cu is not None:
+                if cu.getMinAddress().compareTo(a_start) < 0:
+                    a_start = cu.getMinAddress()
+                if cu.getMaxAddress().compareTo(a_end) > 0:
+                    a_end = cu.getMaxAddress()
+        if has_insn and (a_start.compareTo(addr) != 0 or a_end.compareTo(end) != 0) and not force:
+            raise WorkerError("boundary", f"the patch {addr}-{end} cuts an instruction "
+                              f"(code covers {a_start}-{a_end})")
+        cleared = None
+        if has_insn:
+            listing.clearCodeUnits(a_start, a_end, False)
+            cleared = [S.addr_int(a_start), S.addr_int(a_end)]
+        mem.setBytes(addr, _jbytes(data))
+        count = 0
+        if has_insn:
+            restricted = AddressSet(a_start, a_end)
+            cur, ok = a_start, True
+            while cur is not None and cur.compareTo(a_end) <= 0:
+                ins = listing.getInstructionAt(cur)
+                if ins is None:
+                    DisassembleCommand(cur, restricted, True).applyTo(program, TaskMonitor.DUMMY)
+                    ins = listing.getInstructionAt(cur)
+                if ins is None:
+                    ok = False
+                    break
+                count += 1
+                cur = ins.getMaxAddress().next()
+            if not force:   # the new instructions must tile the old range exactly
+                last = listing.getInstructionContaining(a_end)
+                if not ok or last is None or last.getMaxAddress().compareTo(a_end) != 0:
+                    raise WorkerError("boundary", f"the new bytes do not decode to whole instructions "
+                                      f"over {a_start}-{a_end}")
+        fns = []
+        fit = program.getFunctionManager().getFunctions(AddressSet(a_start, a_end), True)
+        while fit.hasNext():
+            fns.append(S.addr_int(fit.next().getEntryPoint()))
+        fc = program.getFunctionManager().getFunctionContaining(addr)
+        if fc is not None and S.addr_int(fc.getEntryPoint()) not in fns:
+            fns.append(S.addr_int(fc.getEntryPoint()))
+        return {"address": S.addr_int(addr), "length": n, "old": old.hex(), "new": data.hex(),
+                "cleared": cleared, "instructions": count, "functions": sorted(fns)}
+    return _write(args, "patch bytes", body)

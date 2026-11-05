@@ -95,7 +95,9 @@ def score(got: list[str] | None, truth: list[str], c: Counts) -> None:
         c.wrong += 1
 
 
-def measure(exe: Path, mp: Path, sigdir: Path, own_dir: Path | None = None) -> OracleResult:
+def _truth(exe: Path, mp: Path, own_dir: Path | None):
+    """(image, compiler, funcs, info, library routines) of a program and its map: ``funcs`` are (address, size)
+    of every map routine, ``info[address]`` = (names, module, size)."""
     own = {p.stem.lower() for p in (own_dir or exe.parent).glob("*.dcu")} | {exe.stem.lower()}
     pimg, named, starts = dm.map_routines(exe, mp)
     mf = dm.parse_map(mp.read_text(encoding="latin-1", errors="replace"))
@@ -105,10 +107,6 @@ def measure(exe: Path, mp: Path, sigdir: Path, own_dir: Path | None = None) -> O
     srt = sorted(starts)
     img = Image.from_pe(exe)
     comp = idr.compiler_version(img)
-    files = [f for f in idr.sig_files(sigdir, img.psize) if f.sig and not f.rtti and int(f.year) == comp]
-    if not files:
-        raise OracleError(f"no signature database for compiler {comp}, {img.psize * 8}-bit in {sigdir}")
-    kb = idr.load_kb(files[0])
 
     def module(rva: int):
         i = bisect.bisect_right(mstart, rva) - 1
@@ -126,12 +124,47 @@ def measure(exe: Path, mp: Path, sigdir: Path, own_dir: Path | None = None) -> O
             size = None
         funcs.append((img.base + rva, size))
         info[img.base + rva] = (named[rva], m, size)
+    lib = [a for a in info if (info[a][1] or "").lower() not in own]
+    return img, comp, funcs, info, lib
+
+
+def measure_foreign(exe: Path, mp: Path, sigdir: Path, warp_dir: Path | None, own_dir: Path | None = None
+                    ) -> OracleResult:
+    """Leave-one-out measurement: the program's own compiler version is treated as one without databases. The
+    exact-version signature database (and RTTI database) of that compiler is hidden; the stages are the other
+    signature databases through the analysis' tier chain (``idr._pick``) without and with the WARP libraries of
+    ``warp_dir``. Counts are for library routines."""
+    img, comp, funcs, info, lib = _truth(exe, mp, own_dir)
+    sigs = [f for f in idr.kb_files(None, img.psize, sigdir) if not (comp is not None and int(f.year) == comp)]
+    wfiles = idr.warp_files(warp_dir, img.psize)
+    res = OracleResult(comp or 0, img.psize * 8, len(sigs), len(funcs), len(lib), 0, len(funcs) - len(lib))
+    prev: dict[int, list[str]] = {}
+    for label, files in (("other versions", sigs), ("+warp", sigs + wfiles)):
+        _l, hits, _n = idr._pick(files, img, funcs)
+        st = Stage(label)
+        for a in lib:
+            truth, _m, sz = info[a]
+            score(hits.get(a), truth, st.all)
+            if sz is not None and sz >= MIN_BIG:
+                score(hits.get(a), truth, st.big)
+            if a in hits and a not in prev:
+                score(hits.get(a), truth, st.added)
+        res.stages.append(st)
+        prev = hits
+    return res
+
+
+def measure(exe: Path, mp: Path, sigdir: Path, own_dir: Path | None = None) -> OracleResult:
+    img, comp, funcs, info, lib = _truth(exe, mp, own_dir)
+    files = [f for f in idr.sig_files(sigdir, img.psize) if f.sig and not f.rtti and int(f.year) == comp]
+    if not files:
+        raise OracleError(f"no signature database for compiler {comp}, {img.psize * 8}-bit in {sigdir}")
+    kb = idr.load_kb(files[0])
     code_hits, ctx = idr.match_with_context(kb, img, funcs)
     with_ctx = {**ctx, **code_hits}
     props = {a: [n] for a, n in delphi.accessor_names(delphi.parse_classes(img)).items()
              if a in info and a not in with_ctx}
     with_props = {**props, **with_ctx}
-    lib = [a for a in info if (info[a][1] or "").lower() not in own]
     res = OracleResult(comp, img.psize * 8, len(kb.procs), len(funcs), len(lib), 0, len(funcs) - len(lib))
     prev: dict[int, list[str]] = {}
     for label, hits in (("sigdb", code_hits), ("+calls", with_ctx), ("+props", with_props)):

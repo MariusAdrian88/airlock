@@ -55,17 +55,59 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return run(args.config, args.profile, fix=args.fix, start=args.start)
 
 
-def _cmd_delphi_oracle(args: argparse.Namespace, sigdir: Path) -> int:
+def _cmd_delphi_oracle(args: argparse.Namespace, sigdir: Path, warp_dir: Path | None = None) -> int:
     from airlock.server import delphioracle
     if len(args.install) != 2:
         print("airlock: oracle needs <binary> <map file>", file=sys.stderr)
         return 2
     try:
-        print(delphioracle.format_result(delphioracle.measure(args.install[0], args.install[1], sigdir, args.own)))
+        if args.hide_exact:
+            r = delphioracle.measure_foreign(args.install[0], args.install[1], sigdir, args.warp_dir or warp_dir, args.own)
+        else:
+            r = delphioracle.measure(args.install[0], args.install[1], sigdir, args.own)
+        print(delphioracle.format_result(r))
     except (delphioracle.OracleError, OSError, ValueError) as e:
         print(f"airlock: {e}", file=sys.stderr)
         return 2
     return 0
+
+
+def _cmd_warp_build(args: argparse.Namespace, cfg) -> int:
+    """`delphi-sigs warp-build <kit>... [--bits 64]`: one own WARP library per bitness from the map builds of
+    the given Delphi installs or kits (all compiler versions together; the GUIDs tolerate small layout changes)."""
+    from airlock.server import delphimap, delphimega, warp
+    out = args.out or cfg.warp_dir
+    say = print if args.verbose else None
+    built = 0
+    for psize in ([4, 8] if args.bits == "both" else [int(args.bits) // 8]):
+        pairs = [(Path(b), Path(m)) for b, m in args.map or [] if delphimap.pair_psize(Path(b)) == psize]
+        work = args.work or (out / "work")
+        for kit in args.install:
+            folder = work / f"{kit.name}-win{psize * 8}"
+            try:
+                with delphimega.work_lock(folder):
+                    mega = delphimega.build(kit, folder, psize, say, jobs=args.jobs)
+            except delphimega.MegaError as e:
+                print(f"{kit}: {psize * 8}-bit: {e}")
+                continue
+            print(f"{kit}: {psize * 8}-bit, {len(mega.pairs)} packages, {mega.units} units, {len(mega.excluded)} left out")
+            pairs += mega.pairs
+        if not pairs:
+            print(f"{psize * 8}-bit: no package built")
+            continue
+        dest = out / f"{warp.OWN_PREFIX}win{psize * 8}.warp"
+        try:
+            guids, names = warp.build_library(pairs, dest, args.jobs, say)
+        except warp.WarpError as e:
+            print(f"{psize * 8}-bit: {e}")
+            continue
+        finally:
+            if not args.keep_work:
+                for kit in args.install:
+                    shutil.rmtree(work / f"{kit.name}-win{psize * 8}", ignore_errors=True)
+        built += 1
+        print(f"{dest}: {guids} function GUIDs, {names} names, {dest.stat().st_size // 1024} KB")
+    return 0 if built else 1
 
 
 def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
@@ -124,7 +166,9 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
         print(f"{args.install[1]}: kit of {size / 1048576:.0f} MB; use it like the install: delphi-sigs build")
         return 0
     if args.action == "oracle":
-        return _cmd_delphi_oracle(args, out)
+        return _cmd_delphi_oracle(args, out, cfg.warp_dir)
+    if args.action == "warp-build":
+        return _cmd_warp_build(args, cfg)
     from airlock.server import delphimap, delphimega
     bits = [4, 8] if args.bits == "both" else [int(args.bits) // 8]
     say = print if args.verbose else None
@@ -150,7 +194,8 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
                 else:
                     pairs += mega.pairs
                     print(f"{psize * 8}-bit units: {len(mega.pairs)} packages, {mega.units} units, "
-                          f"{len(mega.excluded)} left out, {mega.rounds} rounds, {mega.seconds:.0f} s")
+                          f"{len(mega.excluded)} left out, {len(mega.stubbed)} resource files stubbed, "
+                          f"{mega.program_units} units in a program, {mega.rounds} rounds, {mega.seconds:.0f} s")
                     if mega.failed:
                         print(f"{psize * 8}-bit: warning: {len(mega.failed)} packages failed: "
                               + "; ".join(mega.failed))
@@ -203,19 +248,24 @@ def main(argv: list[str] | None = None) -> int:
     d.set_defaults(fn=_cmd_doctor)
 
     g = sub.add_parser("delphi-sigs", help="build or list Delphi RTL / VCL signature databases")
-    g.add_argument("action", choices=["build", "rtti-build", "list", "kit", "oracle"])
+    g.add_argument("action", choices=["build", "rtti-build", "list", "kit", "oracle", "warp-build"])
     g.add_argument("install", nargs="*", type=Path,
                    help="build: Delphi install folder (the one with bin and Redist); kit: install folder and "
-                        "destination; oracle: binary and its map file; rtti-build: folders with "
+                        "destination; oracle: binary and its map file; warp-build: installs or kits; rtti-build: folders with "
                         "Delphi programs, one product per folder")
     g.add_argument("--own", type=Path, default=None,
                    help="oracle: folder of the program's own .dcu files (their units are not library code)")
+    g.add_argument("--hide-exact", action="store_true",
+                   help="oracle: leave-one-out, hide the database of the program's own compiler and measure the "
+                        "other databases without and with the WARP libraries")
+    g.add_argument("--warp-dir", type=Path, default=None, help="oracle --hide-exact: folder of the WARP libraries")
     g.add_argument("--min-binaries", type=int, default=3, help="rtti-build: distinct files that must agree (3)")
     g.add_argument("--min-products", type=int, default=1, help="rtti-build: distinct products that must agree (1)")
     g.add_argument("--exclude", type=Path, action="append", help="rtti-build: a file to leave out (repeatable)")
     g.add_argument("--indy", action="store_true", help="rtti-build: also keep Indy (Id*) units")
     g.add_argument("--bits", choices=["32", "64", "both"], default="both", help="build: platform (default both)")
-    g.add_argument("--out", type=Path, default=None, help="folder of the databases (default: delphi_sigdb_dir)")
+    g.add_argument("--out", type=Path, default=None,
+                   help="folder of the databases (default: delphi_sigdb_dir; warp-build: warp_dir)")
     g.add_argument("--jobs", type=int, default=4, help="build: worker processes")
     g.add_argument("--units", action="store_true",
                    help="build: also build a package of all compiled units (.dcu) with dcc and read its map file "

@@ -28,7 +28,7 @@ import struct
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import pefile
 
@@ -36,7 +36,7 @@ from airlock.index.store import Binary, Store
 
 log = logging.getLogger("airlock")
 
-CPP_VERSION = 1
+CPP_VERSION = 2                   # 2: names for classes without RTTI, dispatch / interface / event maps
 CPP_META = "cpp_version"          # meta key prefix; the full key is ``cpp_version:<binary id>``
 
 MAX_SLOTS = 1024                  # slots read per vtable
@@ -606,7 +606,7 @@ def entry_label(message: int, code: int) -> str:
 
 # ── derivation ─────────────────────────────────────────────────────────────
 
-SCHEMA_TABLES = ("rtti_class", "vtable_slot", "msgmap_entry")
+SCHEMA_TABLES = ("rtti_class", "vtable_slot", "msgmap_entry", "mfc_class", "mfc_map_entry")
 
 
 def clear_binary(store: Store, binary_id: int) -> None:
@@ -625,7 +625,8 @@ def parse_image(img: Image) -> tuple[list[RttiClass], dict[int, list[int]], list
 
 
 def store_rows(store: Store, binary_id: int, classes: list[RttiClass],
-               slots: dict[int, list[int]], maps: list[MsgMap]) -> None:
+               slots: dict[int, list[int]], maps: list[MsgMap], extra: Any = None) -> None:
+    """``extra`` is a ``mfc.Mfc`` (classes without RTTI, dispatch / interface / event maps) or None."""
     with store.db:
         clear_binary(store, binary_id)
         store.db.executemany(
@@ -640,6 +641,17 @@ def store_rows(store: Store, binary_id: int, classes: list[RttiClass],
             "sig, handler, seq) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [(binary_id, m.cls, m.map_addr, e.message, e.code, e.id, e.last_id, e.sig, e.handler, k)
              for m in maps for k, e in enumerate(m.entries)])
+        if extra is not None:
+            store.db.executemany(
+                "INSERT OR REPLACE INTO mfc_class(binary_id, name, vtable_addr, rc_addr, obj_size, schema, base, "
+                "map_addr, dialog, source) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(binary_id, c.name, c.vtable, c.rc, c.size, c.schema, c.base, c.map_addr, c.dialog, c.source)
+                 for c in extra.classes])
+            store.db.executemany(
+                "INSERT INTO mfc_map_entry(binary_id, class, kind, map_addr, seq, name, id, vt, flags, pfn, "
+                "pfn_set, extra) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(binary_id, m.cls, m.kind, m.addr, e.seq, e.name, e.id, e.vt, e.flags, e.pfn or None,
+                  e.pfn_set or None, e.extra) for m in extra.maps for e in m.entries])
         store.set_meta(meta_key(binary_id), str(CPP_VERSION))
 
 
@@ -651,7 +663,9 @@ def derive_binary(store: Store, binary_id: int, artifact: Path) -> tuple[int, in
         store_rows(store, binary_id, [], {}, [])
         return 0, 0, 0
     classes, slots, maps = parse_image(img)
-    store_rows(store, binary_id, classes, slots, maps)
+    from airlock.server import mfc                                  # lazy: mfc imports this module
+    extra = mfc.analyse(img, classes, slots, maps, artifact)         # renames anonymous maps in place
+    store_rows(store, binary_id, classes, slots, maps, extra)
     return len(classes), len(slots), sum(len(m.entries) for m in maps)
 
 

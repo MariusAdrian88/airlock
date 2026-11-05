@@ -8,7 +8,7 @@ after a successful worker answer only. Notes are agent data in the ``note`` tabl
 written to Ghidra except as the optional plate-comment mirror).
 
 Tools exist only when allow_writes is on (the loader hides them otherwise); a clean session never
-reaches them (role gate). ``patch_bytes`` is not implemented.
+reaches them (role gate). ``patch_bytes`` is off by default (``disabled_tools``).
 """
 
 from __future__ import annotations
@@ -43,6 +43,9 @@ _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
 _NAME_BAD = re.compile(r"[\s\x00-\x1f]")
 
 _HINTS = {
+    "uninitialized": "Patch bytes that the file maps; uninitialised memory has none",
+    "boundary": "Patch whole instructions, or pass force=true to cut or re-decode them",
+    "changed": "The bytes were changed since; pass force=true to restore anyway",
     "bad_name": "Use a name without spaces or special characters",
     "bad_type": "Use a C type such as int, char *, or a struct defined with struct_define",
     "exists": "Choose another name",
@@ -456,3 +459,90 @@ def struct_define(ctx: ServerContext, name: str, fields: list[dict[str, Any]], s
     verb = "replaced" if res.get("replaced") else "created"
     tail = f"; {_invalidated(len(ids))}" if ids else ""
     return f"struct {name} {verb}: {res['size']} bytes, {res['fields']} fields{tail}"
+
+
+# -- patch_bytes -----------------------------------------------------------------------------------
+
+_PATCH_NOTE = re.compile(r"patch (\S+) (\d+) bytes: old=([0-9a-f]+) new=([0-9a-f]+)")
+MAX_PATCH = 512
+
+
+def _hex_bytes(text: str) -> bytes | None:
+    s = re.sub(r"0x|[\s,]", "", text or "", flags=re.I)
+    if not s or len(s) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", s):
+        return None
+    return bytes.fromhex(s)
+
+
+@tool("patch_bytes", "Write bytes into the Ghidra program (never the file) with an automatic note; "
+                     "restore=<note id> undoes a patch.")
+def patch_bytes(ctx: ServerContext, address: str = "", hex: str = "", why: str = "", force: bool = False,
+                restore: int = 0, binary: str = "") -> str:
+    refused = _gate(ctx)
+    if refused:
+        return refused
+    if restore:
+        return _restore_patch(ctx, restore, why, force, binary)
+    if not address.strip():
+        return "error bad_target: address is empty. Pass an address like 0x00401000 (binary!0x... to pick a binary)."
+    data = _hex_bytes(hex)
+    if data is None or len(data) > MAX_PATCH:
+        return (f"error bad_args: hex must be 1 to {MAX_PATCH} bytes of hex digits, e.g. '90 90' or "
+                "8BFF55. Fix and retry.")
+    site = _site(ctx, binary, address)
+    if isinstance(site, str):
+        return site
+    bd, space, offset, fn = site
+    return _do_patch(ctx, bd, space, offset, fn, data, why, force, None, 0)
+
+
+def _do_patch(ctx: ServerContext, bd: Bound, space: str, offset: int, fn: Function | None,
+              data: bytes, why: str, force: bool, expect: bytes | None, restores: int) -> str:
+    if dn.is_managed_only(bd.binary) or (fn is not None and _managed_fn(bd, fn)):
+        return _managed_only_refusal(bd, "it has no machine code to patch.")
+    wargs: dict[str, Any] = {"space": space, "address": offset, "hex": data.hex(), "force": force}
+    if expect is not None:
+        wargs["expect"] = expect.hex()
+    res, err = _worker(ctx, bd, "patch_bytes", wargs)
+    if err:
+        return err
+    st = bd.store
+    ids: set[int] = {fn.id} if fn is not None else set()
+    for entry in res.get("functions") or []:
+        f = st.function_at(bd.binary.id, entry, "ram")
+        if f is not None:
+            ids.add(f.id)
+    key = fn if fn is not None else (st.get_function(min(ids)) if ids else None)
+    where = bd.addr(res["address"], space)
+    summary = (f"patch {where} {res['length']} bytes: old={res['old']} new={res['new']}"
+               + (f" (restore of note #{restores})" if restores else "")
+               + (f" why: {why.strip()}" if why.strip() else ""))
+    nid = st.add_note(bd.binary.id, key.space if key else space, key.entry if key else res["address"],
+                      summary, "patch", None, "agent", _now(), None, ids)
+    _refresh_map(ctx, bd)
+    name = f" in {key.qualified_name}" if key else ""
+    out = (f"patched {res['length']} bytes at {where}{name}: old {res['old']}, new {res['new']}; "
+           f"note #{nid}; {_invalidated(len(ids))}")
+    if res.get("cleared"):
+        out += f"; re-disassembled {res.get('instructions', 0)} instructions"
+    return out + f". Undo with patch_bytes(restore={nid})."
+
+
+def _restore_patch(ctx: ServerContext, note_id: int, why: str, force: bool, binary: str) -> str:
+    bd = bind_binary(ctx, binary)
+    if isinstance(bd, str):
+        return bd
+    row = bd.store.get_note(note_id)
+    m = _PATCH_NOTE.search(row["summary"]) if row is not None else None
+    if row is None or m is None or "patch" not in (row["tags"] or "").split(","):
+        return f"error not_found: note #{note_id} is not a patch note of this binary. List them with search kind=note."
+    other = row["binary_id"]
+    if other != bd.binary.id:
+        bd = Bound(bd.project, bd.store, bd.store.get_binary_by_id(other))   # type: ignore[arg-type]
+    p = parse_address(m.group(1))
+    if p is None:
+        return f"error bad_args: note #{note_id} has no readable address. Patch by address instead."
+    space, offset = p
+    fn = bd.store.function_containing(bd.binary.id, offset, space)
+    return _do_patch(ctx, bd, space, offset, fn, bytes.fromhex(m.group(3)), why or "", force,
+                     bytes.fromhex(m.group(4)), note_id)

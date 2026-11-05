@@ -257,3 +257,23 @@ def _v13(db: sqlite3.Connection) -> None:
 
 MIGRATIONS[13] = _v13
 MIGRATIONS.setdefault(13, lambda db: None)   # placeholder: the real v13 (Qt tables) is registered above
+
+
+def _v14(db: sqlite3.Connection) -> None:
+    """MFC classes without RTTI and dispatch / interface / event sink maps (derived, server/mfc.py)."""
+    from importlib import resources
+    sql = resources.files("airlock.index").joinpath("schema.sql").read_text("utf-8")
+    block = sql[sql.index("CREATE TABLE mfc_class"):sql.index("CREATE TABLE meta (")]
+    block = chr(10).join(ln.split("--", 1)[0] for ln in block.splitlines())
+    for stmt in block.split(";"):
+        text = " ".join(stmt.split())
+        if not text:
+            continue
+        if text.startswith("CREATE TABLE"):
+            text = text.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+        else:
+            text = text.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1)
+        db.execute(text)
+
+
+MIGRATIONS.setdefault(14, _v14)

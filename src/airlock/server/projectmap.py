@@ -329,6 +329,50 @@ def write_lines(pp: ProjectPaths) -> list[str]:
             "Purpose: project_describe."]
 
 
+# -- frameworks (overview) --------------------------------------------------------------
+
+FRAMEWORKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("Delphi", "dl_class", "classes", ("delphi_classes", "delphi_forms", "delphi_events")),
+    ("Qt", "qt_class", "classes", ("qt_metaobjects",)),
+    ("MFC", "msgmap_entry", "message map entries", ("mfc_message_maps", "dialogs", "menus")),
+    (".NET", "dn_type", "types", ("dotnet_types", "dotnet_decompile")),
+    ("C++ RTTI", "rtti_class", "classes", ("rtti_classes", "vtable")),
+    ("Win32 resources", "res_dialog", "dialogs", ("dialogs", "menus", "string_tables")),
+)
+
+
+def framework_lines(store: Store, tools: list[str] | None = None, disabled_sets: list[str] | None = None,
+                    disabled_tools: list[str] | None = None) -> list[str]:
+    """One line per detected framework with its tools; says how to enable tools the profile hides."""
+    from airlock.config.catalog import CATALOG
+    out: list[str] = []
+    for fw, table, noun, names in FRAMEWORKS:
+        try:
+            n = int(store.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        except sqlite3.Error:
+            continue
+        if not n:
+            continue
+        line = f"{fw} ({n} {noun}): {', '.join(names)}"
+        if tools is not None:
+            off = [t for t in names if t not in tools]
+            if off:
+                sets = sorted({CATALOG[t].set for t in off if CATALOG[t].set in (disabled_sets or [])})
+                tl = [t for t in off if t in (disabled_tools or [])]
+                fix = []
+                if sets:
+                    rest = [x for x in (disabled_sets or []) if x not in sets]
+                    fix.append(f"airlock config --set disabled_sets {','.join(rest) or '[]'}")
+                if tl:
+                    rest = [x for x in (disabled_tools or []) if x not in tl]
+                    fix.append(f"airlock config --set disabled_tools {','.join(rest) or '[]'}")
+                line += f" | off in this profile: {', '.join(off)}"
+                if fix:
+                    line += f". Enable with {' and '.join(fix)}, then restart the server"
+        out.append(line)
+    return out
+
+
 def dirty_sections(pp: ProjectPaths, store: Store, man: dict[str, Any] | None = None,
                    only: tuple[str, ...] | None = None) -> dict[str, list[str]]:
     man = load_manifest(pp) if man is None else man

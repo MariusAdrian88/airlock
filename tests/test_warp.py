@@ -260,3 +260,107 @@ def test_idr_file_is_chosen_without_the_functions_warp_names(tmp_path):
     finally:
         mp.undo()
     assert seen["funcs"] == [(0x401010, 16)] and seen["score"] == [(0x401000, 32), (0x401010, 16)]
+
+
+# ---- generic instance names, own 64-bit libraries ------------------------------------------------
+
+def test_generic_arity_suffix_becomes_the_placeholder_form():
+    d = warp.dotted
+    assert d("System.Generics.Collections::TDictionary__2::Add") == "System.Generics.Collections.TDictionary<T>.Add"
+    assert d("System.Generics.Collections::TList__1::TEnumerator::MoveNext") == \
+        "System.Generics.Collections.TList<T>.TEnumerator.MoveNext"
+    assert d("System.Net.Mime::TAcceptValueListBase__1::Add") == "System.Net.Mime.TAcceptValueListBase<T>.Add"
+    assert d("AxCtrls::_NF__385") == "AxCtrls._NF__385"                  # not a generic: no type name before ``__``
+    assert d("crtl::__ftoul") == "crtl.__ftoul"
+    assert d(d("A::TX__2::Run")) == "A.TX<T>.Run"                         # idempotent
+    assert warp.collapse_generics("A.TDictionary<System.string,TList<X>>.Add<Y>") == "A.TDictionary<T>.Add<T>"
+    assert warp.collapse_generics("A.TList<T>.Add") == "A.TList<T>.Add"
+
+
+def test_real_type_arguments_replace_the_placeholder_only_when_unambiguous():
+    inst = warp.instance_args([("System.Generics.Collections", "TDictionary<System.string,System.Integer>"),
+                               ("System.Generics.Collections", "TList<System.Integer>"),
+                               ("System.Generics.Collections", "TList<System.string>"),
+                               ("", "TPlain"), ("U", "TFoo<A>.TEnum")])
+    assert inst["System.Generics.Collections.TDictionary"] == {"System.string,System.Integer"}
+    names = ["System.Generics.Collections.TDictionary<T>.Add", "System.Generics.Collections.TList<T>.Add",
+             "Other.TFoo<T>.Run"]
+    assert warp.refine_generics(names, inst) == [
+        "System.Generics.Collections.TDictionary<System.string,System.Integer>.Add",
+        "System.Generics.Collections.TList<T>.Add", "Other.TFoo<T>.Run"]
+    assert warp.refine_generics(names, {}) == names
+
+
+def test_write_warp_round_trip():
+    g1, g2 = warp.block_guid(b"\x90\xc3"), warp.block_guid(b"\xc3")
+    data = warp.write_warp([(g1, "System.TObject.Free"), (g1, "Other.Same"), (g2, "System._Halt")])
+    lib = warp.read_warp(data)
+    assert [f.name for f in lib.functions[g1]] == ["System.TObject.Free", "Other.Same"]
+    assert lib.functions[g2][0].name == "System._Halt" and len(lib) == 3
+
+
+def _image64(rel_call: int, rip_disp: int, base: int = 0x400000):
+    """lea rax,[rip+d]; call rel; mov ecx,5; ret  in a 64-bit image with a data section at +0x2000."""
+    from airlock.server.cpp import Image, Section
+    code = (b"\x48\x8d\x05" + rip_disp.to_bytes(4, "little", signed=True) + b"\xe8"
+            + rel_call.to_bytes(4, "little", signed=True) + b"\xb9\x05\x00\x00\x00\xc3")
+    code += b"\xcc" * (32 - len(code))
+    return Image(8, base, [Section(base + 0x1000, code, True, 0x1000), Section(base + 0x2000, bytes(0x100), False, 0x1000)])
+
+
+def test_x64_guid_ignores_rip_relative_and_call_targets():
+    a, b = _image64(0x100, 0x1000 + 0x10 - 7), _image64(0x300, 0x1000 + 0x80 - 7)
+    ga = warp.guid_from_blocks(warp.image_blocks(a, 0x401000, 32, warp.image_regions(a)))
+    gb = warp.guid_from_blocks(warp.image_blocks(b, 0x401000, 32, warp.image_regions(b)))
+    assert ga is not None and ga == gb
+    # another base address gives the same GUID (the operands are relocatable either way)
+    c = _image64(0x100, 0x1000 + 0x10 - 7, base=0x140000000)
+    assert warp.guid_from_blocks(warp.image_blocks(c, 0x140001000, 32, warp.image_regions(c))) == ga
+    # different code gives another GUID
+    d = _image64(0x100, 0x1000 + 0x10 - 7)
+    d.sections[0].data = d.sections[0].data.replace(b"\xb9\x05", b"\xb9\x06")
+    assert warp.guid_from_blocks(warp.image_blocks(d, 0x401000, 32, warp.image_regions(d))) != ga
+    lib = warp.read_warp(warp.write_warp([(ga, "System.Demo64")]))
+    assert warp.match_functions(lib, b, [(0x401000, 32)]) == {0x401000: ["System.Demo64"]}
+
+
+def test_own_64bit_library_is_a_tier_for_any_compiler_version(tmp_path):
+    from airlock.server import idr
+    img = _image64(0x100, 0x1000 + 0x10 - 7)
+    g = warp.guid_from_blocks(warp.image_blocks(img, 0x401000, 32, warp.image_regions(img)))
+    wd = tmp_path / "w"
+    wd.mkdir()
+    (wd / "airlock-rtl-win64.warp").write_bytes(warp.write_warp([(g, "System.Demo64")]))
+    (wd / "airlock-rtl-win32.warp").write_bytes(warp.write_warp([(g, "Wrong.Bits")]))
+    (wd / "delphi-rtl-core-11.warp").write_bytes(warp.write_warp([(g, "Wrong.Delphinja")]))
+    f64, f32 = idr.warp_files(wd, 8), idr.warp_files(wd, 4)
+    assert [f.label for f in f64] == ["warp-win64"]
+    assert sorted(f.label for f in f32) == ["warp-core-11", "warp-win32"]
+    assert warp.warp_stem(wd / "airlock-rtl-win64.warp") == "win64" and warp.own_stem("win64", 8)
+    label, hits, notes = idr._pick(f64, img, [(0x401000, 32)])           # no compiler stamp in the image
+    assert label == "warp" and hits == {0x401000: ["System.Demo64"]}, notes
+
+
+def test_warp_names_get_real_generic_arguments_in_pick(tmp_path):
+    from airlock.server import idr
+    img = _image(0x100, 0x403010)
+    g = warp.guid_from_blocks(warp.image_blocks(img, 0x401000, 32, warp.image_regions(img)))
+    wd = tmp_path / "w"
+    wd.mkdir()
+    (wd / "delphi-rtl-core-11.warp").write_bytes(make_warp([(g, "A.B::TStack__1::Push", [])]))
+    files = idr.kb_files(None, 4, None, wd)
+    _l, hits, _n = idr._pick(files, img, [(0x401000, 32)])
+    assert hits == {0x401000: ["A.B.TStack<T>.Push"]}
+    _l, hits, _n = idr._pick(files, img, [(0x401000, 32)], {"A.B.TStack": {"System.Integer"}})
+    assert hits == {0x401000: ["A.B.TStack<System.Integer>.Push"]}
+
+
+def test_write_library_drops_ambiguous_guids_and_keeps_sorted_names(tmp_path):
+    g1, g2, g3 = (warp.block_guid(bytes([i])) for i in (1, 2, 3))
+    dest = tmp_path / "w" / "airlock-rtl-win64.warp"
+    guids, names = warp.write_library({g1: {"B.f", "A.f"}, g2: {"a", "b", "c", "d"}, g3: {"X.g"}}, dest)
+    assert (guids, names) == (2, 3)                                    # g2 has more than LIB_MAX_NAMES names
+    lib = warp.read_warp_file(dest)
+    assert [f.name for f in lib.functions[g1]] == ["A.f", "B.f"] and g2 not in lib.functions
+    with pytest.raises(warp.WarpError):
+        warp.write_library({g2: {"a", "b", "c", "d"}}, tmp_path / "none.warp")

@@ -210,7 +210,7 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
                   f"none in {cfg.delphi_sigdb_dir}; build with `airlock delphi-sigs build <Delphi install folder>`"))
 
     # WARP libraries (delphinja)
-    warps = _idr.warp_files(cfg.warp_dir, 4)
+    warps = _idr.warp_files(cfg.warp_dir, 4) + _idr.warp_files(cfg.warp_dir, 8)
     add(Check("OK", "warp libraries",
               f"{cfg.warp_dir}: " + ", ".join(f.path.name for f in warps) if warps else
               f"none in {cfg.warp_dir}; optional, delphi-rtl-*.warp from github.com/psifertex/delphinja (signatures)"))

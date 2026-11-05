@@ -136,7 +136,8 @@ def dotnet_decompile(ctx: ServerContext, type: str, member: str = "", binary: st
         return code
     text = code
     if member.strip():
-        part = dn.member_text(code, member.strip())
+        part = dn.member_text(code, member.strip()) or dn.member_text(
+            code, dn.member_alias(member.strip(), full))
         if part is None:
             return (f"error not_found: no member '{member.strip()}' in {full}. "
                     "Call dotnet_types with kind=method and query= to list members.")

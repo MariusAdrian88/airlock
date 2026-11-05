@@ -320,6 +320,8 @@ def test_strings(ctx):
     assert core.strings(ctx, "^open.*failed$", regex=True).count("\n") == 1
     assert core.strings(ctx, "(", regex=True).startswith("error bad_regex:")
     assert core.strings(ctx, "zzz") == "no strings match 'zzz'"
+    assert core.strings(ctx, "zzz|yyy").endswith("Pass regex=true.")
+    assert core.strings(ctx, "zzz|yyy", regex=True) == "no strings match 'zzz|yyy'"
     assert core.strings(ctx, "").startswith("error bad_args:")
 
 
@@ -556,9 +558,10 @@ def test_function_views_and_errors(ctx):
     assert ext.startswith("error external:")
     assert core.function(ctx, "0x00401104").startswith("// resolved from interior address")
     ctx.worker.decompile_reply = {"status": "timeout", "error": "took too long"}
-    assert core.function(ctx, "FUN_00401200").startswith("error decompile_timeout:")
+    lst = core.function(ctx, "FUN_00401200")             # a failed decompile shows the block listing
+    assert lst.startswith("// decompile failed: FUN_00401200: took too long") and "insns]" in lst
     ctx.worker.decompile_reply = {"status": "error", "error": "bad"}
-    assert core.function(ctx, "FUN_00401200", retry=True).startswith("error decompile_failed:")
+    assert core.function(ctx, "FUN_00401200", retry=True).startswith("// decompile failed: FUN_00401200: bad")
     ctx.worker.decompile_reply = WorkerError  # type: ignore[assignment]
 
 
@@ -759,3 +762,109 @@ def test_function_small_unchanged_except_noise(ctx):
                          "  /* WARNING: x */\n\n  OnFoo();\n  return 0;\n}\n")
     assert core.function(ctx, "main") == (
         "int main(void)\n\n{\n  int a;\n  int b;\n\n  OnFoo/*0x00401100*/();\n  return 0;\n}")
+
+
+# -- agent evaluation fixes ----------------------------------------------------------------------
+
+def test_infra_error_is_not_a_decompiler_result():
+    from airlock.server.tools.core import _infra_error
+    assert _infra_error("JVMNotRunning: Java Virtual Machine is not running.")
+    assert _infra_error("ClosedException: File is closed")
+    assert not _infra_error("Low-level Error: Unable to resolve data-type")
+    assert not _infra_error(None)
+
+
+def test_search_finds_qt_methods_by_name():
+    import sqlite3
+    from types import SimpleNamespace
+    from airlock.server.tools.core import _qt_method_hits
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE qt_class (binary_id, meta_addr, name)")
+    db.execute("CREATE TABLE qt_method (binary_id, meta_addr, idx, kind, name, addr)")
+    db.execute("INSERT INTO qt_class VALUES (1, 10, 'ImageWriter')")
+    db.executemany("INSERT INTO qt_method VALUES (1, 10, ?, ?, ?, ?)",
+                   [(0, "slot", "cancelWrite", 0x406cc0), (1, "signal", "cancelled", 0x4019f0),
+                    (2, "slot", "other", 0x500000), (3, "slot", "cancelNoAddr", None)])
+    bd = SimpleNamespace(store=SimpleNamespace(db=db), binary=SimpleNamespace(id=1),
+                         addr=lambda a, *x: f"0x{a:08x}")
+    groups = {"function": [((0, 1, 1), "function FUN_00406cc0 0x00406cc0 undefined")]}
+    _qt_method_hits(bd, "cancel", 50, groups, 1, "")
+    lines = sorted(x for _, x in groups["function"])
+    assert lines == ["function ImageWriter::cancelWrite 0x00406cc0 (Qt slot)",
+                     "function ImageWriter::cancelled 0x004019f0 (Qt signal)"]
+
+
+
+def test_function_retries_a_transient_failure_once(ctx, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda s: None)
+    replies = [{"status": "error", "error": "JVMNotRunning: Java Virtual Machine is not running"}]
+    real = ctx.worker.request
+
+    def flaky(op, args=None, timeout=0):
+        if op == "decompile" and replies:
+            ctx.worker.calls.append((op, args or {}))
+            return replies.pop(0)
+        return real(op, args, timeout)
+    monkeypatch.setattr(ctx.worker, "request", flaky)
+    out = core.function(ctx, "main")
+    assert out.startswith("void main(void)") and ctx.worker.count("decompile") == 2
+    # two transient failures in a row: the listing with the hint, and nothing cached
+    ctx.worker.calls.clear()
+    st = ctx.indexer.store("proj")
+    st.db.execute("DELETE FROM decomp")
+    st.db.commit()
+    ctx.worker.decompile_reply = {"status": "error", "error": "JVMNotRunning: down"}
+    monkeypatch.setattr(ctx.worker, "request", real)
+    lst = core.function(ctx, "main")
+    assert lst.startswith("// decompile failed") and ctx.worker.count("decompile") == 2
+
+
+def test_dotnet_member_alias():
+    from airlock.server.dotnet import member_alias
+    assert member_alias(".ctor", "OpenHardwareMonitor.GUI.MainForm") == "MainForm"
+    assert member_alias("<.ctor>b__37_5", "A.B.MainForm") == "MainForm"
+    assert member_alias("<Run>d__3", "A.B.Worker") == "Run"
+    assert member_alias("Load", "A.B.Worker") == "Load"
+    assert member_alias("set_Startup", "A.B.StartupManager") == "Startup"
+
+
+def test_qt_method_name_resolves_to_its_address():
+    import sqlite3
+    from types import SimpleNamespace
+    from airlock.server.targets import _qt_method_addr
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE qt_class (binary_id, meta_addr, name)")
+    db.execute("CREATE TABLE qt_method (binary_id, meta_addr, idx, kind, name, addr)")
+    db.execute("INSERT INTO qt_class VALUES (1, 10, 'MainWindow')")
+    db.executemany("INSERT INTO qt_method VALUES (1, 10, ?, 'slot', ?, ?)",
+                   [(0, "fileOpen", 0x6f750), (1, "fileOpen", 0x6f750), (2, "a", 1), (3, "a", 2)])
+    sc = SimpleNamespace(bounds=[SimpleNamespace(store=SimpleNamespace(db=db), binary=SimpleNamespace(id=1))])
+    assert _qt_method_addr(sc, "MainWindow::fileOpen") == 0x6f750
+    assert _qt_method_addr(sc, "MainWindow::fileOpen(QString)") == 0x6f750
+    assert _qt_method_addr(sc, "MainWindow::a") is None          # two addresses: ambiguous
+    assert _qt_method_addr(sc, "fileOpen") is None and _qt_method_addr(sc, "Other::x") is None
+
+
+def test_delphi_method_names_resolve_and_search():
+    import sqlite3
+    from types import SimpleNamespace
+    from airlock.server.targets import _qt_method_addr
+    from airlock.server.tools.core import _qt_method_hits
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE dl_class (binary_id, vmt, name)")
+    db.execute("CREATE TABLE dl_method (binary_id, vmt, kind, slot, name, addr)")
+    db.execute("INSERT INTO dl_class VALUES (1, 5, 'TFRemoveMeta')")
+    db.executemany("INSERT INTO dl_method VALUES (1, 5, ?, ?, ?, ?)",
+                   [("published", 0, "Button2Click", 0x82d2a8), ("virtual", 1, "", 0x100)])
+    bd = SimpleNamespace(store=SimpleNamespace(db=db), binary=SimpleNamespace(id=1),
+                         addr=lambda a, *x: f"0x{a:08x}")
+    sc = SimpleNamespace(bounds=[bd])
+    assert _qt_method_addr(sc, "TFRemoveMeta.Button2Click") == 0x82d2a8
+    assert _qt_method_addr(sc, "tfremovemeta.button2click") == 0x82d2a8
+    groups = {}
+    _qt_method_hits(bd, "button2", 50, groups, 0, "")
+    assert [x for _, x in groups["function"]] == [
+        "function TFRemoveMeta.Button2Click 0x0082d2a8 (Delphi published)"]
