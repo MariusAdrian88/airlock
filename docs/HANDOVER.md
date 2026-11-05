@@ -269,7 +269,11 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   one on 99.9% of the common exported routines (masked bytes). The `.jdbg` route is dropped (32-bit only, names use an
   undocumented compressed form). Units that cannot be in a package are left out by the build loop (62 of 1,951
   for 32-bit, 55 of 1,919 for 64-bit: missing `.res` / `.fmx` files, `$DENYPACKAGEUNIT`, BDE; mostly FMX and TeeChart
-  editors, REST backends, WebBroker, IntraWeb, ComServ). The Delphi install is needed only for this build; the
+  editors, REST backends, WebBroker, IntraWeb, ComServ). Newer installs (compiler 33, 35) overflow the export table
+  of one package (`E2621`), so `delphimega` now builds one package per shipped package (PACKAGEINFO contains list,
+  requires the shipped `.dcp`) plus one for the remaining units, in parallel (`--jobs`); a failed units step prints
+  one warning and the database is written from the package exports. **[verified]** on compilers 30, 33 and 35, both
+  bitnesses. The Delphi install is needed only for this build; the
   `.sigdb` files stay usable without it.
   Oracle (own program, map as truth, routines that are no type tables or thunks): right name 32-bit 58.0% -> 70.9% of
   all routines, 77.0% -> 94.6% of those with at least 24 bytes; 64-bit 69.9% -> 83.9% and 78.9% -> 94.6%; wrong names about

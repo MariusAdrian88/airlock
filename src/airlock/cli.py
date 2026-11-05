@@ -107,10 +107,18 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
         try:
             if args.units:
                 work = args.work or (out / "work")
-                mega = delphimega.build(args.install[0], work / f"win{psize * 8}", psize, say)
-                pairs.append((mega.binary, mega.map))
-                print(f"{psize * 8}-bit units package: {mega.units} units, {len(mega.excluded)} left out, "
-                      f"{mega.rounds} rounds, {mega.seconds:.0f} s")
+                try:
+                    mega = delphimega.build(args.install[0], work / f"win{psize * 8}", psize, say, jobs=args.jobs)
+                except delphimega.MegaError as e:
+                    print(f"{psize * 8}-bit: warning: the units step failed, the database has the package "
+                          f"exports only ({e})")
+                else:
+                    pairs += mega.pairs
+                    print(f"{psize * 8}-bit units: {len(mega.pairs)} packages, {mega.units} units, "
+                          f"{len(mega.excluded)} left out, {mega.rounds} rounds, {mega.seconds:.0f} s")
+                    if mega.failed:
+                        print(f"{psize * 8}-bit: warning: {len(mega.failed)} packages failed: "
+                              + "; ".join(mega.failed))
             r = delphisigs.build(args.install[0], out, psize, progress=say, jobs=args.jobs, pairs=pairs)
         except (delphisigs.SigError, delphimega.MegaError) as e:
             print(f"{psize * 8}-bit: {e}")

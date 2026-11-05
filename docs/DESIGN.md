@@ -1040,6 +1040,20 @@ time is about 1 minute per bitness. **[verified]** The code is the shipped code:
 package and `rtl230.bpl` have in common, 99.9% have the same masked bytes (the layout differs by a few hundred bytes,
 the unit order is another one).
 
+**One package is too big for newer Delphi versions.** **[verified]** With Rio (compiler 33) and Alexandria (35) the
+package of all units fails with `E2621 Export table in output file too large: exceeds 65536 limits`, in both
+bitnesses. Decision: split along the shipped packages. Each shipped `.bpl` (`Redist\win32|win64`, `bin`, `bin64`) has a
+`PACKAGEINFO` resource (flags, required packages as hash and name, contained units as flags, hash and name), and the
+`.dcp` files of the packages sit in `lib\<platform>\release` without the version number (`rtl260.bpl` -> `rtl.dcp`).
+`delphimega.plan_parts` makes one package per shipped package: the same contains list (limited to units that have a
+`.dcu`), and `requires` the `.dcp` of the packages the shipped one requires. A unit that a required package holds is
+dropped, so no unit is linked twice. A shipped package that has no `.dcp`, or that requires one without, is not used.
+One last package holds the units that no used package holds and requires all used packages. Each shipped package is
+under the export limit by construction. The culprit rounds run per package, the packages build in parallel (`--jobs`,
+a work folder each), and the map files of all of them are merged into the name records. A package that fails does not
+end the build (it is listed in the result); if no package can be built, the CLI prints one warning line and writes the
+database from the package exports alone.
+
 `server/delphimap.py` reads the map. Segment numbers map to the PE section of the same name; a public is a segment
 offset and a name in the Pascal form (`System.SysUtils.TStringHelper.Split`, nested `Unit.Outer.Inner.Method`, a generic
 instance `Unit.{Owner}TList<System.Integer>.Add`, shown as `Owner.TList<System.Integer>.Add`). A name with an empty part

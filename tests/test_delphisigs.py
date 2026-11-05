@@ -563,3 +563,58 @@ def test_command_builds_with_a_map_pair(tmp_path, capsys):
     assert main(["--config", str(cfg), "delphi-sigs", "build", str(inst), "--out", str(out), "--jobs", "1",
                  "--bits", "32", "--map", str(tmp_path / "mega.bpl"), str(tmp_path / "mega.map")]) == 0
     assert "2 names, 1 from maps" in capsys.readouterr().out
+
+
+def _package_info(requires: list[str], units: list[str]) -> bytes:
+    import struct
+    b = struct.pack("<II", 0x4C300005, len(requires))
+    for r in requires:
+        b += b"\xab" + r.encode() + b"\0"
+    b += struct.pack("<I", len(units))
+    for u in units:
+        b += b"\x00\xde" + u.encode() + b"\0"
+    return b
+
+
+def test_mega_reads_package_info_and_rejects_truncated_data():
+    from airlock.server import delphimega
+    data = _package_info(["rtl260.bpl"], ["vcl", "Vcl.Forms", "Vcl.Controls"])
+    assert delphimega.parse_package_info(data) == (["rtl260.bpl"], ["vcl", "Vcl.Forms", "Vcl.Controls"])
+    assert delphimega.parse_package_info(_package_info([], [])) == ([], [])
+    with pytest.raises(ValueError):
+        delphimega.parse_package_info(data[:-6])
+
+
+def test_mega_plan_follows_the_shipped_packages():
+    from airlock.server import delphimega
+    infos = {"rtl260.bpl": ([], ["rtl", "System.Classes", "System.SysUtils"]),
+             "vcl260.bpl": (["rtl260.bpl"], ["vcl", "Vcl.Forms", "System.Classes", "Vcl.Missing"]),
+             "dcldemo260.bpl": (["designide260.bpl"], ["Vcl.Reg"])}              # a required package has no .dcp
+    units = ["System.Classes", "System.SysUtils", "Vcl.Forms", "Vcl.Reg", "Vcl.Orphan"]
+    dcps = {"rtl": "rtl", "vcl": "vcl", "dcldemo": "dcldemo"}
+    parts = {p.name: p for p in delphimega.plan_parts(infos, units, dcps)}
+    assert parts["rtl260"].units == ["System.Classes", "System.SysUtils"] and parts["rtl260"].requires == []
+    assert parts["vcl260"].units == ["Vcl.Forms"] and parts["vcl260"].requires == ["rtl"]     # Classes is in rtl
+    assert "dcldemo260" not in parts
+    assert parts["rest"].units == ["Vcl.Reg", "Vcl.Orphan"] and parts["rest"].requires == ["rtl", "vcl"]
+    # no readable package: one package of all units
+    only = delphimega.plan_parts({}, units, dcps)
+    assert [(p.name, p.units, p.requires) for p in only] == [("rest", units, [])]
+    assert delphimega.dcp_stem("RTL260.bpl", dcps) == "rtl" and delphimega.dcp_stem("nope260.bpl", dcps) is None
+    dpk = delphimega.dpk_text("m_vcl260", ["Vcl.Forms"], ["rtl"])
+    assert "requires\n  rtl;\ncontains\n  Vcl.Forms;" in dpk
+
+
+def test_command_warns_and_writes_the_database_when_the_units_step_fails(tmp_path, capsys):
+    pytest.importorskip("capstone")
+    from airlock.cli import main
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code)], rel, tail=COMPILER)
+    inst = _install(tmp_path)                                                   # no compiler in the install
+    cfg = tmp_path / "config.jsonc"
+    cfg.write_text('{"ghidra_dir": "%s"}' % str(tmp_path).replace("\\", "/"))
+    out = tmp_path / "out"
+    assert main(["--config", str(cfg), "delphi-sigs", "build", str(inst), "--out", str(out), "--jobs", "1",
+                 "--bits", "32", "--units", "--work", str(tmp_path / "w")]) == 0
+    text = capsys.readouterr().out
+    assert "warning: the units step failed" in text and "1 names" in text
