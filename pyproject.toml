@@ -22,7 +22,7 @@ dependencies = [
 # so `airlock doctor --fix` installs it from the wheels bundled with Ghidra.
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-xdist>=3"]
 
 [project.scripts]
 airlock = "airlock.cli:main"
@@ -35,3 +35,5 @@ packages = ["src/airlock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Parallel by default (pytest-xdist), at most 8 workers. Ghidra runs (--binary/--xbin) run serially.
+addopts = "-n auto --maxprocesses=8"

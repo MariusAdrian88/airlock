@@ -128,6 +128,7 @@ def test_hook_regenerates_project_md_after_ready(proj):
 def bound(proj):
     ctx, pp, st, _ = proj
     assert ctx.bind_session("dirty", pp) is None
+    assert ctx.wait_maps(20)                    # bind may start a background map refresh: let it finish
     return ctx, pp, st
 
 

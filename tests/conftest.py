@@ -24,6 +24,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
                           "pass with = like --binary")
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config: pytest.Config) -> None:
+    # Ghidra integration runs start a JVM per worker and share Ghidra projects: run them serially.
+    if (config.getoption("--binary") or config.getoption("--xbin")) and hasattr(config.option, "numprocesses"):
+        config.option.numprocesses = 0
+        config.option.dist = "no"
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "ghidra: needs a Ghidra install and --binary <exe>")
 
