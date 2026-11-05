@@ -85,3 +85,24 @@ def test_gap_address_becomes_a_function(world):
         assert any(f["entry"] == target for f in _functions(world))
         again = world.request("create_functions", {"program": PROGRAM, "addresses": [target]}, timeout=600)
         assert again["created"] == 0 and again["reasons"].get("exists") == 1, again
+
+
+def test_chunked_creation_keeps_the_worker_alive(world):
+    """Several chunks (one transaction and save each, conventions with the last only), then the same
+    addresses again: nothing is created twice and the worker process is the same one throughout."""
+    fns = sorted(_functions(world), key=lambda f: f["entry"])
+    gaps = [a["entry"] + a["size"] for a, b in zip(fns, fns[1:])
+            if a["size"] and a["entry"] + a["size"] < b["entry"]][:40]
+    if len(gaps) < 4:
+        pytest.skip("too few gaps between functions in this binary")
+    pid = world.proc.pid
+    chunks = [gaps[i:i + 10] for i in range(0, len(gaps), 10)]
+    created = 0
+    for i, chunk in enumerate(chunks):
+        res = world.request("create_functions", {"program": PROGRAM, "addresses": chunk,
+                                                 "conventions": i == len(chunks) - 1}, timeout=600)
+        assert res["requested"] == len(chunk), res
+        created += res["created"]
+    assert world.proc.pid == pid and world.running()
+    again = world.request("create_functions", {"program": PROGRAM, "addresses": gaps}, timeout=600)
+    assert again["created"] == 0 and again["reasons"].get("exists", 0) == created, again

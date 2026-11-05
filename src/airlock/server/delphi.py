@@ -684,23 +684,30 @@ def stale(store: Store, binary_id: int) -> bool:
     return store.get_meta(meta_key(binary_id)) != str(DELPHI_VERSION)
 
 
-def ensure(store: Store, binary: Binary, artifact: Path) -> bool:
-    """Derive the Delphi rows of a Delphi binary when missing or from an older DELPHI_VERSION. Never
-    raises; True when rows were (re)written. Other toolchains are not parsed."""
-    if not is_delphi(binary) or not stale(store, binary.id) or not artifact.is_file():
+def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = None,
+           sig_dir: Path | None = None) -> bool:
+    """Derive the Delphi rows of a Delphi binary when missing or from an older DELPHI_VERSION, then the
+    IDR names (``idr.ensure``; ``idr_dir`` is the knowledge base folder or None, ``sig_dir`` the folder of
+    the signature databases). Never raises; True
+    when anything was (re)written. Other toolchains are not parsed."""
+    if not is_delphi(binary) or not artifact.is_file():
         return False
-    try:
-        derive_binary(store, binary.id, artifact)
-        return True
-    except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
-        log.warning("Delphi analysis of %s failed: %s", binary.name, e)
-        return False
+    done = False
+    if stale(store, binary.id):
+        try:
+            derive_binary(store, binary.id, artifact)
+            done = True
+        except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
+            log.warning("Delphi analysis of %s failed: %s", binary.name, e)
+            return False
+    from airlock.server import idr
+    return idr.ensure(store, binary, artifact, idr_dir, sig_dir) or done
 
 
-def ensure_project(store: Store, artifacts: Path) -> int:
+def ensure_project(store: Store, artifacts: Path, idr_dir: Path | None = None, sig_dir: Path | None = None) -> int:
     n = 0
     for b in store.list_binaries():
-        if store.get_meta(f"status:{b.id}") == "ready" and ensure(store, b, artifacts / b.sha256):
+        if store.get_meta(f"status:{b.id}") == "ready" and ensure(store, b, artifacts / b.sha256, idr_dir, sig_dir):
             n += 1
     return n
 
@@ -735,6 +742,8 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
     for slot, names in list(by_slot.items())[:3]:
         extra = f" (+{len(names) - 1} classes)" if len(names) > 1 else ""
         out.append(f"{names[0]}::vslot {slot}{extra}")
+    from airlock.server import idr
+    out.extend(idr.hint_for(store, binary_id, entry))
     return out
 
 
@@ -824,8 +833,10 @@ def runtime_name(name: str, ns: str | None) -> bool:
 
 
 def runtime_addrs(store: Store, binary_id: int) -> set[int]:
-    """Addresses of published and virtual methods of classes declared in runtime units."""
-    out: set[int] = set()
+    """Addresses of published and virtual methods of classes declared in runtime units, and of the
+    functions named from an IDR knowledge base (RTL / VCL code by definition)."""
+    from airlock.server import idr
+    out: set[int] = idr.hit_addrs(store, binary_id)
     cache: dict[str, bool] = {}
     for unit, addr in store.db.execute(
             "SELECT c.unit, m.addr FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "

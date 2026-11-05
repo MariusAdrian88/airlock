@@ -381,3 +381,70 @@ CREATE TABLE dl_event (
 );
 CREATE INDEX dl_event_by_form ON dl_event(binary_id, form, seq);
 CREATE INDEX dl_event_by_addr ON dl_event(binary_id, addr);
+
+-- Qt metaobjects (DESIGN 11), parsed server side from the PE bytes (server/qt.py). Derived: rebuilt when
+-- the index meta qt_version:<binary id> is older than QT_VERSION. qt_method.addr and qt_class.parent
+-- (when the superclass is imported) come from the worker op qt_dispatch (meta qt_dispatch:<binary id>).
+CREATE TABLE qt_class (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  meta_addr     INTEGER NOT NULL,        -- staticMetaObject
+  name          TEXT NOT NULL,           -- Qt class name, Ns::Foo
+  major         INTEGER NOT NULL,        -- 5 or 6
+  revision      INTEGER NOT NULL,        -- moc output revision (data[0])
+  super_addr    INTEGER,                 -- d.superdata, NULL when not stored in the file
+  parent        TEXT NOT NULL DEFAULT '',
+  metacall      INTEGER,                 -- d.static_metacall
+  data_addr     INTEGER NOT NULL,
+  nsignals      INTEGER NOT NULL,
+  nmethods      INTEGER NOT NULL,
+  nprops        INTEGER NOT NULL,
+  nenums        INTEGER NOT NULL,
+  nctors        INTEGER NOT NULL,
+  info          TEXT NOT NULL DEFAULT '',   -- Q_CLASSINFO key=value;...
+  PRIMARY KEY (binary_id, meta_addr)
+);
+CREATE INDEX qt_class_by_name ON qt_class(binary_id, name);
+CREATE TABLE qt_method (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  meta_addr     INTEGER NOT NULL,
+  idx           INTEGER NOT NULL,        -- method index in the class (the id of qt_static_metacall)
+  kind          TEXT NOT NULL,           -- signal | slot | method | constructor
+  name          TEXT NOT NULL,
+  ret           TEXT NOT NULL DEFAULT '',
+  params        TEXT NOT NULL DEFAULT '',   -- "int count, QString text"
+  access        TEXT NOT NULL DEFAULT '',   -- public | protected | private
+  flags         INTEGER NOT NULL DEFAULT 0,
+  addr          INTEGER,                 -- function that runs it (worker op qt_dispatch)
+  PRIMARY KEY (binary_id, meta_addr, kind, idx)
+);
+CREATE INDEX qt_method_by_addr ON qt_method(binary_id, addr);
+CREATE INDEX qt_method_by_name ON qt_method(binary_id, name);
+CREATE TABLE qt_prop (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  meta_addr     INTEGER NOT NULL,
+  idx           INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  type          TEXT NOT NULL DEFAULT '',
+  flags         INTEGER NOT NULL DEFAULT 0,
+  notify        INTEGER,                 -- signal index in the class, NULL without one
+  PRIMARY KEY (binary_id, meta_addr, idx)
+);
+CREATE TABLE qt_enum (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  meta_addr     INTEGER NOT NULL,
+  idx           INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  is_flag       INTEGER NOT NULL DEFAULT 0,
+  vals          TEXT NOT NULL DEFAULT '',   -- "A=0,B=1"
+  PRIMARY KEY (binary_id, meta_addr, idx)
+);
+CREATE TABLE qt_connect (
+  binary_id     INTEGER NOT NULL REFERENCES binary(id),
+  fn_entry      INTEGER NOT NULL,        -- function that makes the connection
+  site          INTEGER NOT NULL,        -- address of the reference to the signal string / call
+  kind          TEXT NOT NULL,           -- string | ptr
+  signal        TEXT NOT NULL DEFAULT '',   -- name(args) of the SIGNAL() string
+  slot          TEXT NOT NULL DEFAULT '',   -- name(args) of the SLOT() / SIGNAL() string
+  slot_kind     TEXT NOT NULL DEFAULT ''    -- slot | signal
+);
+CREATE INDEX qt_connect_by_fn ON qt_connect(binary_id, fn_entry);

@@ -923,7 +923,7 @@ Details settled in M3:
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
 | `vtable` | `target` (class name or address) | slots: index, address, function name |
 | `mfc_message_maps` | `target?` (class) | no class: the classes that have a map (with the class's dialog); a class: message, control id, handler function per entry, `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one) |
-| `qt_metaobjects` | `class?` | signals, slots, properties with method indices → functions |
+| `qt_metaobjects` | `class_?`, `limit=50`, `connections=false`, `binary?` | no class: one line per Qt class (parent, signal/slot/property counts, methods mapped); a class: signals, slots, invokable methods and constructors with index, parameter types and names, flags and the function behind each; properties (notify signal), enums, `Q_CLASSINFO`, connections that name its signals or slots. `connections=true`: all string connects and `connectImpl` call sites. Done in M8 |
 
 ### delphi
 
@@ -943,8 +943,52 @@ methods and event handlers that Ghidra has no function for are created through `
 features, and methods of classes from runtime units (`System`, `Vcl.*`, `Classes`...) plus `@`-prefixed
 helper names count as runtime (`runtime: Delphi`).
 
-The format code is written from the format description (no code copied; DelphiReSym and IDR were not
-used). 64-bit Delphi binaries use the standard Win64 calling convention.
+The format code is written from the format description (no code copied; DelphiReSym was not used).
+64-bit Delphi binaries use the standard Win64 calling convention.
+
+**IDR names for the RTL and VCL** (`server/idr.py`, optional). The IDR project (crypto2011/IDR, MIT)
+publishes knowledge bases: the compiled code of the RTL and VCL units of one Delphi release with the
+address-dependent bytes masked. The files are never committed; the user downloads them and sets
+`idr_kb_dir` in config.jsonc (32-bit files in the folder or `x86\`, 64-bit files in `x64\`).
+The reader is written from the file layout (IDR is a format reference only). Matching: an unnamed
+(`FUN_...`) function gets the name of every KB proc whose unmasked bytes equal the code at the entry
+(a proc dump ends with up to 15 padding bytes that Ghidra leaves out). Procs with fewer than 10
+unmasked bytes and procs matching more than 3 functions of one binary (a wrapper around one call) are
+not used. The KB is chosen by the compiler version that the System unit stores as `Embarcadero Delphi
+for Win32 compiler version N.0`; without an exact file the one with the most matches on a sample wins.
+**Decision: hints, no rename.** The worker has no bulk rename (each `rename_function` saves the whole
+Ghidra project), a rename would make the name `user`, and Ghidra stays the truth for names. The result
+is meta only (no table): `idr_version:<id>` (`IDR_VERSION:kb signature:unnamed functions`, so old
+projects compute on open and again when the KB files or the function list change), `idr_hits:<id>`
+(`address<TAB>names` lines, at most 3 names, plain names first) and `idr_info:<id>`. `function` shows
+`idr: System.@LStrAsg`, and the addresses count as runtime (`graph.lib_hint`, `runtime: Delphi`
+clusters), so they and the functions that only they call leave the unclassified part. Without
+`idr_kb_dir` nothing is computed. Knowledge bases exist for Delphi 2 to XE4 (32-bit) and system units
+only for XE2 to XE4 (64-bit); newer compilers match in part (the code of the RTL changed).
+
+**Signature databases from a local Delphi install** (`server/delphisigs.py`, optional). The IDR files end
+at XE4; newer compilers match in part. A Delphi install ships the RTL and VCL as packages
+(`Redist\win32\*.bpl`, `Redist\win64\*.bpl`), and each package exports every interface routine under its
+C++ Builder style mangled name (`@System@Classes@TList@Add$qqrpv`). `airlock delphi-sigs build <install>`
+reads the export table itself (pefile stops at 8192 names), demangles the names (`System.@LStrAsg`,
+`System.Classes.TList.Add`; `$bctr` is `Create`, template arguments are left out: `TList<T>.Add`; exports
+without a parameter list are type info, class tables or strings and are skipped) and masks the position
+dependent bytes of each routine: relocation entries (`HIGHLOW`, `DIR64`), `rel32` operands of
+`call` / `jmp` / `jcc` whose target is outside the routine, and RIP-relative `disp32` outside the routine
+in 64-bit code. **Decision: capstone** (BSD-3-Clause, optional `sigs` extra, needed by the build only) decodes
+the instructions; a hand-written length decoder would need the x87, SSE and VEX tables. **Bounds:** a linear
+sweep from the export to the first `ret` or unconditional jump that no earlier forward branch reaches past,
+at most 2048 bytes kept; a jump table in the code stream is followed through its relocated slots; a routine
+that cannot be swept to its end keeps the swept prefix (a prefix still matches the start of the static
+copy). **[verified]** with Delphi 10 Seattle Update 1: a program built with `dcc32 -GD` and no runtime
+packages (map file as oracle) is named by the database for 99% of its routines that the packages export;
+the other bytes differ only in the masked operands. The database is derived data of a licensed install,
+cached outside the repo as `<compiler>-<bits>.sigdb` in `delphi_sigdb_dir` (null: `sigdb\` in the data
+directory), zlib packed, and is never committed. It loads into the same matcher as an IDR file. Selection:
+the database of the binary's exact compiler version names the functions first; the IDR file (or a database
+of another version) that matches most then names the rest, so a name from the database wins. `IDR_VERSION`
+2 makes projects compute again on open. Routines the packages do not export (private helpers, nested
+routines, generic instances nobody exports) stay unnamed. `airlock doctor` lists the databases.
 
 ### dotnet
 
@@ -987,9 +1031,9 @@ MFC message map entries.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `trace_values` | `function`, `variable` or `param`, `depth=2` | def-use chain across resolved calls (high p-code) |
-| `switch_tables` | `function` | recovered switch: case values → targets, defaults separate |
-| `constants` | `value`, `limit=30` | functions using the constant (magic numbers, record tags) |
+| `trace_values` | `function`, `variable` or `param`, `depth=2` | def-use chain across resolved calls (high p-code). Done in M8: lines `def`/`use`/`alias`/`call ... arg N`/`store`/`cmp`/`return`/`into <callee> param_N`; follows COPY/CAST/arithmetic/phi forward and into direct callees up to `depth` (max 5), 120 lines. Not done: backward into callers, indirect calls, aliasing through stores |
+| `switch_tables` | `function` | recovered switch: case values → targets, defaults separate. Done in M8 from the decompiler jump tables; compare chains are not listed |
+| `constants` | `value`, `limit=30` | functions using the constant (magic numbers, record tags). Done in M8: byte search for the 32/16/64-bit immediate in executable blocks, then an operand check; values below 0x80 are refused; constants in data tables are not searched |
 
 ### fileformat (no Ghidra)
 
@@ -1605,9 +1649,14 @@ formats is the primary use case of this project.
 
 ### Qt metaobjects
 
-- `staticMetaObject` → `QMetaObject::d.stringdata` and `d.data`; method
-  descriptors give signal/slot names and indices; `qt_static_metacall` maps
-  indices to functions **[verify layout per Qt major version]**.
+- Parsed from the PE bytes in `server/qt.py` (tables `qt_class`, `qt_method`, `qt_prop`, `qt_enum`, `qt_connect`, schema v13, meta `qt_version:<id>`). Scan: every pointer-wide word in the data sections whose next two words point into the image and whose second target starts with a plausible header; the class name must decode.
+- `QMetaObject::d` Qt5: `superdata, stringdata, data, static_metacall, relatedMetaObjects, extradata` (6 pointers) **[verified]** on 64-bit MSVC and 32-bit MinGW builds. Qt6 adds `metaTypes` before `extradata` (7 pointers) **[verify]** (no Qt6 sample was authorised; synthetic tests only).
+- `data` header, 14 words: revision, className, classInfo(count, offset), methods, properties, enums, constructors, flags, signalCount **[verified]** (revision 8 = Qt 5.12 to 5.15; revision 7 occurs in a few internal classes). Method record 5 words (name, argc, parameters, tag, flags), parameter block `ret, types, names`, bit 31 of a type word = string index, else a `QMetaType` id **[verified]**; access = flags & 3, kind = flags & 0xc (signal 4, slot 8), cloned 0x20; the first `signalCount` methods are the signals **[verified]**. Property record 3 words (name, type, flags) plus a notify-id array of `propertyCount` words when any property has the Notify flag **[verified]** against the notify signals of Qt classes with known sources. Enum record 5 words from revision 8 (name, alias, flags, count, data) **[verified]**; 4 words for revision 7 **[verify]**. Qt6 (revision 9 and up): method 6 words, property 5 words (name, type, flags, notifyId, revision) **[verify]**.
+- String data Qt5: `QByteArrayData[]` of 16 (32-bit) or 24 (64-bit) bytes, `ref = -1`, `size`, `alloc`, `offset` relative to the item **[verified]**. Qt6 since 6.4: `uint offsetsAndSizes[]` pairs, offset relative to the array **[verify]**; the reader tries both.
+- Superclass: `d.superdata` is a pointer for a parent in the same image **[verified]**; for a parent in another DLL it is 0 in the file and the program fills it at start-up. Worker op `qt_dispatch` finds the store to the field, traces the source register back to the load of the import `staticMetaObject` and reads the class from its (MSVC, Itanium or demangled) name **[verified]** on a MinGW 32-bit build (every imported parent found).
+- Method to function: `qt_dispatch` decompiles `d.static_metacall` and walks the tokens. The `InvokeMetaMethod` switch is the one whose case labels fit the method count best; the first call to a function of the program in each case is the method. Small classes (the compiler drops the switch) use `if (id == K)` blocks; a class with one method uses the first call. Signals the compiler inlined into the dispatcher (a call to `QMetaObject::activate` only) are taken from the `IndexOfMethod` branch (`== signalFunction` then `*result = index`). **[verified]** on both builds: about 94% of signals and 75% to 100% of slots and invokable methods are mapped. Limits: a method inlined into the dispatcher maps nothing; inherited methods are not in the switch; property accessors (ReadProperty/WriteProperty) are not mapped.
+- Connections: `QObject::connect` with `SIGNAL("2name(args)")` and `SLOT("1name(args)")` strings. Each connect call takes the two closest signal/slot strings of its function; without identifiable connect call edges adjacent strings are paired (a 32-bit cdecl call pushes the slot first, so both orders are accepted). Pointer-to-member connects (`connectImpl`) carry no strings: their call sites are listed when the call edges are found (**[open]** not found for calls through the import table of a MinGW build). Connected classes are looked up by normalised signature (const and & removed).
+- Runtime recognition: the dispatcher and, with RTTI, vtable slots 0 to 2 of every Qt class (`metaObject`, `qt_metacast`, `qt_metacall`) are boilerplate: `function` hints say so and the call graph marks them runtime family `Qt`. Gate: toolchain `qt` or a file named `Qt<n>*.dll`; a statically linked Qt is not scanned.
 
 ### Delphi
 
@@ -1726,6 +1775,7 @@ formats is the primary use case of this project.
 | Component | License | Use |
 |---|---|---|
 | DelphiReSym | BSD-3-Clause | format reference only; nothing copied |
+| IDR / IDR64 (crypto2011) | MIT | knowledge base file format reference only; the reader is written from the layout; the `kb*.bin` files are never committed or shipped |
 | REA (morluto/rea) | MIT | design ideas: selectors, artifact identity, analysis profiles, bounded output; any copied code keeps its notice |
 | IDA-Ghidra-bridge | MIT | handler logic ported to the worker |
 | Ghidra / PyGhidra | Apache-2.0 | runtime dependency, not redistributed |

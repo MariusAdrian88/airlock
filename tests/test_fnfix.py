@@ -19,12 +19,18 @@ class FixWorker(FakeWorker):
     def __init__(self) -> None:
         super().__init__()
         self.created = False
+        self.exit_on: set[int] = set()      # 1-based create_functions calls that end with the worker dying
+        self.made: set[int] = set()
 
     def request(self, op, args=None, timeout=0):
         if op == "create_functions" and op != self.fail_op:
             self.calls.append((op, args))
+            n = self.count("create_functions")
+            if n in self.exit_on:
+                raise WorkerError("worker_exited", "worker process exited")
             got = set(args["addresses"])
             made = got & {NEW_HANDLER, NEW_VSLOT}
+            self.made |= made
             self.created = self.created or bool(made)
             return {"created": len(made), "skipped": 0, "failed": len(got - made),
                     "reasons": {"created": len(made), "failed": len(got - made)},
@@ -34,7 +40,7 @@ class FixWorker(FakeWorker):
             cols, rows = DATA[args["kind"]]
             if args["kind"] == "functions":
                 rows = rows + [["ram", a, f"FUN_{a:08x}", "auto", "DEFAULT", None, "void f(void)",
-                                "__cdecl", 8, 0, 0] for a in (NEW_HANDLER, NEW_VSLOT)]
+                                "__cdecl", 8, 0, 0] for a in sorted(self.made)]
             else:
                 rows = rows + [[0x401405, NEW_HANDLER, "ram", 0x401200, 0x401200, "call"]]
             return {"columns": cols, "rows": rows, "done": True, "next_offset": None,
@@ -119,3 +125,52 @@ def test_worker_failure_is_not_recorded(tmp_path):
     with pytest.raises(WorkerError):
         ctx.indexer.create_missing_functions("proj", st, b)
     assert fnfix.stale(st, bid)                                # retried on the next open
+
+
+def test_chunks_and_conventions_only_with_the_last(tmp_path, monkeypatch):
+    ctx, st, bid = _setup(tmp_path)
+    monkeypatch.setattr(fnfix, "BATCH", 1)
+    assert ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid)) == 2
+    sent = [a for o, a in ctx.worker.calls if o == "create_functions"]
+    assert [a["addresses"] for a in sent] == [[NEW_HANDLER], [NEW_VSLOT], [FAILING]]
+    assert [a["conventions"] for a in sent] == [False, False, True]
+
+
+def test_worker_exit_is_recovered_once(tmp_path, monkeypatch):
+    ctx, st, bid = _setup(tmp_path)
+    monkeypatch.setattr(fnfix, "BATCH", 1)
+    ctx.worker.exit_on = {2}                  # the worker dies on the second chunk, the first was saved
+    assert ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid)) == 2
+    sent = [a["addresses"] for o, a in ctx.worker.calls if o == "create_functions"]
+    assert sent == [[NEW_HANDLER], [NEW_VSLOT], [NEW_VSLOT], [FAILING]]   # the handler is not sent again
+    assert ctx.worker.count("extract") >= 2                                # functions were re-read
+    assert not fnfix.stale(st, bid)
+    for a in (NEW_HANDLER, NEW_VSLOT):
+        assert st.db.execute("SELECT 1 FROM function WHERE binary_id=? AND entry=?", (bid, a)).fetchone()
+    log = (ctx.indexer.paths("proj").logs / "project.log").read_text(encoding="utf-8")
+    assert "worker lost during create_functions (worker_exited" in log
+
+
+def test_second_worker_exit_raises(tmp_path, monkeypatch):
+    ctx, st, bid = _setup(tmp_path)
+    monkeypatch.setattr(fnfix, "BATCH", 1)
+    ctx.worker.exit_on = {2, 3}
+    with pytest.raises(WorkerError) as ei:
+        ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid))
+    assert ei.value.code == "worker_exited" and fnfix.stale(st, bid)
+
+
+def test_shutdown_during_creation_is_not_an_error(tmp_path):
+    ctx, st, bid = _setup(tmp_path)
+    orig = ctx.worker.request
+
+    def stopped(op, args=None, timeout=0):
+        if op == "create_functions":
+            raise WorkerError("worker_stopped", "worker was stopped (server shutdown)")
+        return orig(op, args, timeout)
+
+    ctx.worker.request = ctx.indexer.worker.request = stopped
+    assert ctx.indexer.create_missing_functions("proj", st, st.get_binary_by_id(bid)) == 0
+    assert fnfix.stale(st, bid)                               # not recorded: done again at the next open
+    log = (ctx.indexer.paths("proj").logs / "project.log").read_text(encoding="utf-8")
+    assert "interrupted by the server shutdown" in log

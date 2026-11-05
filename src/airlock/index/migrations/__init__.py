@@ -235,3 +235,25 @@ def _v12(db: sqlite3.Connection) -> None:
 
 MIGRATIONS[12] = _v12
 MIGRATIONS.setdefault(12, lambda db: None)   # placeholder: the real v12 (Delphi tables) is registered above
+
+
+def _v13(db: sqlite3.Connection) -> None:
+    """Qt metaobjects (classes, methods, properties, enums, string connections); derived, filled by
+    server/qt.py. The statements are the Qt block of schema.sql, made idempotent."""
+    from importlib import resources
+    sql = resources.files("airlock.index").joinpath("schema.sql").read_text("utf-8")
+    block = sql[sql.index("CREATE TABLE qt_class"):]
+    block = "\n".join(ln.split("--", 1)[0] for ln in block.splitlines())     # comments may hold a ';'
+    for stmt in block.split(";"):
+        text = " ".join(stmt.split())
+        if not text:
+            continue
+        if text.startswith("CREATE TABLE"):
+            text = text.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+        else:
+            text = text.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1)
+        db.execute(text)
+
+
+MIGRATIONS[13] = _v13
+MIGRATIONS.setdefault(13, lambda db: None)   # placeholder: the real v13 (Qt tables) is registered above

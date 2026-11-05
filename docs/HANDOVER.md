@@ -2,7 +2,7 @@
 
 Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
-the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`), M6 (`delphi`) and M7 (`dotnet`) are done.
+the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`), M6 (`delphi`) M7 (`dotnet`) and M8 (`qt_metaobjects`, `dataflow`) are done.
 
 ## State
 
@@ -13,7 +13,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 796 passed, 38 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 838 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -56,7 +56,7 @@ Project folder: `<projects_root>\<name>\` with `airlock-project.jsonc`,
 | Specs (M4) | `tools/spec.py`, `server/specs.py`, `server/specfilter.py` |
 | Targets | `server/targets.py` (shared resolver) |
 | Decompile | `server/bulk.py`, `worker/pool.py`, `worker/rwlock.py`, `worker/ghidra_ops/bulk.py` |
-| Index | schema v12: `dl_class`/`dl_method`/`dl_field`/`dl_form`/`dl_component`/`dl_event` (v12), `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8), `res_dialog`/`res_control`/`res_menu_item`/`res_string` (v9), `rtti_class`/`vtable_slot`/`msgmap_entry` (v10), `dn_type`/`dn_method`/`dn_pinvoke` (v11; xedge kind `pinvoke`) |
+| Index | schema v13: `dl_class`/`dl_method`/`dl_field`/`dl_form`/`dl_component`/`dl_event` (v12), `export`, `xedge` (kinds import/dynamic/dynlib), `feature`, `feature_entry`, `string_link` (v6), `spec`/`spec_provenance`/`audit` (v7), `note` keyed by address (v8), `res_dialog`/`res_control`/`res_menu_item`/`res_string` (v9), `rtti_class`/`vtable_slot`/`msgmap_entry` (v10), `dn_type`/`dn_method`/`dn_pinvoke` (v11; xedge kind `pinvoke`), `qt_class`/`qt_method`/`qt_prop`/`qt_enum`/`qt_connect` (v13) |
 
 ## Config
 
@@ -110,7 +110,7 @@ join all run at analysis time; estimate within 20% of the real time.
 4. `path` treats runtime wrappers just before an import as clean through a
    length cap and a CRT plumbing name list (heuristic).
 5. Some very large functions hit `decompile_timeout`; `view=asm` still works.
-6. `patch_bytes` and `qt_metaobjects` are not implemented.
+6. `patch_bytes` is not implemented.
 7. MFC dispatch/automation (OLE) tables are not decoded.
 
 Fixed on 2026-11-05: framework range handlers (tooltips) hidden on control
@@ -185,16 +185,53 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   `dl_component`, `dl_event` (the resolved handler address is stored). Meta `delphi_version:<id>`
   (`DELPHI_VERSION`); `Indexer.resume_project` and `_after_ready` derive them for Delphi binaries only.
 - `fnfix.FIX_VERSION` is 2: `dl_method` and `dl_event` addresses are candidates for `create_functions`.
-  `create_missing_functions` also re-reads the functions when the worker reports `exists` for an address
-  the index lacks: on two real Delphi DLLs the worker process exited during `create_functions` in the
-  background run (cause not found; the functions were saved in Ghidra, the index did not know them).
-  Open: find why the worker exits there.
+  `create_missing_functions` sends the candidates in chunks of `fnfix.BATCH` (500; one transaction and save
+  each, the conventions pass with the last chunk only) and logs progress to `project.log`. It also
+  re-reads the functions when the worker reports `exists` for an address the index lacks.
+  **[verified]** The worker exit seen on two large Delphi DLLs was no crash: the driver script saw `ready`
+  (published before `_after_ready` runs) and called `WorkerClient.stop()` while the background job was
+  between `create_functions` and the re-read. The worker ended on `shutdown`; the in-flight request failed
+  as `worker_exited`. Reproduced on a fresh analysis (about 3,750 functions are created in 4 s; no crash,
+  no memory problem). Now: requests lost to `stop()` fail as `worker_stopped` (logged at info, redone at
+  the next open through the `exists` path); a real exit is logged with its exit code in `worker.log`, and
+  `fnfix.run` restarts the worker once (reopen, re-read, send the rest).
+  Open: `ready` still comes before the after-ready work; a client that stops right after `ready` loses the
+  cross-binary links and the decompile pass until the next open.
 - Nothing is renamed in Ghidra (as for MFC): `function` shows hints. Project map `UI:` line, `ui-menu` /
   `ui-dialog` feature seeds (`FEATURES_VERSION` 6), `runtime: Delphi` clusters (`graph.CallGraph.lib_hint`
   from units of runtime classes, plus `@`-prefixed names in `clusters.runtime_family`).
 - Tests: `tests/test_delphi.py` (synthetic 32/64-bit PEs, all DFM value types, tools, hints, seeds).
+- IDR names (`server/idr.py`, `tests/test_idr.py`, DESIGN §11 "Delphi"): optional, config key `idr_kb_dir`
+  (a folder with the IDR `kb*.bin` / `syskb*.bin`; 32-bit files in it or in `x86\`, 64-bit files in `x64\`).
+  Files come from github.com/crypto2011/IDR (32-bit: `kb2` to `kb2014`, `syskb2` to `syskb2014`, XE4 is the
+  newest) and crypto2011/IDR64 (64-bit `syskb2012` to `syskb2014`, system units only); the `kb*.7z` need
+  unpacking. Both repos are MIT. Hints only (no rename, no table): meta `idr_version:<id>` / `idr_hits:<id>` /
+  `idr_info:<id>`; `function` shows `idr: Unit.Proc`; hits join `runtime_addrs`. Computed in `delphi.ensure`
+  (ready flow, after `create_missing_functions`, and on open); stale when `IDR_VERSION`, the KB files or the
+  number of unnamed functions change. Open: files for newer compilers (Delphi 10 Seattle and later only match in
+  part, 64-bit much less), no 64-bit full KB (only system units), fixup
+  names (calls between procs) are not used to confirm a match.
+- Signature databases (`server/delphisigs.py`, `tests/test_delphisigs.py`, DESIGN §11 "Delphi"): exact-version
+  names built from the packages of a local Delphi (`airlock delphi-sigs build <install folder>`, `list`;
+  needs capstone, extra `sigs`; config key `delphi_sigdb_dir`, default `<data dir>\sigdb`; files
+  `<compiler>-<32|64>.sigdb`). Derived from licensed files: never commit them. `idr.kb_files(root, psize,
+  sig_dir)` lists them after the IDR files; `idr._pick` runs the exact-compiler database first, then the best
+  IDR file on the functions left (merged, the database wins). `IDR_VERSION` 2. 32-bit Seattle Update 1 built
+  (119 packages, about 1 minute, 5 MB). 64-bit: the install has no Win64 platform; add "Windows 64-bit" in
+  the installer feature list (Modify mode; Delphi > Windows 64-bit), then rerun the build (the x64 masking is only tested on
+  synthetic code). Open: routines the packages do not export (use `.jdbg` JCL debug info next to the BPLs, or a
+  `-GD` map of a program that uses every unit), signatures for FMX-only or older installs.
 - Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file), published
   properties, dynamic/message method tables, interface tables, virtual method names, renaming.
+
+## Qt and dataflow (M8)
+
+Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked **[verified]**). Facts:
+
+- `server/qt.py` parses `QMetaObject` data from the PE bytes (Qt5 and Qt6 layouts, 32/64-bit); meta `qt_version:<id>` (`QT_VERSION`); `Indexer.resume_project` and `_after_ready` derive it for Qt binaries (toolchain `qt` or `Qt<n>*.dll`).
+- Worker op `qt_dispatch` (`worker/ghidra_ops/qt.py`) maps method indices to functions from the decompiled `qt_static_metacall` and finds imported parent classes; run by `qt.resolve` after the missing-function step; meta `qt_dispatch:<id>`. Tool `qt_metaobjects` (`tools/qt.py`); hints in `function`, a `Qt:` line in the project map, moc boilerplate marked runtime family `Qt`.
+- Dataflow ops (`worker/ghidra_ops/dataflow.py`) and tools (`tools/dataflow.py`): `switch_tables`, `trace_values`, `constants`. Ghidra tests: `tests/test_dataflow.py` with `-m ghidra --binary=...`.
+- Qt6 layout is synthetic-only (no sample authorised). Pointer-to-member connect call sites were not found on the MinGW sample. Not done: Qt seeds for the feature index.
 
 ## Next
 

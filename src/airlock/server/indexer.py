@@ -30,7 +30,7 @@ from airlock import logs
 from airlock.config import Config
 from airlock.index.store import Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, delphi, dotnet, fnfix, linking, peres
+from airlock.server import cpp, delphi, dotnet, fnfix, linking, peres, qt
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
@@ -452,9 +452,13 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
-            delphi.ensure_project(store, paths.artifacts)  # Delphi tables missing or stale: no re-analysis
+            delphi.ensure_project(store, paths.artifacts, self.config.idr_kb_dir, self.config.delphi_sigdb_dir)  # Delphi tables and IDR names missing or stale: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the Delphi tables of %s: %s", slug, e)
+        try:
+            qt.ensure_project(store, paths.artifacts)  # Qt metaobject tables missing or stale: no re-analysis
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot refresh the Qt tables of %s: %s", slug, e)
         try:
             if self.refresh_missing_functions(slug, store):   # C++ entry points without a function
                 ready = linking.ready_ids(store)
@@ -462,6 +466,10 @@ class Indexer:
                                        after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot create the missing functions of %s: %s", slug, e)
+        try:
+            qt.resolve_project(self, slug, store)   # Qt method addresses and imported parents (worker)
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot resolve the Qt methods of %s: %s", slug, e)
         try:
             self.bulk.resume(slug)  # ready binaries whose decompile pass was cut short
         except Exception as e:
@@ -516,7 +524,20 @@ class Indexer:
             return 0
         self.ensure_open(project)
         t0 = time.monotonic()
-        res = fnfix.run(store, b.id, self.worker, program)
+        plog = logs.project_log(self.paths(project).logs)
+
+        def recover() -> None:      # the worker process died: reopen the program, read what was saved
+            self.ensure_open(project)
+            self.reextract_code(store, b, program)
+
+        try:
+            res = fnfix.run(store, b.id, self.worker, program, recover=recover, log=plog.info)
+        except WorkerError as e:
+            if e.code != "worker_stopped":
+                raise
+            plog.info("missing functions of %s: interrupted by the server shutdown; done again at the next open",
+                      b.name)
+            return 0
         # "exists" for an address the index has no function for: an earlier run created it, then the worker
         # died before the index was refreshed (seen once on a Delphi DLL) - read the functions back too
         if res["created"] or (res.get("reasons") or {}).get("exists"):
@@ -998,11 +1019,19 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  resources are an extra
             self._plog(job).warning("resources of %s: %s", me.name, e)
         cpp.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # RTTI, vtables, message maps
-        delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # VMTs, published methods, DFM
+        delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
+                         self.config.delphi_sigdb_dir)   # VMTs, published methods, DFM, IDR names
+        qt.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # QMetaObjects, string connects
         try:
             self.create_missing_functions(job.project, st, me)   # handlers, vtable targets
         except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
             self._plog(job).warning("missing functions of %s: %s", me.name, e)
+        delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,
+                         self.config.delphi_sigdb_dir)   # IDR names: the function list may have grown
+        try:
+            qt.resolve(self, job.project, st, me)   # Qt method addresses, imported parents
+        except Exception as e:  # noqa: BLE001  an extra; the binary stays ready
+            self._plog(job).warning("Qt dispatch of %s: %s", me.name, e)
         st.link_cross_binary(bid, [b.id for b in others])
         try:
             linking.link_dynamic_for(st, bid, [b.id for b in others])

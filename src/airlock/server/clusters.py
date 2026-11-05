@@ -271,7 +271,7 @@ def name_label(names: list[str]) -> str:
 
 def runtime_label(fams: list[str]) -> str:
     """``runtime: MFC`` by the majority of the identified families, else plain ``runtime``."""
-    cnt = Counter(f for f in fams if f in ("MFC", "CRT", "ATL/STL", "Delphi"))
+    cnt = Counter(f for f in fams if f in ("MFC", "CRT", "ATL/STL", "Delphi", "Qt"))
     if not cnt:
         return RUNTIME_PREFIX
     top = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]

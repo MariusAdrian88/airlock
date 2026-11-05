@@ -22,7 +22,9 @@ dependencies = [
 # so `airlock doctor --fix` installs it from the wheels bundled with Ghidra.
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-xdist>=3"]
+dev = ["pytest>=8", "pytest-xdist>=3", "capstone>=5"]
+# capstone decodes x86 for `airlock delphi-sigs build` only; matching needs no decoder
+sigs = ["capstone>=5"]
 
 [project.scripts]
 airlock = "airlock.cli:main"

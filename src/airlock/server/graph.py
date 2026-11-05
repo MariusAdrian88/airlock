@@ -430,6 +430,15 @@ def build_graph(st: Store, bids: list[int]) -> CallGraph:
                     g.lib_hint[i] = "Delphi"
     except Exception:  # noqa: BLE001  an extra: names and propagation still apply
         pass
+    try:
+        from airlock.server import qt          # lazy; moc boilerplate: dispatcher and the three moc virtuals
+        for bid in bids:
+            for addr in qt.runtime_addrs(st, bid):
+                i = g.index.get((bid, "ram", addr))
+                if i is not None:
+                    g.lib_hint.setdefault(i, "Qt")
+    except Exception:  # noqa: BLE001  an extra
+        pass
     return g
 
 

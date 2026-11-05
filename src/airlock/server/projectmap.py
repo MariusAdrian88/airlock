@@ -25,6 +25,7 @@ from airlock.server import clusters as cl
 from airlock.server import features as fx
 from airlock.server.selectors import fmt_addr
 from airlock.server.delphi import ui_line as delphi_ui_line
+from airlock.server.qt import ui_line as qt_ui_line
 from airlock.server.uijoin import ui_line
 
 log = logging.getLogger("airlock")
@@ -157,7 +158,7 @@ def binaries_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[
             f"code {code / _MB:.1f} MB" if code else "code ?",
             f"functions {named}/{total} named" if total else "functions -",
             tool, roles[b.id]]))
-        ui = ui_line(store, b.id) or delphi_ui_line(store, b.id)
+        ui = ui_line(store, b.id) or delphi_ui_line(store, b.id) or qt_ui_line(store, b.id)
         if ui:
             out.append(f"  {ui}")
     out.append("Detail: outline(binary=<name>), search(query), strings(pattern), list_binaries.")

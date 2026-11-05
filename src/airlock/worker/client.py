@@ -28,6 +28,7 @@ class WorkerClient:
         self.python = python or sys.executable
         self.proc: subprocess.Popen[bytes] | None = None
         self.in_job = False
+        self._stopping = False      # stop() asked the worker to end: requests lost to it are no crash
         self.ghidra: dict[str, Any] | None = None
         self._next_id = 0
         self._lock = threading.Lock()
@@ -86,6 +87,7 @@ class WorkerClient:
         with self._lock:
             if self.running():
                 return
+            self._stopping = False
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = logs.rotating(self.log_path, "%(message)s")   # size-rotated worker.log
             flags = 0
@@ -120,8 +122,9 @@ class WorkerClient:
             pass
 
     def _read_loop(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        for line in self.proc.stdout:
+        proc = self.proc
+        assert proc is not None and proc.stdout is not None
+        for line in proc.stdout:
             try:
                 msg = decode(line)
             except ValueError:
@@ -134,17 +137,39 @@ class WorkerClient:
                 event, box = self._pending[rid]
                 box.append(msg)
                 event.set()
-        # worker gone: fail everything still waiting
+        # worker gone: log the exit code (a crash has none of its own), then fail everything waiting
+        self._note_exit(proc)
+        # fail everything still waiting
         for event, box in list(self._pending.values()):
             if not box:
-                box.append({"ok": False, "error": {"code": "worker_exited",
-                                                   "message": "worker process exited"}})
+                box.append({"ok": False, "error": (
+                    {"code": "worker_stopped", "message": "worker was stopped (server shutdown)"}
+                    if self._stopping else
+                    {"code": "worker_exited", "message": "worker process exited"})})
             event.set()
+
+    def _note_exit(self, proc: Any) -> None:
+        """Write how the worker ended into worker.log; 0xC0000005 and the like name a native crash."""
+        handler = self._log_file
+        if proc is None or handler is None:
+            return
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return
+        if self._pending and code != 0 and not self._stopping:
+            text = (f"[server] worker pid {proc.pid} exited with code {code & 0xFFFFFFFF:#010x} ({code}) "
+                    f"while {len(self._pending)} request(s) were pending")
+            try:
+                handler.handle(logging.makeLogRecord({"msg": text, "levelno": logging.WARNING}))
+            except (OSError, ValueError):
+                pass
 
     def stop(self, timeout: float = 5.0) -> None:
         proc = self.proc
         if proc is None:
             return
+        self._stopping = True
         if proc.poll() is None:
             try:
                 self.request("shutdown", timeout=timeout)

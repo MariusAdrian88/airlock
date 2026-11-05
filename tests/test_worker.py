@@ -46,3 +46,22 @@ def test_worker_log_receives_stderr(client):
     client.request("hello", timeout=30)
     client.stop()
     assert "[worker] airlock" in client.log_path.read_text("utf-8")
+
+
+def test_requests_lost_to_stop_are_not_a_crash(client):
+    """A request still pending when stop() ended the worker fails as worker_stopped; a worker that
+    died on its own fails as worker_exited and its exit code goes to worker.log."""
+    import types
+    import threading as th
+    for stopping, code in ((True, "worker_stopped"), (False, "worker_exited")):
+        client.request("hello", timeout=30)
+        proc = types.SimpleNamespace(stdout=iter(()), pid=4242, wait=lambda timeout=None: 3)
+        client.proc, client._stopping = proc, stopping
+        ev, box = th.Event(), []
+        client._pending[99] = (ev, box)
+        client._read_loop()
+        client._pending.pop(99)
+        assert ev.is_set() and box[0]["error"]["code"] == code
+        client.proc = None
+        client.stop()
+    assert "worker pid 4242 exited with code 0x00000003" in client.log_path.read_text("utf-8")

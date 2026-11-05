@@ -193,6 +193,22 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
         add(Check("OK" if cfg.ilspycmd.exists() else "WARN", "ilspycmd",
                   str(cfg.ilspycmd) + ("" if cfg.ilspycmd.exists() else " not found")))
 
+    # IDR knowledge bases
+    if cfg.idr_kb_dir:
+        from airlock.server import idr
+        n = len(idr.kb_files(cfg.idr_kb_dir, 4)) + len(idr.kb_files(cfg.idr_kb_dir, 8))
+        add(Check("OK" if n else "WARN", "idr_kb_dir",
+                  f"{cfg.idr_kb_dir}: {n} knowledge base file(s)" if n else f"{cfg.idr_kb_dir}: no kb*.bin / syskb*.bin found"))
+
+    # Delphi signature databases
+    from airlock.server import idr as _idr
+    sigs = _idr.sig_files(cfg.delphi_sigdb_dir, 4) + _idr.sig_files(cfg.delphi_sigdb_dir, 8)
+    if sigs:
+        add(Check("OK", "delphi sigdb", f"{cfg.delphi_sigdb_dir}: " + ", ".join(f.path.name for f in sigs)))
+    else:
+        add(Check("OK", "delphi sigdb",
+                  f"none in {cfg.delphi_sigdb_dir}; build with `airlock delphi-sigs build <Delphi install folder>`"))
+
     # Live start
     if start and not any(c.status == "FAIL" for c in checks):
         from airlock.worker.client import WorkerClient

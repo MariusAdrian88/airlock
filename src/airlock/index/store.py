@@ -14,7 +14,7 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DN_METHOD_LO, DN_METHOD_HI = 0x06000000, 0x07000000   # MethodDef metadata tokens (P/Invoke thunks)
 
 FTS_KINDS = ("function", "string", "import", "note")

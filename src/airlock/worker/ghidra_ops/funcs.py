@@ -76,7 +76,7 @@ def _one(program: Any, addr: Any, monitor: Any) -> str:
 @op("create_functions")
 @guarded
 def create_functions(args: dict[str, Any]) -> dict[str, Any]:
-    """create_functions(program, addresses, space=None): disassemble and create a function at each
+    """create_functions(program, addresses, space=None, conventions=True): disassemble and create a function at each
     address that is code but belongs to no function. Returns created, skipped, failed, reasons
     (count per outcome), sample (a few addresses per failing reason) and the conventions set on
     the new functions."""
@@ -101,7 +101,7 @@ def create_functions(args: dict[str, Any]) -> dict[str, Any]:
             if r not in ("created", "exists") and len(sample.setdefault(r, [])) < SAMPLE:
                 sample[r].append(a)
         stats["reasons"], stats["sample"] = reasons, sample
-        if reasons.get("created"):
+        if reasons.get("created") and args.get("conventions", True):
             stats["conventions"] = fixups.apply_conventions(program, monitor, relabel_fastcall=True)
         return {}
 

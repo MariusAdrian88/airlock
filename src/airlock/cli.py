@@ -53,6 +53,44 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return run(args.config, args.profile, fix=args.fix, start=args.start)
 
 
+def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
+    from airlock.config import ConfigError, load_config
+    from airlock.server import delphisigs
+
+    try:
+        cfg = load_config(args.config, None)
+    except ConfigError as e:
+        print(f"airlock: {e}", file=sys.stderr)
+        return 2
+    out = args.out or cfg.delphi_sigdb_dir
+    if args.action == "list":
+        from airlock.server import idr
+        files = idr.sig_files(out, 4) + idr.sig_files(out, 8)
+        for f in files:
+            h = delphisigs.read_sigdb_header(f.path)
+            print(f"{f.path.name}: compiler {h.get('compiler')}, {h.get('bits')}-bit, {h.get('count')} names, "
+                  f"{f.size // 1024} KB, built {h.get('built', '?')} from {h.get('install', '?')}")
+        if not files:
+            print(f"no signature databases in {out}")
+        return 0
+    if args.install is None:
+        print("airlock: give the Delphi install folder (the one with bin and Redist)", file=sys.stderr)
+        return 2
+    bits = [4, 8] if args.bits == "both" else [int(args.bits) // 8]
+    built = 0
+    for psize in bits:
+        try:
+            r = delphisigs.build(args.install, out, psize, progress=print if args.verbose else None,
+                                 jobs=args.jobs)
+        except delphisigs.SigError as e:
+            print(f"{psize * 8}-bit: {e}")
+            continue
+        built += 1
+        print(f"{r.path}: compiler {r.compiler}, {r.psize * 8}-bit, {r.packages} packages, {r.names} names, "
+              f"{r.routines} distinct routines, {r.path.stat().st_size // 1024} KB, {r.seconds:.0f} s")
+    return 0 if built else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="airlock", description="Lean Ghidra MCP server")
     p.add_argument("--version", action="version", version=f"airlock {__version__}")
@@ -85,6 +123,16 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--fix", action="store_true", help="install PyGhidra from Ghidra's bundled wheels")
     d.add_argument("--start", action="store_true", help="also start the worker and Ghidra")
     d.set_defaults(fn=_cmd_doctor)
+
+    g = sub.add_parser("delphi-sigs", help="build or list exact-version Delphi RTL / VCL signature databases")
+    g.add_argument("action", choices=["build", "list"])
+    g.add_argument("install", nargs="?", type=Path, default=None,
+                   help="build: Delphi install folder (the one with bin and Redist)")
+    g.add_argument("--bits", choices=["32", "64", "both"], default="both", help="build: platform (default both)")
+    g.add_argument("--out", type=Path, default=None, help="folder of the databases (default: delphi_sigdb_dir)")
+    g.add_argument("--jobs", type=int, default=4, help="build: worker processes")
+    g.add_argument("-v", "--verbose", action="store_true")
+    g.set_defaults(fn=_cmd_delphi_sigs)
 
     args = p.parse_args(argv)
     return args.fn(args)

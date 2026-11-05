@@ -5,3 +5,4 @@ yet); Java classes are imported inside functions after `start_ghidra`.
 """
 
 from airlock.worker.ghidra_ops import annotate, bulk, decompile, disasm, extract, funcs, project  # noqa: F401
+from airlock.worker.ghidra_ops import dataflow, qt  # noqa: F401  (M8)
