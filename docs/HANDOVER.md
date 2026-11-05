@@ -2,7 +2,8 @@
 
 Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
-the UI join), M3 (annotate) and M4 (specs) are done. Next: **M5**.
+the UI join), M3 (annotate), M4 (specs) and M5 (`fileformat`) are done.
+Next: **M6 (`delphi` set)**.
 
 ## State
 
@@ -13,7 +14,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 732 passed, 37 skipped (~2 min). Ghidra suites:
+Tests: `pytest -q` → 744 passed, 37 skipped (~2 min). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -50,6 +51,7 @@ Project folder: `<projects_root>\<name>\` with `airlock-project.jsonc`,
 | Links | `server/linking.py` (ordinals via pefile, dynamic LoadLibrary/GetProcAddress links, `call_imp` normalisation, relink) |
 | Map | `server/features.py`, `server/projectmap.py`, `server/clusters.py`, `server/graph.py`, `server/diagrams.py`, `tools/map.py`, `tools/fmap.py`, `tools/graphtools.py` |
 | Annotate and notes (M3) | `tools/annotate.py`, `server/notes.py`, `worker/ghidra_ops/annotate.py` |
+| File formats (M5) | `server/fileformat.py`, `tools/fileformat.py` (olefile; paths limited to the program source folder and `dirty\work\`) |
 | Specs (M4) | `tools/spec.py`, `server/specs.py`, `server/specfilter.py` |
 | Targets | `server/targets.py` (shared resolver) |
 | Decompile | `server/bulk.py`, `worker/pool.py`, `worker/rwlock.py`, `worker/ghidra_ops/bulk.py` |
@@ -136,4 +138,6 @@ Acceptance test: `tests/test_ui_join.py` (synthetic PE with RTTI, a message map,
 
 ## Next
 
-M5 (`fileformat` set, DESIGN.md §12).
+M6 (`delphi` set, DESIGN.md §12). The `fileformat` record detectors
+(`record_guess` strides and length prefixes) are only proven on synthetic
+files; check them on real record files when one is available.

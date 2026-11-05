@@ -96,13 +96,13 @@ airlock/
     schema.sql
     migrations/
     store.py
+  server/fileformat.py    # olefile, hexdump, diff, record guessing
   worker/
     main.py               # PyGhidra entry, request loop
     ghidra_ops/           # functions, decompile, xrefs, types, writes
     analyzers/            # msvc_rtti, mfc, qt, delphi
   backends/
     dotnet.py             # dnfile + ilspycmd
-    fileformat.py         # olefile, hexdump, diff, record guessing
     pe.py                 # pefile: resources, version info, imports
   win/
     jobobject.py          # kill-on-close job object
@@ -977,6 +977,15 @@ MFC message map entries.
 | `hexdump` | `path`, `offset=0`, `length=256` | hex + ASCII |
 | `file_diff` | `path_a`, `path_b`, `stream?` | changed byte ranges with context; for OLE, per stream |
 | `record_guess` | `path`, `stream?`, `offset?` | candidate record layouts: length prefixes, repeated strides, string fields |
+
+Implemented in `server/fileformat.py` (logic) and `server/tools/fileformat.py` (tools); `olefile` is a dependency.
+
+- **Role and paths.** Dirty only (not `clean_safe`). A relative path resolves against the program source folder from the manifest (`source.path`), then `dirty\work\`. An absolute path is accepted only inside one of those two roots (`error outside_project`), so the tools cannot read arbitrary files. `binary!` is not used.
+- **Paging.** All four take `cursor` and `budget` (§7). `hexdump` and `ole_streams stream=` take `offset`/`length` (max 16 KiB per call; the footer gives the next `offset=`).
+- **`ole_streams`.** One line per stream (`Root/WordDocument 4096`) and storage (`Root/ObjectPool/ (storage)`); control characters in names are shown as hex escapes (the byte 0x05 before `SummaryInformation` is shown as backslash, x, 05), and `stream=` accepts the escaped form with or without `Root/`. Not an OLE file: `error not_ole`.
+- **`hexdump`.** `0x` offset, 16 hex bytes, `|ASCII|`; `stream=` dumps an OLE stream instead of the file.
+- **`file_diff`.** Compares in 1 MiB chunks (memory bounded; an OLE stream is held in memory, one pair at a time). Changed bytes closer than 8 bytes merge into one range; each range shows 4 context bytes on each side and up to 16 changed bytes per side (`[..]`); a size difference ends in an `only in a/b` range. If both files are OLE: header counts, `added`/`removed` streams, then `changed <stream>` with its ranges (`stream=` limits it to one). At most 4000 ranges per pair are listed; the rest is counted.
+- **`record_guess`.** Analyses a window of up to 1 MiB from `offset`. Candidates, strongest first: fixed stride (byte autocorrelation over the first 32 KiB, strides 2..512, fundamental only; per-column constants, u16/u32, f32/f64 ranges), length-prefixed chains (u8/u16/u32 LE, with or without the prefix counted, header skip 0/2/4/8/16; evidence is that the chain ends exactly at the end of the data, so it is weak for short records), then strings (ASCII and UTF-16LE runs of 4+, spacing, length prefix before runs) and entropy. Mostly-zero files give no stride (autocorrelation is meaningless); high-entropy data skips strings. These are hints to verify with `hexdump`, not a parser.
 
 ### spec_write / spec_read
 
