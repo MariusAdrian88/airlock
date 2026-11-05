@@ -15,6 +15,13 @@ parent class reference), then ``Equals``, ``GetHashCode``, ``ToString``, ``SafeC
 
 * method table: ``u16 count`` then entries ``{u16 size; ptr code; ShortString name; ...}``, ``size``
   covers the whole entry (extended RTTI follows the name inside it).
+* extended method table (Delphi 2010 and later): right after the ``count`` entries, ``u16 exCount`` and
+  ``exCount`` records ``{ptr entry; u16 flags; i16 virtualIndex}`` (``ps + 4`` bytes, packed). ``entry``
+  points to a method entry of the layout above (it need not lie in the table). It names every method that
+  has RTTI, published or not. Flags: bits 0-2 kind (1 static class method, 2 method, 3 class method, 4
+  constructor, 5 destructor), bits 3-4 dispatch (0 static, 1 virtual, 2 dynamic, 3 message), bits 5-6
+  visibility (0 private, 1 protected, 2 public, 3 published), bit 7 abstract. ``virtualIndex`` is the vtable
+  index for virtual methods (the message number for message methods), negative otherwise.
 * field table: ``u16 count; ptr classTab`` then entries ``{uint offset (pointer wide); u16 typeIndex;
   ShortString name}``; ``classTab`` is ``u16 count`` and pointers to class reference cells.
 * type info (``vmtTypeInfo``): ``u8 kind (7 = class); ShortString name``, then ``ptr classType; ptr
@@ -40,11 +47,12 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 1
+DELPHI_VERSION = 2
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
 MAX_PUBLISHED = 4096
+MAX_RTTI = 16384                   # extended method entries read per class
 MAX_COMPONENTS = 20000             # per form
 MAX_DEPTH = 64
 MIN_SLOTS, MAX_SLOTS = 19, 32      # slots before the class reference (22 in 32-bit Delphi 2009+, 19 older)
@@ -60,8 +68,8 @@ def meta_key(binary_id: int) -> str:
 
 @dataclass
 class DlMethod:
-    kind: str            # published | virtual
-    slot: int
+    kind: str            # published | virtual | rtti-private | rtti-protected | rtti-public | rtti-published
+    slot: int            # virtual: vtable slot; rtti: virtual index (-1 when not virtual)
     name: str
     addr: int
 
@@ -199,6 +207,47 @@ def _published(img: Image, c: DlClass, tab: int) -> list[DlMethod]:
     return out
 
 
+_VISIBILITY = ("private", "protected", "public", "published")
+
+
+def _rtti_methods(img: Image, tab: int) -> list[DlMethod]:
+    """Methods named by the extended method table that follows the published entries (Delphi 2010+; empty
+    when the table is absent or does not parse: older compilers put other data there)."""
+    ps = img.psize
+    n = _u16(img, tab)
+    if n is None or n > MAX_PUBLISHED:
+        return []
+    p = tab + 2
+    for _ in range(n):
+        size = _u16(img, p)
+        if size is None or size < 2 + ps + 2:
+            return []
+        p += size
+    ex = _u16(img, p)
+    if not ex or ex > MAX_RTTI:
+        return []
+    out: list[DlMethod] = []
+    q = p + 2
+    for i in range(ex):
+        raw = img.read(q, ps + 4)
+        q += ps + 4
+        if raw is None:
+            break
+        entry = int.from_bytes(raw[:ps], "little")
+        flags, vindex = struct.unpack("<Hh", raw[ps:])
+        code = img.ptr(entry + 2) if img.in_image(entry) else None
+        name = _sstr(img, entry + 2 + ps) if code is not None else None
+        if name is None:
+            if i == 0:
+                return []                  # not an extended table
+            break
+        if not code or not img.is_code(code):
+            continue                       # abstract method: no code
+        kind = "rtti-" + _VISIBILITY[(flags >> 5) & 3]
+        out.append(DlMethod(kind, vindex if (flags >> 3) & 3 == 1 else -1, name, code))
+    return out
+
+
 def _fields(img: Image, tab: int, by_vmt: dict[int, DlClass]) -> list[DlField]:
     ps = img.psize
     n = _u16(img, tab)
@@ -268,11 +317,19 @@ def parse_classes(img: Image) -> list[DlClass]:
         mt = img.ptr(lo + 6 * ps) or 0
         if mt:
             c.methods.extend(_published(img, c, mt))
+            have = {(m.name, m.addr) for m in c.methods}
+            c.methods.extend(m for m in _rtti_methods(img, mt) if (m.name, m.addr) not in have)
         ft = img.ptr(lo + 5 * ps) or 0
         if ft:
             c.fields = _fields(img, ft, by_vmt)
         nxt = order[i + 1] - found[order[i + 1]][1] * ps if i + 1 < len(order) else vmt + MAX_VIRTUAL * ps
         c.methods.extend(_virtuals(img, vmt, max(0, (nxt - vmt) // ps)))
+    for c in by_vmt.values():             # a method that a parent already names belongs to the parent
+        if not any(m.kind.startswith("rtti") for m in c.methods):
+            continue
+        up = {(m.name, m.addr) for a in ancestors(c, by_vmt)[1:] for m in a.methods if m.kind != "virtual"}
+        if up:
+            c.methods = [m for m in c.methods if m.kind == "virtual" or (m.name, m.addr) not in up]
     return [found[v][0] for v in order]
 
 
@@ -724,6 +781,13 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
             (binary_id, entry)).fetchall()
     for r in pub:
         out.append(f"{r[0]}.{r[1]} (published)")
+    seen = {(r[0], r[1]) for r in pub}
+    for r in q("SELECT c.unit, c.name, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
+               "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind LIKE 'rtti-%' ORDER BY c.vmt LIMIT 3",
+               (binary_id, entry)):
+        if (r[1], r[2]) not in seen:
+            seen.add((r[1], r[2]))
+            out.append(f"rtti: {r[0] + '.' if r[0] else ''}{r[1]}.{r[2]}")
     ev = q("SELECT e.prop, c.name, c.class, c.caption, f.class FROM dl_event e JOIN dl_form f ON "
            "f.binary_id=e.binary_id AND f.res_name=e.form JOIN dl_component c ON c.binary_id=e.binary_id AND "
            "c.form=e.form AND c.seq=e.seq WHERE e.binary_id=? AND e.addr=? ORDER BY e.form, e.seq LIMIT 4",

@@ -315,9 +315,39 @@ def _decode_exact(md, code: bytes, rva: int) -> list[tuple[int, int, str, str]]:
     return out
 
 
-def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None) -> tuple[bytes, bytes] | None:
+_HEX = re.compile(r"0x[0-9a-f]+")
+
+
+def _mask_abs(md, code: bytes, rva: int, ins_list: list[tuple[int, int, str, str]], n: int, mask: bytearray,
+              lo: int, hi: int) -> None:
+    """Mask 32-bit absolute operands (``disp32`` / ``imm32`` inside ``[lo, hi)``, the image) that the relocation
+    table does not cover: a program without a ``.reloc`` section keeps its addresses fixed."""
+    for off_i, size, mn, ops in ins_list:
+        if off_i >= n:
+            break
+        if mn == "<table>" or "0x" not in ops:
+            continue
+        if (mn == "call" or mn[0] == "j" or mn.startswith("loop")) and _direct_target(ops) is not None:
+            continue
+        if not any(lo <= int(h, 16) < hi for h in _HEX.findall(ops)):
+            continue
+        for ins in md.disasm(code[off_i:off_i + size], rva + off_i):
+            if ins.disp_size == 4 and lo <= ins.disp & 0xFFFFFFFF < hi:
+                for k in range(ins.disp_offset, ins.disp_offset + 4):
+                    if off_i + k < n:
+                        mask[off_i + k] = 0xFF
+            if ins.imm_size == 4 and any(o.type == 2 and lo <= o.imm & 0xFFFFFFFF < hi for o in ins.operands):
+                for k in range(ins.imm_offset, ins.imm_offset + 4):
+                    if off_i + k < n:
+                        mask[off_i + k] = 0xFF
+            break
+
+
+def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None,
+                  abs_range: tuple[int, int] | None = None) -> tuple[bytes, bytes] | None:
     """Dump and mask of the routine at ``rva``. ``exact``: its known size (``.pdata``); otherwise the end is
-    found by a sweep, at most ``limit`` bytes."""
+    found by a sweep, at most ``limit`` bytes. ``abs_range``: (low, high) addresses of the image; 32-bit
+    absolute operands inside it are masked as well (a program without relocations)."""
     off = _rva_off(img, rva)
     if off is None:
         return None
@@ -352,6 +382,8 @@ def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None) 
                         mask[off_i + k] = 0xFF
         elif img.psize == 8 and "rip" in ops:
             _mask_rip(md, b, rva + off_i, rva, end, mask, off_i, n)
+    if abs_range is not None and img.psize == 4:
+        _mask_abs(md, code, rva, ins_list, n, mask, abs_range[0], abs_range[1])
     if img.reloc_rvas is None:
         img.reloc_rvas = sorted(img.relocs)
     rr = img.reloc_rvas

@@ -238,8 +238,32 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   other words. I could not decode them without the JCL source or a known pair of name and record, and no
   oracle (a `.map` of the package) exists. Other ways: a `-GD` map of a program that uses every unit (no
   packages needed, gives the private routines of the units it links), or reading the `.dcu` files.
+- Extended RTTI and the consensus database (`server/delphi.py` `_rtti_methods`, `server/delphirtti.py`,
+  `tests/test_delphirtti.py`, DESIGN §11 "Delphi" and "RTTI consensus database"). **[verified]** layout of the
+  extended method table (32/64-bit) and flags; `dl_method` kind `rtti-<visibility>`, `DELPHI_VERSION` 2, hint
+  `rtti: Unit.Class.Method`; no schema change. `airlock delphi-sigs rtti-build <folder>... [--out] [--min-binaries 3]
+  [--min-products 1] [--exclude FILE] [--indy] [--jobs]` (one folder = one product; about 8 minutes for 300
+  programs with 6 jobs) writes `rtti-<compiler>-<bits>.sigdb`; `idr._pick` runs exact sigdb, then this database, then
+  IDR. `IDR_VERSION` 4. Measured: direct names are the big gain on a program that still has the table (a quarter or
+  more of its unnamed functions); the consensus database adds almost nothing on top of them (they name the same
+  routines) but gives a Delphi-less install a database of its own (an own build: 29% / 39% of routines named, 99%
+  right). The copies rule of `idr.match_all` was loosened (`LONG_SHAPE`, `GENERIC_MIN`): +48% / +62% named routines on
+  the own builds at the same precision. Tried and not worth it: naming overridden virtual slots from the parent's
+  RTTI (a few dozen extra functions on a real DLL).
+  Open: property accessors (the `GetProc` / `SetProc` code of published properties are not named), unit-level
+  procedures and private routines that no table lists, a larger and more varied corpus (the product-count
+  rule matters once there are several products per bitness), `rtti-build` has no incremental mode (a new
+  corpus rescans everything), and the Ghidra side does not rename anything (hints only).
 - Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file), published
   properties, dynamic/message method tables, interface tables, virtual method names, renaming.
+
+- WARP spike (`server/warp.py`, `worker/ghidra_ops/warp.py`, `tests/test_warp.py`; DESIGN section 11): reads Binary Ninja
+  `.warp` libraries (delphinja Delphi RTL) and computes the WARP function GUID from capstone blocks or from the worker op
+  `warp_blocks`. Verdict: feasible, approximate (a Binary Ninja analysis detail changes about 20% of the blocks).
+  Not wired into `idr.py`: it needs a `warp_dir` key (`config/keys.py`, `loader.py`) and a parameter through
+  `indexer` -> `delphi.ensure` -> `idr.derive/stale`, then one tier in `_pick` after the exact sigdb (library by
+  compiler: 34 -> `delphi-rtl-10.4-only` + `core-11`, 35 -> `core-11`; older compilers `core-8`, `<year>-only`,
+  `xe2plus-only`), `IDR_VERSION` bump and the file list in the stale signature. The `.warp` files are not in the repo.
 
 ## Qt and dataflow (M8)
 

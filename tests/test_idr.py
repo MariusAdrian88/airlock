@@ -203,6 +203,24 @@ def test_names_are_ranked_and_common_shapes_dropped(tmp_path):
     assert not any(at[f"w{i}"] in got for i in range(idr.MAX_COPIES + 1))      # one shape in too many places
 
 
+def test_generic_templates_and_long_shapes_may_match_many_functions(tmp_path, monkeypatch):
+    monkeypatch.setattr(idr, "LONG_SHAPE", 16)                  # 16 compared bytes here, 10 for the short proc
+    gen, lng, short = body(4), body(5), body(6)
+    tiny = masks(len(short), ((2, 8), (10, 14), (18, 22)))
+    procs = [(0, "TList<T>.Add", gen, masks(len(gen))), (0, "Long", lng, masks(len(lng))),
+             (0, "Short", short, tiny), (0, "TList<T>.Tiny", body(7), tiny)]
+    build_kb(tmp_path / "kb2010.bin", ["System"], procs)
+    many = idr.MAX_COPIES + 3
+    blobs = {f"{k}{i}": relocated(raw, i, i) for k, raw in (("g", gen), ("l", lng), ("s", short), ("t", body(7))) for i in range(many)}
+    path, at = make_image(tmp_path, blobs)
+    img = Image.from_pe(path)
+    got = idr.match_all(idr.read_kb(tmp_path / "kb2010.bin"), img, [(va, None) for va in at.values()])
+    assert all(got[at[f"g{i}"]] == ["System.TList<T>.Add"] for i in range(many))
+    assert all(got[at[f"l{i}"]] == ["System.Long"] for i in range(many))
+    assert not any(at[f"s{i}"] in got for i in range(many))                       # a short plain wrapper stays dropped
+    assert not any(at[f"t{i}"] in got for i in range(many))                       # so does a generic with 10 bytes
+
+
 def test_pick_chooses_the_knowledge_base_with_most_matches(tmp_path):
     a, b, c = body(10), body(11), body(12)
     build_kb(tmp_path / "kb2009.bin", ["System"], [(0, "OnlyA", a, masks(len(a)))])

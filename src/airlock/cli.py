@@ -69,18 +69,38 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
         for f in files:
             h = delphisigs.read_sigdb_header(f.path)
             print(f"{f.path.name}: compiler {h.get('compiler')}, {h.get('bits')}-bit, {h.get('count')} names, "
-                  f"{f.size // 1024} KB, built {h.get('built', '?')} from {h.get('install', '?')}")
+                  f"{f.size // 1024} KB, built {h.get('built', '?')} from "
+                  f"{h.get('install') or str(h.get('binaries', '?')) + ' binaries'}")
         if not files:
             print(f"no signature databases in {out}")
         return 0
-    if args.install is None:
+    if args.action == "rtti-build":
+        from airlock.server import delphirtti
+        if not args.install:
+            print("airlock: give one or more folders with Delphi programs (one product per folder)", file=sys.stderr)
+            return 2
+        try:
+            res = delphirtti.build(args.install, out, args.min_binaries, args.min_products, args.jobs,
+                                   args.exclude or [], args.indy, progress=print if args.verbose else None)
+        except (delphirtti.RttiError, delphisigs.SigError) as e:
+            print(f"airlock: {e}", file=sys.stderr)
+            return 2
+        for r in res:
+            print(f"{r.path}: compiler {r.compiler}, {r.psize * 8}-bit, {r.binaries} binaries, {r.names} names, "
+                  f"{r.shapes} code shapes ({r.cross_product} names agreed by several products, "
+                  f"{r.single_product} by one), {r.stubs} stub shapes dropped, {r.path.stat().st_size // 1024} KB, "
+                  f"{r.seconds:.0f} s")
+        if not res:
+            print("no database written: no Delphi program with extended RTTI, or too few binaries agree")
+        return 0 if res else 1
+    if not args.install:
         print("airlock: give the Delphi install folder (the one with bin and Redist)", file=sys.stderr)
         return 2
     bits = [4, 8] if args.bits == "both" else [int(args.bits) // 8]
     built = 0
     for psize in bits:
         try:
-            r = delphisigs.build(args.install, out, psize, progress=print if args.verbose else None,
+            r = delphisigs.build(args.install[0], out, psize, progress=print if args.verbose else None,
                                  jobs=args.jobs)
         except delphisigs.SigError as e:
             print(f"{psize * 8}-bit: {e}")
@@ -124,10 +144,15 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--start", action="store_true", help="also start the worker and Ghidra")
     d.set_defaults(fn=_cmd_doctor)
 
-    g = sub.add_parser("delphi-sigs", help="build or list exact-version Delphi RTL / VCL signature databases")
-    g.add_argument("action", choices=["build", "list"])
-    g.add_argument("install", nargs="?", type=Path, default=None,
-                   help="build: Delphi install folder (the one with bin and Redist)")
+    g = sub.add_parser("delphi-sigs", help="build or list Delphi RTL / VCL signature databases")
+    g.add_argument("action", choices=["build", "rtti-build", "list"])
+    g.add_argument("install", nargs="*", type=Path,
+                   help="build: Delphi install folder (the one with bin and Redist); rtti-build: folders with "
+                        "Delphi programs, one product per folder")
+    g.add_argument("--min-binaries", type=int, default=3, help="rtti-build: distinct files that must agree (3)")
+    g.add_argument("--min-products", type=int, default=1, help="rtti-build: distinct products that must agree (1)")
+    g.add_argument("--exclude", type=Path, action="append", help="rtti-build: a file to leave out (repeatable)")
+    g.add_argument("--indy", action="store_true", help="rtti-build: also keep Indy (Id*) units")
     g.add_argument("--bits", choices=["32", "64", "both"], default="both", help="build: platform (default both)")
     g.add_argument("--out", type=Path, default=None, help="folder of the databases (default: delphi_sigdb_dir)")
     g.add_argument("--jobs", type=int, default=4, help="build: worker processes")

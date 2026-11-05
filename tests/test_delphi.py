@@ -151,8 +151,10 @@ class Pe:
 
     def klass(self, name: str, parent: str | None, unit: str, size: int = 16,
               published: tuple[str, ...] = (), virtuals: tuple[str, ...] = (),
-              fields: tuple[tuple[str, int, str], ...] = ()) -> int:
-        """A class: VMT with ``virtuals`` code slots, a published method table and a field table."""
+              fields: tuple[tuple[str, int, str], ...] = (),
+              rtti: tuple[tuple[str, int, int], ...] = ()) -> int:
+        """A class: VMT with ``virtuals`` code slots, a published method table (``rtti``: extended entries
+        ``(name, flags, virtual index)`` after it) and a field table."""
         ps = self.ps
         lo = self.alloc(self.slots * ps + max(len(virtuals), 1) * ps + 8)
         vmt = lo + self.slots * ps
@@ -164,11 +166,20 @@ class Pe:
         ti = self.alloc(2 + len(name) + 2 * ps + 2 + 1 + len(unit), 1)
         self.put(ti, b"\x07" + _ss(name) + self.p(vmt) + self.p(0) + struct.pack("<h", 0) + _ss(unit))
         words[4] = ti
-        if published:
+        if published or rtti:
             ents = b"".join(struct.pack("<H", 2 + ps + 1 + len(m)) + self.p(self.stub(f"{name}.{m}")) + _ss(m)
                             for m in published)
-            tab = self.alloc(2 + len(ents), 2)
-            self.put(tab, struct.pack("<H", len(published)) + ents)
+            ex = b""
+            if rtti:                     # extended table: {entry pointer, flags, virtual index}, entries elsewhere
+                recs = []
+                for m, flags, vi in rtti:
+                    code = 0 if m.startswith("Abstract") else self.stub(f"{name}.{m}")
+                    ent = self.alloc(2 + ps + 1 + len(m) + 3, 1)
+                    self.put(ent, struct.pack("<H", 2 + ps + 1 + len(m) + 3) + self.p(code) + _ss(m) + b"\x03\0\0")
+                    recs.append(self.p(ent) + struct.pack("<Hh", flags, vi))
+                ex = struct.pack("<H", len(rtti)) + b"".join(recs)
+            tab = self.alloc(2 + len(ents) + len(ex), 2)
+            self.put(tab, struct.pack("<H", len(published)) + ents + ex)
             words[6] = tab
         if fields:
             ctab = self.alloc(2 + ps * len(fields), 2)
@@ -256,11 +267,14 @@ CHILD_DFM = dfm(comp("TChildForm", "ChildForm", prop("OnShow", "ident", "BaseSho
 def build(path: Path, psize: int, slots: int | None = None) -> Pe:
     pe = Pe(psize, slots)
     pe.klass("TObject", None, "System", 8, virtuals=("Dtor",))
-    pe.klass("TComponent", "TObject", "System.Classes", 32, virtuals=("Dtor",))
+    pe.klass("TComponent", "TObject", "System.Classes", 32, virtuals=("Dtor",),
+             rtti=(("Create", 0x44, -12), ("Destroy", 0x4d, 0), ("GetNamePath", 0x42, -1), ("SetName", 0x22, -1),
+                   ("AbstractGet", 0xAA, 3)))
     pe.klass("TBaseForm", "TComponent", "BaseUnit", 64, published=("BaseMouseDown", "BaseShow"), virtuals=("Init", "Done"))
     pe.klass("TMainForm", "TBaseForm", "MainUnit", 128, published=("FormCreate", "Button1Click", "CheckClick", "OpenClick",
                                                                   "GridCol"),
-             virtuals=("Init", "Done", "Extra"), fields=(("Button1", 40, "TObject"), ("Check1", 48, "TComponent")))
+             virtuals=("Init", "Done", "Extra"), fields=(("Button1", 40, "TObject"), ("Check1", 48, "TComponent")),
+             rtti=(("Helper", 0x22, -1), ("WMSize", 0x5A, 2026), ("Refresh", 0x4A, 7)))
     pe.klass("TFrame1", "TBaseForm", "FrameUnit", 80, published=("FrameBtnClick",))
     pe.klass("TChildForm", "TMainForm", "ChildUnit", 140, published=("ChildClose",))
     pe.res[(10, "TMAINFORM", 0x409)] = MAIN_DFM
@@ -345,6 +359,36 @@ def test_vmt_and_join(tmp_path, psize, slots):
     child = {(e.prop, e.handler): e.addr for e in fm["TCHILDFORM"].events}
     assert child[("OnShow", "BaseShow")] == pe.code["TBaseForm.BaseShow"]
     assert child[("OnClose", "ChildClose")] == pe.code["TChildForm.ChildClose"]
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_extended_rtti_methods(tmp_path, psize):
+    pe = build(tmp_path / "app.exe", psize)
+    classes, _forms = delphi.parse_file(tmp_path / "app.exe")
+    by = {c.name: c for c in classes}
+    got = {(m.name): (m.kind, m.slot, m.addr) for m in by["TComponent"].methods if m.kind.startswith("rtti")}
+    assert got == {
+        "Create": ("rtti-public", -1, pe.code["TComponent.Create"]),
+        "Destroy": ("rtti-public", 0, pe.code["TComponent.Destroy"]),          # flags 0x4d: virtual, index 0
+        "GetNamePath": ("rtti-public", -1, pe.code["TComponent.GetNamePath"]),
+        "SetName": ("rtti-protected", -1, pe.code["TComponent.SetName"])}        # the abstract method has no code: left out
+    main = {m.name: (m.kind, m.slot) for m in by["TMainForm"].methods if m.kind.startswith("rtti")}
+    assert main == {"Helper": ("rtti-protected", -1), "WMSize": ("rtti-public", -1), "Refresh": ("rtti-public", 7)}
+    assert not any(m.kind.startswith("rtti") for m in by["TObject"].methods)       # no table
+    # the published list is unchanged
+    assert [m.name for m in by["TMainForm"].methods if m.kind == "published"][:2] == ["FormCreate", "Button1Click"]
+
+
+def test_extended_table_of_an_old_compiler_is_ignored(tmp_path):
+    """A published table with no extended table after it gives no rtti methods."""
+    pe = Pe(4)
+    pe.klass("TObject", None, "System", 8)
+    pe.klass("TOld", "TObject", "OldUnit", 16, published=("Foo",))
+    pe.write(tmp_path / "a.exe")
+    classes, _f = delphi.parse_file(tmp_path / "a.exe")
+    old = {c.name: c for c in classes}["TOld"]
+    assert [m.name for m in old.methods if m.kind == "published"] == ["Foo"]
+    assert not any(m.kind.startswith("rtti") for m in old.methods)
 
 
 def test_not_delphi_gives_no_classes(tmp_path):
@@ -444,6 +488,9 @@ def test_hints_and_candidates(proj):
     assert 'handler OnClick of Button1 (TButton "Run") in form TMainForm' in hints
     v = delphi.hints_for(st, bid, pe.code["TMainForm.v2_Extra"])
     assert v == ["TMainForm::vslot 2"]
+    assert delphi.hints_for(st, bid, pe.code["TComponent.Create"]) == ["rtti: System.Classes.TComponent.Create"]
+    assert delphi.hints_for(st, bid, pe.code["TMainForm.Helper"]) == ["rtti: MainUnit.TMainForm.Helper"]
+    assert pe.code["TMainForm.Refresh"] in set(fnfix.candidates(st, bid))
     # fnfix: the handler of Button1Click is a function; the others are candidates
     cands = set(fnfix.candidates(st, bid))
     assert pe.code["TMainForm.OpenClick"] in cands and a not in cands

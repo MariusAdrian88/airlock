@@ -21,6 +21,8 @@ copyright notice and license, reproduced here when the code lands.
 | [JCL](https://github.com/project-jedi/jcl) (`.jdbg` debug info) | MPL-1.1 | format reference only; the layout of the files next to the Delphi packages was studied for a reader that is not part of airlock; no code copied |
 | Itanium C++ ABI | public specification | format reference for `server/itanium.py` (written from the description) |
 | [IDR](https://github.com/crypto2011/IDR) and [IDR64](https://github.com/crypto2011/IDR64) | MIT | optional knowledge bases (`kb*.bin`) that name Delphi RTL / VCL functions; file format reference only, the files are supplied by the user and never committed |
+| [WARP](https://github.com/Vector35/warp) and [delphinja](https://github.com/psifertex/delphinja) | Apache-2.0 / MIT | `.warp` file format and function GUID rules (spec and reference code read, no code copied); the Delphi `.warp` libraries are supplied by the user and never committed |
+| [delphinja](https://github.com/psifertex/delphinja) (`tools/RTTI.md`, `rttikb.py`) | MIT | the "extended RTTI consensus" method behind `server/delphirtti.py`: read the method names that a Delphi 2010+ binary states about its own RTL code, keep a code shape to name pair only where independent programs agree. Idea only: the code is new and masks bytes with `delphisigs`; no delphinja code is copied. The databases are derived from the user's programs and never committed |
 | [REA](https://github.com/morluto/rea) | MIT | design ideas: selectors, artifact identity, analysis profiles, bounded output |
 | [IDA-Ghidra-bridge](https://github.com/oscarsantanaarias/IDA-Ghidra-bridge) | MIT | MSVC RTTI / vtable / xref handler logic (M2) |
 | pefile, dnfile, olefile | MIT / BSD | PE, .NET metadata and OLE parsing |

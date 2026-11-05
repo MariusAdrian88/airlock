@@ -1005,11 +1005,83 @@ code and are not found. Wrong names (2 to 3% of the matched functions) are routi
 `<compiler>-<bits>.sigdb` in `delphi_sigdb_dir` (null: `sigdb\` in the data directory), zlib packed, and is never
 committed. It loads into the same matcher as an IDR file. Selection: the database of the binary's exact compiler
 version names the functions first; the IDR file (or a database of another version) that matches most then names the
-rest, so a name from the database wins. `IDR_VERSION` 3 makes projects compute again on open (version 2 databases stay
+rest, so a name from the database wins. `IDR_VERSION` 3 (now 4) makes projects compute again on open (version 2 databases stay
 loadable: the file layout did not change). Routines the packages do not export (private helpers, nested routines,
 generic instances nobody exports) stay unnamed: 32-bit exports cover about 60% of the routines of a static program,
 64-bit about 79%. The `.jdbg` files next to the 32-bit packages hold them (see HANDOVER), but the name table is
 compressed and the reader is not written. `airlock doctor` lists the databases.
+
+**RTTI consensus database** (`server/delphirtti.py`, optional, needs capstone like the sigdb build). Since Delphi 2010 the
+extended method table (see "Delphi" in section 11) names the methods of every class that a program links, the RTL and
+VCL classes included, with their code addresses. A program therefore states the names of thousands of its own RTL
+routines. `airlock delphi-sigs rtti-build <folder>...` (one folder = one product) reads these names from many
+unrelated programs, takes the masked code bytes at each address and keeps a (code shape, name) pair only where
+independent files agree. The idea is the "extended RTTI consensus" of psifertex/delphinja (MIT, `tools/RTTI.md`); the
+code is new (THIRD_PARTY_NOTICES). Pure Python: pefile and capstone, no Ghidra. Rules:
+- Only classes of runtime units go in (`delphi.runtime_unit`: `System.*`, `Vcl.*`, `Winapi.*`, `Data.*`, `Xml.*`...;
+  `--indy` adds `Id*`). Program classes never do: they are the code of the target and their names would leak
+  between products. Generic instances are stored as `TList<T>.Add`, and a class name that a ShortString cut at 255
+  characters leaves with an open bracket is cut at the bracket, because type arguments are program types.
+- Bounds and masks are the ones of the package sigdb (`delphisigs._scan_routine`): `.pdata` for 64-bit, a sweep for
+  32-bit, relocations, `rel32` operands that leave the routine and RIP-relative operands masked. A program has no
+  package relocations to rely on (an exe may have none), so 32-bit absolute operands that point into the image are
+  masked too (`_mask_abs`).
+- A name needs `--min-binaries` distinct files (default 3; identical files count once, by SHA-256) and
+  `--min-products` distinct products (default 1; the build reports how many names several products agree on). All
+  the binaries of one product share one RTL build, so agreement inside a product is weaker evidence than agreement
+  across products. A shape with more than 6 names is a stub (`ret`, one call) and is dropped; a shape with 2 to 6
+  names keeps all of them (code aliases such as `Exception.Create` and `CreateFmt` are listed together).
+- A method that a parent class already names (same name and address) belongs to the parent.
+- `--exclude <file>` leaves a file (and its identical copies) out, to measure a database on a program it has
+  not seen.
+Output: `rtti-<compiler>-<32|64>.sigdb` next to the other sigdb files (same file layout, header `kind: rtti`). Selection
+in `idr._pick`: exact-version package database, then the RTTI database of the exact compiler, then the IDR file that
+matches most; each tier names only the functions the earlier ones left. Derived data of the user's programs: never
+committed; a database holds names of RTL classes only.
+
+**Direct names and where the consensus database helps.** A binary's own extended table names its functions directly
+(hint `rtti: Unit.Class.Method`, kind `rtti-<visibility>` in `dl_method`), whatever the compiler version, so the
+consensus database adds almost nothing on a program that still has this table: the routines it knows are the ones
+the table already names. The database is for programs without a local Delphi install (no exact sigdb), where it
+names routines the IDR files do not know: on an own `dcc32` / `dcc64` build of most RTL and VCL units (map file as
+truth) a database built from other programs alone names 29% (32-bit) and 39% (64-bit) of all routines, 99% of them
+with the right name (Delphi 10 Seattle, held out). Unit-level procedures, private routines of units and everything
+the table does not list stay unnamed, as does a program's own code.
+
+**Copies of a code shape.** `idr.match_all` drops a proc that matches more than `MAX_COPIES` (3) functions of one binary:
+a short wrapper around one call occurs in hundreds of program functions. That rule dropped about 9% of the routines
+that the database can name. Since `IDR_VERSION` 4 two kinds of proc are kept: a proc with at least `LONG_SHAPE` (64)
+compared bytes, and a generic template (`<` in the name) with at least `GENERIC_MIN` (16): one instance per element
+type is normal (`TList<T>.Add`). Measured with the oracle programs (map file as truth, right = same class and method,
+or the same method of a generic or alias class): with the exact package database 32-bit named 5,126 routines with
+97.5% right and now 7,564 with 98.3%, 64-bit 5,452 with 98.4% and now 8,807 with 98.7%; lifting the rule completely
+gives 8,291 / 9,847 named but 3% / 1.5% wrong and, on real programs, adds many program functions that
+only look like runtime code (measured as methods of the program's own classes, whose true names are in its RTTI, that
+get a runtime name). A generic stub of 10 compared bytes shared by thousands of functions was the main source, hence
+`GENERIC_MIN`; with it the increase is small. Rules tried and not kept: all procs of one unit, all functions
+with the same name, a lower length threshold.
+
+**WARP signature libraries** (`server/warp.py`, `worker/ghidra_ops/warp.py`, spike, not yet wired into `idr.py`).
+Binary Ninja WARP (github.com/Vector35/warp, Apache-2.0) with the Delphi libraries of psifertex/delphinja
+(`signatures/*.warp`, MIT, built from IDR knowledge bases and Delphi 10.4/11 packages). **[verified]** Function GUID =
+UUIDv5 (namespace `0192a179-61ac-7cef-88ed-012296e9492f`) of the block GUIDs ordered by ascending start address; block
+GUID = UUIDv5 (namespace `0192a178-7a5f-7936-8653-3cbaa7d6afe7`) of the block's instruction bytes with nops (and
+`mov r,r` of one register on x86) dropped and every "variant" instruction zeroed as a whole. The README says "highest
+to lowest" but the reference code and the data say ascending. Variant, in Binary Ninja's own LLIL: a constant or
+pointer operand that lies inside a segment or within 0x10000 of one. The GUID therefore depends on Binary Ninja's
+analysis (block recovery, no-return calls, lifter), but only mildly: rules that Ghidra bytes can reproduce give,
+**[verified]** on a Delphi 10 Seattle program (map file as truth, libraries of other compilers): zero the whole
+instruction for calls and for instructions with an operand or reference in the image; zero a jump only when it leaves
+the function or is indirect; keep conditional jumps and returns. Counting a conditional jump as variant drops the
+matches from 61% to 17% of the same-name pairs. Of the functions with a same-name entry in the libraries 61% have an
+equal GUID (the rest differ in code between compiler versions, or in Binary Ninja's blocks). Over all functions of
+16 bytes or more: 27% (capstone blocks) and 35% (Ghidra blocks) got a name, 94% of them with the right name or the
+same name under an older unit name; ambiguous GUIDs (more than 3 names) are dropped. The `.warp` file is a FlatBuffers
+`File` with chunks that the delphinja files store zlib packed although the header says zstd; `read_warp` takes the
+magic. Constraints (called functions, adjacency) are read but not used. Blocks come from the capstone recursive
+descent over the PE bytes (`image_blocks`, 32-bit, same input as the IDR matcher) or from the worker op `warp_blocks`
+(Ghidra blocks plus per-instruction facts). They agree on 81% of the functions; the rest differ in no-return and
+function extent handling. 64-bit is not done (no Delphi 64-bit library exists).
 
 ### dotnet
 
@@ -1699,6 +1771,23 @@ formats is the primary use case of this project.
   the entry including extended RTTI that follows the name). Published field table: `u16 count; ptr
   classTab`, then `pointer-wide offset; u16 typeIndex; ShortString name`; `classTab` is `u16 count` and
   pointers to cells that hold class references **[verified]**, 32-bit and 64-bit.
+- Extended method table (Delphi 2010 and later): right after the `count` entries of the method table, `u16
+  exCount` and `exCount` packed records `{ptr entry; u16 flags; i16 virtualIndex}` (`ps + 4` bytes each).
+  `entry` points to a method entry of the layout above, anywhere in the image (not necessarily inside the
+  table; with `count` 0 all entries lie elsewhere). The records name every method that has RTTI, published
+  or not, with its code address; an abstract method has code 0. Flags: bits 0 to 2 kind (1 static class
+  method, 2 method, 3 class method, 4 constructor, 5 destructor), bits 3 and 4 dispatch (0 static, 1
+  virtual, 2 dynamic, 3 message), bits 5 and 6 visibility (0 private, 1 protected, 2 public, 3 published),
+  bit 7 abstract. `virtualIndex` is the vtable index of a virtual method (negative for the standard
+  `TObject` virtuals `Equals` to `Destroy`, which sit before the class reference), the message number of a
+  message method, and a negative number otherwise. **[verified]** with Delphi 10 Seattle `dcc32` / `dcc64`
+  programs (map file as truth: every one of 5,605 / 5,648 RTTI methods starts a routine of the map and
+  5,603 / 5,646 carry the same class and method name; the other two are redeclared properties of a parent
+  class) and with the two real programs of the acceptance corpus (32- and 64-bit). Visibility 3 matched the
+  published methods of forms. In the RTL the table also lists private and protected methods (174 and 21 in
+  the oracle). Stored as `dl_method` rows of kind `rtti-<visibility>` (slot = virtual index, -1 when the
+  method is not virtual; no schema change); `DELPHI_VERSION` 2. The hint is `rtti: Unit.Class.Method`.
+  A table that is absent (older compilers) or does not parse gives no rows.
 - Virtual methods: consecutive code pointers from the class reference, up to the start of the next
   class's slots. Their names are unknown.
 - DFM: `RT_RCDATA` resources starting with `TPF0`. Component: optional prefix byte `0xF0 | flags`

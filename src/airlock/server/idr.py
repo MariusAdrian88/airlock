@@ -40,13 +40,15 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 3                      # bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 4                      # bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
 
 MIN_FIXED = 10                       # unmasked bytes a proc needs to be used (import thunks have 2)
-MAX_COPIES = 3                       # functions of one binary that may match the same proc
+MAX_COPIES = 3                       # functions of one binary that may match the same proc ...
+LONG_SHAPE = 64                      # ... unless it has this many compared bytes
+GENERIC_MIN = 16                     # ... or is a generic template (``TList<T>.Add``) with this many
 SAMPLE = 2500                        # functions used to choose between knowledge bases
 MAX_NAMES = 3                        # names listed for one function
 MAX_HITS_PAYLOAD = 4_000_000         # characters of the hits meta value
@@ -76,6 +78,7 @@ class KbFile:
     full: bool           # kb (RTL + VCL) rather than syskb (system units only)
     size: int
     sig: bool = False    # signature database built from a local Delphi install (``year`` = compiler version)
+    rtti: bool = False   # RTTI consensus database (``delphirtti``), a sigdb file named ``rtti-<compiler>-<bits>``
 
 
 def kb_folders(root: Path, psize: int) -> list[Path]:
@@ -96,6 +99,8 @@ def sig_files(sig_dir: Path | None, psize: int) -> list[KbFile]:
         return []
     for p in names:
         m = delphisigs.SIG_NAME.match(p.name)
+        r = None if m else re.match(r"^rtti-(\d+)-(32|64)\.sigdb$", p.name)
+        m = m or r
         if not m or int(m.group(2)) != psize * 8:
             continue
         try:
@@ -103,8 +108,9 @@ def sig_files(sig_dir: Path | None, psize: int) -> list[KbFile]:
         except OSError:
             continue
         if p.is_file() and st.st_size > 64:
-            out.append(KbFile(p, f"sig{m.group(1)}-{m.group(2)}", m.group(1), True, st.st_size, True))
-    return sorted(out, key=lambda f: int(f.year))
+            out.append(KbFile(p, f"{'rtti' if r else 'sig'}{m.group(1)}-{m.group(2)}", m.group(1), True, st.st_size,
+                              True, r is not None))
+    return sorted(out, key=lambda f: (int(f.year), f.rtti))
 
 
 def kb_files(root: Path | None, psize: int, sig_dir: Path | None = None) -> list[KbFile]:
@@ -154,6 +160,7 @@ class Proc:
     dump: int            # code bytes as a little-endian integer
     keep: int            # 0xFF for compared bytes, 0 for masked ones
     size: int
+    fixed: int = 0       # compared bytes
 
 
 class Kb:
@@ -179,7 +186,7 @@ class Kb:
             return
         a0, w = anchor
         keep = bytes(0 if r == 0xFF else 0xFF for r in reloc)
-        self.procs.append(Proc(name, int.from_bytes(dump, "little"), int.from_bytes(keep, "little"), n))
+        self.procs.append(Proc(name, int.from_bytes(dump, "little"), int.from_bytes(keep, "little"), n, fixed))
         self.table.setdefault((a0, dump[a0:a0 + w]), []).append(len(self.procs) - 1)
 
     def finish(self) -> None:
@@ -342,9 +349,21 @@ def match_procs(kb: Kb, img: Image, entry: int, size: int | None) -> list[int]:
     return out
 
 
+def _many_ok(p: Proc) -> bool:
+    """A proc that may match more than MAX_COPIES functions of one binary."""
+    return p.fixed >= LONG_SHAPE or ("<" in p.name and p.fixed >= GENERIC_MIN)
+
+
 def match_all(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]) -> dict[int, list[str]]:
     """{entry: names} for the functions that match. A proc that matches more than MAX_COPIES functions
-    is a common code shape (a wrapper around one call), not a routine of the runtime: it is dropped."""
+    is usually a common code shape (a wrapper around one call), not a routine of the runtime: it is dropped.
+    Two kinds of proc may match many functions and are kept: a generic template (``TList<T>.Add``: one
+    instance per element type) with at least ``GENERIC_MIN`` compared bytes, and a long shape
+    (``LONG_SHAPE`` compared bytes: such code is not a wrapper). A generic with fewer bytes is a stub that
+    thousands of program functions share.
+    Measured on programs with a map file as truth and on two real programs (DESIGN 11): the long and generic
+    procs add many named routines at a similar share of right names, the other procs add program methods that
+    only look like runtime code."""
     found: dict[int, list[int]] = {}
     copies: dict[int, int] = {}
     for entry, size in funcs:
@@ -355,7 +374,8 @@ def match_all(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]) -> dict[i
                 copies[i] = copies.get(i, 0) + 1
     out: dict[int, list[str]] = {}
     for entry, idxs in found.items():
-        names = sorted({kb.procs[i].name for i in idxs if copies[i] <= MAX_COPIES}, key=_name_rank)
+        names = sorted({kb.procs[i].name for i in idxs if copies[i] <= MAX_COPIES or _many_ok(kb.procs[i])},
+                       key=_name_rank)
         if names:
             out[entry] = names
     return out
@@ -415,18 +435,24 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
     the knowledge bases (and signature databases of other versions) then name the functions it left
     unnamed. Returns (label, matches, notes)."""
     comp = compiler_version(img)
-    exact = [f for f in files if f.sig and comp is not None and int(f.year) == comp]
-    pool = [f for f in files if f not in exact]
+    exact = [f for f in files if f.sig and not f.rtti and comp is not None and int(f.year) == comp]
+    rtti = [f for f in files if f.rtti and comp is not None and int(f.year) == comp]
+    pool = [f for f in files if f not in exact and f not in rtti]
     hits: dict[int, list[str]] = {}
     labels: list[str] = []
     notes: list[str] = []
-    if exact:
+    for tier in (exact[:1], rtti[:1]):           # exact-version database, then the RTTI consensus database
+        if not tier:
+            continue
+        rest = [x for x in funcs if x[0] not in hits] if hits else funcs
         try:
-            hits = match_all(load_kb(exact[0]), img, funcs)
-            labels.append(exact[0].label)
-            notes.append(f"{exact[0].label} {len(hits)}/{len(funcs)}")
+            got = match_all(load_kb(tier[0]), img, rest)
+            for entry, names in got.items():
+                hits.setdefault(entry, names)
+            labels.append(tier[0].label)
+            notes.append(f"{tier[0].label} {len(got)}/{len(rest)}")
         except KbError as e:
-            notes.append(f"{exact[0].label}: {e}")
+            notes.append(f"{tier[0].label}: {e}")
     if pool:
         rest = [x for x in funcs if x[0] not in hits] if hits else funcs
         f, more, n2 = _pick_idr(pool, img, rest, comp)
