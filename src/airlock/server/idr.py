@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 7               # bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 8               # bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -56,6 +56,7 @@ MAX_KB_BYTES = 600_000_000
 HEAD = 1024                          # bytes of a function read once; longer procs are read again
 ANCHOR_MAX = 48                      # a proc is keyed by a window of fixed bytes starting before this offset
 WINDOWS = (16, 12, 8, 6, 4)                 # window lengths, longest first
+CTX_MIN_VOTES = 1                    # callers that must give a callee the same name (call-context pass)
 PAD_SLACK = 16                       # a proc dump ends with up to 15 padding bytes that Ghidra leaves out
 
 _KB_NAME = re.compile(r"^(sys)?kb(\d+)\.bin$", re.IGNORECASE)
@@ -182,6 +183,7 @@ class Proc:
     keep: int            # 0xFF for compared bytes, 0 for masked ones
     size: int
     fixed: int = 0       # compared bytes
+    calls: tuple = ()    # ((offset of the rel32 operand, opcode 0xE8 / 0xE9, callee name), ...) of the reference
 
 
 class Kb:
@@ -195,7 +197,7 @@ class Kb:
         self.total = 0                  # proc records in the file
         self.skipped = 0                # code procs dropped (too few unmasked bytes)
 
-    def add(self, name: str, dump: bytes, reloc: bytes) -> None:
+    def add(self, name: str, dump: bytes, reloc: bytes, calls: tuple = ()) -> None:
         n = len(dump)
         fixed = n - reloc.count(0xFF)
         anchor = _anchor(reloc, n) if fixed >= MIN_FIXED else None
@@ -204,7 +206,8 @@ class Kb:
             return
         a0, w = anchor
         keep = bytes(0 if r == 0xFF else 0xFF for r in reloc)
-        self.procs.append(Proc(name, int.from_bytes(dump, "little"), int.from_bytes(keep, "little"), n, fixed))
+        self.procs.append(Proc(name, int.from_bytes(dump, "little"), int.from_bytes(keep, "little"), n, fixed,
+                               calls))
         self.table.setdefault((a0, dump[a0:a0 + w]), []).append(len(self.procs) - 1)
 
     def finish(self) -> None:
@@ -389,6 +392,12 @@ def match_all(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]) -> dict[i
     Measured on programs with a map file as truth and on two real programs (DESIGN 11): the long and generic
     procs add many named routines at a similar share of right names, the other procs add program methods that
     only look like runtime code."""
+    return _match(kb, img, funcs)[0]
+
+
+def _match(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]
+           ) -> tuple[dict[int, list[str]], dict[int, list[int]]]:
+    """(``match_all`` result, {entry: indexes of the procs behind those names})."""
     found: dict[int, list[int]] = {}
     copies: dict[int, int] = {}
     for entry, size in funcs:
@@ -398,12 +407,53 @@ def match_all(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]) -> dict[i
             for i in got:
                 copies[i] = copies.get(i, 0) + 1
     out: dict[int, list[str]] = {}
+    kept: dict[int, list[int]] = {}
     for entry, idxs in found.items():
-        names = sorted({kb.procs[i].name for i in idxs if copies[i] <= MAX_COPIES or _many_ok(kb.procs[i])},
-                       key=_name_rank)
+        ok = [i for i in idxs if copies[i] <= MAX_COPIES or _many_ok(kb.procs[i])]
+        names = sorted({kb.procs[i].name for i in ok}, key=_name_rank)
         if names:
             out[entry] = names
-    return out
+            kept[entry] = ok
+    return out, kept
+
+
+def call_context(kb: Kb, img: Image, entries: set[int], kept: dict[int, list[int]], known: set[int]
+                 ) -> dict[int, list[str]]:
+    """Names for the callees of named functions. A routine under ``MIN_FIXED`` compared bytes cannot be
+    matched by its code, but the database remembers, for each reference routine, the name of every callee
+    at the offset of its ``call`` / ``jmp`` operand. The code of a matched function equals the reference on
+    every compared byte, and the opcode byte before the operand is one of them: the instruction at that
+    offset is the same call, so its target plays the same role as the reference callee. The target gets the
+    callee's name when it is an unnamed function (``entries`` minus ``known``) and all callers (at least
+    ``CTX_MIN_VOTES``) agree; one disagreeing name rejects it. Returns {entry: [name]}."""
+    if not any(p.calls for p in kb.procs):
+        return {}
+    mask = (1 << (8 * img.psize)) - 1
+    votes: dict[int, dict[str, int]] = {}
+    for entry, idxs in kept.items():
+        at: dict[tuple[int, int], set[str]] = {}
+        for i in idxs:
+            for off, op, name in kb.procs[i].calls:
+                at.setdefault((off, op), set()).add(name)
+        for (off, op), names in at.items():
+            if len(names) != 1:                      # aliases of one routine disagree here
+                continue
+            raw = img.read(entry + off - 1, 5)
+            if raw is None or raw[0] != op:
+                continue
+            tgt = (entry + off + 4 + int.from_bytes(raw[1:], "little", signed=True)) & mask
+            if tgt in entries and tgt not in known and tgt != entry:
+                v = votes.setdefault(tgt, {})
+                nm = next(iter(names))
+                v[nm] = v.get(nm, 0) + 1
+    return {t: [next(iter(v))] for t, v in votes.items() if len(v) == 1 and sum(v.values()) >= CTX_MIN_VOTES}
+
+
+def match_with_context(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]
+                       ) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
+    """(names by code, names by call context) for the functions; the second never repeats the first."""
+    names, kept = _match(kb, img, funcs)
+    return names, call_context(kb, img, {e for e, _s in funcs}, kept, set(names))
 
 
 # -- store ------------------------------------------------------------------------------------
@@ -478,11 +528,13 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
             continue
         rest = [x for x in funcs if x[0] not in hits] if hits else funcs
         try:
-            got = match_all(load_kb(tier[0]), img, rest)
+            got, ctx = match_with_context(load_kb(tier[0]), img, rest)
             for entry, names in got.items():
                 hits.setdefault(entry, names)
+            for entry, names in ctx.items():
+                hits.setdefault(entry, names)
             labels.append(tier[0].label)
-            notes.append(f"{tier[0].label} {len(got)}/{len(rest)}")
+            notes.append(f"{tier[0].label} {len(got)}/{len(rest)}" + (f" +{len(ctx)} by calls" if ctx else ""))
         except KbError as e:
             notes.append(f"{tier[0].label}: {e}")
     score = [x for x in funcs if x[0] not in hits] if hits else funcs   # the IDR file is chosen on these,

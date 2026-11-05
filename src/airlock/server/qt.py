@@ -41,9 +41,9 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-QT_VERSION = 2   # 2: Qt6 SuperData getter layout, Qt6 notify ids, C++ import rows, connect call sites through import slots
+QT_VERSION = 3   # 3: Itanium import names, string connects with the import loaded into a register; 2: Qt6 SuperData getter layout, Qt6 notify ids, C++ import rows, connect call sites through import slots
 QT_META = "qt_version"             # meta key prefix; the full key is ``qt_version:<binary id>``
-DISPATCH_VERSION = 2   # 2: pointer-to-member connects (worker op qt_connects)
+DISPATCH_VERSION = 3   # 3: connectImpl calls through a register, 32-bit and Itanium shapes; 2: pointer-to-member connects (worker op qt_connects)
 DISPATCH_META = "qt_dispatch"      # set when the worker op ran (``qt_dispatch:<binary id>``)
 
 HEADER_WORDS = 14
@@ -491,9 +491,41 @@ def pe_imports(path: Path) -> dict[int, str]:
 _MSVC_FN = re.compile(r"^\?(\?[01])?((?:[A-Za-z_][\w]*@)+)@")
 
 
+_ITANIUM_ID = re.compile(r"(\d+)")
+_ITANIUM_CD = re.compile(r"^(C[1-3]|D[0-5])")
+
+
+def _itanium_qualname(mangled: str) -> str:
+    """``_ZN7QObject11connectImplEPKS_...`` -> ``QObject::connectImpl`` (nested names of plain identifiers,
+    constructors and destructors; "" for templates, substitutions and operators)."""
+    i = 4 if mangled.startswith("_ZNK") else 3
+    parts: list[str] = []
+    while i < len(mangled):
+        m = _ITANIUM_ID.match(mangled, i)
+        if not m:
+            break
+        n = int(m.group(1))
+        ident = mangled[m.end():m.end() + n]
+        if len(ident) != n:
+            return ""
+        parts.append(ident)
+        i = m.end() + n
+    if not parts:
+        return ""
+    cd = _ITANIUM_CD.match(mangled[i:i + 2]) if i < len(mangled) else None
+    if cd:
+        name = ("~" if cd.group(1)[0] == "D" else "") + parts[-1]
+        return "::".join([*parts, name])
+    if mangled[i:i + 1] != "E":      # template arguments (I...), operators, substitutions: not read
+        return ""
+    return "::".join(parts)
+
+
 def import_qualname(mangled: str) -> str:
-    """``?connectImpl@QObject@@CA...`` -> ``QObject::connectImpl``; ``??0Foo@@...`` -> ``Foo::Foo``; "" for the
-    forms this does not read (templates, operators, Itanium names)."""
+    """``?connectImpl@QObject@@CA...`` / ``_ZN7QObject11connectImplE...`` -> ``QObject::connectImpl``;
+    ``??0Foo@@...`` -> ``Foo::Foo``; "" for the forms this does not read (templates, operators)."""
+    if mangled.startswith("_ZN"):
+        return _itanium_qualname(mangled)
     m = _MSVC_FN.match(mangled)
     if not m:
         return ""
@@ -514,7 +546,7 @@ def fill_imports(store: Store, binary_id: int, artifact: Path) -> int:
                                            (binary_id,))}
     add = []
     for dll, name, slot in rows:
-        if slot in have or not name.startswith("?"):
+        if slot in have or not name.startswith(("?", "_ZN")):
             continue
         q = import_qualname(name)
         if q:
@@ -639,11 +671,33 @@ def resolve(ix: Any, project: str, store: Store, b: Binary) -> tuple[int, int]:
         (b.id,))]
     if sites:        # pointer-to-member connects: the signal and the slot of each connectImpl call site
         try:
-            cres = ix.worker.request("qt_connects", {"program": program, "sites": sites}, timeout=3600)
+            imps = {r[0]: r[1] for r in store.db.execute(
+                "SELECT address, name FROM import WHERE binary_id=? AND address IS NOT NULL AND name LIKE '%::%'",
+                (b.id,))}
+            cres = ix.worker.request("qt_connects", {"program": program, "sites": sites, "imports": imps},
+                                     timeout=3600)
             store_connects(store, b.id, cres, sites)
+            if (cres.get("stats") or {}).get("signatures", 0) > 0:
+                bump_connect_callers(store, b.id)      # the signature changed the decompiler output of the callers
         except Exception as e:  # noqa: BLE001  an extra: the call sites stay listed
             log.warning("Qt pointer connects of %s failed: %s", b.name, e)
     return out
+
+
+def bump_connect_callers(store: Store, binary_id: int) -> int:
+    """Invalidate the cached decompiles of every function that calls ``connectImpl`` (its signature changed, so
+    the decompiler output differs): ``function.version`` +1 through ``Store.bump_versions``. Returns rows bumped."""
+    slots = [a for a, k in _connect_slots(store.db, binary_id).items() if k == "ptr"]
+    ids = {r[0] for r in store.db.execute("SELECT DISTINCT src_fn FROM edge WHERE binary_id=? AND src_fn IS NOT NULL "
+                                          "AND dst_addr IN (%s)" % ",".join("?" * len(slots)), (binary_id, *slots))}         if slots else set()
+    ids |= {r[0] for r in store.db.execute(
+        "SELECT f.id FROM qt_connect q JOIN function f ON f.binary_id=q.binary_id AND f.entry=q.fn_entry "
+        "WHERE q.binary_id=? AND q.kind='ptr'", (binary_id,))}
+    cfn = [i for i, k in _connect_functions(store.db, binary_id).items() if k == "ptr"]
+    if cfn:
+        ids |= {r[0] for r in store.db.execute("SELECT DISTINCT src_fn FROM edge WHERE binary_id=? AND src_fn IS NOT NULL "
+                                               "AND dst_fn IN (%s)" % ",".join("?" * len(cfn)), (binary_id, *cfn))}
+    return store.bump_versions(ids)
 
 
 def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]) -> tuple[int, int]:
@@ -670,6 +724,8 @@ def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]
         sg, sl = r.get("signal") or {}, r.get("slot") or {}
         if sg.get("ext"):
             sig = sg["ext"]
+        elif sg.get("virtual") is not None:
+            sig = f"vtable+0x{sg['virtual']:x}"
         elif "meta" in sg and (sg["meta"], sg.get("idx", -1)) in sig_by_idx:
             sig = sig_by_idx[(sg["meta"], sg["idx"])]
         elif sg.get("addr") in by_addr:
@@ -678,6 +734,8 @@ def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]
             sig = f"0x{sg.get('addr', 0):x}"
         if sl.get("ext"):
             slot, kind = sl["ext"], "ext"
+        elif sl.get("virtual") is not None:
+            slot, kind = f"vtable+0x{sl['virtual']:x}", "virtual"
         elif sl.get("addr") is None:
             slot, kind = "", ""
         else:
@@ -686,7 +744,12 @@ def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]
             if kind == "method":
                 kind = "slot"
         rows.append((binary_id, r["fn"], r["site"], "ptr", sig, slot, kind))
-        found.add(r["site"])
+        found.add(r.get("origin", r["site"]))        # a call chased up to a caller counts for the site it started at
+    expanded = {int(k): v for k, v in (result.get("expanded") or {}).items()}
+    if expanded:        # a site that is no call (the import was loaded into a register) stands for the calls of its function
+        sites = [x for s in sites for x in ([{"fn": s["fn"], "site": c} for c in expanded[s["site"]]]
+                                            if s["site"] in expanded else [s])]
+        sites = list({(s["fn"], s["site"]): s for s in sites}.values())
     left = [s for s in sites if s["site"] not in found]
     rows += [(binary_id, s["fn"], s["site"], "ptr", "", "", "") for s in left]
     with db:
@@ -764,6 +827,8 @@ def derive_connects(store: Store, binary_id: int) -> int:
       (the two closest to the call). The signal is the string that starts with ``2``; if both do, the order of
       the argument pushes decides (32-bit cdecl pushes the slot first).
     * ``connectImpl`` (pointer to member form) takes no strings: each call site is listed (kind ``ptr``).
+    * Pairs made by order alone (strings no call site claimed, or no connect function at all) are a guess: kind
+      ``string-guess``, not counted as connections.
     * Without any identifiable connect function (a statically linked Qt), a signal string is paired with the
       next string of the same function.
     """
@@ -820,24 +885,40 @@ def derive_connects(store: Store, binary_id: int) -> int:
         seen_fn.add(fn)
         refs = by_fn.get(fn, [])
         prev = -1
+        used: set[int] = set()
+        has_string = False
         for site, kind in cl:
             if kind == "ptr":
                 out.append((binary_id, fn, site, "ptr", "", "", ""))
                 prev = site
                 continue
+            has_string = True
             window = [r for r in refs if prev < r[0] < site]
             prev = site
             if len(window) >= 2:
                 got = pair(window[-2], window[-1])
                 if got is not None:
                     out.append((binary_id, fn, site, "string", got[0], got[1], got[2]))
+                    used.update((window[-2][0], window[-1][0]))
+        if has_string:
+            # the compiler may load the import into a register once and call it from there (MinGW): the strings
+            # that no call site claimed are paired in order, as without any connect function
+            rest = [r for r in refs if r[0] not in used]
+            i = 0
+            while i + 1 < len(rest):
+                got = pair(rest[i], rest[i + 1])
+                if got is not None:
+                    out.append((binary_id, fn, got[3], "string-guess", got[0], got[1], got[2]))
+                    i += 2
+                else:
+                    i += 1
     if not calls:
         for fn, refs in by_fn.items():
             i = 0
             while i + 1 < len(refs):
                 got = pair(refs[i], refs[i + 1])
                 if got is not None:
-                    out.append((binary_id, fn, got[3], "string", got[0], got[1], got[2]))
+                    out.append((binary_id, fn, got[3], "string-guess", got[0], got[1], got[2]))
                     i += 2
                 else:
                     i += 1
@@ -883,11 +964,15 @@ def ui_line(store: Store, binary_id: int) -> str:
             "SELECT SUM(kind='signal'), SUM(kind='slot'), SUM(kind IN ('signal','slot') AND addr IS NOT NULL) "
             "FROM qt_method WHERE binary_id=?", (binary_id,)).fetchone()
         c = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='string'", (binary_id,)).fetchone()[0]
+        g = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='string-guess'",
+                             (binary_id,)).fetchone()[0]
         pc = store.db.execute("SELECT COUNT(*), SUM(signal<>'') FROM qt_connect WHERE binary_id=? AND kind='ptr'",
                               (binary_id,)).fetchone()
     except Exception:  # noqa: BLE001  an extra
         return ""
     extra = f", string connections {c}" if c else ""
+    if g:
+        extra += f", {g} string pairs guessed by order"
     if pc and pc[0]:
         extra += f", pointer connects {pc[1] or 0} of {pc[0]} call sites resolved"
     return f"Qt: {n} classes, signals {r[0] or 0}, slots {r[1] or 0} ({r[2] or 0} signals and slots mapped to functions){extra}"

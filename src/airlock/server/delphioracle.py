@@ -6,7 +6,9 @@ analysis uses, ``idr.match_all``) and compares with the map. Routines of units t
 *library* routines; a database can only know those. ``right`` = a returned name equals the map name (generic
 arguments ignored: ``TList<X>.Add`` equals ``TList<T>.Add``), ``exact`` = the same without ignoring them,
 ``wrong`` = a name that differs, ``none`` = no name. Counted for all routines and for those of at least
-``MIN_BIG`` bytes.
+``MIN_BIG`` bytes. The measurement runs the passes in the order of the analysis and reports each stage: the
+database by code (``sigdb``), plus the call-context pass (``idr.call_context``), plus the property accessors
+(``delphi.accessor_names``, named ``Class.GetProp`` by convention).
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import bisect
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from airlock.server import delphimap as dm, idr
+from airlock.server import delphi, delphimap as dm, idr
 from airlock.server.cpp import Image
 
 MIN_BIG = 24
@@ -35,6 +37,14 @@ class Counts:
 
 
 @dataclass
+class Stage:
+    label: str
+    all: Counts = field(default_factory=Counts)
+    big: Counts = field(default_factory=Counts)
+    added: Counts = field(default_factory=Counts)      # routines this stage named (library routines only)
+
+
+@dataclass
 class OracleResult:
     compiler: int
     bits: int
@@ -43,8 +53,15 @@ class OracleResult:
     library: int
     own_named: int
     own_total: int
-    all: Counts = field(default_factory=Counts)
-    big: Counts = field(default_factory=Counts)
+    stages: list[Stage] = field(default_factory=list)
+
+    @property
+    def all(self) -> Counts:
+        return self.stages[0].all
+
+    @property
+    def big(self) -> Counts:
+        return self.stages[0].big
 
 
 def norm(n: str) -> str:
@@ -109,16 +126,27 @@ def measure(exe: Path, mp: Path, sigdir: Path, own_dir: Path | None = None) -> O
             size = None
         funcs.append((img.base + rva, size))
         info[img.base + rva] = (named[rva], m, size)
-    hits = idr.match_all(kb, img, funcs)
+    code_hits, ctx = idr.match_with_context(kb, img, funcs)
+    with_ctx = {**ctx, **code_hits}
+    props = {a: [n] for a, n in delphi.accessor_names(delphi.parse_classes(img)).items()
+             if a in info and a not in with_ctx}
+    with_props = {**props, **with_ctx}
     lib = [a for a in info if (info[a][1] or "").lower() not in own]
     res = OracleResult(comp, img.psize * 8, len(kb.procs), len(funcs), len(lib), 0, len(funcs) - len(lib))
-    for a in lib:
-        truth, _m, sz = info[a]
-        score(hits.get(a), truth, res.all)
-        if sz is not None and sz >= MIN_BIG:
-            score(hits.get(a), truth, res.big)
+    prev: dict[int, list[str]] = {}
+    for label, hits in (("sigdb", code_hits), ("+calls", with_ctx), ("+props", with_props)):
+        st = Stage(label)
+        for a in lib:
+            truth, _m, sz = info[a]
+            score(hits.get(a), truth, st.all)
+            if sz is not None and sz >= MIN_BIG:
+                score(hits.get(a), truth, st.big)
+            if a in hits and a not in prev:
+                score(hits.get(a), truth, st.added)
+        res.stages.append(st)
+        prev = hits
     libs = set(lib)
-    res.own_named = sum(1 for a in info if a not in libs and a in hits)
+    res.own_named = sum(1 for a in info if a not in libs and a in with_props)
     return res
 
 
@@ -129,9 +157,11 @@ def format_result(r: OracleResult) -> str:
                 f"({100 * c.exact / d:.1f}%), wrong {c.wrong} ({100 * c.wrong / d:.1f}%), none {c.none} "
                 f"({100 * c.none / d:.1f}%)")
 
-    return "\n".join([
-        f"compiler {r.compiler}, {r.bits}-bit, {r.sigdb_names} database names, {r.routines} map routines, "
-        f"{r.library} library ({100 * r.library / max(1, r.routines):.1f}%)",
-        row("all", r.all),
-        row(f">={MIN_BIG} bytes", r.big),
-        f"own code named: {r.own_named} of {r.own_total}"])
+    lines = [f"compiler {r.compiler}, {r.bits}-bit, {r.sigdb_names} database names, {r.routines} map routines, "
+             f"{r.library} library ({100 * r.library / max(1, r.routines):.1f}%)"]
+    for st in r.stages:
+        lines += [row(f"[{st.label}] all", st.all), row(f"[{st.label}] >={MIN_BIG} bytes", st.big)]
+        if st is not r.stages[0]:
+            lines.append(row(f"[{st.label}] newly named", st.added))
+    lines.append(f"own code named: {r.own_named} of {r.own_total}")
+    return "\n".join(lines)

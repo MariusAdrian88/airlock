@@ -396,6 +396,113 @@ def test_ensure_uses_signatures_without_knowledge_bases(proj, tmp_path):  # noqa
     assert idr.stale(st, b, None, sig) and idr.ensure(st, b, art, None, sig) and idr.hits(st, bid) == {}
 
 
+# ── call lists and the call-context pass ────────────────────────────────────
+
+TINY = b"\x8b\x40\x04\xc3"                 # mov eax,[eax+4]; ret: under 10 compared bytes, no code signature
+
+
+def caller(seed: int) -> bytes:
+    """``body`` with a ``call rel32`` opcode in front of the operand slot at 18."""
+    b = bytearray(body(seed))
+    b[17] = 0xE8
+    return bytes(b)
+
+
+def linked(raw: bytes, at: int, callee: int, v1: int = 0x1000) -> bytes:
+    """``raw`` placed at VA ``at`` with its call operand pointing to ``callee``."""
+    return relocated(raw, v1, 0)[:18] + struct.pack("<i", callee - (at + 22)) + raw[22:]
+
+
+def test_database_with_call_lists_roundtrip_and_old_files(tmp_path):
+    raw = caller(1)
+    calls = ((18, 0xE8, "System.Tiny.Get"), (30, 0xE9, "System.Tiny.Jump"))
+    delphisigs.write_sigdb(tmp_path / "30-32.sigdb", 30, 4,
+                           [("System.A", raw, masks(len(raw)), calls), ("System.B", body(2), masks(24))])
+    kb = delphisigs.read_sigdb(tmp_path / "30-32.sigdb")
+    assert [p.calls for p in kb.procs] == [calls, ()]                       # a 3-tuple record has an empty list
+    assert delphisigs.read_sigdb_header(tmp_path / "30-32.sigdb")["format"] == 3
+    delphisigs.write_sigdb(tmp_path / "30-64.sigdb", 30, 8, [("System.A", raw, masks(len(raw)))])    # old layout
+    head = delphisigs.read_sigdb_header(tmp_path / "30-64.sigdb")
+    assert "calls" not in head and delphisigs.read_sigdb(tmp_path / "30-64.sigdb").procs[0].calls == ()
+
+
+def _ctx_image(tmp_path, names: dict[str, bytes]):
+    """Functions at 64-byte slots: caller1, callee, caller2 (so the callee sits at slot 1)."""
+    path, at = make_image(tmp_path, names, data=COMPILER)
+    return Image.from_pe(path), at
+
+
+def test_call_context_names_unnamed_callees(tmp_path):
+    base = 0x400000 + 0x1000
+    c1, c2, other = caller(1), caller(3), body(9)
+    sig = tmp_path / "30-32.sigdb"
+    delphisigs.write_sigdb(sig, 30, 4, [
+        ("System.One", c1, masks(len(c1)), ((18, 0xE8, "System.Tiny.Get"),)),
+        ("System.Two", c2, masks(len(c2)), ((18, 0xE8, "System.Tiny.Get"),)),
+        ("System.Other", other, masks(len(other)))])
+    callee = base + 64
+    img, at = _ctx_image(tmp_path, {"c1": linked(c1, base, callee), "tiny": TINY,
+                                    "c2": linked(c2, base + 128, callee), "named": linked(other, base + 192, 0)})
+    kb = delphisigs.read_sigdb(sig)
+    funcs = [(a, None) for a in at.values()]
+    names, ctx = idr.match_with_context(kb, img, funcs)
+    assert names[at["c1"]] == ["System.One"] and names[at["c2"]] == ["System.Two"]
+    assert ctx == {at["tiny"]: ["System.Tiny.Get"]}
+    label, hits, notes = idr._pick(idr.sig_files(tmp_path, 4), img, funcs)
+    assert hits[at["tiny"]] == ["System.Tiny.Get"] and "+1 by calls" in notes[0]
+    # a callee that code already names keeps that name
+    tiny_named = body(7)
+    delphisigs.write_sigdb(sig, 30, 4, [
+        ("System.One", c1, masks(len(c1)), ((18, 0xE8, "System.Tiny.Get"),)),
+        ("System.Real", tiny_named, masks(len(tiny_named)))])
+    img, at = _ctx_image(tmp_path, {"c1": linked(c1, base, callee), "tiny": tiny_named})
+    names, ctx = idr.match_with_context(delphisigs.read_sigdb(sig), img, [(a, None) for a in at.values()])
+    assert names[at["tiny"]] == ["System.Real"] and ctx == {}
+
+
+def test_call_context_rejects_conflicts_and_wrong_opcodes(tmp_path):
+    base = 0x400000 + 0x1000
+    c1, c2 = caller(1), caller(3)
+    sig = tmp_path / "30-32.sigdb"
+    delphisigs.write_sigdb(sig, 30, 4, [
+        ("System.One", c1, masks(len(c1)), ((18, 0xE8, "System.Tiny.Get"),)),
+        ("System.Two", c2, masks(len(c2)), ((18, 0xE8, "System.Tiny.Other"),))])
+    callee = base + 64
+    img, at = _ctx_image(tmp_path, {"c1": linked(c1, base, callee), "tiny": TINY, "c2": linked(c2, base + 128, callee)})
+    funcs = [(a, None) for a in at.values()]
+    assert idr.match_with_context(delphisigs.read_sigdb(sig), img, funcs)[1] == {}       # two callers disagree
+    # the reference remembers a jmp (E9) at that offset: the call in this function is another instruction
+    delphisigs.write_sigdb(sig, 30, 4, [("System.One", c1, masks(len(c1)), ((18, 0xE9, "System.Tiny.Get"),))])
+    assert idr.match_with_context(delphisigs.read_sigdb(sig), img, funcs)[1] == {}
+    # a target that is not a known function start gets no name
+    img, at = _ctx_image(tmp_path, {"c1": linked(c1, base, callee + 2), "tiny": TINY})
+    delphisigs.write_sigdb(sig, 30, 4, [("System.One", c1, masks(len(c1)), ((18, 0xE8, "System.Tiny.Get"),))])
+    assert idr.match_with_context(delphisigs.read_sigdb(sig), img, [(a, None) for a in at.values()])[1] == {}
+
+
+def test_scan_records_calls_to_named_routines(tmp_path):
+    pytest.importorskip("capstone")
+    # layout of make_bpl: routines 16-aligned from rva 0x1000; the callee follows the caller
+    code, rel = routine32(0, BASE32 + 0x5000)
+    callee_rva = 0x1000 + (len(code) + 15) // 16 * 16
+    code, rel = routine32(callee_rva - (0x1000 + 17), BASE32 + 0x5000)
+    make_bpl(tmp_path / "t.bpl", [("@System@Foo@Run$qqrv", code), ("@System@Foo@Get$qqrv", TINY + b"\x90" * 4)], rel)
+    _ps, plain = delphisigs.scan_bpl(str(tmp_path / "t.bpl"))
+    assert all(len(r) == 3 for r in plain)
+    _ps, recs = delphisigs.scan_bpl(str(tmp_path / "t.bpl"), True)
+    by = {r[0]: r for r in recs}
+    assert by["System.Foo.Run"][3] == ((13, 0xE8, "System.Foo.Get"),)
+    assert by["System.Foo.Run"][1:3] == plain[0][1:3] or by["System.Foo.Run"][1:3] == plain[1][1:3]
+
+
+def test_map_calls_upgrade_exported_records():
+    rec = ("A", b"x", b"y", ((5, 0xE8, "Old"), (9, 0xE8, "Keep")))
+    assert delphisigs._with_calls(rec, ((5, 0xE8, "New"), (20, 0xE9, "Add")))[3] == (
+        (5, 0xE8, "New"), (9, 0xE8, "Keep"), (20, 0xE9, "Add"))
+    assert delphisigs._with_calls(("A", b"x", b"y"), ((1, 0xE8, "N"),))[3] == ((1, 0xE8, "N"),)
+    assert delphisigs._with_calls(rec, None) is rec
+
+
 # ── configuration and command ────────────────────────────────────────────────
 
 def test_config_key_default_and_override(tmp_path):

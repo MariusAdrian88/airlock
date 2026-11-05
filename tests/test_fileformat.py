@@ -314,3 +314,153 @@ def test_record_guess_no_false_chain_in_text_or_tables(env):
     assert "records from" not in _rg(env, "t.txt", b"The quick brown fox jumps over the lazy dog. " * 300)
     small = bytes(rnd.choice([0, 0, 0, 1, 2, 3, 0, 4, 0, 5]) for _ in range(20000))
     assert "records from" not in _rg(env, "n.bin", small)
+
+
+# -- OpenPGP packets, delimited text, registry policy, small tables, sample streams -----------------
+
+def _pgp_packet(tag, body, kind="old"):
+    n = len(body)
+    if kind == "new":
+        hdr = bytes([0xc0 | tag]) + (bytes([n]) if n < 192 else bytes([192 + ((n - 192) >> 8), (n - 192) & 255]))
+    elif n < 256:
+        hdr = bytes([0x80 | tag << 2, n])
+    else:
+        hdr = bytes([0x80 | tag << 2 | 1]) + n.to_bytes(2, "big")
+    return hdr + body
+
+
+def test_record_guess_openpgp_packets(env):
+    rnd = random.Random(11)
+
+    def rb(n):
+        return bytes(rnd.randrange(256) for _ in range(n))
+
+    def mpi(nbytes):
+        return struct.pack(">H", nbytes * 8) + bytes([0x80]) + rb(nbytes - 1)
+
+    def pubkey():
+        return bytes([4]) + rb(4) + bytes([1]) + mpi(128) + mpi(3)
+
+    def sig(rsa_len):
+        hashed = bytes([5, 2]) + rb(4)
+        return (bytes([4, 0x13, 1, 8]) + struct.pack(">H", len(hashed)) + hashed + bytes([0, 10, 9, 16])
+                + rb(6) + rb(2) + mpi(rsa_len))
+    key = (_pgp_packet(6, pubkey()) + _pgp_packet(13, b"Test User <t@example.org>")
+           + _pgp_packet(2, sig(256)) + _pgp_packet(14, pubkey(), "new") + _pgp_packet(2, sig(128), "new"))
+    out = _rg(env, "k.gpg", key)
+    assert "openpgp packets: 5 records from 0x0" in out
+    assert f"chain ends exactly at {hex(len(key))}" in out
+    assert "pubkey" in out and "uid" in out and "sigx2" in out
+    assert "old 1B" in out and "old 2B" in out and "new 1B" in out
+    # a flipped length byte breaks the chain: no claim
+    bad = bytearray(key)
+    bad[1] += 7
+    assert "openpgp" not in _rg(env, "bad.gpg", bytes(bad))
+    # a key packet whose body does not parse (unknown algorithm, MPI too long) is no claim
+    assert "openpgp" not in _rg(env, "one.gpg", _pgp_packet(6, bytes([4]) + rb(4) + bytes([0x63]) + rb(200)))
+    assert "openpgp packets: 1 records" in _rg(env, "pub.gpg", _pgp_packet(6, pubkey()))
+    # a chain that starts at a non-zero offset needs 3 packets
+    assert "openpgp" not in _rg(env, "off.gpg", bytes(3) + _pgp_packet(6, pubkey()))
+
+
+def test_record_guess_no_openpgp_in_random_data(env):
+    rnd = random.Random(2)
+    for i in range(300):
+        data = bytes(rnd.randrange(256) for _ in range(rnd.choice([40, 300, 3000])))
+        assert "openpgp" not in _rg(env, f"r{i}.bin", data)
+
+
+def test_record_guess_delimited_text(env):
+    rows = ["id,name,score,when"] + [f"{i},user{i * 7 % 13},{i * 1.5:.1f},2024-01-{i % 28 + 1:02d}" for i in range(60)]
+    out = _rg(env, "t.csv", ("\r\n".join(rows) + "\r\n").encode())
+    assert "delimited text (ascii/utf-8): 60 rows x 4 fields, separator comma, CRLF" in out
+    assert "header row: id,name,score,when" in out
+    assert "field 1 id: int 0..59" in out and "field 3 score: number" in out and "field 4 when: date" in out
+    # semicolon with quoted separators, inside a binary blob
+    body = "\n".join(f'{i};"a;b {i}";{i * 3}' for i in range(40)).encode()
+    blob = bytes(range(256)) * 3 + b"\x00\x01" + body + b"\x00" + bytes(range(255, 0, -1))
+    out = _rg(env, "blob.bin", blob)
+    assert "delimited text" in out and "separator semicolon" in out and "x 3 fields" in out
+    # tab separated, utf-16le
+    tsv = "\n".join(f"{i}\tname{i}\t{i * i}" for i in range(30)).encode("utf-16le")
+    assert "separator tab" in _rg(env, "u.tsv", b"\xff\xfe" + tsv)
+    # prose with commas is not a table
+    prose = ("The quick brown fox, which was tired, jumped over the dog.\n"
+             "Meanwhile, the dog slept. It did not notice, or care, about the fox.\n"
+             "Later on, in the evening, everybody went home, and that was that.\n"
+             "No more words, said the author, are needed to finish this short text.\n" * 3).encode()
+    assert "delimited text" not in _rg(env, "p.txt", prose)
+
+
+def test_record_guess_registry_policy(env):
+    def rec(key, val, typ, data):
+        u = lambda s: s.encode("utf-16le") + b"\0\0"  # noqa: E731
+        return (b"[\0" + u(key) + b";\0" + u(val) + b";\0" + struct.pack("<I", typ) + b";\0"
+                + struct.pack("<I", len(data)) + b";\0" + data + b"]\0")
+    data = b"PReg\x01\0\0\0" + b"".join(
+        rec(f"Software\Policies\Vendor{i % 3}", f"Value{i}", 4 if i % 2 else 1,
+            struct.pack("<I", i) if i % 2 else "text".encode("utf-16le") + b"\0\0") for i in range(12))
+    out = _rg(env, "r.pol", data)
+    assert "bracketed records [key;value;type;size;data] (utf-16le): 12 records from 0x8" in out
+    assert "dwordx6" in out and "szx6" in out and "3 distinct keys" in out
+
+
+def _ico_like(n, rnd):
+    imgs = [bytes(rnd.randrange(256) for _ in range(rnd.randrange(80, 400))) for _ in range(n)]
+    off = 6 + 16 * n
+    ent = b""
+    for im in imgs:
+        ent += struct.pack("<BBBBHHII", 16, 16, 0, 0, 1, 32, len(im), off)
+        off += len(im)
+    return struct.pack("<HHH", 0, 1, n) + ent + b"".join(imgs)
+
+
+def test_record_guess_small_offset_table(env):
+    out = _rg(env, "a.ico", _ico_like(4, random.Random(4)))
+    assert "offset/length table: 4 entries x 16 bytes from 0x6; offset u32le at +12, length u32le at +8" in out
+    assert "right after the table" in out
+    # TrueType-like directory: big endian, sorted by tag, offsets unordered
+    rnd = random.Random(8)
+    tabs = [(t, bytes(rnd.randrange(256) for _ in range(rnd.randrange(50, 300)))) for t in (b"OS/2", b"cmap", b"head", b"glyf", b"name")]
+    off = 12 + 16 * len(tabs)
+    ent, body = b"", b""
+    for t, b in tabs:
+        ent += t + struct.pack(">III", 0x1234, off + len(body), len(b))
+        body += b + b"\0" * (-len(b) % 4)
+    out = _rg(env, "f.ttf", struct.pack(">IHHHH", 0x10000, len(tabs), 0, 0, 0) + ent + body)
+    assert "offset/length table: 5 entries x 16 bytes from 0xc; offset u32be at +8, length u32be at +12" in out
+    # a header with random fields has no table
+    rnd = random.Random(9)
+    assert "offset/length" not in _rg(env, "n.bin", bytes(rnd.randrange(256) for _ in range(2000)))
+    # a dBase-like field list with shifted small numbers is no directory
+    fl = b"".join(b"FIELD%02d\0\0\0C" % i + b"\0\0\0\0" + bytes([10 + i, 0]) + b"\0" * 14 for i in range(8))
+    assert "offset/length" not in _rg(env, "d.dat", fl + b"\x0d" + b" " * 3000)
+
+
+def _wave(n, rnd, stereo=False):
+    import math as m
+    out = bytearray()
+    for i in range(n):
+        v = 128 + 70 * m.sin(i / 9.0) + 30 * m.sin(i / 3.1) + rnd.gauss(0, 2)
+        out.append(max(0, min(255, int(v))))
+        if stereo:
+            out.append(max(0, min(255, int(128 + 60 * m.sin(i / 7.0) + rnd.gauss(0, 2)))))
+    return bytes(out)
+
+
+def test_record_guess_sample_stream(env):
+    rnd = random.Random(6)
+    out = _rg(env, "s8.raw", _wave(20000, rnd))
+    assert "sample stream: 8-bit PCM-like waveform" in out and "no records" in out
+    assert "fixed stride" not in out and "strings" not in out
+    assert "sample stream" in _rg(env, "s8st.raw", _wave(20000, rnd, stereo=True))
+    # a RIFF header in front keeps its exact chain but no stride is claimed inside the samples
+    wav = (b"RIFF" + struct.pack("<I", 36 + 20000) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 8000, 1, 8)
+           + b"data" + struct.pack("<I", 20000) + _wave(20000, rnd))
+    out = _rg(env, "w.wav", wav)
+    assert "length-prefixed u32le at +4" in out and "sample stream" in out and "fixed stride" not in out
+    # records and noise are not waveforms
+    recs = b"".join(struct.pack("<IHhf8s", i, rnd.randrange(1000), -5, i * 1.5 + 0.5, b"AB%05d\0" % i) for i in range(300))
+    assert "sample stream" not in _rg(env, "rec.dat", recs)
+    assert "sample stream" not in _rg(env, "noise.raw", bytes(rnd.randrange(256) for _ in range(20000)))
+    assert "sample stream" not in _rg(env, "ramp.raw", bytes(range(256)) * 80)

@@ -19,6 +19,8 @@ from typing import Iterator, Protocol
 
 import olefile
 
+from airlock.server import recdetect
+
 CHUNK = 1 << 20           # diff compare unit
 SUB = 4096                # diff refine unit inside a differing chunk
 GAP = 8                   # changed ranges closer than this many bytes are merged
@@ -500,7 +502,7 @@ def _stride_guess(d: bytes, s: int, score: float, ratio: float, base: float, org
     else:
         head = (f"fixed stride {s}: {recs} records from 0x{org + a:x} to 0x{org + e:x}; "
                 f"{ratio * 100:.0f}% of bytes repeat at +{s} (typical {base * 100:.0f}%)")
-    return Guess(score, [head] + ["  " + f for f in _column_fields(d[a:e], s)[:14]], "stride", (a, e))
+    return Guess(score, [head] + ["  " + f for f in _column_fields(d[a:e], s)[:14]], "stride", (a, e), True, (e - a) // s)
 
 
 def _fundamentals(strong: list[int]) -> list[int]:
@@ -936,6 +938,17 @@ def _strings(d: bytes, base: int) -> list[str]:
     return out
 
 
+def _extra_guesses(d: bytes, offset: int, full: bool, entropy: float) -> list[Guess]:
+    found = []
+    for f in (recdetect.pgp_packets(d, offset, full), recdetect.preg_records(d, offset)):
+        if f:
+            found.append(f)
+    if not found:
+        found = [f for f in (recdetect.delimited_text(d, offset),
+                             recdetect.offset_tables(d, offset, _column_fields)) if f]
+    return [Guess(f.score, f.lines, f.kind, f.span, True, f.recs) for f in found]
+
+
 def record_guess(src: Src, offset: int = 0) -> list[str]:
     if offset < 0 or offset >= src.size:
         return [f"error bad_args: offset 0x{offset:x} is outside the data ({src.size} bytes). Use 0 to {max(src.size - 1, 0)}."]
@@ -951,13 +964,30 @@ def record_guess(src: Src, offset: int = 0) -> list[str]:
     chains = [c for c in chains if c.recs < 8 or not any(
         min(c.span[1], t.span[1]) - max(c.span[0], t.span[0]) >= 0.8 * (c.span[1] - c.span[0]) for t in strides)]
     guesses = strides + chains
+    extra = _extra_guesses(d, offset, full, entropy)
+    stream = recdetect.sample_stream(d) if not extra else None
+    if any(g.kind in ("pgp", "preg") for g in extra):
+        guesses = []                      # an exact packet / record chain explains the bytes
+    elif stream:                          # a waveform has no records; keep only exact chains (RIFF)
+        guesses = [g for g in guesses if g.kind == "chain" and g.exact]
+    else:
+        spans = [g.span for g in extra if g.kind in ("text", "table")]
+        guesses = [g for g in guesses if not any(
+            g.kind == "stride" and g.recs < 20 and min(g.span[1], b) - max(g.span[0], a) >= 0.5 * (g.span[1] - g.span[0])
+            for a, b in spans)]
+    big = [g.span for g in guesses if g.kind == "stride" and g.recs >= 20]
+    extra = [g for g in extra if not (g.kind == "table" and any(
+        min(g.span[1], b) - max(g.span[0], a) >= 0.9 * (g.span[1] - g.span[0]) for a, b in big))]
+    guesses = guesses + extra
     guesses.sort(key=lambda g: -g.score)
     out = [head]
     for g in guesses[:4]:
         out += g.lines
-    if not guesses:
+    if stream:
+        out.append(stream)
+    elif not guesses:
         out.append("no fixed stride or length-prefixed chain found.")
-    if entropy <= 7.5:
+    if entropy <= 7.5 and not stream and not any(g.kind in ("pgp", "preg") for g in extra):
         out += _strings(d, offset)
     out.append(f"entropy {entropy:.2f} bits/byte" + (" (looks compressed or encrypted)" if entropy > 7.5 else ""))
     return out

@@ -344,8 +344,11 @@ def _mask_abs(md, code: bytes, rva: int, ins_list: list[tuple[int, int, str, str
 
 
 def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None,
-                  abs_range: tuple[int, int] | None = None) -> tuple[bytes, bytes] | None:
-    """Dump and mask of the routine at ``rva``. ``exact``: its known size (``.pdata``); otherwise the end is
+                  abs_range: tuple[int, int] | None = None, callees: dict[int, str] | None = None
+                  ) -> tuple[bytes, bytes, tuple] | None:
+    """Dump, mask and calls of the routine at ``rva``. ``callees``: {rva: name} of the routines whose name is
+    known; a direct ``call`` / ``jmp`` (``E8`` / ``E9``) to one of them outside the routine is recorded as
+    ``(offset of the operand, opcode, name)``. ``exact``: its known size (``.pdata``); otherwise the end is
     found by a sweep, at most ``limit`` bytes. ``abs_range``: (low, high) addresses of the image; 32-bit
     absolute operands inside it are masked as well (a program without relocations)."""
     off = _rva_off(img, rva)
@@ -367,6 +370,7 @@ def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None,
     n = min(end, MAX_LEN, len(code))
     dump = bytearray(code[:n])
     mask = bytearray(n)
+    calls: list[tuple[int, int, str]] = []
     for off_i, size, mn, ops in ins_list:
         if off_i >= n:
             break
@@ -380,6 +384,8 @@ def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None,
                 for k in range(size - w, size):
                     if off_i + k < n:
                         mask[off_i + k] = 0xFF
+                if callees and size == 5 and b[0] in (0xE8, 0xE9) and off_i + 5 <= n and t in callees:
+                    calls.append((off_i + 1, b[0], callees[t]))
         elif img.psize == 8 and "rip" in ops:
             _mask_rip(md, b, rva + off_i, rva, end, mask, off_i, n)
     if abs_range is not None and img.psize == 4:
@@ -397,7 +403,7 @@ def _scan_routine(md, img: _Pe, rva: int, limit: int, exact: int | None = None,
     for i in range(n):
         if mask[i]:
             dump[i] = 0
-    return bytes(dump), bytes(mask)
+    return bytes(dump), bytes(mask), tuple(calls)
 
 
 def _mask_rip(md, b: bytes, addr: int, rva: int, end: int, mask: bytearray, off_i: int, n: int) -> None:
@@ -421,8 +427,9 @@ def _rip_disp(ins) -> int:
     return ins.disp
 
 
-def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
-    """(pointer size, [(Unit.Class.Method, dump, mask)]) of one package. Runs in worker processes."""
+def scan_bpl(path_str: str, with_calls: bool = False) -> tuple[int, list[tuple]]:
+    """(pointer size, [(Unit.Class.Method, dump, mask)]) of one package; with ``with_calls`` each record also
+    has the calls to exported routines (see ``scan_named``). Runs in worker processes."""
     try:
         import capstone
     except ImportError as e:                                    # pragma: no cover
@@ -444,40 +451,59 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
         if name is None or not any(s <= rva < e for s, e in xsecs):
             continue
         seen.setdefault(rva, []).append(name)
-    return img.psize, scan_named(md, img, seen, {r for r, _n in img.exports})
+    return img.psize, scan_named(md, img, seen, {r for r, _n in img.exports}, with_calls)
 
 
-def scan_named(md, img: _Pe, seen: dict[int, list[str]], starts: set[int] | None = None
-               ) -> list[tuple[str, bytes, bytes]]:
+def callee_names(seen: dict[int, list[str]]) -> dict[int, str]:
+    """{rva: the name a call to it is remembered by}: the best-ranked of the names of the routine."""
+    return {rva: min(names, key=idr._name_rank) for rva, names in seen.items() if names}
+
+
+def scan_named(md, img: _Pe, seen: dict[int, list[str]], starts: set[int] | None = None,
+               with_calls: bool = False) -> list[tuple]:
     """[(name, dump, mask)] for the routines ``seen`` ({rva: names}) of an image. ``starts``: more addresses
-    that end a 32-bit routine (the next symbol); the section ends and the ``.pdata`` routines always do."""
+    that end a 32-bit routine (the next symbol); the section ends and the ``.pdata`` routines always do.
+    ``with_calls``: records are ``(name, dump, mask, calls)``, ``calls`` = ((operand offset, opcode, callee
+    name), ...) for the direct calls and jumps to routines of ``seen``."""
     xsecs = [(va, va + max(vs, rs)) for va, vs, _r, rs, x in img.sections if x]
     funcs = img.funcs
     bounds = sorted((starts or set()) | set(seen) | {e for _s, e in xsecs} | (set(funcs) if funcs else set()))
-    out: list[tuple[str, bytes, bytes]] = []
+    out: list[tuple] = []
+    callees = callee_names(seen) if with_calls else None
     for rva, names in seen.items():
         i = bisect.bisect_right(bounds, rva)
         limit = (bounds[i] if i < len(bounds) else rva + MAX_SWEEP) - rva
         exact = funcs[rva] - rva if funcs and rva in funcs else None
-        got = _scan_routine(md, img, rva, limit, exact)
+        got = _scan_routine(md, img, rva, limit, exact, callees=callees)
         if got is None:
             continue
         for nm in sorted(set(names)):
-            out.append((nm, got[0], got[1]))
+            out.append((nm, got[0], got[1], got[2]) if with_calls else (nm, got[0], got[1]))
     return out
 
 
 # -- database file ----------------------------------------------------------------------------
 
-def write_sigdb(path: Path, compiler: int, psize: int, records: list[tuple[str, bytes, bytes]],
+def write_sigdb(path: Path, compiler: int, psize: int, records: list[tuple],
                 meta: dict | None = None) -> None:
     """File layout: ``MAGIC; u32 header length; JSON header; zlib(records)``. A record is
-    ``u16 name length; name; u32 size; code bytes; mask bytes`` (mask 0xFF = byte not compared)."""
+    ``u16 name length; name; u32 size; code bytes; mask bytes`` (mask 0xFF = byte not compared). When any
+    record is a 4-tuple (the fourth item is its calls) the header says ``"calls":1`` and every record ends
+    with ``u16 count`` and per call ``u16 operand offset; u8 opcode; u16 name length; name`` (format 3; files
+    without the key are format 2 and have no call lists)."""
+    with_calls = any(len(r) > 3 for r in records)
     body = bytearray()
-    for name, dump, mask in records:
-        nb = name.encode("utf-8")
-        body += struct.pack("<H", len(nb)) + nb + struct.pack("<I", len(dump)) + dump + mask
-    head = json.dumps({"compiler": compiler, "bits": psize * 8, "count": len(records), **(meta or {})},
+    for r in records:
+        nb = r[0].encode("utf-8")
+        body += struct.pack("<H", len(nb)) + nb + struct.pack("<I", len(r[1])) + r[1] + r[2]
+        if with_calls:
+            calls = r[3] if len(r) > 3 else ()
+            body += struct.pack("<H", len(calls))
+            for off, op, cn in calls:
+                cb = cn.encode("utf-8")
+                body += struct.pack("<HBH", off, op, len(cb)) + cb
+    extra = {"calls": 1, "format": 3} if with_calls else {}
+    head = json.dumps({"compiler": compiler, "bits": psize * 8, "count": len(records), **extra, **(meta or {})},
                       separators=(",", ":")).encode()
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_bytes(MAGIC + struct.pack("<I", len(head)) + head + zlib.compress(bytes(body), 6))
@@ -515,8 +541,17 @@ def read_sigdb(path: Path, label: str = "") -> idr.Kb:
             p += 2 + nl
             (size,) = struct.unpack_from("<I", body, p)
             p += 4
-            kb.add(name, body[p:p + size], body[p + size:p + 2 * size])
+            code, rel = body[p:p + size], body[p + size:p + 2 * size]
             p += 2 * size
+            calls: list[tuple[int, int, str]] = []
+            if head.get("calls"):
+                (nc,) = struct.unpack_from("<H", body, p)
+                p += 2
+                for _c in range(nc):
+                    off, op, cl = struct.unpack_from("<HBH", body, p)
+                    calls.append((off, op, body[p + 5:p + 5 + cl].decode("utf-8")))
+                    p += 5 + cl
+            kb.add(name, code, rel, tuple(calls))
         kb.finish()
         return kb
     except (SigError, OSError, zlib.error, struct.error, KeyError, UnicodeDecodeError) as e:
@@ -572,13 +607,13 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
     if comp is None:
         raise SigError("no compiler version string found in the packages")
     say = progress or (lambda _m: None)
-    merged: dict[tuple[str, bytes, bytes], None] = {}
+    merged: dict[tuple, None] = {}
     sizes = [p.stat().st_size for p in pkgs]
     order = sorted(range(len(pkgs)), key=lambda i: -sizes[i])      # big packages first
     done = 0
     if jobs > 1 and len(pkgs) > 1:
         with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futs = [(i, ex.submit(scan_bpl, str(pkgs[i]))) for i in order]
+            futs = [(i, ex.submit(scan_bpl, str(pkgs[i]), True)) for i in order]
             for i, fut in futs:
                 try:
                     _ps, recs = fut.result()
@@ -591,7 +626,7 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
     else:
         for i in order:
             try:
-                _ps, recs = scan_bpl(str(pkgs[i]))
+                _ps, recs = scan_bpl(str(pkgs[i]), True)
             except Exception as e:  # noqa: BLE001
                 say(f"{pkgs[i].name}: skipped ({e})")
                 continue
@@ -602,34 +637,52 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
     say(f"{len(merged) - len(records)} unusable records dropped")
     n_export = len(records)
     if pairs:
-        records += _map_records(records, pairs, say)
+        fresh, upgrades = _map_records(records, pairs, say)
+        records = [_with_calls(r, upgrades.get((r[1], r[2]))) for r in records] + fresh
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{comp}-{psize * 8}.sigdb"
-    meta = {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d"), "format": 2}
+    meta = {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d"), "format": 3}
     if pairs:
         meta["mapped"] = len(records) - n_export
     write_sigdb(path, comp, psize, records, meta)
-    return BuildResult(path, comp, psize, done, len({(d, m) for _n, d, m in records}), len(records),
+    return BuildResult(path, comp, psize, done, len({(r[1], r[2]) for r in records}), len(records),
                        time.time() - t0, len(records) - n_export)
 
 
-def _map_records(exported: list[tuple[str, bytes, bytes]], pairs: list[tuple[Path, Path]],
-                 say: Callable[[str], None]) -> list[tuple[str, bytes, bytes]]:
-    """Records from (binary, map) pairs whose masked code no exported name already covers."""
+def _with_calls(rec: tuple, extra: tuple | None) -> tuple:
+    """``rec`` with the calls of ``extra`` added; a call at the same operand offset takes the name of ``extra``
+    (a map names more routines than the package exports)."""
+    if not extra:
+        return rec
+    by = {(o, op): n for o, op, n in (rec[3] if len(rec) > 3 else ())}
+    by.update({(o, op): n for o, op, n in extra})
+    return (rec[0], rec[1], rec[2], tuple(sorted((o, op, n) for (o, op), n in by.items())))
+
+
+def _map_records(exported: list[tuple], pairs: list[tuple[Path, Path]], say: Callable[[str], None]
+                 ) -> tuple[list[tuple], dict[tuple[bytes, bytes], tuple]]:
+    """(records from (binary, map) pairs whose masked code no exported name already covers, {(code, mask): calls
+    seen in the map} for the code the exported names do cover)."""
     from airlock.server import delphimap
-    have = {(d, m) for _n, d, m in exported}
-    out: dict[tuple[str, bytes, bytes], None] = {}
+    have = {(r[1], r[2]) for r in exported}
+    upgrades: dict[tuple[bytes, bytes], tuple] = {}
+    out: dict[tuple, None] = {}
     for binary, mp in pairs:
         for f in (binary, mp):
             if not f.is_file():
                 raise SigError(f"{f} is gone (was the work folder used by another run?)")
-        _ps, recs = delphimap.scan_pair(str(binary), str(mp))
+        _ps, recs = delphimap.scan_pair(str(binary), str(mp), True)
         fresh = 0
         for r in recs:
-            if (r[1], r[2]) in have or not idr.usable(r[2]):
+            if (r[1], r[2]) in have:
+                if r[3] and idr.usable(r[2]):
+                    old = upgrades.get((r[1], r[2]), ())
+                    upgrades[(r[1], r[2])] = _with_calls((r[0], r[1], r[2], old), r[3])[3]
+                continue
+            if not idr.usable(r[2]):
                 continue
             if r not in out:
                 out[r] = None
                 fresh += 1
         say(f"{binary.name}: {len(recs)} routines in the map, {fresh} new names")
-    return list(out)
+    return list(out), upgrades

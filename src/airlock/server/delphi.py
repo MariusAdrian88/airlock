@@ -47,12 +47,13 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 2
+DELPHI_VERSION = 3
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
 MAX_PUBLISHED = 4096
 MAX_RTTI = 16384                   # extended method entries read per class
+MAX_PROPS = 4096                   # properties read per class
 MAX_COMPONENTS = 20000             # per form
 MAX_DEPTH = 64
 MIN_SLOTS, MAX_SLOTS = 19, 32      # slots before the class reference (22 in 32-bit Delphi 2009+, 19 older)
@@ -68,7 +69,8 @@ def meta_key(binary_id: int) -> str:
 
 @dataclass
 class DlMethod:
-    kind: str            # published | virtual | rtti-private | rtti-protected | rtti-public | rtti-published
+    kind: str            # published | virtual | rtti-private | rtti-protected | rtti-public | rtti-published |
+    #                      prop-get | prop-set (accessor method of a property; ``name`` is the property)
     slot: int            # virtual: vtable slot; rtti: virtual index (-1 when not virtual)
     name: str
     addr: int
@@ -248,6 +250,104 @@ def _rtti_methods(img: Image, tab: int) -> list[DlMethod]:
     return out
 
 
+PROP_FIELD, PROP_VIRTUAL = 0xFF, 0xFE
+PROP_KINDS = ("prop-get", "prop-set")
+
+
+def accessor_name(kind: str, prop: str) -> str:
+    """Conventional method name of a property accessor: ``Get<Prop>`` / ``Set<Prop>``."""
+    return ("Get" if kind == "prop-get" else "Set") + prop
+
+
+def _prop_target(img: Image, vmt: int, w: int) -> tuple[int, int] | None:
+    """(code address, vtable slot or -1) of an accessor word of a ``TPropInfo``. The top byte selects the
+    encoding: ``0xFF`` the accessor is a field (offset in the low bits), ``0xFE`` a virtual method (the low
+    16 bits are the byte offset of the slot from the class reference), anything else is the code address."""
+    ps = img.psize
+    top = w >> (8 * ps - 8)
+    if top == PROP_FIELD:
+        return None
+    if top == PROP_VIRTUAL:
+        off = w & 0xFFFF
+        if off % ps or off >= MAX_VIRTUAL * ps:
+            return None
+        t = img.ptr(vmt + off)
+        return (t, off // ps) if t and img.is_code(t) else None
+    return (w, -1) if w and img.is_code(w) else None
+
+
+def _prop_info(img: Image, at: int) -> tuple[str, int, int, int] | None:
+    """(name, GetProc, SetProc, record size) of the packed ``TPropInfo`` at ``at``: ``PropType, GetProc,
+    SetProc, StoredProc`` (pointers), ``Index`` (i32), ``Default`` (i32), ``NameIndex`` (i16), ShortString name."""
+    ps = img.psize
+    raw = img.read(at, 4 * ps + 10)
+    if raw is None:
+        return None
+    nm = _sstr(img, at + 4 * ps + 10)
+    if nm is None:
+        return None
+    return (nm, int.from_bytes(raw[ps:2 * ps], "little"), int.from_bytes(raw[2 * ps:3 * ps], "little"),
+            4 * ps + 11 + len(nm))
+
+
+def _properties(img: Image, c: DlClass) -> list[DlMethod]:
+    """Accessor methods of the properties that the class declares (``DlMethod`` kinds ``prop-get`` and
+    ``prop-set``, ``name`` = property). Sources: the property list that follows the unit name in the class
+    type info (published properties) and the extended list after it (Delphi 2010+; records ``{u8 flags;
+    ptr info; u16 attrLen; attributes}`` whose ``info`` points to a ``TPropInfo``, for any visibility)."""
+    ps = img.psize
+    ti = c.typeinfo
+    k = img.read(ti, 1) if ti else None
+    if not k or k[0] != 7:
+        return []
+    nm = _sstr_raw(img, ti + 1)
+    if nm is None:
+        return []
+    p = ti + 2 + nm[1] + 2 * ps
+    un = _sstr_raw(img, p + 2)
+    if un is None:
+        return []
+    q = p + 3 + un[1]
+    n = _u16(img, q)
+    if n is None or n > MAX_PROPS:
+        return []
+    q += 2
+    infos: list[int] = []
+    for _ in range(n):
+        got = _prop_info(img, q)
+        if got is None:
+            return []
+        infos.append(q)
+        q += got[3]
+    ex = _u16(img, q)
+    if ex and ex <= MAX_PROPS:
+        q += 2
+        for i in range(ex):
+            raw = img.read(q, 1 + ps + 2)
+            if raw is None:
+                break
+            info = int.from_bytes(raw[1:1 + ps], "little")
+            alen = int.from_bytes(raw[1 + ps:], "little")
+            if not img.in_image(info) or _prop_info(img, info) is None or alen < 2 or alen > 4096:
+                if i == 0:
+                    ex = 0
+                break
+            infos.append(info)
+            q += 1 + ps + alen
+    out: list[DlMethod] = []
+    seen: set[tuple[str, int]] = set()
+    for at in infos:
+        got = _prop_info(img, at)
+        if got is None:
+            continue
+        for kind, w in (("prop-get", got[1]), ("prop-set", got[2])):
+            t = _prop_target(img, c.vmt, w)
+            if t is not None and (kind, t[0]) not in seen:
+                seen.add((kind, t[0]))
+                out.append(DlMethod(kind, t[1], got[0], t[0]))
+    return out
+
+
 def _fields(img: Image, tab: int, by_vmt: dict[int, DlClass]) -> list[DlField]:
     ps = img.psize
     n = _u16(img, tab)
@@ -322,8 +422,15 @@ def parse_classes(img: Image) -> list[DlClass]:
         ft = img.ptr(lo + 5 * ps) or 0
         if ft:
             c.fields = _fields(img, ft, by_vmt)
+        named = {m.addr for m in c.methods}
+        c.methods.extend(m for m in _properties(img, c) if m.addr not in named)
         nxt = order[i + 1] - found[order[i + 1]][1] * ps if i + 1 < len(order) else vmt + MAX_VIRTUAL * ps
         c.methods.extend(_virtuals(img, vmt, max(0, (nxt - vmt) // ps)))
+    for c in by_vmt.values():             # a property whose accessor an ancestor already declares (a redeclared
+        anc = ancestors(c, by_vmt)[1:]    # ``published`` property) belongs to the ancestor
+        up_p = {(m.kind, m.addr) for a in anc for m in a.methods if m.kind in PROP_KINDS}
+        if up_p:
+            c.methods = [m for m in c.methods if m.kind not in PROP_KINDS or (m.kind, m.addr) not in up_p]
     for c in by_vmt.values():             # a method that a parent already names belongs to the parent
         if not any(m.kind.startswith("rtti") for m in c.methods):
             continue
@@ -331,6 +438,18 @@ def parse_classes(img: Image) -> list[DlClass]:
         if up:
             c.methods = [m for m in c.methods if m.kind == "virtual" or (m.name, m.addr) not in up]
     return [found[v][0] for v in order]
+
+
+def accessor_names(classes: list[DlClass]) -> dict[int, str]:
+    """{address: ``Unit.Class.GetProp``} for the accessor methods that belong to one property of one class
+    (a shared accessor, such as the abstract-method stub of several virtual properties or an indexed
+    getter, is left out). The method name is the Delphi convention, not read from the program."""
+    by: dict[int, set[tuple[str, str, str]]] = {}
+    for c in classes:
+        for m in c.methods:
+            if m.kind in PROP_KINDS:
+                by.setdefault(m.addr, set()).add((f"{c.unit}.{c.name}" if c.unit else c.name, m.kind, m.name))
+    return {a: f"{cn}.{accessor_name(k, pn)}" for a, v in by.items() if len(v) == 1 for cn, k, pn in v}
 
 
 def ancestors(c: DlClass, by_vmt: dict[int, DlClass]) -> list[DlClass]:
@@ -797,6 +916,12 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
         cap = f' "{_short(r[3])}"' if r[3] else ""
         who = f"{r[1]} ({r[2]}{cap})" if r[1] else f"form ({r[2]})"
         out.append(f"handler {r[0]} of {who} in form {r[4]}")
+    props = q("SELECT c.unit, c.name, m.kind, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
+              "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind IN ('prop-get','prop-set') "
+              "ORDER BY c.vmt, m.name LIMIT 3", (binary_id, entry)).fetchall()
+    for r in props:
+        out.append(f"prop: {r[0] + '.' if r[0] else ''}{r[1]}.{accessor_name(r[2], r[3])} "
+                   f"({'getter' if r[2] == 'prop-get' else 'setter'} of {r[3]}, name by convention)")
     by_slot: dict[int, list[str]] = {}
     for r in q("SELECT c.name, m.slot FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
                "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind='virtual' ORDER BY m.slot, c.vmt",

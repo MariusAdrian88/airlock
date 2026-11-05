@@ -114,14 +114,14 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
             types = ",".join(p.rsplit(" ", 1)[0] if " " in p.strip() else p for p in r["params"].split(", ") if p)
             own.add(_norm_sig(f"{r['name']}({types})"))
     lines: list[str] = []
-    for r in db.execute("SELECT fn_entry, site, signal, slot, slot_kind FROM qt_connect WHERE binary_id=? "
-                        "AND kind='string' ORDER BY fn_entry, site", (bid,)):
+    for r in db.execute("SELECT fn_entry, site, signal, slot, slot_kind, kind FROM qt_connect WHERE binary_id=? "
+                        "AND kind IN ('string','string-guess') ORDER BY fn_entry, site", (bid,)):
         sg, sl = _norm_sig(r["signal"]), _norm_sig(r["slot"])
         if cls is not None and sg not in own and sl not in own:
             continue
         a = [c for c, k, _ad, _n in by_sig.get(sg, []) if k == "signal"]
         b = [(c, ad) for c, k, ad, _n in by_sig.get(sl, []) if k in ("slot", "method", "signal")]
-        left = f"signal {r['signal']}" + (f" [{', '.join(a[:3])}]" if a else "")
+        left = ("~" if r["kind"] == "string-guess" else "") + f"signal {r['signal']}" + (f" [{', '.join(a[:3])}]" if a else "")
         right = f"{r['slot_kind']} {r['slot']}"
         if b:
             c0, ad0 = b[0]

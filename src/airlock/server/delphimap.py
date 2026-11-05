@@ -149,8 +149,9 @@ def map_routines(path_bin: Path, path_map: Path) -> tuple[ds._Pe, dict[int, list
     return img, named, starts
 
 
-def scan_pair(bin_str: str, map_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
-    """(pointer size, [(name, dump, mask)]) of one binary with its map. Runs in worker processes."""
+def scan_pair(bin_str: str, map_str: str, with_calls: bool = False) -> tuple[int, list[tuple]]:
+    """(pointer size, [(name, dump, mask)]) of one binary with its map; with ``with_calls`` the records are
+    ``(name, dump, mask, calls)`` (``delphisigs.scan_named``). Runs in worker processes."""
     try:
         import capstone
     except ImportError as e:                                    # pragma: no cover
@@ -159,4 +160,4 @@ def scan_pair(bin_str: str, map_str: str) -> tuple[int, list[tuple[str, bytes, b
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if img.psize == 8 else capstone.CS_MODE_32)
     md.detail = True
     md.skipdata = False
-    return img.psize, ds.scan_named(md, img, named, starts)
+    return img.psize, ds.scan_named(md, img, named, starts, with_calls)

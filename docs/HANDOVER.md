@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 964 passed, 43 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 991 passed, 43 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -211,7 +211,7 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
 - Tables (schema v12): `dl_class`, `dl_method` (published + virtual), `dl_field`, `dl_form`,
   `dl_component`, `dl_event` (the resolved handler address is stored). Meta `delphi_version:<id>`
   (`DELPHI_VERSION`); `Indexer.resume_project` and `_after_ready` derive them for Delphi binaries only.
-- `fnfix.FIX_VERSION` is 2: `dl_method` and `dl_event` addresses are candidates for `create_functions`.
+- `fnfix.FIX_VERSION` is 3: `dl_method` (incl. property accessors) and `dl_event` addresses are candidates for `create_functions`.
   `create_missing_functions` sends the candidates in chunks of `fnfix.BATCH` (500; one transaction and save
   each, the conventions pass with the last chunk only) and logs progress to `project.log`. It also
   re-reads the functions when the worker reports `exists` for an address the index lacks.
@@ -291,12 +291,23 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   right). The copies rule of `idr.match_all` was loosened (`LONG_SHAPE`, `GENERIC_MIN`): +48% / +62% named routines on
   the own builds at the same precision. Tried and not worth it: naming overridden virtual slots from the parent's
   RTTI (a few dozen extra functions on a real DLL).
-  Open: property accessors (the `GetProc` / `SetProc` code of published properties are not named), unit-level
-  procedures and private routines that no table lists, a larger and more varied corpus (the product-count
+  Open: unit-level procedures and private routines that no table lists, a larger and more varied corpus (the product-count
   rule matters once there are several products per bitness), `rtti-build` has no incremental mode (a new
   corpus rescans everything), and the Ghidra side does not rename anything (hints only).
-- Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file), published
-  properties, dynamic/message method tables, interface tables, virtual method names, renaming.
+- Property accessors and call-context names (`delphi._properties`, `delphi.accessor_names`, `idr.call_context`,
+  `delphisigs` format 3, `delphioracle`; DESIGN §11 "Delphi" and "Call-context naming"). `DELPHI_VERSION` 3,
+  `IDR_VERSION` 8, `fnfix.FIX_VERSION` 3: old projects recompute once. Accessors of published and extended-RTTI
+  properties become `dl_method` kinds `prop-get` / `prop-set`; the hint is `prop: Unit.Class.GetProp (getter of
+  Prop, name by convention)`. **[verified]** layout on compilers 30, 33, 35, 32 and 64 bit (map as truth); the
+  name is right for 94% of the accessors. The sigdb stores, per reference routine, the names of its direct callees
+  by operand offset; a function that code names gives each unnamed callee that name (all callers must agree).
+  Old sigdb files (no call lists) still load and give no call-context names; rebuild them to get the pass
+  (`airlock delphi-sigs build <kit> --units --jobs 8`, then copy the `.sigdb` files to the sigdb folder). The
+  oracle command prints the stages `sigdb`, `+calls`, `+props` (table in DESIGN). Not done: a second round that
+  lets a context-named callee name its own callees, callers that reach the target through a virtual call or a
+  function pointer, call lists in the RTTI consensus database.
+- Not done: Delphi 2007 and older layout (accepted by the scan, never seen on a real file),
+  dynamic/message method tables, interface tables, virtual method names, renaming.
 
 - WARP names (`server/warp.py`, `worker/ghidra_ops/warp.py`, `tests/test_warp.py`; DESIGN section 11): reads Binary Ninja
   `.warp` libraries (delphinja Delphi RTL) and computes the WARP function GUID from capstone blocks (used by
@@ -317,22 +328,23 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 - Worker op `qt_dispatch` (`worker/ghidra_ops/qt.py`) maps method indices to functions from the decompiled `qt_static_metacall` and finds imported parent classes; run by `qt.resolve` after the missing-function step; meta `qt_dispatch:<id>`. Tool `qt_metaobjects` (`tools/qt.py`); hints in `function`, a `Qt:` line in the project map, moc boilerplate marked runtime family `Qt`.
 - Dataflow ops (`worker/ghidra_ops/dataflow.py`) and tools (`tools/dataflow.py`): `switch_tables`, `trace_values`, `constants`. Ghidra tests: `tests/test_dataflow.py` with `-m ghidra --binary=...`.
 - Qt6 layout is verified on a real 64-bit MSVC Qt 6.10 desktop client (revision 13; see DESIGN section 11 for each fact). Two parser bugs fixed: with `QT_NO_DATA_RELOCATION` `superdata` is two words `{direct, getter}` (the metaobject starts one pointer before the scan address; parents come from the getter, local or from the import name, no worker needed); Qt6 has no Notify property flag (`notifyId` is -1 or the signal index). `QT_VERSION` 2.
-- Pointer-to-member connects work (Qt6 MSVC x64): `qt.fill_imports` adds the C++ imports Ghidra leaves out of the `import` table, `derive_connects` finds the call sites as read edges to the `connectImpl` slot, worker op `qt_connects` (`worker/ghidra_ops/qt.py`, `_Flow`) resolves signal and slot (chases forwarding wrappers up the callers). Rows are `qt_connect` kind `ptr`. `DISPATCH_VERSION` 2. Sites in template instances nobody calls (incremental-link leftovers) stay unresolved. Not tried: Qt5 / MinGW (Itanium) shapes of the call, 32-bit, virtual member pointers.
+- Pointer-to-member connects work (Qt6 MSVC x64): `qt.fill_imports` adds the C++ imports Ghidra leaves out of the `import` table, `derive_connects` finds the call sites as read edges to the `connectImpl` slot, worker op `qt_connects` (`worker/ghidra_ops/qt.py`, `_Flow`) resolves signal and slot (chases forwarding wrappers up the callers). Rows are `qt_connect` kind `ptr`. `DISPATCH_VERSION` 2. Sites in template instances nobody calls (incremental-link leftovers) stay unresolved. Qt5 MSVC x64 and Qt5 MinGW 32-bit are verified too (DESIGN section 11): Itanium import names, calls through a register (a site stands for all calls of its function), a signature set on the imported `connectImpl`, stack stores read from instructions, string pairs for register-loaded `connect`. `QT_VERSION` 3, `DISPATCH_VERSION` 3. Virtual member pointers: Itanium only, as `vtable+0x..`; MSVC virtual pointers and 64-bit MinGW are not tried.
 - Qt feature seeds (`qt.feature_seeds`, `FEATURES_VERSION` 7): slots of QAction / button / dialog signals seed ui-menu / ui-dialog; Qt library class prefixes in `features.API_PREFIX`.
 - Scratch tip: `connectImpl` returns `QMetaObject::Connection` by value, so argument 1 is the result pointer (the decompiler also shows the stack arguments shifted).
 
 ## Next
 
-- Qt: pointer-to-member connects are only checked on Qt6 / MSVC x64; try Qt5 and MinGW (Itanium
-  `_ZN7QObject11connectImpl...` import, different argument order), 32-bit, and `QObject::connect`
-  string form through import slots. Unresolved call sites could be chased through function pointers.
+- Qt: pointer connects through function pointers or virtual MSVC member pointers are unresolved; 64-bit MinGW is untried.
+  Unresolved call sites could be chased through function pointers.
 - Delphi: `delphi-sigs kit` makes a small rebuild kit of an install, `delphi-sigs oracle` is the supported
   oracle measurement (DESIGN §11); the sigdb no longer stores records the matcher drops (import stubs), and a
   `--units` run locks its work folder (a second run on the same folder used to delete the maps of the first).
-  Property accessors are not named; routines under 10 compared bytes cannot be named by code
-  signatures (a call-context pass could); the map build skips the FMX / TeeChart / REST-backend units.
+  Routines under 10 compared bytes are named by the call-context pass only when a named caller exists; the map
+  build skips the FMX / TeeChart / REST-backend units.
 - WARP is tested on compilers 30, 33, 35 and 36 (no compiler 34 binary was
   available). 64-bit WARP has no library: 64-bit relies on extended RTTI and IDR.
 - `record_guess` is proven on public sample files (DESIGN §6 `record_guess`).
-  Open: OpenPGP-style packets (length width depends on the tag), delimited
-  text records, tables under about 20 entries, 8-bit PCM frames.
+  OpenPGP packets, `.pol`, delimited text, small offset/length tables
+  (ICO, TrueType) and 8-bit sample streams are now found (`server/recdetect.py`).
+  Open: `.class` constant pool, tables under 3 entries, 16-bit PCM, noisy 8-bit
+  audio, tables with u16/u64 fields.

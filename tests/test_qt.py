@@ -418,15 +418,128 @@ def test_string_connections(proj):
         db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
                    (bid, fid, fn + 4 * k, None, a, "data"))
     db.commit()
-    assert qt.derive_connects(st, bid) == 2
-    rows = db.execute("SELECT signal, slot, slot_kind FROM qt_connect WHERE binary_id=? ORDER BY site", (bid,)).fetchall()
-    assert [tuple(r) for r in rows] == [("progress(int,int)", "onOpenClicked()", "slot"),
-                                        ("openRequested(QString)", "changed(int)", "signal")]
+    assert qt.derive_connects(st, bid) == 0          # no connect function: order-only pairs are guesses
+    rows = db.execute("SELECT kind, signal, slot, slot_kind FROM qt_connect WHERE binary_id=? ORDER BY site",
+                      (bid,)).fetchall()
+    assert [tuple(r) for r in rows] == [("string-guess", "progress(int,int)", "onOpenClicked()", "slot"),
+                                        ("string-guess", "openRequested(QString)", "changed(int)", "signal")]
     out = qtools.qt_metaobjects(ctx, connections=True)
-    assert "signal progress(int,int) [MainWindow] -> slot onOpenClicked() [MainWindow" in out
+    assert "~signal progress(int,int) [MainWindow] -> slot onOpenClicked() [MainWindow" in out
     cls = qtools.qt_metaobjects(ctx, class_="MainWindow")
     assert "connections:" in cls and "connect_all" in cls
-    assert "1 connections" not in qt.ui_line(st, bid) and "string connections 2" in qt.ui_line(st, bid)
+    line = qt.ui_line(st, bid)
+    assert "string connections" not in line and "2 string pairs guessed by order" in line
+
+
+def test_string_connections_import_in_register(proj):
+    """MinGW loads the import into a register once: one read edge of the connect slot, several string pairs."""
+    ctx, st, bid, pe = proj
+    db = st.db
+    fn = 0x140001000
+    st.insert_functions(bid, [{"entry": fn, "name": "setup", "name_state": "auto", "size": 200}])
+    fid = db.execute("SELECT id FROM function WHERE binary_id=? AND entry=?", (bid, fn)).fetchone()[0]
+    slot = 0x140008000
+    db.execute("INSERT INTO import(binary_id, dll, name, address) VALUES (?,?,?,?)",
+               (bid, "QT5CORE.DLL", "QObject::connect", slot))
+    strings = [(0x140009000, "1onOpenClicked()"), (0x140009020, "2progress(int,int)"),   # slot pushed first
+               (0x140009040, "2changed(int)"), (0x140009060, "1onChanged(int)")]
+    for a, v in strings:
+        db.execute("INSERT INTO string(binary_id, address, encoding, value) VALUES (?,?,?,?)", (bid, a, "ascii", v))
+    db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+               (bid, fid, fn + 4, None, slot, "read"))
+    for k, (a, _v) in enumerate(strings):
+        db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+                   (bid, fid, fn + 0x10 + 4 * k, None, a, "data"))
+    db.commit()
+    assert qt.derive_connects(st, bid) == 0
+    rows = db.execute("SELECT kind, signal, slot, slot_kind FROM qt_connect WHERE binary_id=? ORDER BY site",
+                      (bid,)).fetchall()
+    assert [tuple(r) for r in rows] == [("string-guess", "progress(int,int)", "onOpenClicked()", "slot"),
+                                        ("string-guess", "changed(int)", "onChanged(int)", "slot")]
+
+
+def test_proven_pair_and_guess_are_kept_apart(proj):
+    ctx, st, bid, pe = proj
+    db = st.db
+    fn = 0x140001000
+    st.insert_functions(bid, [{"entry": fn, "name": "setup", "name_state": "auto", "size": 200}])
+    fid = db.execute("SELECT id FROM function WHERE binary_id=? AND entry=?", (bid, fn)).fetchone()[0]
+    slot = 0x140008000
+    db.execute("INSERT INTO import(binary_id, dll, name, address) VALUES (?,?,?,?)",
+               (bid, "QT5CORE.DLL", "QObject::connect", slot))
+    strings = [(0x140009000, "2a()"), (0x140009020, "1b()"), (0x140009040, "2c()"), (0x140009060, "1d()")]
+    for a, v in strings:
+        db.execute("INSERT INTO string(binary_id, address, encoding, value) VALUES (?,?,?,?)", (bid, a, "ascii", v))
+    for k, (a, _v) in enumerate(strings):
+        db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+                   (bid, fid, fn + 4 * k, None, a, "data"))
+    db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+               (bid, fid, fn + 0x10, None, slot, "call_imp"))        # one call right after the first two strings
+    db.commit()
+    assert qt.derive_connects(st, bid) == 1
+    rows = [tuple(r) for r in db.execute("SELECT kind, signal FROM qt_connect WHERE binary_id=? ORDER BY site", (bid,))]
+    assert rows == [("string-guess", "a()"), ("string", "c()")]
+    line = qt.ui_line(st, bid)
+    assert "string connections 1" in line and "1 string pairs guessed" in line
+
+
+def test_signature_change_bumps_caller_versions(proj):
+    ctx, st, bid, pe = proj
+    db = st.db
+    st.insert_functions(bid, [{"entry": 0x140001000, "name": "a", "name_state": "auto", "size": 20},
+                              {"entry": 0x140001100, "name": "b", "name_state": "auto", "size": 20},
+                              {"entry": 0x140001200, "name": "other", "name_state": "auto", "size": 20}])
+    ids = {r[0]: r[1] for r in db.execute("SELECT entry, id FROM function WHERE binary_id=?", (bid,))}
+    slot = 0x140008000
+    db.execute("INSERT INTO import(binary_id, dll, name, address) VALUES (?,?,?,?)",
+               (bid, "QT5CORE.DLL", "QObject::connectImpl", slot))
+    db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+               (bid, ids[0x140001000], 0x140001004, None, slot, "read"))
+    db.execute("INSERT INTO qt_connect(binary_id, fn_entry, site, kind) VALUES (?,?,?,?)", (bid, 0x140001100, 0x140001104, "ptr"))
+    db.commit()
+    before = {e: db.execute("SELECT version FROM function WHERE id=?", (i,)).fetchone()[0] for e, i in ids.items()}
+    assert qt.bump_connect_callers(st, bid) == 2
+    after = {e: db.execute("SELECT version FROM function WHERE id=?", (i,)).fetchone()[0] for e, i in ids.items()}
+    assert after[0x140001000] == before[0x140001000] + 1 and after[0x140001100] == before[0x140001100] + 1
+    assert after[0x140001200] == before[0x140001200]
+
+
+def test_itanium_import_names():
+    assert qt.import_qualname("_ZN7QObject11connectImplEPKS_PPvS1_S3_PN9QtPrivate15QSlotObjectBaseE") == "QObject::connectImpl"
+    assert qt.import_qualname("_ZN7QObject7connectEPKS_PKcS1_S3_N2Qt14ConnectionTypeE") == "QObject::connect"
+    assert qt.import_qualname("_ZNK7QObject6senderEv") == "QObject::sender"
+    assert qt.import_qualname("_ZN11QMetaObject10ConnectionD1Ev") == "QMetaObject::Connection::~Connection"
+    assert qt.import_qualname("_ZN7QStringC1Ev") == "QString::QString"
+    assert qt.import_qualname("_ZN5QListIiE6appendEi") == ""        # template class: not read
+    assert qt.import_qualname("_ZN3Foo3barXE") == ""                 # truncated name
+
+
+def test_fill_imports_itanium(proj, monkeypatch):
+    ctx, st, bid, pe = proj
+    rows = [("QT5CORE.DLL", "_ZN7QObject11connectImplEPKS_PPvS1_S3_PN9QtPrivate15QSlotObjectBaseE", 0x140008000),
+            ("QT5CORE.DLL", "_ZN7QObject7connectEPKS_PKcS1_S3_N2Qt14ConnectionTypeE", 0x140008008),
+            ("KERNEL32.DLL", "ExitProcess", 0x140008010)]
+    monkeypatch.setattr(qt, "pe_import_rows", lambda _p: rows)
+    assert qt.fill_imports(st, bid, Path("x.exe")) == 2
+    assert qt._connect_slots(st.db, bid) == {0x140008000: "ptr", 0x140008008: "string"}
+
+
+def test_store_connects_expanded_and_virtual(proj):
+    ctx, st, bid, pe = proj
+    fn = 0x140001000
+    sites = [{"fn": fn, "site": fn + 4}, {"fn": fn, "site": fn + 0x80}]
+    res = {"results": [
+        {"fn": fn, "site": fn + 0x20, "signal": {"addr": 0x140008100, "ext": "QAction::triggered"},
+         "slot": {"virtual": 0x18, "kind": "pmf"}},
+        {"fn": fn, "site": fn + 0x40, "signal": {"addr": 0x140008100, "ext": "QAction::triggered"},
+         "slot": {"addr": 0x140001a00, "kind": "functor"}}],
+        "expanded": {str(fn + 4): [fn + 0x20, fn + 0x40, fn + 0x60]}}
+    assert qt.store_connects(st, bid, res, sites) == (2, 2)      # one expanded call and the plain site stay open
+    rows = [tuple(r) for r in st.db.execute("SELECT site, signal, slot, slot_kind FROM qt_connect WHERE kind='ptr' "
+                                            "ORDER BY site")]
+    assert rows == [(fn + 0x20, "QAction::triggered", "vtable+0x18", "virtual"),
+                    (fn + 0x40, "QAction::triggered", "0x140001a00", "functor"),
+                    (fn + 0x60, "", "", ""), (fn + 0x80, "", "", "")]
 
 
 def test_feature_seeds(proj):
@@ -511,3 +624,5 @@ def test_worker_helpers():
     pick = wq.pick_switch([{9: 1, 10: 2}, {0: 5, 1: 6, 2: None}, {0: 7}], 3)
     assert pick == {0: 5, 1: 6, 2: None}
     assert wq.pick_switch([{50: 1}], 3) == {}
+    assert wq._signed(0xffffff70, 4) == -0x90 and wq._signed(0x10, 4) == 0x10
+    assert wq._signed(0xffffffffffffff70) == -0x90

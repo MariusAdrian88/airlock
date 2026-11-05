@@ -152,9 +152,11 @@ class Pe:
     def klass(self, name: str, parent: str | None, unit: str, size: int = 16,
               published: tuple[str, ...] = (), virtuals: tuple[str, ...] = (),
               fields: tuple[tuple[str, int, str], ...] = (),
-              rtti: tuple[tuple[str, int, int], ...] = ()) -> int:
+              rtti: tuple[tuple[str, int, int], ...] = (), props: tuple = (), ext_props: tuple = ()) -> int:
         """A class: VMT with ``virtuals`` code slots, a published method table (``rtti``: extended entries
-        ``(name, flags, virtual index)`` after it) and a field table."""
+        ``(name, flags, virtual index)`` after it) and a field table. ``props``: published properties
+        ``(name, getter, setter)`` and ``ext_props``: properties of the extended list only; an accessor is
+        ``("code", method)``, ``("field", offset)``, ``("virt", slot index)``, ``("abs", address)`` or None."""
         ps = self.ps
         lo = self.alloc(self.slots * ps + max(len(virtuals), 1) * ps + 8)
         vmt = lo + self.slots * ps
@@ -162,9 +164,39 @@ class Pe:
         words = [0] * self.slots
         words[0] = vmt
         words[8] = self.cstring(name)
-        # type info: kind, name, classType, parentInfo, propCount, unit
-        ti = self.alloc(2 + len(name) + 2 * ps + 2 + 1 + len(unit), 1)
-        self.put(ti, b"\x07" + _ss(name) + self.p(vmt) + self.p(0) + struct.pack("<h", 0) + _ss(unit))
+        # type info: kind, name, classType, parentInfo, propCount, unit, property list, extended list
+        shift = 8 * ps - 8
+
+        def acc(spec) -> int:
+            if spec is None:
+                return 0
+            if spec[0] == "code":
+                return self.code.get(f"{name}.{spec[1]}") or self.stub(f"{name}.{spec[1]}")
+            if spec[0] == "abs":
+                return spec[1]
+            return ((0xFF if spec[0] == "field" else 0xFE) << shift) | (spec[1] if spec[0] == "field" else spec[1] * ps)
+
+        def info(pname: str, g, s) -> bytes:
+            return (self.p(0) + self.p(acc(g)) + self.p(acc(s)) + self.p(0) + struct.pack("<iih", 0, 0, 0)
+                    + _ss(pname))
+
+        plist = struct.pack("<H", len(props)) + b"".join(info(*p) for p in props)
+        exrecs = []
+        for p in props:
+            exrecs.append((3, info(*p), 2))
+        for p in ext_props:
+            exrecs.append((2, info(*p), 6 if p[0].startswith("Attr") else 2))
+        exlist = struct.pack("<H", len(exrecs))
+        pending = []
+        for fl, raw, alen in exrecs:
+            at = self.alloc(len(raw), 1)
+            self.put(at, raw)
+            pending.append(bytes([fl]) + self.p(at) + struct.pack("<H", alen) + b"\0" * (alen - 2))
+        # the published records live inside the list, so the extended entries of published properties point there
+        blob = (b"\x07" + _ss(name) + self.p(vmt) + self.p(0) + struct.pack("<h", len(props)) + _ss(unit) + plist
+                + exlist + b"".join(pending))
+        ti = self.alloc(len(blob), 1)
+        self.put(ti, blob)
         words[4] = ti
         if published or rtti:
             ents = b"".join(struct.pack("<H", 2 + ps + 1 + len(m)) + self.p(self.stub(f"{name}.{m}")) + _ss(m)
@@ -274,7 +306,8 @@ def build(path: Path, psize: int, slots: int | None = None) -> Pe:
     pe.klass("TMainForm", "TBaseForm", "MainUnit", 128, published=("FormCreate", "Button1Click", "CheckClick", "OpenClick",
                                                                   "GridCol"),
              virtuals=("Init", "Done", "Extra"), fields=(("Button1", 40, "TObject"), ("Check1", 48, "TComponent")),
-             rtti=(("Helper", 0x22, -1), ("WMSize", 0x5A, 2026), ("Refresh", 0x4A, 7)))
+             rtti=(("Helper", 0x22, -1), ("WMSize", 0x5A, 2026), ("Refresh", 0x4A, 7)),
+             props=(("Title", ("code", "GetTitle"), ("code", "SetTitle")),))
     pe.klass("TFrame1", "TBaseForm", "FrameUnit", 80, published=("FrameBtnClick",))
     pe.klass("TChildForm", "TMainForm", "ChildUnit", 140, published=("ChildClose",))
     pe.res[(10, "TMAINFORM", 0x409)] = MAIN_DFM
@@ -377,6 +410,38 @@ def test_extended_rtti_methods(tmp_path, psize):
     assert not any(m.kind.startswith("rtti") for m in by["TObject"].methods)       # no table
     # the published list is unchanged
     assert [m.name for m in by["TMainForm"].methods if m.kind == "published"][:2] == ["FormCreate", "Button1Click"]
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_property_accessors(tmp_path, psize):
+    """Getter / setter methods of published and extended-list properties; field offsets and abstract slots
+    give none; a virtual slot is resolved through the class VMT; a redeclared property belongs to the ancestor."""
+    pe = Pe(psize)
+    pe.klass("TObject", None, "System", 8)
+    pe.klass("TBase", "TObject", "BaseUnit", 32, virtuals=("GetSize", "SetSize"),
+             props=(("Caption", ("code", "GetCaption"), ("code", "SetCaption")),
+                    ("Left", ("field", 0x10), ("code", "SetLeft")),
+                    ("Size", ("virt", 0), ("virt", 1))),
+             ext_props=(("Hidden", ("code", "GetHidden"), None), ("AttrOne", ("code", "GetAttrOne"), None),
+                        ("Last", ("code", "GetLast"), None)))
+    pe.klass("TDerived", "TBase", "DerivedUnit", 40,
+             props=(("Caption", ("abs", pe.code["TBase.GetCaption"]), None), ("Own", ("code", "GetOwn"), None)))
+    pe.write(tmp_path / "p.exe")
+    classes, _f = delphi.parse_file(tmp_path / "p.exe")
+    by = {c.name: c for c in classes}
+    got = {(m.kind, m.name): (m.addr, m.slot) for m in by["TBase"].methods if m.kind.startswith("prop-")}
+    assert got == {
+        ("prop-get", "Caption"): (pe.code["TBase.GetCaption"], -1),
+        ("prop-set", "Caption"): (pe.code["TBase.SetCaption"], -1),
+        ("prop-set", "Left"): (pe.code["TBase.SetLeft"], -1),                      # the getter is a field
+        ("prop-get", "Size"): (pe.code["TBase.v0_GetSize"], 0),                    # virtual slots
+        ("prop-set", "Size"): (pe.code["TBase.v1_SetSize"], 1),
+        ("prop-get", "Hidden"): (pe.code["TBase.GetHidden"], -1),                  # extended list only
+        ("prop-get", "AttrOne"): (pe.code["TBase.GetAttrOne"], -1),                # record with attribute data
+        ("prop-get", "Last"): (pe.code["TBase.GetLast"], -1)}                      # read after the longer record
+    assert [(m.kind, m.name) for m in by["TDerived"].methods if m.kind.startswith("prop-")] == [("prop-get", "Own")]
+    assert delphi.accessor_names(classes)[pe.code["TBase.SetLeft"]] == "BaseUnit.TBase.SetLeft"
+    assert pe.code["TBase.v0_GetSize"] in delphi.accessor_names(classes)
 
 
 def test_extended_table_of_an_old_compiler_is_ignored(tmp_path):
@@ -500,6 +565,10 @@ def test_hints_and_candidates(proj):
     assert delphi.hints_for(st, bid, pe.code["TComponent.Create"]) == ["rtti: System.Classes.TComponent.Create"]
     assert delphi.hints_for(st, bid, pe.code["TMainForm.Helper"]) == ["rtti: MainUnit.TMainForm.Helper"]
     assert pe.code["TMainForm.Refresh"] in set(fnfix.candidates(st, bid))
+    assert delphi.hints_for(st, bid, pe.code["TMainForm.GetTitle"]) == [
+        "prop: MainUnit.TMainForm.GetTitle (getter of Title, name by convention)"]
+    assert delphi.hints_for(st, bid, pe.code["TMainForm.SetTitle"])[0].startswith("prop: MainUnit.TMainForm.SetTitle (setter")
+    assert pe.code["TMainForm.GetTitle"] in set(fnfix.candidates(st, bid))
     # fnfix: the handler of Button1Click is a function; the others are candidates
     cands = set(fnfix.candidates(st, bid))
     assert pe.code["TMainForm.OpenClick"] in cands and a not in cands
