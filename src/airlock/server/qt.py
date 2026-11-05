@@ -41,9 +41,9 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-QT_VERSION = 1
+QT_VERSION = 2   # 2: Qt6 SuperData getter layout, Qt6 notify ids, C++ import rows, connect call sites through import slots
 QT_META = "qt_version"             # meta key prefix; the full key is ``qt_version:<binary id>``
-DISPATCH_VERSION = 1
+DISPATCH_VERSION = 2   # 2: pointer-to-member connects (worker op qt_connects)
 DISPATCH_META = "qt_dispatch"      # set when the worker op ran (``qt_dispatch:<binary id>``)
 
 HEADER_WORDS = 14
@@ -328,9 +328,9 @@ def _decode(img: Image, cand: tuple) -> QtClass | None:
         p = poff + i * pw
         flags = at(p + 2)
         notify: int | None = None
-        if major == 6:
+        if major == 6:       # Qt6 has no Notify flag: ``notifyId`` is -1 or the signal index
             nid = at(p + 3)
-            notify = nid if (flags & PROP_NOTIFY) and nid != 0xFFFFFFFF else None
+            notify = nid if nid != 0xFFFFFFFF and nid < max(h[13], 1) else None
         elif has_notify_array and (flags & PROP_NOTIFY):
             nid = at(notify_base + i)
             notify = nid if nid != 0xFFFFFFFF else None
@@ -348,24 +348,76 @@ def _decode(img: Image, cand: tuple) -> QtClass | None:
     return c
 
 
-def parse_image(img: Image) -> list[QtClass]:
+def _getter_target(img: Image, fn: int, depth: int = 3) -> tuple[str, int] | None:
+    """What the ``SuperData`` getter returns: ``("addr", a)`` for ``lea rax,[rip+d]; ret`` (a metaobject of
+    this image), ``("slot", a)`` for ``mov rax,[rip+d]; ret`` (the import slot of the parent's
+    ``staticMetaObject``). 32-bit forms ``mov eax,imm`` / ``mov eax,[imm]`` too; ``jmp`` thunks are followed."""
+    b = img.read(fn, 8)
+    if b is None or depth < 0:
+        return None
+    mask = 2 ** (8 * img.psize) - 1
+    if img.psize == 8 and b[0] == 0x48 and b[2] == 0x05 and b[7] == 0xC3 and b[1] in (0x8D, 0x8B):
+        a = (fn + 7 + struct.unpack_from("<i", b, 3)[0]) & mask
+        return ("addr" if b[1] == 0x8D else "slot", a)
+    if img.psize == 4 and b[0] in (0xB8, 0xA1) and b[5] == 0xC3:
+        return ("addr" if b[0] == 0xB8 else "slot", struct.unpack_from("<I", b, 1)[0])
+    if b[0] == 0xE9:
+        return _getter_target(img, (fn + 5 + struct.unpack_from("<i", b, 1)[0]) & mask, depth - 1)
+    return None
+
+
+_MSVC_META = re.compile(r"\?staticMetaObject@((?:[A-Za-z_]\w*@)+)@")
+
+
+def parent_from_import(name: str) -> str:
+    """Class name out of the import name of ``staticMetaObject`` (MSVC ``?staticMetaObject@B@A@@2U...``)."""
+    m = _MSVC_META.search(name)
+    if m:
+        return "::".join(reversed([p for p in m.group(1).split("@") if p]))
+    m = re.search(r"([A-Za-z_][\w:]*)::staticMetaObject\b", name)
+    return m.group(1) if m else ""
+
+
+def parse_image(img: Image, imports: dict[int, str] | None = None) -> list[QtClass]:
     """Every QMetaObject of the image, with the parent class name where the file holds a pointer to
-    another metaobject of the image. Sorted by name."""
+    another metaobject of the image (or, with ``imports`` = {import slot address: name}, a getter that loads the
+    parent's import). Sorted by name.
+
+    Qt6 built with ``QT_NO_DATA_RELOCATION`` (Windows) has a two word ``SuperData`` ``{direct, getter}``: the scan
+    finds the getter word, ``QMetaObject`` starts one pointer earlier, and the parent comes from the getter."""
     classes: list[QtClass] = []
     seen: set[int] = set()
-    for cand in _candidates(img):
+    cands = _candidates(img)
+    ps = img.psize
+    indirect = any(c[1] and c[6] is not None and img.is_code(c[1]) for c in cands)
+    for cand in cands:
         if cand[0] in seen:
             continue
         try:
             c = _decode(img, cand)
         except (struct.error, IndexError, ValueError):
             c = None
-        if c is not None and c.name:
-            seen.add(c.meta)
-            classes.append(c)
+        if c is None or not c.name:
+            continue
+        if indirect and c.major == 6:
+            getter, c.super_addr = c.super_addr, None
+            c.meta -= ps
+            direct = img.ptr(c.meta)
+            if getter and img.is_code(getter):
+                t = _getter_target(img, getter)
+                if t is not None and t[0] == "addr":
+                    c.super_addr = t[1]
+                elif t is not None and imports:
+                    c.parent = parent_from_import(imports.get(t[1], ""))
+            elif direct and img.in_image(direct):
+                c.super_addr = direct
+        if c.meta in seen:
+            continue
+        seen.add(c.meta)
+        classes.append(c)
     by_meta = {c.meta: c for c in classes}
     for c in classes:
-        if c.super_addr and c.super_addr in by_meta:
+        if c.super_addr and c.super_addr in by_meta and not c.parent:
             c.parent = by_meta[c.super_addr].name
     classes.sort(key=lambda c: (c.name, c.meta))
     return classes
@@ -411,9 +463,72 @@ def store_rows(store: Store, binary_id: int, classes: list[QtClass]) -> None:
         store.db.execute("DELETE FROM meta WHERE key=?", (dispatch_key(binary_id),))
 
 
+def pe_import_rows(path: Path) -> list[tuple[str, str, int]]:
+    """(dll, symbol name, import slot address) of the by-name imports of a PE (empty on any problem)."""
+    out: list[tuple[str, str, int]] = []
+    try:
+        import pefile
+        pe = pefile.PE(str(path), fast_load=True)
+        try:
+            pe.parse_data_directories([pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+            for d in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+                dll = d.dll.decode("latin-1").upper() if d.dll else ""
+                for imp in d.imports:
+                    if imp.name and imp.address:
+                        out.append((dll, imp.name.decode("latin-1"), int(imp.address)))
+        finally:
+            pe.close()
+    except Exception:  # noqa: BLE001  an extra: parents from imports are then left to the worker
+        return out
+    return out
+
+
+def pe_imports(path: Path) -> dict[int, str]:
+    """{import slot address: symbol name} of the by-name imports of a PE."""
+    return {a: n for _d, n, a in pe_import_rows(path)}
+
+
+_MSVC_FN = re.compile(r"^\?(\?[01])?((?:[A-Za-z_][\w]*@)+)@")
+
+
+def import_qualname(mangled: str) -> str:
+    """``?connectImpl@QObject@@CA...`` -> ``QObject::connectImpl``; ``??0Foo@@...`` -> ``Foo::Foo``; "" for the
+    forms this does not read (templates, operators, Itanium names)."""
+    m = _MSVC_FN.match(mangled)
+    if not m:
+        return ""
+    parts = [p for p in m.group(2).split("@") if p]
+    if m.group(1):                      # constructor / destructor: the first part is the class
+        name, scopes = ("~" if m.group(1) == "?1" else "") + parts[0], parts
+    else:
+        name, scopes = parts[0], parts[1:]
+    return "::".join([*reversed(scopes), name])
+
+
+def fill_imports(store: Store, binary_id: int, artifact: Path) -> int:
+    """Add the C++ imports (mangled names) the analysis left out of the ``import`` table: Ghidra files them under
+    the class namespace of the external library, so neither the import row nor a call edge to a function
+    exists, only a read edge to the import slot. Rows are named ``Class::method``. Returns rows added."""
+    rows = pe_import_rows(artifact)
+    have = {r[0] for r in store.db.execute("SELECT address FROM import WHERE binary_id=? AND address IS NOT NULL",
+                                           (binary_id,))}
+    add = []
+    for dll, name, slot in rows:
+        if slot in have or not name.startswith("?"):
+            continue
+        q = import_qualname(name)
+        if q:
+            add.append((binary_id, dll, q, None, slot, None))
+    if add:
+        with store.db:
+            store.db.executemany("INSERT INTO import(binary_id, dll, name, ordinal, address, resolved) "
+                                 "VALUES (?,?,?,?,?,?)", add)
+    return len(add)
+
+
 def parse_file(path: Path) -> list[QtClass] | None:
     img = Image.from_pe(path)
-    return None if img is None else parse_image(img)
+    return None if img is None else parse_image(img, pe_imports(path))
 
 
 def derive_binary(store: Store, binary_id: int, artifact: Path) -> tuple[int, int, int]:
@@ -444,6 +559,7 @@ def ensure(store: Store, binary: Binary, artifact: Path) -> bool:
         return False
     try:
         derive_binary(store, binary.id, artifact)
+        fill_imports(store, binary.id, artifact)
         derive_connects(store, binary.id)
         return True
     except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
@@ -517,7 +633,67 @@ def resolve(ix: Any, project: str, store: Store, b: Binary) -> tuple[int, int]:
         if r.get("created"):
             ix.reextract_code(store, b, program)
     res = ix.worker.request("qt_dispatch", {"program": program, "classes": pend}, timeout=3600)
-    return store_dispatch(store, b.id, res)
+    out = store_dispatch(store, b.id, res)
+    sites = [dict(r) for r in store.db.execute(
+        "SELECT fn_entry AS fn, site FROM qt_connect WHERE binary_id=? AND kind='ptr' AND signal='' ORDER BY site",
+        (b.id,))]
+    if sites:        # pointer-to-member connects: the signal and the slot of each connectImpl call site
+        try:
+            cres = ix.worker.request("qt_connects", {"program": program, "sites": sites}, timeout=3600)
+            store_connects(store, b.id, cres, sites)
+        except Exception as e:  # noqa: BLE001  an extra: the call sites stay listed
+            log.warning("Qt pointer connects of %s failed: %s", b.name, e)
+    return out
+
+
+def store_connects(store: Store, binary_id: int, result: dict, sites: list[dict]) -> tuple[int, int]:
+    """Write the worker result of ``qt_connects``: one ``ptr`` row per resolved connection (filed at the call that
+    holds the member pointers, which can be a caller of the function with the ``connectImpl`` call), the sites
+    without a result stay as empty rows. ``signal`` is ``Class::name(args)`` (a signal of the binary, by
+    metaobject and index, or by function address) or ``Class::name`` (an imported signal); ``slot`` is the
+    function address ``0x...`` (``slot_kind`` slot, signal, fn, functor) or an imported function name (ext).
+    Returns (connections resolved, sites unresolved)."""
+    db = store.db
+    sig_by_idx: dict[tuple[int, int], str] = {}
+    by_addr: dict[int, tuple[str, str]] = {}
+    for r in db.execute("SELECT m.meta_addr, m.idx, m.kind, m.name, m.params, m.addr, c.name AS cname FROM qt_method m "
+                        "JOIN qt_class c ON c.binary_id=m.binary_id AND c.meta_addr=m.meta_addr "
+                        "WHERE m.binary_id=? AND m.kind<>'constructor'", (binary_id,)):
+        types = ",".join(p.rsplit(" ", 1)[0] if " " in p.strip() else p for p in r["params"].split(", ") if p)
+        text = f"{r['cname']}::{r['name']}({types})"
+        sig_by_idx[(r["meta_addr"], r["idx"])] = text
+        if r["addr"] is not None:
+            by_addr.setdefault(r["addr"], (text, r["kind"]))
+    rows = []
+    found = set()
+    for r in result.get("results", []):
+        sg, sl = r.get("signal") or {}, r.get("slot") or {}
+        if sg.get("ext"):
+            sig = sg["ext"]
+        elif "meta" in sg and (sg["meta"], sg.get("idx", -1)) in sig_by_idx:
+            sig = sig_by_idx[(sg["meta"], sg["idx"])]
+        elif sg.get("addr") in by_addr:
+            sig = by_addr[sg["addr"]][0]
+        else:
+            sig = f"0x{sg.get('addr', 0):x}"
+        if sl.get("ext"):
+            slot, kind = sl["ext"], "ext"
+        elif sl.get("addr") is None:
+            slot, kind = "", ""
+        else:
+            slot = f"0x{sl['addr']:x}"
+            kind = "functor" if sl.get("kind") == "functor" else (by_addr.get(sl["addr"], ("", "fn"))[1])
+            if kind == "method":
+                kind = "slot"
+        rows.append((binary_id, r["fn"], r["site"], "ptr", sig, slot, kind))
+        found.add(r["site"])
+    left = [s for s in sites if s["site"] not in found]
+    rows += [(binary_id, s["fn"], s["site"], "ptr", "", "", "") for s in left]
+    with db:
+        db.execute("DELETE FROM qt_connect WHERE binary_id=? AND kind='ptr'", (binary_id,))
+        db.executemany("INSERT INTO qt_connect(binary_id, fn_entry, site, kind, signal, slot, slot_kind) "
+                       "VALUES (?,?,?,?,?,?,?)", rows)
+    return len(rows) - len(left), len(left)
 
 
 def resolve_project(ix: Any, project: str, store: Store) -> int:
@@ -565,6 +741,21 @@ def _connect_functions(db, binary_id: int) -> dict[int, str]:
     return out
 
 
+_CONNECT_IMPORT = re.compile(r"(?:^|::)QObject::connect(Impl)?$")
+
+
+def _connect_slots(db, binary_id: int) -> dict[int, str]:
+    """{import slot address: 'string' | 'ptr'} of the imported ``QObject::connect`` / ``connectImpl``: the
+    import row (a call through the slot is only a read edge to the slot, there is no edge to a function)."""
+    out: dict[int, str] = {}
+    for r in db.execute("SELECT name, address FROM import WHERE binary_id=? AND address IS NOT NULL "
+                        "AND name LIKE '%onnect%'", (binary_id,)):
+        m = _CONNECT_IMPORT.search(r["name"] or "")
+        if m:
+            out[r["address"]] = "ptr" if m.group(1) else "string"
+    return out
+
+
 def derive_connects(store: Store, binary_id: int) -> int:
     """Connections of a Qt binary, from the string and edge tables.
 
@@ -599,6 +790,16 @@ def derive_connects(store: Store, binary_id: int) -> int:
                 f"WHERE e.binary_id=? AND e.dst_fn IN ({marks}) ORDER BY f.entry, e.src_addr",
                 (binary_id, *cfn)):
             calls.setdefault(r["entry"], []).append((r["src_addr"], cfn[r["dst_fn"]]))
+    slots = _connect_slots(q, binary_id)
+    if slots:
+        marks = ",".join("?" * len(slots))
+        for r in q.execute(
+                f"SELECT e.src_addr, f.entry, e.dst_addr FROM edge e JOIN function f ON f.id=e.src_fn "
+                f"WHERE e.binary_id=? AND e.dst_addr IN ({marks}) AND e.kind IN ('read','call_imp','call','data') "
+                f"ORDER BY f.entry, e.src_addr", (binary_id, *slots)):
+            calls.setdefault(r["entry"], []).append((r["src_addr"], slots[r["dst_addr"]]))
+    for cl in calls.values():
+        cl.sort()
 
     def pair(a: tuple[int, str, int], bb: tuple[int, str, int]) -> tuple | None:
         sa, sb = _SIGSLOT.match(a[1]), _SIGSLOT.match(bb[1])
@@ -681,10 +882,14 @@ def ui_line(store: Store, binary_id: int) -> str:
         r = store.db.execute(
             "SELECT SUM(kind='signal'), SUM(kind='slot'), SUM(kind IN ('signal','slot') AND addr IS NOT NULL) "
             "FROM qt_method WHERE binary_id=?", (binary_id,)).fetchone()
-        c = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=?", (binary_id,)).fetchone()[0]
+        c = store.db.execute("SELECT COUNT(*) FROM qt_connect WHERE binary_id=? AND kind='string'", (binary_id,)).fetchone()[0]
+        pc = store.db.execute("SELECT COUNT(*), SUM(signal<>'') FROM qt_connect WHERE binary_id=? AND kind='ptr'",
+                              (binary_id,)).fetchone()
     except Exception:  # noqa: BLE001  an extra
         return ""
     extra = f", string connections {c}" if c else ""
+    if pc and pc[0]:
+        extra += f", pointer connects {pc[1] or 0} of {pc[0]} call sites resolved"
     return f"Qt: {n} classes, signals {r[0] or 0}, slots {r[1] or 0} ({r[2] or 0} signals and slots mapped to functions){extra}"
 
 
@@ -700,4 +905,79 @@ def runtime_addrs(store: Store, binary_id: int) -> set[int]:
             "WHERE s.binary_id=? AND s.slot<3", (binary_id,)))
     except Exception:  # noqa: BLE001  an extra
         pass
+    return out
+
+
+# ── feature seeds ──────────────────────────────────────────────────────────
+
+# sender class -> signals whose slots are user interface handlers (feature key). A subclass is covered through
+# the parent chain (``qt_class.parent`` for classes of the binary, ``_QT_BASES`` for the Qt library ones).
+_SEED_SIGNALS: dict[str, tuple[str, frozenset[str]]] = {
+    "QAction": ("ui-menu", frozenset({"triggered", "toggled"})),
+    "QActionGroup": ("ui-menu", frozenset({"triggered"})),
+    "QMenu": ("ui-menu", frozenset({"triggered", "aboutToShow"})),
+    "QMenuBar": ("ui-menu", frozenset({"triggered"})),
+    "QAbstractButton": ("ui-dialog", frozenset({"clicked", "toggled", "pressed", "released"})),
+    "QDialog": ("ui-dialog", frozenset({"accepted", "rejected", "finished"})),
+    "QDialogButtonBox": ("ui-dialog", frozenset({"accepted", "rejected", "clicked"})),
+    "QWizard": ("ui-dialog", frozenset({"accepted", "rejected", "finished", "currentIdChanged"})),
+}
+_QT_BASES = {
+    **{c: "QAbstractButton" for c in ("QPushButton", "QToolButton", "QCheckBox", "QRadioButton", "QCommandLinkButton")},
+    **{c: "QDialog" for c in ("QMessageBox", "QFileDialog", "QInputDialog", "QProgressDialog", "QColorDialog",
+                              "QFontDialog", "QErrorMessage", "QWizard")},
+}
+# a string connect names no class: these signal names are enough
+_SEED_NAME_ONLY = {"triggered": "ui-menu", "clicked": "ui-dialog", "accepted": "ui-dialog", "rejected": "ui-dialog"}
+_PTR_SIG = re.compile(r"^(?:(.+)::)?(\w+)(?:\(.*\))?$")
+
+
+def seed_for_signal(cls: str, name: str, parents: dict[str, str]) -> tuple[str, str] | None:
+    """(feature key, evidence) for a signal ``cls::name`` that fires a user interface handler, else None.
+    ``parents`` maps a class of the binary to its parent."""
+    seen = 0
+    c = cls
+    while c and seen < 16:
+        hit = _SEED_SIGNALS.get(c)
+        if hit and name in hit[1]:
+            return hit[0], f"Qt {c}::{name}"
+        c = parents.get(c) or _QT_BASES.get(c, "")
+        seen += 1
+    return None
+
+
+def feature_seeds(store: Store, binary_id: int) -> list[tuple[int, str, str]]:
+    """(function address, feature key, evidence) for the handlers connected to user interface signals:
+    pointer connects (class and signal known, slot address in ``qt_connect.slot``) and string connects
+    (signal name only; the slot must name one function in the binary)."""
+    db = store.db
+    out: list[tuple[int, str, str]] = []
+    try:
+        parents = {r[0]: r[1] for r in db.execute(
+            "SELECT name, parent FROM qt_class WHERE binary_id=? AND parent<>''", (binary_id,))}
+        by_sig: dict[str, set[int]] = {}
+        for r in db.execute("SELECT name, params, addr FROM qt_method WHERE binary_id=? AND addr IS NOT NULL "
+                            "AND kind IN ('slot','method')", (binary_id,)):
+            types = ",".join(p.rsplit(" ", 1)[0] if " " in p.strip() else p for p in r["params"].split(", ") if p)
+            by_sig.setdefault(f"{r['name']}({_norm_args(types)})", set()).add(r["addr"])
+        for r in db.execute("SELECT kind, signal, slot FROM qt_connect WHERE binary_id=?", (binary_id,)):
+            if r["kind"] == "ptr":
+                m = _PTR_SIG.match(r["signal"] or "")
+                try:
+                    addr = int(r["slot"], 16) if (r["slot"] or "").startswith("0x") else None
+                except ValueError:
+                    addr = None
+                got = seed_for_signal(m.group(1) or "", m.group(2), parents) if m else None
+                if got and addr is not None:
+                    out.append((addr, got[0], got[1]))
+            elif r["kind"] == "string":
+                m = _SIGSLOT.match("2" + (r["signal"] or ""))
+                key = _SEED_NAME_ONLY.get(m.group(2)) if m else None
+                s = _SIGSLOT.match("1" + (r["slot"] or ""))
+                if key and s:
+                    cand = by_sig.get(f"{s.group(2)}({_norm_args(s.group(3))})", set())
+                    if len(cand) == 1:
+                        out.append((next(iter(cand)), key, f"Qt connect {m.group(2)}"))
+    except Exception:  # noqa: BLE001  an extra: the other seeds stay
+        log.warning("Qt seeds of binary %s failed", binary_id)
     return out

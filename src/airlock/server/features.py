@@ -20,7 +20,7 @@ from typing import Any
 
 from airlock.index.store import CODE_EDGES, Store
 from airlock.projects import ProjectPaths, read_manifest
-from airlock.server import delphi
+from airlock.server import delphi, qt
 from airlock.server.uijoin import UiIndex
 
 log = logging.getLogger("airlock")
@@ -45,7 +45,7 @@ DATA_FORMAT = "data-format:"
 MAX_DEPTH = 2
 MAX_FANIN = 40        # a function with more callers is a utility: its callers are not followed
 MAX_ENTRIES = 1500    # per feature; strong seeds first (strongest evidence), then callers by depth
-FEATURES_VERSION = 6  # 6: Delphi DFM event handlers seed ui-menu / ui-dialog; 5: framework range / runtime message map entries no longer seed ui features; 4: ui-menu / ui-dialog seeds from message map handlers of menu items and dialog controls; 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
+FEATURES_VERSION = 7  # 7: Qt seeds (slots of QAction / button / dialog signals, Qt library class prefixes); 6: Delphi DFM event handlers seed ui-menu / ui-dialog; 5: framework range / runtime message map entries no longer seed ui features; 4: ui-menu / ui-dialog seeds from message map handlers of menu items and dialog controls; 3: CRT underscore rule needs a known CRT name; meta key FEATURES_VERSION_META; a project derived by an older version is derived again on open
 FEATURES_VERSION_META = "features_version"
 DROPPED_META = "feature_dropped"   # JSON {feature key: entry points cut by MAX_ENTRIES}
 MAX_EVIDENCE = 4
@@ -208,6 +208,17 @@ API_PREFIX: tuple[tuple[str, str], ...] = (
     ("CSocket::", "network"), ("CAsyncSocket::", "network"), ("CInternetSession::", "network"),
     ("CHttpFile::", "network"), ("CDC::", "ui-draw"), ("CBitmap::", "ui-draw"),
     ("CBrush::", "ui-draw"), ("CPen::", "ui-draw"), ("CFont::", "ui-draw"),
+    # Qt library classes (imports of a Qt DLL, demangled)
+    ("QNetworkAccessManager::", "network"), ("QNetworkReply::", "network"), ("QNetworkRequest::", "network"),
+    ("QAbstractSocket::", "network"), ("QTcpSocket::", "network"), ("QUdpSocket::", "network"),
+    ("QSslSocket::", "network"), ("QTcpServer::", "network"), ("QLocalSocket::", "network"),
+    ("QWebSocket::", "network"), ("QFile::", "file-io"), ("QSaveFile::", "file-io"), ("QDir::", "file-io"),
+    ("QFileInfo::", "file-io"), ("QFileSystemWatcher::", "file-io"), ("QSettings::", "config"),
+    ("QMenu::", "ui-menu"), ("QMenuBar::", "ui-menu"), ("QAction::", "ui-menu"),
+    ("QDialog::", "ui-dialog"), ("QMessageBox::", "ui-dialog"), ("QFileDialog::", "ui-dialog"),
+    ("QInputDialog::", "ui-dialog"), ("QPainter::", "ui-draw"), ("QPluginLoader::", "plugins"),
+    ("QLibrary::", "plugins"), ("QJSEngine::", "scripting"), ("QQmlEngine::", "scripting"),
+    ("QQmlApplicationEngine::", "scripting"),
 )
 # gl*/glu*/glut* only when followed by an uppercase letter (glBegin, not global).
 _GL_RE = re.compile(r"^(?:wgl|glu|glut|gl)[A-Z]")
@@ -265,7 +276,8 @@ WEAK_API = frozenset(
 _WEAK_MEMBERS = frozenset(
     "FromHandle FromHandlePermanent Default Attach Detach Delete InvokeHelper SetProperty GetProperty "
     "SendChildNotifyLastMsg PrepareForHelp GetOwner SelectObject SelectGdiObject SetBkMode SetBkColor "
-    "SetTextColor GetSafeHwnd AssertValid Dump GetRuntimeClass".split())
+    "SetTextColor GetSafeHwnd AssertValid Dump GetRuntimeClass "
+    "staticMetaObject metaObject qt_metacast qt_metacall tr trUtf8".split())      # last row: Qt boilerplate
 # CWnd methods that create, destroy or subclass a window: strong ui-window evidence
 _CWND_STRONG = frozenset(
     "Create CreateEx PreCreateWindow DestroyWindow WindowProc DefWindowProc SubclassWindow SubclassDlgItem "
@@ -669,6 +681,14 @@ def derive(store: Store, runtime_ids: Iterable[int] = (), data_exts: Iterable[st
                     seed(key, bid, fid, ev, ev)
         except Exception as e:  # noqa: BLE001  an extra: the other seeds stay
             log.warning("delphi seeds of binary %s failed: %s", bid, e)
+        # Qt: a slot connected to QAction::triggered / a button's clicked / a dialog's accepted is a strong seed
+        try:
+            for addr, key, ev in qt.feature_seeds(store, bid):
+                fid = bn.at.get(("ram", addr))
+                if fid is not None and fid not in bn.thunk_ids and fid not in bn.lib:
+                    seed(key, bid, fid, ev, ev)
+        except Exception as e:  # noqa: BLE001  an extra: the other seeds stay
+            log.warning("qt seeds of binary %s failed: %s", bid, e)
         # a data-format extension that appears in strings is a feature even when no code refs it
         for addr, lst in hits.items():
             for k, lab in lst:

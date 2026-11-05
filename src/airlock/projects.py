@@ -345,7 +345,8 @@ def classify_toolchain(
 
 
 def _has_tpf0(pe: pefile.PE) -> bool:
-    """True if an RCDATA resource starts with the Delphi form signature TPF0."""
+    """True if an RCDATA resource starts with the Delphi form signature TPF0, or is the DVCLAL license
+    resource that every Delphi 2+ program carries (console programs and DLLs have no form)."""
     d = getattr(pe, "DIRECTORY_ENTRY_RESOURCE", None)
     if d is None:
         return False
@@ -356,6 +357,8 @@ def _has_tpf0(pe: pefile.PE) -> bool:
         for n in t.directory.entries:
             if not hasattr(n, "directory"):
                 continue
+            if getattr(n, "name", None) is not None and str(n.name) == "DVCLAL":
+                return True
             for lang in n.directory.entries:
                 data = getattr(lang, "data", None)
                 if data is None:

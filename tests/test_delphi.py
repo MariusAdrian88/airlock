@@ -391,6 +391,15 @@ def test_extended_table_of_an_old_compiler_is_ignored(tmp_path):
     assert not any(m.kind.startswith("rtti") for m in old.methods)
 
 
+def test_formless_program_is_detected_by_the_license_resource(tmp_path):
+    from airlock import projects
+    pe = Pe(4)
+    pe.res[(10, "DVCLAL", 0x409)] = b"\x00" * 16
+    f = tmp_path / "cli.exe"
+    pe.write(f)
+    assert projects.detect(f).toolchain == "delphi"
+
+
 def test_not_delphi_gives_no_classes(tmp_path):
     p = tmp_path / "x.bin"
     p.write_bytes(b"MZ" + b"\0" * 100)

@@ -422,3 +422,144 @@ def test_command_builds_and_lists(tmp_path, capsys):
     assert (out / "30-32.sigdb").is_file()
     assert main(["--config", str(cfg), "delphi-sigs", "list", "--out", str(out)]) == 0
     assert "30-32.sigdb: compiler 30, 32-bit, 1 names" in capsys.readouterr().out
+
+
+
+# ── names from map files (delphimap) and the units package (delphimega) ───────
+
+def map_text(where: dict[str, int], names: dict[str, str], extra: list[tuple[int, str]] = ()) -> str:
+    """A linker map in the layout of dcc -GD: a segment table, a module table and the publics by value."""
+    pubs = sorted([(where[k] - 0x1000, v) for k, v in names.items()] + [(o, n) for o, n in extra])
+    lines = [" Start         Length     Name                   Class",
+             " 0001:00401000 00000400H .text                   CODE",
+             " 0002:00402000 00000100H .data                   DATA", "", "",
+             "Detailed map of segments", "",
+             " 0001:00000000 00000400 C=CODE     S=.text    G=(none)   M=Unit     ACBP=A9", "", "",
+             "  Address             Publics by Value", ""]
+    lines += [f" 0001:{o:08X}       {n}" for o, n in pubs]
+    lines += [" 0002:00000010       Unit.SomeData"]
+    return "\n".join(lines) + "\n"
+
+
+def test_parse_map_reads_segments_modules_and_publics():
+    from airlock.server import delphimap
+    mp = delphimap.parse_map(map_text({"a": 0x1010}, {"a": "Unit.TThing.Run"}))
+    assert mp.segments[1] == (".text", "CODE", 0x401000) and mp.segments[2][1] == "DATA"
+    assert mp.modules == [(1, 0, 0x400, "Unit")]
+    assert mp.publics == [(1, 0x10, "Unit.TThing.Run"), (2, 0x10, "Unit.SomeData")]
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("System.SysUtils.TStringHelper.Split", "System.SysUtils.TStringHelper.Split"),
+    ("System.@Str1Ext", "System.@Str1Ext"),
+    ("Unit.TOuter.TInner.Go", "Unit.TOuter.TInner.Go"),
+    ("System.Classes.{System.Generics.Collections}TList<System.Integer>.Add",
+     "System.Generics.Collections.TList<System.Integer>.Add"),
+    ("Unit.TRec.&op_Addition", "Unit.TRec.op_Addition"),
+    ("System..TObject", None),                                           # a type table, not a routine
+    ("Unit.Sub..{System.Generics.Collections}TList<System.Integer>", None),
+    ("Winapi.Windows.$thunk_CreateWindowExW", None),
+    ("", None)])
+def test_map_display_names(raw, want):
+    from airlock.server import delphimap
+    assert delphimap.display_name(raw) == want
+
+
+def test_map_pair_names_routines_masks_code_and_skips_tables(tmp_path):
+    pytest.importorskip("capstone")
+    from airlock.server import delphimap
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    where = make_bpl(tmp_path / "mega.bpl", [("a", code), ("table", b"\x00" * 12), ("thunk", b"\xff\x25\0\0\0\0")],
+                     rel)
+    (tmp_path / "mega.map").write_text(map_text(where, {"a": "Unit.TThing.Run", "table": "Unit..TThing",
+                                                         "thunk": "Unit.$thunk_Foo"}), encoding="latin-1")
+    ps, recs = delphimap.scan_pair(str(tmp_path / "mega.bpl"), str(tmp_path / "mega.map"))
+    assert ps == 4 and [r[0] for r in recs] == ["Unit.TThing.Run"]
+    _n, dump, mask = recs[0]
+    assert len(dump) == len(code) and mask[13:17] == b"\xff" * 4 and dump[13:17] == b"\0" * 4   # call operand masked
+    assert delphimap.pair_psize(tmp_path / "mega.bpl") == 4 and delphimap.pair_psize(tmp_path / "mega.map") is None
+
+
+def test_map_pair_64_bit_uses_pdata_bounds(tmp_path):
+    pytest.importorskip("capstone")
+    from airlock.server import delphimap
+    ret_early = (b"\x48\x83\xec\x28" + b"\x84\xc9\x74\x08" + b"\xe8" + i32(0x400) + b"\x48\x83\xc4\x28\xc3"
+                 + b"\xb8\x01\x00\x00\x00\x48\x83\xc4\x28\xc3")
+    where = make_bpl(tmp_path / "m.bpl", [("e", ret_early)], psize=8, pdata={"e"})
+    (tmp_path / "m.map").write_text(map_text(where, {"e": "Unit.Early"}), encoding="latin-1")
+    _ps, recs = delphimap.scan_pair(str(tmp_path / "m.bpl"), str(tmp_path / "m.map"))
+    assert [(r[0], len(r[1])) for r in recs] == [("Unit.Early", len(ret_early))]
+
+
+OTHER32 = b"\x55\x8b\xec\x83\xc4\xf4\x53\x56\x8b\xd8\x33\xc0\xb8\x07\x00\x00\x00\x5e\x5b\x8b\xe5\x5d\xc3"
+
+
+def test_build_adds_map_names_and_the_exported_name_wins(tmp_path):
+    pytest.importorskip("capstone")
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code)], rel, tail=COMPILER)
+    inst = _install(tmp_path)
+    where = make_bpl(tmp_path / "mega.bpl", [("a", code), ("b", OTHER32)], rel, tail=COMPILER)
+    (tmp_path / "mega.map").write_text(map_text(where, {"a": "System.Classes.TThing.Run",
+                                                         "b": "System.Classes.TThing.Helper"}), encoding="latin-1")
+    res = delphisigs.build(inst, tmp_path / "sig", 4, jobs=1, pairs=[(tmp_path / "mega.bpl", tmp_path / "mega.map")])
+    assert res.names == 2 and res.mapped == 1                               # the map's copy of Run adds nothing
+    kb = delphisigs.read_sigdb(res.path)
+    assert sorted(p.name for p in kb.procs) == ["System.Classes.TThing.Helper", "System.Classes.TThing.Run"]
+    assert delphisigs.read_sigdb_header(res.path)["mapped"] == 1
+
+
+def _dcu_lib(tmp_path: Path, units: dict[str, bytes]) -> Path:
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for n, data in units.items():
+        (lib / f"{n}.dcu").write_bytes(b"DCU1" + data)
+    return lib
+
+
+def test_mega_blames_units_from_compiler_messages(tmp_path):
+    from airlock.server import delphimega
+    lib = _dcu_lib(tmp_path, {"Alpha": b"uses Beta.Core", "Beta.Core": b"", "Gamma": b"{$R Thing.res}",
+                              "Delta": b"uses Web.WebBroker", "Web.WebBroker": b"", "Epsilon": b"", "Zeta.Form": b""})
+    units = delphimega.unit_names(lib)
+    assert units == ["Alpha", "Beta.Core", "Delta", "Epsilon", "Gamma", "Web.WebBroker", "Zeta.Form"]
+    out = ("mega.dpk(9) Fatal: F2613 Unit 'BDE' not found.\n + mega.dpk(9) Unit 'BDE' is used by 'Epsilon'\n"
+           "Error: E1026 File not found: 'Thing.res'\nError: E1026 File not found: 'Zeta.Form.fmx'\n"
+           "Error: E2223 $DENYPACKAGEUNIT 'Web.WebBroker' cannot be put into a package\n")
+    assert delphimega.culprits(out, units, lib) == {"epsilon", "gamma", "zeta.form", "web.webbroker", "delta"}
+    assert delphimega.culprits("Fatal: something else", units, lib) == set()
+    assert delphimega.culprits("Alpha.pas(3) Error: E2003 Undeclared identifier", units, lib) == {"alpha"}
+
+
+def test_mega_project_files_and_missing_compiler(tmp_path):
+    from airlock.server import delphimega
+    inst = tmp_path / "inst"
+    lib = delphimega.lib_dir(inst, 8)
+    lib.mkdir(parents=True)
+    for n in ("System", "SysInit", "Vcl.Forms", "Winapi.Windows"):
+        (lib / f"{n}.dcu").write_bytes(b"x")
+    assert delphimega.unit_names(lib) == ["Vcl.Forms", "Winapi.Windows"]      # System and SysInit are implicit
+    work = tmp_path / "work"
+    delphimega.write_project(work, lib, ["Vcl.Forms", "Winapi.Windows"], 8, [tmp_path / "res"])
+    dpk = (work / "mega.dpk").read_text()
+    assert "package mega;" in dpk and "Vcl.Forms,\n  Winapi.Windows;" in dpk
+    cfg = (work / "mega.cfg").read_text()
+    assert "-GD" in cfg and "-B" in cfg and "Bde" not in cfg and str(tmp_path / "res") in cfg
+    with pytest.raises(delphimega.MegaError, match="dcc64.exe"):
+        delphimega.build(inst, work, 8)
+
+
+def test_command_builds_with_a_map_pair(tmp_path, capsys):
+    pytest.importorskip("capstone")
+    from airlock.cli import main
+    code, rel = routine32(0x111, BASE32 + 0x5000)
+    make_bpl(tmp_path / "rtl230.bpl", [("@System@Classes@TThing@Run$qqrv", code)], rel, tail=COMPILER)
+    inst = _install(tmp_path)
+    where = make_bpl(tmp_path / "mega.bpl", [("b", OTHER32)], rel, tail=COMPILER)
+    (tmp_path / "mega.map").write_text(map_text(where, {"b": "System.Classes.TThing.Helper"}), encoding="latin-1")
+    cfg = tmp_path / "config.jsonc"
+    cfg.write_text('{"ghidra_dir": "%s"}' % str(tmp_path).replace("\\", "/"))
+    out = tmp_path / "out"
+    assert main(["--config", str(cfg), "delphi-sigs", "build", str(inst), "--out", str(out), "--jobs", "1",
+                 "--bits", "32", "--map", str(tmp_path / "mega.bpl"), str(tmp_path / "mega.map")]) == 0
+    assert "2 names, 1 from maps" in capsys.readouterr().out

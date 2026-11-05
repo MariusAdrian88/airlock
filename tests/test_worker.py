@@ -65,3 +65,20 @@ def test_requests_lost_to_stop_are_not_a_crash(client):
         client.proc = None
         client.stop()
     assert "worker pid 4242 exited with code 0x00000003" in client.log_path.read_text("utf-8")
+
+
+def test_check_project_refuses_another_open_project():
+    from airlock.worker.ghidra_ops import session as S
+    old = S.SESSION.path
+    try:
+        S.SESSION.path = r"C:\a\ghidra"
+        S.check_project({})                              # requests without a project are not checked
+        S.check_project({"project": r"C:\a\ghidra"})
+        with pytest.raises(WorkerError) as e:
+            S.check_project({"project": r"C:\b\ghidra"})
+        assert e.value.code == "wrong_project"
+        S.SESSION.path = None
+        with pytest.raises(WorkerError):
+            S.check_project({"project": r"C:\a\ghidra"})
+    finally:
+        S.SESSION.path = old

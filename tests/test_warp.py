@@ -172,9 +172,11 @@ def _image(call_rel: int, abs_addr: int, tail: bytes = b""):
 
 
 def test_library_stems():
-    assert warp.library_stems(35) == ["core-11"]
-    assert warp.library_stems(34) == ["10.4-only", "core-11"]
-    assert warp.library_stems(30) == ["core-11", "xe2plus-only"]
+    assert warp.library_stems(35) == ["10.4-only", "core-11", "xe2plus-only"]
+    assert warp.library_stems(34) == ["10.4-only", "core-11", "xe2plus-only"]
+    assert warp.library_stems(30) == ["10.4-only", "core-11", "xe2plus-only"]
+    assert warp.library_stems(36) == ["10.4-only", "core-11", "xe2plus-only"]
+    assert warp.library_stems(28) == ["core-11", "xe2plus-only"]
     assert warp.library_stems(20) == ["2009-only", "core-8"]
     assert warp.library_stems(None) == []
 

@@ -7,7 +7,9 @@ the output. Everything here is memory-bounded: files are read in chunks or cappe
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 import operator
+import random
 import re
 import struct
 from collections import Counter
@@ -302,6 +304,16 @@ def ole_diff(pa: Path, pb: Path) -> list[str]:
 class Guess:
     score: float
     lines: list[str]
+    kind: str = ""
+    span: tuple[int, int] = (0, 0)
+    exact: bool = True
+    recs: int = 0
+
+
+_FILLER = re.compile(rb"(.)\1{15,}", re.S)   # runs of 16+ equal bytes: padding, not structure
+_ZFILL = re.compile(rb"\x00{8,}|\xff{8,}")   # zero / ff padding
+RUN_BLOCK = 16
+MIN_RUN_DENSITY = 0.4
 
 
 def _stride_scores(d: bytes) -> dict[int, float]:
@@ -317,31 +329,79 @@ def _fmt_f(x: float) -> str:
     return f"{x:.6g}"
 
 
+def _printable(b: int) -> bool:
+    return 0x20 <= b < 0x7f
+
+
+def _seq_note(vs: list[int]) -> str:
+    """', +N per record' when the column is an arithmetic progression."""
+    if len(vs) < 3:
+        return ""
+    step = vs[1] - vs[0]
+    if step and all(vs[i + 1] - vs[i] == step for i in range(len(vs) - 1)):
+        return f", {step:+d} per record"
+    if all(vs[i + 1] > vs[i] for i in range(len(vs) - 1)):
+        return ", ascending"
+    return ""
+
+
+def _int_col(chunks: list[bytes], w: int) -> tuple[str, list[int]] | None:
+    """Best little/big-endian reading of an integer column: the one with the smaller maximum."""
+    le = [int.from_bytes(c, "little") for c in chunks]
+    be = [int.from_bytes(c, "big") for c in chunks]
+    return ("", le) if max(le) <= max(be) else ("be", be)
+
+
 def _column_fields(d: bytes, stride: int) -> list[str]:
-    """Per-column summary of records of ``stride`` bytes: constants, ints, floats."""
+    """Per-column summary of records of ``stride`` bytes: constants, text, ints, floats."""
     recs = min(len(d) // stride, 4096)
     if recs < 3:
         return []
     rows = [d[i * stride:(i + 1) * stride] for i in range(recs)]
+    const = [len({r[j] for r in rows}) == 1 for j in range(stride)]
+    prn = [all(_printable(r[j]) for r in rows) for j in range(stride)]
     out: list[str] = []
     j = 0
     while j < stride:
-        col = [r[j] for r in rows]
-        if len(set(col)) == 1:
+        if const[j]:
             end = j
-            while end + 1 < stride and len({r[end + 1] for r in rows}) == 1:
+            while end + 1 < stride and const[end + 1]:
                 end += 1
-            vals = {rows[0][x] for x in range(j, end + 1)}
-            const = hx(rows[0][j:end + 1]) if end - j < 4 else f"{hx(rows[0][j:j + 4])} …"
-            tag = "zero" if vals == {0} else f"const {const}"
-            out.append(f"+0x{j:02x}" + (f"..0x{end:02x}" if end > j else "") + f" {tag}")
-            j = end + 1
+            nxt = end + 1
+            # a text field that starts with constant printable bytes stays one field
+            if nxt < stride and prn[nxt] and all(prn[j:end + 1]) and end - j + 1 < 8 and nxt - j >= 0:
+                t = nxt
+                while t < stride and prn[t]:
+                    t += 1
+                if t - j >= 4:
+                    out.append(f"+0x{j:02x} text {t - j} chars e.g. \"{rows[0][j:min(t, j + 16)].decode('ascii')}\"")
+                    j = t
+                    continue
+            # keep the constant bytes that share an aligned word with a varied byte
+            if nxt < stride:
+                for w in (8, 4, 2):
+                    ws = nxt - nxt % w
+                    if j <= ws <= end and ws + w <= stride:
+                        end = ws - 1
+                        break
+            if end >= j:
+                vals = {rows[0][x] for x in range(j, end + 1)}
+                cs = hx(rows[0][j:end + 1]) if end - j < 4 else f"{hx(rows[0][j:j + 4])} …"
+                tag = "zero" if vals == {0} else f"const {cs}"
+                out.append(f"+0x{j:02x}" + (f"..0x{end:02x}" if end > j else "") + f" {tag}")
+                j = end + 1
+                continue
+        # text run (printable in every record)
+        t = j
+        while t < stride and prn[t]:
+            t += 1
+        if t - j >= 4:
+            out.append(f"+0x{j:02x} text {t - j} chars e.g. \"{rows[0][j:min(t, j + 16)].decode('ascii')}\"")
+            j = t
             continue
         got = None
-        for w, kind in ((8, "f64"), (4, "f32"), (4, "u32"), (2, "u16")):
-            if j + w > stride:
-                continue
-            if kind == "f64" and j % 8:
+        for w, kind in ((8, "f64"), (4, "u32"), (4, "f32"), (4, "u32be"), (2, "u16")):
+            if j + w > stride or j % w:
                 continue
             chunks = [r[j:j + w] for r in rows]
             if kind == "f64":
@@ -354,22 +414,22 @@ def _column_fields(d: bytes, stride: int) -> list[str]:
                 ok = all(v == 0 or (math.isfinite(v) and 1e-6 < abs(v) < 1e9) for v in vs)
                 if ok and len(set(vs)) > 1 and sum(1 for v in vs if v != 0) >= recs // 4:
                     got = (w, f"f32 {_fmt_f(min(vs))}..{_fmt_f(max(vs))} ({len(set(vs))} distinct)")
-            elif kind == "u32":
-                vs = [int.from_bytes(c, "little") for c in chunks]
-                if max(vs) < 1 << 24:
-                    got = (w, f"u32 {min(vs)}..{max(vs)} ({len(set(vs))} distinct)")
+            elif kind in ("u32", "u32be"):
+                e = "be" if kind == "u32be" else ""
+                vs = [int.from_bytes(c, "big" if e else "little") for c in chunks]
+                if max(vs) < 1 << 24 and len(set(vs)) > 1:
+                    got = (w, f"u32{e} {min(vs)}..{max(vs)} ({len(set(vs))} distinct{_seq_note(vs)})")
             else:
-                vs = [int.from_bytes(c, "little") for c in chunks]
+                e, vs = _int_col(chunks, w)
                 if len(set(vs)) > 1:
-                    got = (w, f"u16 {min(vs)}..{max(vs)} ({len(set(vs))} distinct)")
+                    got = (w, f"u16{e} {min(vs)}..{max(vs)} ({len(set(vs))} distinct{_seq_note(vs)})")
             if got:
                 break
         if got:
             out.append(f"+0x{j:02x} {got[1]}")
             j += got[0]
         else:
-            cnt = Counter(col)
-            out.append(f"+0x{j:02x} byte {len(cnt)} distinct")
+            out.append(f"+0x{j:02x} byte {len({r[j] for r in rows})} distinct")
             j += 1
     # collapse consecutive plain byte columns
     merged: list[str] = []
@@ -382,7 +442,129 @@ def _column_fields(d: bytes, stride: int) -> list[str]:
     return merged
 
 
-def _strides(d: bytes) -> list[Guess]:
+def _best_run(m: bytes, thr: float) -> tuple[float, int, int]:
+    """Best run of matches in a 0/1 byte string: +1-thr per match, -thr per miss. (gain, start, end)."""
+    gm, gx = 1.0 - thr, -thr
+    best, bs, be, cur, cs = 0.0, 0, 0, 0.0, 0
+    for i, v in enumerate(m):
+        if v == 2:          # padding byte: neutral
+            continue
+        if cur <= 0:
+            cur, cs = 0.0, i
+        cur += gm if v else gx
+        if cur > best:
+            best, bs, be = cur, cs, i + 1
+    return best, bs, be
+
+
+def _stride_region(d: bytes, s: int) -> tuple[int, int]:
+    """Where records of stride ``s`` run inside ``d``: (first record start, end of last record)."""
+    w = d[:256 * 1024]
+    m = bytes(map(operator.eq, w, w[s:]))
+    # inside long zero / ff runs a match is padding: it counts neither for nor against the stride
+    pad = bytearray(len(m))
+    for mt in _ZFILL.finditer(w):
+        pad[mt.start():min(mt.end(), len(m))] = b"\x01" * (min(mt.end(), len(m)) - mt.start())
+    pi = int.from_bytes(bytes(pad), "big")
+    mi = int.from_bytes(m, "big")
+    neutral = mi & pi
+    mm = ((mi & (neutral ^ int.from_bytes(b"\x01" * len(m), "big"))) | (neutral << 1)).to_bytes(len(m), "big")
+    _, a, b = _best_run(mm, 0.35)
+    if b <= a:
+        return 0, len(d)
+    # the padding-blind run is the core; extend it by up to one record where plain matches continue
+    cur = best = 0.0
+    ext = 0
+    for k in range(1, min(s, a) + 1):
+        cur += 0.65 if m[a - k] else -0.35
+        if cur > best:
+            best, ext = cur, k
+    a -= ext
+    cur = best = 0.0
+    ext = 0
+    for k in range(0, min(s, len(m) - b)):
+        cur += 0.65 if m[b + k] else -0.35
+        if cur > best:
+            best, ext = cur, k + 1
+    return a, min(b + ext + s, len(d))
+
+
+def _stride_guess(d: bytes, s: int, score: float, ratio: float, base: float, org: int) -> Guess:
+    a, e = _stride_region(d, s)
+    if a <= 8 and len(d) - e < s:
+        a, e = 0, len(d)
+    recs, rest = divmod(e - a, s)
+    if a == 0 and e == len(d):
+        head = (f"fixed stride {s}: {recs} records, {rest} bytes left over; "
+                f"{ratio * 100:.0f}% of bytes repeat at +{s} (typical {base * 100:.0f}%)")
+    else:
+        head = (f"fixed stride {s}: {recs} records from 0x{org + a:x} to 0x{org + e:x}; "
+                f"{ratio * 100:.0f}% of bytes repeat at +{s} (typical {base * 100:.0f}%)")
+    return Guess(score, [head] + ["  " + f for f in _column_fields(d[a:e], s)[:14]], "stride", (a, e))
+
+
+def _fundamentals(strong: list[int]) -> list[int]:
+    chosen: list[int] = []
+    for s in sorted(strong):
+        if not any(s % c == 0 for c in chosen):
+            chosen.append(s)
+    return chosen
+
+
+def _local_stride_guesses(d: bytes, org: int) -> list[Guess]:
+    """Strides that hold only inside part of the window (header or tail around the records)."""
+    sample = d[:STRIDE_SAMPLE]
+    n = len(sample)
+    if n < 24:
+        return []
+    fill = bytearray(n)
+    for mt in _FILLER.finditer(sample):
+        fill[mt.start():mt.end()] = b"\x01" * (mt.end() - mt.start())
+    keep = int.from_bytes(bytes(1 - x for x in fill), "big")
+    gains: dict[int, tuple[float, int, int]] = {}
+    ratios = []
+    cands = {}
+    for s in range(2, min(MAX_STRIDE, n // 3) + 1):
+        m = bytes(map(operator.eq, sample, sample[s:]))
+        k = int.from_bytes(m, "big") & (keep >> (8 * s))
+        m = k.to_bytes(len(m), "big")
+        ratios.append(m.count(1) / len(m))
+        cands[s] = m
+    if not ratios:
+        return []
+    base = sorted(ratios)[len(ratios) // 2]
+    thr = max(0.30, base + 0.15)
+    for s, m in cands.items():
+        cur = best = 0.0
+        cs = bs = be = 0
+        for bi, i in enumerate(range(0, len(m), RUN_BLOCK)):
+            c = m.count(1, i, i + RUN_BLOCK) - thr * len(m[i:i + RUN_BLOCK])
+            if cur <= 0:
+                cur, cs = 0.0, bi
+            cur += c
+            if cur > best:
+                best, bs, be = cur, cs, bi + 1
+        run = (be - bs) * RUN_BLOCK
+        if run >= 3 * s and best >= 24:
+            dens = m.count(1, bs * RUN_BLOCK, be * RUN_BLOCK) / run
+            if dens >= MIN_RUN_DENSITY:
+                gains[s] = (best, bs * RUN_BLOCK, be * RUN_BLOCK)
+    if not gains:
+        return []
+    peaks = [s for s, (g, _, _) in gains.items()
+             if g >= gains.get(s - 1, (0,))[0] and g >= gains.get(s + 1, (0,))[0]]
+    if not peaks:
+        return []
+    top = max(gains[s][0] for s in peaks)
+    out = []
+    for s in _fundamentals([s for s in peaks if gains[s][0] >= 0.9 * top])[:2]:
+        g, a, b = gains[s]
+        dens = cands[s].count(1, a, b) / max(b - a, 1)
+        out.append(_stride_guess(d, s, 0.1 + min(dens, 1.0) * 0.4, dens, base, org))
+    return out
+
+
+def _strides(d: bytes, org: int = 0) -> list[Guess]:
     sample = d[:STRIDE_SAMPLE]
     if len(sample) < 24:
         return []
@@ -392,74 +574,331 @@ def _strides(d: bytes) -> list[Guess]:
     vals = sorted(sc.values())
     base = vals[len(vals) // 2]
     if base > 0.95:
-        return []
+        return _local_stride_guesses(d, org)
     peaks = [s for s, v in sc.items()
              if v - base >= 0.15 and v >= sc.get(s - 1, 0) and v >= sc.get(s + 1, 0)]
     if not peaks:
-        return []
+        return _local_stride_guesses(d, org)
     top = max(sc[s] for s in peaks)
-    strong = sorted(s for s in peaks if sc[s] >= 0.9 * top)
-    chosen: list[int] = []
-    for s in strong:
-        if not any(s % c == 0 for c in chosen):
-            chosen.append(s)
-    out = []
-    for s in chosen[:3]:
-        recs, rest = divmod(len(d), s)
-        head = (f"fixed stride {s}: {recs} records, {rest} bytes left over; "
-                f"{sc[s] * 100:.0f}% of bytes repeat at +{s} (typical {base * 100:.0f}%)")
-        out.append(Guess(sc[s] - base, [head] + ["  " + f for f in _column_fields(d, s)[:14]]))
-    return out
+    strong = [s for s in peaks if sc[s] >= 0.9 * top]
+    return [_stride_guess(d, s, sc[s] - base, sc[s], base, org) for s in _fundamentals(strong)[:3]]
 
 
-def _chains(d: bytes, window_full: bool) -> list[Guess]:
+# -- length-prefixed chains --------------------------------------------------------------
+
+_CHAIN_STARTS = tuple(range(0, 33)) + (48, 64, 96, 100, 128, 256, 512)
+_STRUCTS = {(w, big): struct.Struct((">" if big else "<") + c)
+            for w, c in ((2, "H"), (4, "I"), (8, "Q")) for big in (False, True)}
+HOP_BUDGET = 6_000_000
+NULL_SAMPLE = 16 * 1024
+MIN_CHAIN_BITS = 26
+CHAIN_WINDOW = 256 * 1024
+CALIBRATION_WINDOW = 128 * 1024
+
+
+def _chain_configs():
+    """(k, w, big, hx, tr, unit, align, incl): length at +k of w bytes, hx header bytes after it,
+    tr trailer bytes; step = k+w+hx+tr + len*unit (incl: step = len*unit), rounded up to align."""
+    for w in (2, 4, 8):
+        for big in (False, True):
+            for k in (0, 1, 2, 3, 4, 6, 8):
+                for hxx in (0, 2, 4, 8):
+                    for tr in (0, 2, 4):
+                        for unit in (1, 2):
+                            yield (k, w, big, hxx, tr, unit, 1, False)
+                yield (k, w, big, 0, 0, 1, 1, True)
+                for al in (2, 4):
+                    yield (k, w, big, 0, 0, 1, al, False)
+
+
+class _Chain:
+    __slots__ = ("cfg", "start", "recs", "end", "bits", "steps", "why")
+
+
+def _walk(d: bytes, n: int, start: int, cfg: tuple, budget: list[int], keep: list[int] | None = None,
+          null: list[int] | None = None):
+    k, w, big, hxx, tr, unit, al, incl = cfg
+    st = _STRUCTS[(w, big)]
+    a = 0 if incl else k + w + hxx + tr
+    lo = k + w
+    pos, recs, bits, zero = start, 0, 0.0, 0
+    steps: set[int] = set()
+    why = "end"
+    while pos + lo <= n:
+        ln = st.unpack_from(d, pos + k)[0]
+        step = a + ln * unit
+        if al > 1:
+            step = (step + al - 1) // al * al
+        if step < lo:
+            why = "bad"
+            break
+        if ln == 0:
+            zero += 1
+            if zero > recs // 4 + 1:
+                why = "bad"
+                break
+        if pos + step > n:
+            why = "over"
+            break
+        if null is None:
+            bits += 8 * w - 1 - math.log2(step)
+        else:   # chance that a random field value would have fit into what is left of the data
+            bits -= math.log2(max(bisect_right(null, n - pos), 1) / len(null))
+        if len(steps) < 3:
+            steps.add(step)
+        if keep is not None:
+            keep.append(pos)
+        recs += 1
+        pos += step
+        budget[0] -= 1
+        if pos == n:
+            break
+    return recs, pos, bits, len(steps), why
+
+
+def _varint(d: bytes, p: int, n: int) -> tuple[int, int] | None:
+    v = sh = 0
+    for i in range(5):
+        if p + i >= n:
+            return None
+        b = d[p + i]
+        v |= (b & 0x7f) << sh
+        sh += 7
+        if b < 0x80:
+            return v, i + 1
+    return None
+
+
+def _walk_varint(d: bytes, n: int, start: int, k: int, keep: list[int] | None = None):
+    pos, recs, zero = start, 0, 0
+    steps: set[int] = set()
+    while pos + k + 1 <= n:
+        r = _varint(d, pos + k, n)
+        if r is None:
+            break
+        ln, vl = r
+        step = k + vl + ln
+        if ln == 0:
+            zero += 1
+            if zero > recs // 4 + 1:
+                break
+        if pos + step > n:
+            break
+        if len(steps) < 3:
+            steps.add(step)
+        if keep is not None:
+            keep.append(pos)
+        recs += 1
+        pos += step
+        if pos == n:
+            break
+    return recs, pos, len(steps)
+
+
+def _tag_note(d: bytes, starts: list[int], cfg: tuple) -> str:
+    k, w, big, hxx, tr, unit, al, incl = cfg
+    if k in (1, 2, 4):
+        off, tb = 0, k
+    elif k == 0 and hxx in (2, 4):
+        off, tb = w, hxx
+    else:
+        return ""
+    c: Counter = Counter()
+    for p in starts[:4000]:
+        raw = d[p + off:p + off + tb]
+        if len(raw) == tb:
+            c[raw] += 1
+    if len(c) > 12 or not c:
+        return ""
+    def show(raw: bytes) -> str:
+        if all(_printable(x) for x in raw):
+            return raw.decode("ascii")
+        return f"0x{int.from_bytes(raw, 'big' if big and tb > 1 and k == 0 else 'little'):0{tb * 2}x}"
+    items = ", ".join(f"{show(r)}x{n}" if n > 1 else show(r) for r, n in c.most_common(6))
+    return f"; tag at +{off} ({tb}B): {items}"
+
+
+def _cfg_text(cfg: tuple) -> str:
+    k, w, big, hxx, tr, unit, al, incl = cfg
+    fld = f"u{w * 8}{'be' if big else 'le'}"
+    if incl:
+        step = "len" + (f"*{unit}" if unit != 1 else "")
+    else:
+        step = f"{k + w + hxx + tr} + len" + (f"*{unit}" if unit != 1 else "")
+    return f"{fld} at +{k}, step = {step}" + (f", padded to {al}" if al > 1 else "")
+
+
+def _block_shuffle(x: bytes, blk: int = 16) -> bytes:
+    """Same bytes in a different block order: keeps local number statistics, destroys chains."""
+    rnd = random.Random(7)
+    blocks = [x[i:i + blk] for i in range(0, len(x), blk)]
+    rnd.shuffle(blocks)
+    return b"".join(blocks)
+
+
+def _tag_bits(d: bytes, starts: list[int], cfg: tuple) -> float:
+    """Evidence from a text tag (RIFF/PNG/IFF style) in front of or behind every length field."""
+    k, w, big, hxx, tr, unit, al, incl = cfg
+    if k in (3, 4):
+        off, tb = 0, k
+    elif k == 0 and hxx in (4, 8):
+        off, tb = w, hxx
+    else:
+        return 0.0
+    for p in starts[:8]:
+        raw = d[p + off:p + off + tb]
+        if len(raw) < tb or not all(chr(x).isalnum() or x == 0x20 for x in raw):
+            return 0.0
+    return 2.0 * tb * min(len(starts), 6)
+
+
+def _chain_evidence(d: bytes, n: int, last_nz: int, full: bool, cfg: tuple, start: int, pos: int,
+                    recs: int, bits: float, why: str) -> tuple[bool, bool, bool, float]:
+    """(exact, pad, cut, evidence bits) of a finished chain walk."""
+    pad = pos >= last_nz
+    tl = n - pos
+    # a lone pad byte, or a trailer that repeats the bytes before the first record (container magic)
+    near = (tl <= 1 and cfg[6] > 1) or (4 <= tl <= 16 and start >= tl and d[pos:] == d[start - tl:start])
+    exact = full and (pad or near)
+    cut = (not full) and (why == "over" or pos == n)
+    gain = 0.0
+    if exact and pad:
+        gain = math.log2(max((pos - start) / max(recs, 1), 2))
+    return exact, pad, cut, bits + gain
+
+
+def _chains(d: bytes, window_full: bool, org: int = 0, entropy: float = 0.0) -> list[Guess]:
     n = len(d)
-    out = []
-    for w, fmt in ((1, "<B"), (2, "<H"), (4, "<I")):
-        for incl in (False, True):
-            for start in (0, 2, 4, 8, 16):
-                if start + w > n:
+    if n < 16:
+        return []
+    found: dict[tuple, tuple] = {}
+    budget = [HOP_BUDGET]
+    last_nz = len(d.rstrip(b"\0"))
+    probe = d[:NULL_SAMPLE]
+    nulls = {(w, big): sorted(int.from_bytes(probe[i:i + w], "big" if big else "little")
+                              for i in range(len(probe) - w + 1))
+             for w in (2, 4, 8) for big in (False, True)}
+    cfgs = list(_chain_configs())
+
+    # null: the same data with its blocks shuffled still has the same small numbers, but no chains
+    cn = min(n, CALIBRATION_WINDOW)
+    sd = _block_shuffle(d[:cn])
+    sfull = window_full and cn == n
+    slast = len(sd.rstrip(b"\0"))
+    cal = 0.0
+    cbudget = [HOP_BUDGET // 2]
+    for cfg in cfgs:
+        for start in _CHAIN_STARTS:
+            if start + cfg[0] + cfg[1] > cn or cbudget[0] <= 0:
+                continue
+            recs, pos, bits, ds, why = _walk(sd, cn, start, cfg, cbudget, None, nulls[(cfg[1], cfg[2])])
+            if recs >= 2:
+                ex, _p, cut, ev = _chain_evidence(sd, cn, slast, sfull, cfg, start, pos, recs, bits, why)
+                if ex or cut or recs >= 16:
+                    cal = max(cal, ev)
+    need = max(MIN_CHAIN_BITS, cal + 6)
+
+    def consider(cfg, start, recs, pos, bits, ds, why):
+        exact, pad, cut, ev = _chain_evidence(d, n, last_nz, window_full, cfg, start, pos, recs, bits, why)
+        if recs < 2 or ev + 24 < need or bits < 8 or (recs >= 3 and ds < 3):
+            return
+        if not (exact or cut) and (recs < 16 or bits < 100):
+            return
+        keep: list[int] = []
+        _walk(d, n, start, cfg, [10 ** 9], keep)
+        ev += _tag_bits(d, keep, cfg)
+        if ev < need:
+            return
+        mine = set(keep)
+        # a real chain breaks when the start moves; generic small-number tables do not
+        for sh in range(1, 17):
+            alt: list[int] = []
+            r2 = _walk(d, n, start + sh, cfg, [10 ** 9], alt)
+            if r2[0] >= max(3, recs // 2) and sum(1 for x in alt if x in mine) * 2 < len(alt):
+                return
+        avg = (pos - start) / recs
+        tail = ("chain ends exactly at 0x%x" % (org + n) if exact and pad else
+                "chain ends %d bytes before 0x%x" % (n - pos, org + n) if exact else
+                "chain runs through the window" if cut else
+                "chain stops at 0x%x (next length does not fit)" % (org + pos))
+        line = f"length-prefixed {_cfg_text(cfg)}: {recs} records from 0x{org + start:x}, avg {avg:.0f} bytes, {tail}"
+        line += _tag_note(d, keep, cfg)
+        score = 0.6 + min(ev, 240) / 240 * 0.6 + (0.2 if exact else 0.0) + min(recs, 200) / 4000
+        score -= start / 1e7
+        key = (start + cfg[0], cfg[1], pos, recs)
+        if key not in found or found[key][0] < score:
+            found[key] = (score, Guess(score, [line], "chain", (start, pos), exact, recs),
+                          (exact, pos, recs, {p + cfg[0] + cfg[1] for p in keep[:400]}, mine, start))
+
+    for cfg in cfgs:
+        w = cfg[1]
+        covered: set[int] = set()
+        for start in _CHAIN_STARTS:
+            if start + cfg[0] + w > n or start in covered:
+                continue
+            if budget[0] <= 0:
+                break
+            keep: list[int] = []
+            recs, pos, bits, ds, why = _walk(d, n, start, cfg, budget, keep, nulls[(w, cfg[2])])
+            if recs >= 2:
+                covered.update(keep)
+            consider(cfg, start, recs, pos, bits, ds, why)
+    # 1-byte and varint lengths: no information beyond the chain ending exactly
+    if entropy <= 7.0 and window_full:
+        for k, vint in ((0, False), (0, True), (1, False), (1, True)):
+            for start in (0, 1, 2, 4, 8, 16):
+                if vint:
+                    recs, pos, ds = _walk_varint(d, n, start, k)
+                    name = f"varint at +{k}, step = {k} + varint size + len"
+                else:
+                    recs, pos, ds = _walk_u8(d, n, start, k)
+                    name = f"u8 at +{k}, step = {k + 1} + len"
+                avg = (pos - start) / max(recs, 1)
+                if pos != n or recs < 12 or ds < 3 or avg < 24 or math.log2(avg) + recs / 40 < 7:
                     continue
-                pos, recs, zero = start, 0, 0
-                while pos + w <= n:
-                    ln = struct.unpack_from(fmt, d, pos)[0]
-                    step = ln if incl else w + ln
-                    if step < w:
-                        break
-                    if ln == 0:
-                        zero += 1
-                        if zero > recs // 4 + 1:
-                            break
-                    nxt = pos + step
-                    if nxt > n:
-                        break
-                    recs += 1
-                    pos = nxt
-                    if pos == n:
-                        break
-                if recs < 4:
-                    continue
-                exact = pos == n and window_full
-                cut = pos == n or (not window_full and pos + w > n - 8192)
-                if not (exact or (not window_full and cut)):
-                    continue
-                avg = (pos - start) / recs
-                bits = math.log2(max(avg, 2)) - 6   # chance 1/avg per random try, ~60 tries
-                if exact and bits < 0 and w == 1 and recs < 64:
-                    continue
-                lines = [f"length-prefixed u{w * 8}le{' incl. prefix' if incl else ''}"
-                         f" from 0x{start:x}: {recs} records, avg {avg:.0f} bytes, "
-                         f"{'chain ends exactly at ' + hex(n) if exact else 'chain runs through the window'}"]
-                out.append(Guess(0.5 + bits / 10 + (0.2 if exact else 0) + min(recs, 200) / 2000, lines))
-    out.sort(key=lambda g: -g.score)
-    seen, kept = set(), []
-    for g in out:
-        key = g.lines[0].split(":")[1]
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(g)
-    return kept[:2]
+                line = (f"length-prefixed {name}: {recs} records from 0x{org + start:x}, avg {avg:.0f} bytes, "
+                        f"chain ends exactly at 0x{org + n:x}")
+                score = 0.4 + math.log2(avg) / 40 + min(recs, 200) / 4000
+                key = (start, pos, recs)
+                if key not in found:
+                    found[key] = (score, Guess(score, [line], "chain", (start, pos), True, recs),
+                                  (True, pos, recs, set(), set(), start))
+    kept: list[tuple[Guess, tuple]] = []
+    for _, g, meta in sorted(found.values(), key=lambda t: -t[0]):
+        dup = False
+        for i2, (g2, m2) in enumerate(kept):
+            same_end = meta[0] and m2[0] and meta[1] == m2[1] and min(meta[2], m2[2]) * 2 >= max(meta[2], m2[2])
+            share = len(meta[3] & m2[3]) * 2 >= min(len(meta[3]), len(m2[3])) if meta[3] and m2[3] else False
+            same_recs = len(meta[4] & m2[4]) * 2 >= min(len(meta[4]), len(m2[4])) if meta[4] and m2[4] else False
+            if same_end or share or same_recs:
+                dup = True
+                if meta[5] < m2[5] and meta[0] >= m2[0] and meta[2] >= m2[2]:      # the same chain read from an earlier start: keep the earlier
+                    kept[i2] = (g, meta)
+                break
+        if not dup:
+            kept.append((g, meta))
+    return [g for g, _ in kept[:2]]
+
+
+def _walk_u8(d: bytes, n: int, start: int, k: int):
+    pos, recs, zero = start, 0, 0
+    steps: set[int] = set()
+    while pos + k + 1 <= n:
+        ln = d[pos + k]
+        step = k + 1 + ln
+        if ln == 0:
+            zero += 1
+            if zero > recs // 4 + 1:
+                break
+        if pos + step > n:
+            break
+        if len(steps) < 3:
+            steps.add(step)
+        recs += 1
+        pos += step
+        if pos == n:
+            break
+    return recs, pos, len(steps)
 
 
 _ASCII = re.compile(rb"[\x20-\x7e]{4,}")
@@ -505,14 +944,19 @@ def record_guess(src: Src, offset: int = 0) -> list[str]:
     head = f"record_guess region 0x{offset:x}-0x{offset + len(d):x} ({len(d)} bytes{'' if full else ', window cut'})"
     if len(d) < 16:
         return [head, "too small to guess a layout."]
-    guesses = _strides(d) + _chains(d, full)
+    entropy = _entropy(d[:65536])
+    strides = _strides(d, offset)
+    chains = _chains(d[:CHAIN_WINDOW], full and len(d) <= CHAIN_WINDOW, offset, entropy)
+    # a table of small numbers also chains by accident; a stride over the same span explains it better
+    chains = [c for c in chains if c.recs < 8 or not any(
+        min(c.span[1], t.span[1]) - max(c.span[0], t.span[0]) >= 0.8 * (c.span[1] - c.span[0]) for t in strides)]
+    guesses = strides + chains
     guesses.sort(key=lambda g: -g.score)
     out = [head]
     for g in guesses[:4]:
         out += g.lines
     if not guesses:
         out.append("no fixed stride or length-prefixed chain found.")
-    entropy = _entropy(d[:65536])
     if entropy <= 7.5:
         out += _strings(d, offset)
     out.append(f"entropy {entropy:.2f} bits/byte" + (" (looks compressed or encrypted)" if entropy > 7.5 else ""))

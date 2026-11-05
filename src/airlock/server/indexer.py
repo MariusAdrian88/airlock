@@ -119,9 +119,10 @@ def map_edge_rows(columns: list[str], rows: list[list[Any]]) -> list[tuple]:
 
 def run_extraction(worker: Any, store: Store, binary_id: int, program: str,
                    on_kind: Callable[[str, int], None] | None = None,
-                   artifact: Path | None = None) -> dict[str, Any]:
+                   artifact: Path | None = None, project: str | None = None) -> dict[str, Any]:
     """Page through all four kinds into ``store``; returns counts, timings, image
-    base and pointer size. Idempotent: derived rows are cleared first."""
+    base and pointer size. Idempotent: derived rows are cleared first. ``project`` (the Ghidra
+    project folder) makes the worker refuse the reads when another project is open."""
     store.clear_binary_data(binary_id)
     counts: dict[str, int] = {}
     secs: dict[str, float] = {}
@@ -130,8 +131,10 @@ def run_extraction(worker: Any, store: Store, binary_id: int, program: str,
         t0 = time.monotonic()
         offset, n = 0, 0
         while True:
-            r = worker.request("extract", {"program": program, "kind": kind, "offset": offset,
-                                           "limit": PAGE_SIZE[kind]}, timeout=900)
+            args = {"program": program, "kind": kind, "offset": offset, "limit": PAGE_SIZE[kind]}
+            if project:
+                args["project"] = project
+            r = worker.request("extract", args, timeout=900)
             image_base, pointer_size = r.get("image_base"), r.get("pointer_size")
             cols, rows = r["columns"], r["rows"]
             if kind == "functions":
@@ -243,6 +246,7 @@ class Indexer:
         self._runner: threading.Thread | None = None
         self._seq = itertools.count()
         self._mf_lock = threading.RLock()
+        self._switch = threading.Lock()      # the worker's open project changes under this lock only
         self._resumed: set[str] = set()
         # callbacks(project, binary_id) run after a binary became ready and was linked
         self.ready_hooks: list[Callable[[str, int], None]] = []
@@ -437,6 +441,10 @@ class Indexer:
                 continue
             if (paths.artifacts / b.sha256).is_file():
                 n += len(self.enqueue(slug, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
+        if self._other_busy(slug):   # the refresh steps below open this project in the worker: later
+            with self._lock:
+                self._resumed.discard(slug)
+            return n
         try:
             self.refresh_fixups(slug, store)  # older post-analysis fixups: no re-analysis
         except Exception as e:  # noqa: BLE001  an extra; the binaries stay usable
@@ -853,11 +861,16 @@ class Indexer:
         bid = job.binary_id
         try:
             self._state(job, "importing")
-            w.ensure_ghidra()
-            w.request("open_project", {"path": str(job.paths.ghidra), "name": GHIDRA_PROJECT_NAME},
-                      timeout=300)
+            with self._switch:
+                w.ensure_ghidra()
+                w.request("open_project", {"path": str(job.paths.ghidra), "name": GHIDRA_PROJECT_NAME},
+                          timeout=300)
+            # "project" makes the worker refuse the request if the open project was switched since
             imp = w.request("import_binary", {"artifact_path": str(job.artifact),
-                                              "program_name": job.program}, timeout=1800)
+                                              "program_name": job.program,
+                                              "project": str(job.paths.ghidra)}, timeout=1800)
+            if imp.get("pointer_size") is None or imp.get("image_base") is None:
+                raise WorkerError("import_failed", f"the import of {job.program} produced no program")
             b = st.get_binary_by_id(bid)
             assert b is not None
             st.upsert_binary(b.sha256, b.name, pointer_size=imp.get("pointer_size"),
@@ -869,7 +882,7 @@ class Indexer:
             self._state(job, "analysing")
             job.reached.set()
             res = w.request("analyze", {
-                "program": job.program,
+                "program": job.program, "project": str(job.paths.ghidra),
                 "timeout_min": self.config.defaults.get("analysis_timeout_min"),
                 "parameter_id": bool(self.config.defaults.get("decompiler_parameter_id", True)),
             }, timeout=300)
@@ -964,7 +977,8 @@ class Indexer:
                 analysis_s = round(time.monotonic() - job.analysis_started, 1)
             self._state(job, "extracting")
             t0 = time.monotonic()
-            res = run_extraction(self.worker, st, bid, job.program, artifact=job.artifact)
+            res = run_extraction(self.worker, st, bid, job.program, artifact=job.artifact,
+                                 project=str(job.paths.ghidra))
             job.timings = {**{f"extract_{k}": v for k, v in res["secs"].items()},
                            "extract_total": round(time.monotonic() - t0, 2)}
             profile = collector = None
@@ -1101,10 +1115,25 @@ class Indexer:
         """Make sure the worker has Ghidra running and this project open (the worker
         may have been restarted since open_binary). Raises WorkerError."""
         w = self.worker
-        w.ensure_ghidra()
-        s = w.request("status", timeout=30)
-        paths = self.paths(project)
-        cur = s.get("project")
-        if not cur or Path(cur["path"]) != paths.ghidra or cur["name"] != GHIDRA_PROJECT_NAME:
-            w.request("open_project", {"path": str(paths.ghidra), "name": GHIDRA_PROJECT_NAME},
-                      timeout=300)
+        slug = slugify(project)
+        with self._switch:
+            # The queue job owns the worker's open project from its import to its last step;
+            # switching it away would make the job import into or read from the wrong project.
+            with self._lock:
+                job = self._running
+            if job is not None and job.project != slug and not job.finished.is_set():
+                raise WorkerError("busy", f"the worker is indexing project '{job.project}' "
+                                          f"({job.program}). Retry when index_status shows it ready")
+            w.ensure_ghidra()
+            s = w.request("status", timeout=30)
+            paths = self.paths(project)
+            cur = s.get("project")
+            if not cur or Path(cur["path"]) != paths.ghidra or cur["name"] != GHIDRA_PROJECT_NAME:
+                w.request("open_project", {"path": str(paths.ghidra), "name": GHIDRA_PROJECT_NAME},
+                          timeout=300)
+
+    def _other_busy(self, slug: str) -> bool:
+        """True while the queue holds a running or waiting job of another project."""
+        with self._lock:
+            jobs = [self._running] if self._running is not None else []
+            return any(j.project != slug for j in (*jobs, *self._queue))

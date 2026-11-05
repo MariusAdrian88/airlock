@@ -336,3 +336,363 @@ def qt_dispatch(args: dict[str, Any]) -> dict[str, Any]:
                 res["status"] = f"error:{type(ex).__name__}"
             out.append(res)
     return {"classes": out, "secs": round(time.monotonic() - t0, 1)}
+
+
+# ── pointer-to-member connects ─────────────────────────────────────────────
+#
+# ``QObject::connect(sender, &S::sig, receiver, &R::slot)`` compiles to a call of the imported
+# ``QObject::connectImpl(sender, void **signal, receiver, void **slot, QSlotObjectBase *obj, ...)``. The compiler
+# keeps the template instantiation as a small function of its own (the decompiler even shows the stack
+# arguments of the import shifted by one), so the call site holds only parameters: the pointer to the signal
+# member pointer, and a slot object ``new``-ed with ``impl`` at +8 and the slot (a member pointer or a lambda) at
+# +0x10. The member pointers are constants in the callers. ``_Flow`` gives the value of a varnode in terms of
+# constants, parameters and stack slots; ``qt_connects`` chases the signal and the slot up the callers until the
+# signal is a constant. The connection is filed at the call that has the constants (the user's ``connect``).
+
+MAX_SITES = 20000
+MAX_DEPTH = 4
+MAX_CALLERS = 12
+MAX_FLOWS = 6000
+_PASS = frozenset({"COPY", "CAST", "INT_ZEXT", "INT_SEXT", "SUBPIECE", "INDIRECT"})
+
+
+def _signed(v: int) -> int:
+    return v - (1 << 64) if v >= 1 << 63 else v
+
+
+class _Flow:
+    """Symbolic values of one decompiled function: ``("const", a)``, ``("param", i, d)`` (parameter ``i`` read
+    through ``d`` pointers), ``("stack", off)`` (address of a stack slot) or ``("new", id, off)`` (a call result
+    plus an offset)."""
+
+    def __init__(self, hf: Any) -> None:
+        self.hf = hf
+        self.ops = list(hf.getPcodeOps())
+        self._stack: dict[int, list[Any]] = {}      # stack offset -> ops that store there (value = input 0 / 2)
+        self._late: list[Any] = []
+        for p in self.ops:
+            out = p.getOutput()
+            if out is not None and out.getAddress().isStackAddress()                     and p.getMnemonic() in ("COPY", "INDIRECT", "MULTIEQUAL", "PTRSUB", "CAST"):
+                self._stack.setdefault(_signed(int(out.getAddress().getOffset())), []).append(p)
+            elif p.getMnemonic() == "STORE":
+                self._late.append(p)
+        for p in self._late:            # STORE through the address of a stack slot
+            ptr = self.value(p.getInput(1))
+            if ptr is not None and ptr[0] == "stack":
+                self._stack.setdefault(ptr[1], []).append(p)
+
+    def calls(self) -> list[Any]:
+        return [p for p in self.ops if p.getMnemonic() in ("CALL", "CALLIND")]
+
+    def call_at(self, addr: Any) -> Any:
+        it = self.hf.getPcodeOps(addr)
+        while it.hasNext():
+            p = it.next()
+            if p.getMnemonic() in ("CALL", "CALLIND"):
+                return p
+        return None
+
+    def param_index(self, vn: Any) -> int | None:
+        try:
+            hv = vn.getHigh()
+            sym = hv.getSymbol() if hv is not None else None
+            if sym is not None and sym.isParameter():
+                return int(sym.getCategoryIndex())
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def value(self, vn: Any, depth: int = 0) -> tuple | None:
+        if vn is None or depth > 14:
+            return None
+        if vn.isConstant():
+            return ("const", int(vn.getOffset()))
+        if vn.getAddress().isMemoryAddress():
+            return ("mem", int(vn.getAddress().getOffset()))          # a value read from a global (an import slot)
+        d = vn.getDef()
+        if d is None:
+            i = self.param_index(vn)
+            return ("param", i, 0) if i is not None else None
+        name = d.getMnemonic()
+        if name in _PASS:
+            return self.value(d.getInput(0), depth + 1)
+        if name == "MULTIEQUAL":
+            vals = {self.value(d.getInput(k), depth + 1) for k in range(d.getNumInputs())} - {("const", 0)}
+            return vals.pop() if len(vals) == 1 and None not in vals else None
+        if name in ("PTRSUB", "INT_ADD", "PTRADD"):
+            a, b = d.getInput(0), d.getInput(1)
+            if name == "PTRSUB" and a.isRegister() and b.isConstant():
+                return ("stack", _signed(int(b.getOffset())))
+            if name == "PTRSUB" and a.isConstant() and b.isConstant():
+                return ("const", int(b.getOffset()))          # address of a global
+            base = self.value(a, depth + 1)
+            if base is not None and b.isConstant():
+                off = _signed(int(b.getOffset())) * (int(d.getInput(2).getOffset()) if name == "PTRADD" else 1)
+                if base[0] == "stack":
+                    return ("stack", base[1] + off)
+                if base[0] == "new":
+                    return ("new", base[1], base[2] + off)
+            return None
+        if name == "LOAD":
+            return self.deref(self.value(d.getInput(1), depth + 1), depth + 1)
+        if name in ("CALL", "CALLIND"):
+            return ("new", (int(d.getSeqnum().getTarget().getOffset()), int(d.getSeqnum().getTime())), 0)
+        return None
+
+    def deref(self, p: tuple | None, depth: int = 0, before: Any = None) -> tuple | None:
+        """The value stored where pointer ``p`` points; for a stack slot the last store before ``before``
+        (an address) in address order, the only store without ``before``."""
+        if p is None:
+            return None
+        if p[0] == "stack":
+            ops = self._stack.get(p[1], [])
+            if before is not None:
+                ops = [o for o in ops if o.getSeqnum().getTarget().compareTo(before) < 0]
+                if not ops:
+                    return None
+                last = max(ops, key=lambda o: (o.getSeqnum().getTarget().getOffset(), o.getSeqnum().getTime()))
+                return self.slot_value(last, depth + 1)
+            vals = {self.slot_value(op, depth + 1) for op in ops if op.getMnemonic() != "INDIRECT"}
+            return vals.pop() if len(vals) == 1 and None not in vals else None
+        if p[0] == "param":
+            return ("param", p[1], p[2] + 1)
+        if p[0] == "new":
+            return self.heap_field(p[1], p[2])
+        return None
+
+    def slot_value(self, op: Any, depth: int = 0) -> tuple | None:
+        """The value a store-like op leaves in a stack slot: a COPY or STORE gives its source, an INDIRECT (a call
+        that may have touched the slot) is looked through, a MULTIEQUAL needs equal inputs."""
+        if depth > 14:
+            return None
+        m = op.getMnemonic()
+        if m == "STORE":
+            return self.value(op.getInput(2), depth + 1)
+        if m == "COPY":
+            return self.value(op.getInput(0), depth + 1)
+        if m == "INDIRECT":
+            d = op.getInput(0).getDef()
+            return self.slot_value(d, depth + 1) if d is not None else None
+        if m == "MULTIEQUAL":
+            vals = set()
+            for k in range(op.getNumInputs()):
+                d = op.getInput(k).getDef()
+                vals.add(self.slot_value(d, depth + 1) if d is not None else None)
+            vals -= {("const", 0)}
+            return vals.pop() if len(vals) == 1 and None not in vals else None
+        return self.value(op.getOutput(), depth + 1)       # PTRSUB (a function address), CAST, ...
+
+    def heap_field(self, new_id: int, off: int) -> tuple | None:
+        vals = set()
+        for p in self.ops:
+            if p.getMnemonic() != "STORE":
+                continue
+            ptr = self.value(p.getInput(1))
+            if ptr is not None and ptr[0] == "new" and ptr[1] == new_id and ptr[2] == off:
+                vals.add(self.value(p.getInput(2)))
+        return vals.pop() if len(vals) == 1 and None not in vals else None
+
+
+class _Connects:
+    def __init__(self, program: Any, di: Any, timeout: int) -> None:
+        self.program, self.di, self.timeout = program, di, timeout
+        self.fm = program.getFunctionManager()
+        self.rm = program.getReferenceManager()
+        self.space = program.getAddressFactory().getDefaultAddressSpace()
+        self.flows: dict[int, _Flow | None] = {}
+        self.sigcache: dict[int, dict[str, Any]] = {}
+        self.stats = {"decompiled": 0, "failed": 0}
+
+    def addr(self, a: int) -> Any:
+        return self.space.getAddress(a)
+
+    def flow(self, entry: int) -> _Flow | None:
+        if entry in self.flows:
+            return self.flows[entry]
+        fl = None
+        f = self.fm.getFunctionAt(self.addr(entry))
+        if f is not None and len(self.flows) < MAX_FLOWS:
+            try:
+                from ghidra.util.task import TaskMonitor  # type: ignore
+                r = self.di.decompileFunction(f, self.timeout, TaskMonitor.DUMMY)
+                if r.decompileCompleted() and r.getHighFunction() is not None:
+                    fl = _Flow(r.getHighFunction())
+                    self.stats["decompiled"] += 1
+                else:
+                    self.stats["failed"] += 1
+            except Exception:  # noqa: BLE001
+                self.stats["failed"] += 1
+        self.flows[entry] = fl
+        return fl
+
+    def callers(self, entry: int) -> list[tuple[int, int]]:
+        """(caller entry, call address) for calls and tail jumps to the function or its thunks."""
+        f = self.fm.getFunctionAt(self.addr(entry))
+        if f is None:
+            return []
+        targets = [f.getEntryPoint()]
+        for a in f.getFunctionThunkAddresses(True) or []:
+            targets.append(a)
+        out: list[tuple[int, int]] = []
+        for t in targets:
+            for ref in self.rm.getReferencesTo(t):
+                rt = ref.getReferenceType()
+                if not (rt.isCall() or rt.isJump()):
+                    continue
+                frm = ref.getFromAddress()
+                cf = self.fm.getFunctionContaining(frm)
+                if cf is not None and cf.getEntryPoint() != f.getEntryPoint():
+                    out.append((S.addr_int(cf.getEntryPoint()), S.addr_int(frm)))
+        return sorted(set(out))
+
+    def import_name(self, slot: int) -> str:
+        """``Class::name`` of the import behind the pointer slot ``slot`` ("" when it holds no import)."""
+        for ref in self.rm.getReferencesFrom(self.addr(slot)):
+            if ref.isExternalReference():
+                loc = ref.getExternalLocation()
+                sym = loc.getSymbol() if loc is not None else None
+                full = str(sym.getName(True)) if sym is not None else ""
+                parts = full.split("::") if full else ([str(loc.getLabel())] if loc is not None else [])
+                if parts and parts[0].upper().endswith(".DLL"):
+                    parts = parts[1:]
+                return "::".join(parts)
+        return ""
+
+    def target(self, v: tuple) -> dict[str, Any]:
+        """A member pointer as a function: ``{"addr"}`` of the program function (thunks followed) or
+        ``{"addr", "ext": "Class::name"}`` for an import (``("mem", slot)``: the import slot was read)."""
+        if v[0] == "mem":
+            name = self.import_name(v[1])
+            return {"addr": v[1], "ext": name} if name else {"addr": v[1]}
+        a = v[1]
+        f = self.fm.getFunctionAt(self.addr(a)) or self.fm.getFunctionContaining(self.addr(a))
+        if f is None:
+            return {"addr": a}
+        for _ in range(3):
+            if not f.isThunk():
+                break
+            t = f.getThunkedFunction(False)
+            if t is None:
+                break
+            f = t
+        if f.isExternal():
+            parts = str(f.getParentNamespace().getName(True)).split("::")
+            if parts and parts[0].upper().endswith(".DLL"):
+                parts = parts[1:]
+            return {"addr": a, "ext": "::".join([*parts, str(f.getName())])}
+        return {"addr": S.addr_int(f.getEntryPoint())}
+
+    def signal_index(self, entry: int) -> dict[str, Any]:
+        """``{meta, idx}`` of a moc signal function: its call of ``QMetaObject::activate(this, &meta, idx, argv)``."""
+        if entry in self.sigcache:
+            return self.sigcache[entry]
+        res: dict[str, Any] = {}
+        fl = self.flow(entry)
+        if fl is not None:
+            for c in fl.calls():
+                callee = c.getInput(0)
+                if callee is None:
+                    continue
+                f = self.fm.getFunctionAt(callee.getAddress())
+                name = (str(f.getParentNamespace().getName(True)) + "::" + str(f.getName())) if f is not None                     else self.import_name(int(callee.getAddress().getOffset()))
+                if name.endswith("QMetaObject::activate"):
+                    m, i = fl.value(c.getInput(2)), fl.value(c.getInput(3))
+                    if m and i and m[0] == "const" and i[0] == "const":
+                        res = {"meta": m[1], "idx": i[1]}
+                        break
+        self.sigcache[entry] = res
+        return res
+
+    def solve(self, fn: int, site: int) -> tuple[list[dict[str, Any]], str]:
+        fl = self.flow(fn)
+        if fl is None:
+            return [], "no_decompile"
+        call = fl.call_at(self.addr(site))
+        if call is None or call.getNumInputs() < 7:
+            return [], "no_call"
+        # the function returns QMetaObject::Connection by value: input 1 is the result pointer
+        sig = fl.deref(fl.value(call.getInput(3)), 0, self.addr(site))
+        obj = fl.value(call.getInput(6))
+        impl = slot = None
+        if obj is not None and obj[0] == "new":
+            impl = fl.heap_field(obj[1], 8)
+            slot = fl.heap_field(obj[1], 0x10)
+        if slot is None:
+            slot = fl.deref(fl.value(call.getInput(5)), 0, self.addr(site))
+        ncallers = len(self.callers(fn)) if sig is None or sig[0] == "param" else -1
+        self.last = f"sig={sig} slot={slot} impl={impl} callers={ncallers}"
+        out: list[dict[str, Any]] = []
+        self._chase(fn, site, sig, slot, impl, MAX_DEPTH, out, frozenset())
+        status = "ok" if out else ("no_callers" if ncallers == 0 else "unresolved")
+        self.stats[status] = self.stats.get(status, 0) + 1
+        return out, status
+
+    def _chase(self, fn: int, site: int, sig, slot, impl, depth: int, out: list, seen: frozenset) -> None:
+        if sig is not None and sig[0] in ("const", "mem"):
+            r: dict[str, Any] = {"fn": fn, "site": site, "signal": self.target(sig)}
+            if slot is not None and slot[0] in ("const", "mem"):
+                r["slot"] = self.target(slot)
+                r["slot"]["kind"] = "pmf"
+            elif impl is not None:
+                r["slot"] = {"addr": impl[1], "kind": "functor"}
+            out.append(r)
+            return
+        if depth <= 0 or fn in seen or sig is None or sig[0] != "param":
+            return
+        seen = seen | {fn}
+        for cfn, csite in self.callers(fn)[:MAX_CALLERS]:
+            cf = self.flow(cfn)
+            if cf is None:
+                continue
+            c = cf.call_at(self.addr(csite))
+            if c is None:
+                continue
+            self._chase(cfn, csite, self._lift(cf, c, sig), self._lift(cf, c, slot), impl, depth - 1, out, seen)
+
+    @staticmethod
+    def _lift(cf: _Flow, call: Any, v: tuple | None) -> tuple | None:
+        """The value ``v`` (in terms of the callee's parameters) in the caller ``cf``, at the call ``call``."""
+        if v is None or v[0] != "param":
+            return v
+        j, d = v[1], v[2]
+        if call.getNumInputs() <= j + 1:
+            return None
+        w = cf.value(call.getInput(j + 1))
+        for _ in range(d):
+            w = cf.deref(w, 0, call.getSeqnum().getTarget())
+        return w
+
+
+@op("qt_connects")
+@guarded
+def qt_connects(args: dict[str, Any]) -> dict[str, Any]:
+    """qt_connects(program, sites=[{fn, site}], timeout=30): resolve the signal and the slot of the calls of
+    ``QObject::connectImpl`` at ``site`` (inside the function ``fn``). Result {"results": [{fn, site, signal,
+    slot}], "unresolved": [site], "secs", "stats"}; ``signal`` / ``slot`` are {addr, ext?, kind?, meta?, idx?}."""
+    e = S.ready_entry(args.get("program"))
+    sites = args.get("sites")
+    if not isinstance(sites, list) or len(sites) > MAX_SITES:
+        raise WorkerError("bad_args", f"sites must be a list of at most {MAX_SITES} entries")
+    timeout = int(args.get("timeout") or DECOMPILE_TIMEOUT_S)
+    t0 = time.monotonic()
+    results: list[dict[str, Any]] = []
+    unresolved: list[int] = []
+    dbg: list[str] = []
+    with S.POOL.foreground(), e.fg, e.lock.read():
+        check_open(e)
+        cx = _Connects(e.program, _decomp(e), timeout)
+        for s in sites:
+            try:
+                got, _status = cx.solve(int(s["fn"]), int(s["site"]))
+            except Exception:  # noqa: BLE001  one site must not stop the others
+                got = []
+            if not got:
+                unresolved.append(int(s["site"]))
+                if args.get("debug"):
+                    dbg.append(f"{int(s['site']):#x} fn {int(s['fn']):#x} {getattr(cx, 'last', '')}")
+            for r in got:
+                if r["signal"].get("ext") is None:
+                    r["signal"].update(cx.signal_index(r["signal"]["addr"]))
+                results.append(r)
+    return {"results": results, "unresolved": unresolved, "secs": round(time.monotonic() - t0, 1),
+            "stats": cx.stats, "debug": dbg[:80]}

@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 928 passed, 42 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 964 passed, 43 skipped (~45 s; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -114,6 +114,25 @@ join all run at analysis time; estimate within 20% of the real time.
 5. Some very large functions hit `decompile_timeout`; `view=asm` still works.
 6. `patch_bytes` is not implemented.
 7. MFC dispatch/automation (OLE) tables are not decoded.
+
+Fixed on 2026-11-05 (import into the wrong project): new projects ended `error no_program`
+(or `ready` with an empty Ghidra project). Cause: the worker has one open project, and
+`Indexer.ensure_open(A)` (a tool call, `resume_project` of an older project after a server
+restart, the bulk pass) switched it between the queue job's `open_project(B)` and its
+`import_binary`/`analyze`/`extract`. Reproduced with a loop of `ensure_open("A")` during the
+import of B. Fix: `ensure_open` refuses with `busy` while the queue job runs another project
+(under `Indexer._switch`, which the job also takes for its `open_project`);
+`resume_project` of another project defers its refresh steps until the queue has no job of
+another project; `import_binary`, `analyze` and `extract` carry `project` (the Ghidra folder)
+and the worker answers `wrong_project` when another is open; the import is checked (program
+saved in the project, pointer size and image base returned), else the binary is `error`
+with a one-line cause. Tests: `tests/test_queue.py` (fake worker),
+`tests/test_worker.py::test_check_project_*`, `tests/test_project_switch_ghidra.py` (ghidra).
+A server killed with Stop-Process leaves the Ghidra `airlock.lock` of the interrupted project;
+the next open took it over without error (checked).
+Open: tool calls on project A while another project's job runs now get `busy` (before: the
+job broke); the refresh steps of `resume_project` that start before a job of another project
+begins can still fail with `busy` (logged in `project.log`, redone at the next server start).
 
 Fixed on 2026-11-05: `ready` was published before the after-ready work. Status
 sequence now `importing`, `analysing`, `extracting`, `finishing`, `ready`
@@ -236,15 +255,26 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   instances of the RTL's own types are found (`TList<T>` shapes); instances for other types are not. Wrong names are
   2 to 3% of the matched routines and are code aliases. Exported names cover 62% (32-bit) and 79% (64-bit) of the
   routines of the program, so 36% / 43% of all routines are named.
-  Open: routines the packages do not export. The `.jdbg` files next to the 32-bit packages (`bin\rtl230.jdbg`
-  and 314 more; none exist for Win64) hold them. **Not usable yet:** the container is clear (header `JDBG`,
-  version 1, offsets of units, source names, symbols, line numbers and words; LEB128 style integers with 32-bit
-  wraparound for negatives; symbols are triples of deltas: address, first word, second word; words are `0x01`
-  + text xor `0xAA` + `0x00`), but about 97% of the symbol names are not plain words. They are short binary
-  records (8 to 20 bytes for a 10 to 25 character name) that look like lists of references into the text of
-  other words. I could not decode them without the JCL source or a known pair of name and record, and no
-  oracle (a `.map` of the package) exists. Other ways: a `-GD` map of a program that uses every unit (no
-  packages needed, gives the private routines of the units it links), or reading the `.dcu` files.
+  Private routines (helpers, nested routines, implementation-section routines, unexported generic instances):
+  `server/delphimega.py` builds one package that *contains every `.dcu`* of the install
+  (`lib\win32\release`, `lib\win64\release`; `System` and `SysInit` are implicit) with `dcc32` / `dcc64 -B -GD`, and
+  `server/delphimap.py` reads the detailed map (`System.SysUtils.TStringHelper.Split`, nested `Outer.Inner`, generic
+  `Unit.{Owner}TList<T>.Add` shown as `Owner.TList<T>.Add`). `delphisigs.build(pairs=)` adds the map names after the
+  exported ones (an exported name wins on identical masked code). CLI: `airlock delphi-sigs build <install> --units
+  [--work DIR] [--keep-work]` (about 1 minute per bitness for the package, 70 s for the scan), or `--map BINARY MAP`
+  (repeatable) for a pair built another way. `IDR_VERSION` 7. **[verified]** Not done: rebuilding the RTL / VCL packages
+  from `source`: the sources and the shipped `.dcu` files disagree (`F1026`, `F2051` when one unit is compiled from
+  source and the rest linked from `.dcu`), no `.dpk` exists for the VCL, and `BuildWinRTL.dpk` has 176 of the 262 units
+  of `rtl230.bpl`. The `.dcu` files are the truth instead: the code of a rebuilt `rtl` package equals the shipped
+  one on 99.9% of the common exported routines (masked bytes). The `.jdbg` route is dropped (32-bit only, names use an
+  undocumented compressed form). Units that cannot be in a package are left out by the build loop (62 of 1,951
+  for 32-bit, 55 of 1,919 for 64-bit: missing `.res` / `.fmx` files, `$DENYPACKAGEUNIT`, BDE; mostly FMX and TeeChart
+  editors, REST backends, WebBroker, IntraWeb, ComServ). The Delphi install is needed only for this build; the
+  `.sigdb` files stay usable without it.
+  Oracle (own program, map as truth, routines that are no type tables or thunks): right name 32-bit 58.0% -> 70.9% of
+  all routines, 77.0% -> 94.6% of those with at least 24 bytes; 64-bit 69.9% -> 83.9% and 78.9% -> 94.6%; wrong names about
+  1.5% (code aliases). What is left is mostly routines under 10 compared bytes. Sigdb: 129,545 -> 150,015 names (32-bit),
+  118,370 -> 140,900 (64-bit; most map routines share masked code with an exported one).
 - Extended RTTI and the consensus database (`server/delphi.py` `_rtti_methods`, `server/delphirtti.py`,
   `tests/test_delphirtti.py`, DESIGN §11 "Delphi" and "RTTI consensus database"). **[verified]** layout of the
   extended method table (32/64-bit) and flags; `dl_method` kind `rtti-<visibility>`, `DELPHI_VERSION` 2, hint
@@ -268,7 +298,12 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   `.warp` libraries (delphinja Delphi RTL) and computes the WARP function GUID from capstone blocks (used by
   `idr._pick`, tier after the RTTI database, before IDR) or from the worker op `warp_blocks` (Ghidra blocks; 81% equal
   to capstone, not used by the pipeline). Config key `warp_dir`; files in `%LOCALAPPDATA%\airlock\warp` (not in the repo).
-  `IDR_VERSION` 5. 32-bit only. Approximate: Binary Ninja's block recovery differs from ours on some functions.
+  `IDR_VERSION` 6. 32-bit only. Approximate: Binary Ninja's block recovery differs from ours on some functions.
+  **[verified]** on real programs of compilers 30, 33, 35 and 36 (extended RTTI names as truth): `library_stems` is
+  `10.4-only` + `core-11` + `xe2plus-only` from compiler 30 on (before: `core-11` only for 35, which named a third
+  as many); `10.4-only` and `xe2plus-only` are about 99% right, `core-11` 87 to 98% (small shapes). WARP names generic
+  instances as `TDictionary__2.Add` (RTTI says `TDictionary<K,V>.Add`). `projects.detect` now marks a program
+  without forms (console, DLL) as Delphi by its `DVCLAL` resource; before, such a program got no Delphi tiers.
 
 ## Qt and dataflow (M8)
 
@@ -277,15 +312,20 @@ Design in DESIGN section 6 and section 11 "Qt metaobjects" (layout facts marked 
 - `server/qt.py` parses `QMetaObject` data from the PE bytes (Qt5 and Qt6 layouts, 32/64-bit); meta `qt_version:<id>` (`QT_VERSION`); `Indexer.resume_project` and `_after_ready` derive it for Qt binaries (toolchain `qt` or `Qt<n>*.dll`).
 - Worker op `qt_dispatch` (`worker/ghidra_ops/qt.py`) maps method indices to functions from the decompiled `qt_static_metacall` and finds imported parent classes; run by `qt.resolve` after the missing-function step; meta `qt_dispatch:<id>`. Tool `qt_metaobjects` (`tools/qt.py`); hints in `function`, a `Qt:` line in the project map, moc boilerplate marked runtime family `Qt`.
 - Dataflow ops (`worker/ghidra_ops/dataflow.py`) and tools (`tools/dataflow.py`): `switch_tables`, `trace_values`, `constants`. Ghidra tests: `tests/test_dataflow.py` with `-m ghidra --binary=...`.
-- Qt6 layout is synthetic-only (no sample authorised). Pointer-to-member connect call sites were not found on the MinGW sample. Not done: Qt seeds for the feature index.
+- Qt6 layout is verified on a real 64-bit MSVC Qt 6.10 desktop client (revision 13; see DESIGN section 11 for each fact). Two parser bugs fixed: with `QT_NO_DATA_RELOCATION` `superdata` is two words `{direct, getter}` (the metaobject starts one pointer before the scan address; parents come from the getter, local or from the import name, no worker needed); Qt6 has no Notify property flag (`notifyId` is -1 or the signal index). `QT_VERSION` 2.
+- Pointer-to-member connects work (Qt6 MSVC x64): `qt.fill_imports` adds the C++ imports Ghidra leaves out of the `import` table, `derive_connects` finds the call sites as read edges to the `connectImpl` slot, worker op `qt_connects` (`worker/ghidra_ops/qt.py`, `_Flow`) resolves signal and slot (chases forwarding wrappers up the callers). Rows are `qt_connect` kind `ptr`. `DISPATCH_VERSION` 2. Sites in template instances nobody calls (incremental-link leftovers) stay unresolved. Not tried: Qt5 / MinGW (Itanium) shapes of the call, 32-bit, virtual member pointers.
+- Qt feature seeds (`qt.feature_seeds`, `FEATURES_VERSION` 7): slots of QAction / button / dialog signals seed ui-menu / ui-dialog; Qt library class prefixes in `features.API_PREFIX`.
+- Scratch tip: `connectImpl` returns `QMetaObject::Connection` by value, so argument 1 is the result pointer (the decompiler also shows the stack arguments shifted).
 
 ## Next
 
-- Qt6 metaobject layout is proven only on synthetic data; check it on a
-  real Qt6 program. Qt feature seeds and pointer-to-member connects are open.
-- Delphi: private routines have no name source (`.jdbg` names use a
-  compressed form that is not decoded); property accessors are not named.
-- WARP covers compilers 34/35 and older from public libraries; it is not
-  tested on a binary of those compilers yet. 64-bit WARP has no library.
-- The `fileformat` record detectors (`record_guess` strides and length
-  prefixes) are only proven on synthetic files.
+- Qt: pointer-to-member connects are only checked on Qt6 / MSVC x64; try Qt5 and MinGW (Itanium
+  `_ZN7QObject11connectImpl...` import, different argument order), 32-bit, and `QObject::connect`
+  string form through import slots. Unresolved call sites could be chased through function pointers.
+- Delphi: property accessors are not named; routines under 10 compared bytes cannot be named by code
+  signatures (a call-context pass could); the map build skips the FMX / TeeChart / REST-backend units.
+- WARP is tested on compilers 30, 33, 35 and 36 (no compiler 34 binary was
+  available). 64-bit WARP has no library: 64-bit relies on extended RTTI and IDR.
+- `record_guess` is proven on public sample files (DESIGN §6 `record_guess`).
+  Open: OpenPGP-style packets (length width depends on the tag), delimited
+  text records, tables under about 20 entries, 8-bit PCM frames.

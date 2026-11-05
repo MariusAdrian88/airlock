@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import threading
+from pathlib import Path
 from typing import Any, Callable
 
 from airlock.worker.main import STATE
@@ -160,10 +161,24 @@ def java_error(e: BaseException) -> WorkerError:
     return WorkerError("ghidra_error", f"{cls}: {msg}")
 
 
+def check_project(args: dict[str, Any]) -> None:
+    """The worker serves one open project. A request that names its project (``project`` = the
+    Ghidra project folder) is refused when another one is open: the project was switched under
+    it, and acting on the open one would import into or read from the wrong project."""
+    want = args.get("project")
+    if not want:
+        return
+    have = SESSION.path
+    if have is None or Path(str(want)) != Path(have):
+        raise WorkerError("wrong_project", f"the worker has {have or 'no project'} open, not {want}. "
+                                           "Retry once the other project's work is done.")
+
+
 def guarded(fn: Callable[[dict[str, Any]], dict[str, Any]]) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Turn Java exceptions raised by an op into WorkerError."""
     @functools.wraps(fn)
     def wrapper(args: dict[str, Any]) -> dict[str, Any]:
+        check_project(args)
         try:
             return fn(args)
         except WorkerError:

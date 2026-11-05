@@ -334,8 +334,8 @@ def library_stems(comp: int | None) -> list[str]:
     (34 = 10.4, 35 = 11); empty when the compiler is unknown."""
     if comp is None:
         return []
-    if comp >= 34:
-        return (["10.4-only"] if comp == 34 else []) + ["core-11"]
+    if comp >= 30:      # compilers 30 to 36+ measured: all three name routines (99% right on 10.4-only and xe2plus-only)
+        return ["10.4-only", "core-11", "xe2plus-only"]
     if comp >= 26:
         return ["core-11", "xe2plus-only"]
     out = [y + "-only" for y, c in _YEAR_COMPILER.items() if c == comp]

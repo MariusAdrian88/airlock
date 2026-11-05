@@ -433,10 +433,6 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
     md.skipdata = False
     xsecs = [(va, va + max(vs, rs)) for va, vs, _r, rs, x in img.sections if x]
     funcs = img.funcs
-    starts = {r for r, _n in img.exports} | {e for _s, e in xsecs}
-    if funcs:
-        starts |= set(funcs)
-    bounds = sorted(starts)
     seen: dict[int, list[str]] = {}
     for rva, mangled in img.exports:
         if funcs is None:
@@ -448,6 +444,16 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
         if name is None or not any(s <= rva < e for s, e in xsecs):
             continue
         seen.setdefault(rva, []).append(name)
+    return img.psize, scan_named(md, img, seen, {r for r, _n in img.exports})
+
+
+def scan_named(md, img: _Pe, seen: dict[int, list[str]], starts: set[int] | None = None
+               ) -> list[tuple[str, bytes, bytes]]:
+    """[(name, dump, mask)] for the routines ``seen`` ({rva: names}) of an image. ``starts``: more addresses
+    that end a 32-bit routine (the next symbol); the section ends and the ``.pdata`` routines always do."""
+    xsecs = [(va, va + max(vs, rs)) for va, vs, _r, rs, x in img.sections if x]
+    funcs = img.funcs
+    bounds = sorted((starts or set()) | set(seen) | {e for _s, e in xsecs} | (set(funcs) if funcs else set()))
     out: list[tuple[str, bytes, bytes]] = []
     for rva, names in seen.items():
         i = bisect.bisect_right(bounds, rva)
@@ -458,7 +464,7 @@ def scan_bpl(path_str: str) -> tuple[int, list[tuple[str, bytes, bytes]]]:
             continue
         for nm in sorted(set(names)):
             out.append((nm, got[0], got[1]))
-    return img.psize, out
+    return out
 
 
 # -- database file ----------------------------------------------------------------------------
@@ -528,6 +534,7 @@ class BuildResult:
     routines: int
     names: int
     seconds: float
+    mapped: int = 0              # names that come from map files (not exported by the packages)
 
 
 def install_packages(install: Path, psize: int) -> list[Path]:
@@ -547,8 +554,11 @@ def install_packages(install: Path, psize: int) -> list[Path]:
 
 
 def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str], None] | None = None,
-          jobs: int = 4) -> BuildResult:
-    """Build ``<compiler>-<bits>.sigdb`` in ``out_dir`` from the packages of a Delphi install."""
+          jobs: int = 4, pairs: list[tuple[Path, Path]] | None = None) -> BuildResult:
+    """Build ``<compiler>-<bits>.sigdb`` in ``out_dir`` from the packages of a Delphi install. ``pairs``:
+    (binary, map file) of packages rebuilt from the compiled units (``delphimega``); the routines of the map
+    add the names the packages do not export. An exported name wins: a routine whose masked code equals an
+    exported one gets no second name from a map."""
     t0 = time.time()
     pkgs = install_packages(install, psize)
     if not pkgs:
@@ -589,9 +599,33 @@ def build(install: Path, out_dir: Path, psize: int = 4, progress: Callable[[str]
             done += 1
             say(f"{pkgs[i].name}: {len(recs)} routines")
     records = list(merged)
+    n_export = len(records)
+    if pairs:
+        records += _map_records(records, pairs, say)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{comp}-{psize * 8}.sigdb"
-    write_sigdb(path, comp, psize, records,
-                {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d"), "format": 2})
+    meta = {"install": install.name, "packages": done, "built": time.strftime("%Y-%m-%d"), "format": 2}
+    if pairs:
+        meta["mapped"] = len(records) - n_export
+    write_sigdb(path, comp, psize, records, meta)
     return BuildResult(path, comp, psize, done, len({(d, m) for _n, d, m in records}), len(records),
-                       time.time() - t0)
+                       time.time() - t0, len(records) - n_export)
+
+
+def _map_records(exported: list[tuple[str, bytes, bytes]], pairs: list[tuple[Path, Path]],
+                 say: Callable[[str], None]) -> list[tuple[str, bytes, bytes]]:
+    """Records from (binary, map) pairs whose masked code no exported name already covers."""
+    from airlock.server import delphimap
+    have = {(d, m) for _n, d, m in exported}
+    out: dict[tuple[str, bytes, bytes], None] = {}
+    for binary, mp in pairs:
+        _ps, recs = delphimap.scan_pair(str(binary), str(mp))
+        fresh = 0
+        for r in recs:
+            if (r[1], r[2]) in have:
+                continue
+            if r not in out:
+                out[r] = None
+                fresh += 1
+        say(f"{binary.name}: {len(recs)} routines in the map, {fresh} new names")
+    return list(out)

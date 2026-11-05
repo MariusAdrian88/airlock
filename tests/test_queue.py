@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from airlock.worker.protocol import WorkerError
+
 from airlock.projects import hash_file, read_manifest, write_manifest
 from airlock.server.scan import ScanOption, ScannedFile, ScanResult
 from airlock.server.tools import admin
@@ -518,3 +520,97 @@ def test_interrupted_finishing_is_completed_on_resume(tmp_path):
     assert ix.resume_project("proj") == 0
     assert ix.get_status(st, bid)[0] == "ready"
     assert states(ctx)["app.exe"] == "ready"
+
+
+def test_import_without_a_program_ends_in_error(tmp_path):
+    ctx, entries = make_project(tmp_path, [("noprog.dll", "core", 1.0)])
+    ix, w = ctx.indexer, ctx.worker
+    orig = w.request
+    w.request = lambda op, args=None, timeout=0: ({} if op == "import_binary" else orig(op, args, timeout))
+    ix.enqueue("proj", entries)
+    wait_for(lambda: states(ctx)["noprog.dll"] == "error")
+    st = ix.store("proj")
+    status, detail = ix.get_status(st, st.list_binaries()[0].id)
+    assert status == "error" and "produced no program" in detail
+    assert "produced no program" in admin.index_status(ctx)
+    assert not any(c[0] in ("analyze", "extract") for c in w.calls)
+
+
+def test_requests_name_their_project_and_the_worker_may_refuse(tmp_path):
+    ctx, entries = make_project(tmp_path, [("a.dll", "core", 1.0)])
+    ix, w = ctx.indexer, ctx.worker
+    ix.enqueue("proj", entries)
+    wait_for(lambda: states(ctx)["a.dll"] == "ready")
+    want = str(ix.paths("proj").ghidra)
+    for op in ("import_binary", "analyze", "extract"):
+        sent = [a for o, a in w.calls if o == op]
+        assert sent and all(a.get("project") == want for a in sent), op
+
+    # the worker answers wrong_project: the binary must not end up ready
+    ctx2, entries2 = make_project(tmp_path / "second", [("b.dll", "core", 1.0)])
+    orig = ctx2.worker.request
+
+    def refuse(op, args=None, timeout=0):
+        if op == "import_binary":
+            raise WorkerError("wrong_project", "the worker has X open, not Y")
+        return orig(op, args, timeout)
+
+    ctx2.worker.request = refuse
+    ctx2.indexer.enqueue("proj", entries2)
+    wait_for(lambda: states(ctx2)["b.dll"] == "error")
+    assert "wrong_project" in admin.index_status(ctx2)
+
+
+def test_other_project_cannot_take_the_worker_from_a_running_job(tmp_path):
+    ctx, entries = make_project(tmp_path, [("run.dll", "core", 1.0)])
+    ix, w = ctx.indexer, ctx.worker
+    ix.paths("other", create=True)
+    hold, entered = threading.Event(), threading.Event()
+    orig = w.request
+
+    def slow_import(op, args=None, timeout=0):
+        if op == "import_binary":
+            entered.set()
+            assert hold.wait(20)
+        return orig(op, args, timeout)
+
+    w.request = slow_import
+    ix.enqueue("proj", entries)
+    assert entered.wait(20)
+    w.calls.clear()
+    with pytest.raises(WorkerError) as e:
+        ix.ensure_open("other")
+    assert e.value.code == "busy" and "proj" in e.value.message
+    ix.ensure_open("proj")                       # the job's own project is fine
+    assert not [a for o, a in w.calls if o == "open_project" and a["path"] != str(ix.paths("proj").ghidra)]
+    hold.set()
+    wait_for(lambda: states(ctx)["run.dll"] == "ready")
+    idle(ctx)
+    ix.ensure_open("other")                      # idle queue: the switch is allowed
+    assert w.calls[-1][0] == "open_project" and "other" in w.calls[-1][1]["path"]
+
+
+def test_resume_of_another_project_waits_for_the_running_job(tmp_path):
+    ctx, entries = make_project(tmp_path, [("run.dll", "core", 1.0)])
+    ix, w = ctx.indexer, ctx.worker
+    other = ix.paths("other", create=True)
+    write_manifest(other.manifest, {"version": 1, "name": "other", "settings": {}, "files": []})
+    hold, entered = threading.Event(), threading.Event()
+    orig = w.request
+
+    def slow_import(op, args=None, timeout=0):
+        if op == "import_binary":
+            entered.set()
+            assert hold.wait(20)
+        return orig(op, args, timeout)
+
+    w.request = slow_import
+    ix.enqueue("proj", entries)
+    assert entered.wait(20)
+    assert ix.resume_project("other") == 0
+    assert "other" not in ix._resumed            # not done: the refresh steps run at the next call
+    hold.set()
+    wait_for(lambda: states(ctx)["run.dll"] == "ready")
+    idle(ctx)
+    ix.resume_project("other")
+    assert "other" in ix._resumed

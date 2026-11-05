@@ -22,8 +22,9 @@ TEXT_VA, DATA_VA = 0x1000, 0x3000
 class Pe:
     """A synthetic Qt binary. ``major`` 5 (revision 8, QByteArrayData table) or 6 (revision 12, offsets)."""
 
-    def __init__(self, psize: int, major: int) -> None:
-        self.ps, self.major = psize, major
+    def __init__(self, psize: int, major: int, indirect: bool = False) -> None:
+        self.ps, self.major, self.indirect = psize, major, indirect     # indirect: QT_NO_DATA_RELOCATION SuperData
+        self.imports: dict[int, str] = {}
         self.base = 0x400000 if psize == 4 else 0x140000000
         self.text = bytearray(0x1000)
         self.data = bytearray(0x8000)
@@ -55,7 +56,7 @@ class Pe:
         return struct.pack("<I" if self.ps == 4 else "<Q", v)
 
     def klass(self, name: str, parent: str | None, methods=(), props=(), enums=(), info=(), nsignals=None,
-              metacall=True) -> int:
+              metacall=True, parent_import: str | None = None) -> int:
         """methods: (kind, name, ret, [(type, pname)]); kind signal|slot|method. Signals must come first."""
         strings: list[str] = []
 
@@ -104,7 +105,7 @@ class Pe:
         for blk in blocks:
             words += blk
         for pname, ptype, flags, notify in props:
-            fl = flags | (0x00400000 if notify is not None else 0)
+            fl = flags | (0x00400000 if notify is not None and self.major == 5 else 0)   # Qt6 has no Notify flag
             if self.major == 6:
                 words += [sid(pname), tword(ptype), fl, notify if notify is not None else 0xFFFFFFFF, 0]
             else:
@@ -146,17 +147,32 @@ class Pe:
         self.put(dva, struct.pack(f"<{len(words)}I", *words))
         mc = self.stub(f"{name}.metacall") if metacall else 0
         n = 7 if self.major == 6 else 6
+        cells = [0, sdata, dva, mc, 0] + ([0, 0] if self.major == 6 else [0])
+        if self.indirect:
+            cells = [0] + cells                       # direct, then the getter word (the first cell above)
+            n += 1
         meta = self.alloc(n * self.ps)
         self.metas[name] = meta
-        cells = [0, sdata, dva, mc, 0] + ([0, 0] if self.major == 6 else [0])
         self.put(meta, b"".join(self.p(c) for c in cells))
-        if parent:
-            self.fix.append((meta, parent))
+        if parent or parent_import:
+            self.fix.append((meta, parent or "", parent_import or ""))
         return meta
 
     def write(self, path: Path) -> None:
-        for meta, parent in self.fix:
-            self.put(meta, self.p(self.metas[parent]))
+        for meta, parent, imp in self.fix:
+            if not self.indirect:
+                self.put(meta, self.p(self.metas[parent]))
+                continue
+            g = self.stub(f"getter{meta:x}")          # lea rax,[rip+d]; ret  /  mov rax,[rip+d]; ret
+            if imp:
+                slot = self.alloc(8)
+                self.imports[slot] = f"?staticMetaObject@{imp}@@2UQMetaObject@@B"
+                op, target = 0x8B, slot
+            else:
+                op, target = 0x8D, self.metas[parent]
+            off = g - self.base - TEXT_VA
+            self.text[off:off + 8] = bytes([0x48, op, 0x05]) + struct.pack("<i", target - (g + 7)) + b"\xc3"
+            self.put(meta + self.ps, self.p(g))
         plus = self.ps == 8
         text, data = bytes(self.text), bytes(self.data)
         magic = 0x20B if plus else 0x10B
@@ -224,6 +240,44 @@ def test_parse_layouts(tmp_path, psize, major):
     assert [(e.name, e.values) for e in base.enums] == [("Mode", [("Fast", 0), ("Slow", 1)])]
     assert base.info == [("Author", "nobody")]
     assert by["Plain"].methods == []
+
+
+def test_qt6_superdata_getter(tmp_path):
+    """Qt6 on Windows (QT_NO_DATA_RELOCATION): SuperData is {direct, getter}; the metaobject starts one pointer
+    before the getter word; the parent is the getter's lea target or the name of the import it loads."""
+    pe = Pe(8, 6, indirect=True)
+    pe.klass("Base", None, props=[("count", "int", 3, 0)], methods=[("signal", "changed", "void", [])])
+    pe.klass("Child", "Base")
+    pe.klass("Widget", None, parent_import="QWidget")
+    pe.klass("Other", None, parent_import="Thing@Deep")
+    pe.write(tmp_path / "q.dll")
+    img = Image.from_pe(tmp_path / "q.dll")
+    classes = qt.parse_image(img, pe.imports)
+    by = {c.name: c for c in classes}
+    assert {c.name: c.meta for c in classes} == pe.metas
+    assert by["Child"].parent == "Base" and by["Child"].super_addr == pe.metas["Base"]
+    assert by["Widget"].parent == "QWidget" and by["Other"].parent == "Deep::Thing"
+    assert by["Base"].parent == "" and by["Base"].props[0].notify == 0
+    assert {c.name: c.parent for c in qt.parse_image(img)}["Widget"] == ""     # no import table: parent unknown
+
+
+def test_getter_target_forms(tmp_path):
+    pe = Pe(4, 6)
+    pe.write(tmp_path / "q.dll")
+    img = Image.from_pe(tmp_path / "q.dll")
+    a = 0x400000 + TEXT_VA
+    pe.text[0:6] = b"\xb8" + struct.pack("<I", 0x405000) + b"\xc3"
+    pe.text[16:22] = b"\xa1" + struct.pack("<I", 0x405008) + b"\xc3"
+    pe.text[32:37] = b"\xe9" + struct.pack("<i", -37)         # jmp back to the first getter
+    pe.write(tmp_path / "q.dll")
+    img = Image.from_pe(tmp_path / "q.dll")
+    assert qt._getter_target(img, a) == ("addr", 0x405000)
+    assert qt._getter_target(img, a + 16) == ("slot", 0x405008)
+    assert qt._getter_target(img, a + 32) == ("addr", 0x405000)
+    assert qt._getter_target(img, a + 64) is None
+    assert qt.parent_from_import("?staticMetaObject@QObject@@2UQMetaObject@@B") == "QObject"
+    assert qt.parent_from_import("?staticMetaObject@Inner@Outer@@2UQMetaObject@@B") == "Outer::Inner"
+    assert qt.parent_from_import("malloc") == ""
 
 
 def test_revision_and_noise(tmp_path):
@@ -373,6 +427,76 @@ def test_string_connections(proj):
     cls = qtools.qt_metaobjects(ctx, class_="MainWindow")
     assert "connections:" in cls and "connect_all" in cls
     assert "1 connections" not in qt.ui_line(st, bid) and "string connections 2" in qt.ui_line(st, bid)
+
+
+def test_feature_seeds(proj):
+    ctx, st, bid, pe = proj
+    mw = pe.metas["MainWindow"]
+    qt.store_dispatch(st, bid, {"classes": [{"meta": mw, "cases": {"2": 0x140001800, "3": 0x140001900}, "parent": ""}]})
+    rows = [("ptr", "QAction::triggered", "0x140001800", "slot"),
+            ("ptr", "QPushButton::clicked(bool)", "0x140001a00", "fn"),        # the button base class is looked up
+            ("ptr", "QAbstractButton::clicked", "0x140001b00", "lambda"),
+            ("ptr", "MainWindow::progress(int,int)", "0x140001c00", "slot"),   # not a user interface signal
+            ("string", "clicked()", "onSaveClicked(bool)", "slot"),
+            ("string", "openRequested(QString)", "onOpenClicked()", "slot")]
+    for i, r in enumerate(rows):
+        st.db.execute("INSERT INTO qt_connect(binary_id, fn_entry, site, kind, signal, slot, slot_kind) "
+                      "VALUES (?,?,?,?,?,?,?)", (bid, 0x140001000, 0x140001000 + i, *r))
+    st.db.commit()
+    got = sorted(qt.feature_seeds(st, bid))
+    assert got == [(0x140001800, "ui-menu", "Qt QAction::triggered"),
+                   (0x140001900, "ui-dialog", "Qt connect clicked"),
+                   (0x140001a00, "ui-dialog", "Qt QAbstractButton::clicked"),
+                   (0x140001b00, "ui-dialog", "Qt QAbstractButton::clicked")]
+    assert qt.seed_for_signal("MainWindow", "clicked", {"MainWindow": "QPushButton"}) == (
+        "ui-dialog", "Qt QAbstractButton::clicked")
+
+
+def test_pointer_connects(proj):
+    ctx, st, bid, pe = proj
+    db = st.db
+    mw = pe.metas["MainWindow"]
+    qt.store_dispatch(st, bid, {"classes": [{"meta": mw, "cases": {"2": 0x140001800, "0": 0x140001900},
+                                             "parent": ""}]})
+    fn = 0x140001000
+    st.insert_functions(bid, [{"entry": fn, "name": "setup", "name_state": "auto", "size": 80}])
+    fid = db.execute("SELECT id FROM function WHERE binary_id=? AND entry=?", (bid, fn)).fetchone()[0]
+    # the call of an imported C++ function is a read edge to the import slot; the import row is added from the PE
+    slot = 0x140008000
+    db.execute("INSERT INTO import(binary_id, dll, name, address) VALUES (?,?,?,?)",
+               (bid, "QT6CORE.DLL", "QObject::connectImpl", slot))
+    db.execute("INSERT INTO import(binary_id, dll, name, address) VALUES (?,?,?,?)",
+               (bid, "QT6CORE.DLL", "QObject::disconnectImpl", slot + 8))
+    for k, dst in enumerate((slot, slot, slot + 8)):
+        db.execute("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) VALUES (?,?,?,?,?,?)",
+                   (bid, fid, fn + 0x10 * (k + 1), None, dst, "read"))
+    db.commit()
+    assert qt._connect_slots(db, bid) == {slot: "ptr"}
+    qt.derive_connects(st, bid)
+    rows = db.execute("SELECT fn_entry, site, signal FROM qt_connect WHERE kind='ptr' ORDER BY site").fetchall()
+    assert [(r[0], r[1], r[2]) for r in rows] == [(fn, fn + 0x10, ""), (fn, fn + 0x20, "")]
+    sites = [{"fn": fn, "site": fn + 0x10}, {"fn": fn, "site": fn + 0x20}]
+    res = {"results": [
+        {"fn": fn, "site": fn + 0x10, "signal": {"addr": 0x140001500, "meta": mw, "idx": 1},
+         "slot": {"addr": 0x140001800, "kind": "pmf"}},
+        {"fn": 0x140002000, "site": fn + 0x20, "signal": {"addr": 0x140008100, "ext": "QAction::triggered"},
+         "slot": {"addr": 0x140001a00, "kind": "functor"}}]}
+    assert qt.store_connects(st, bid, res, sites) == (2, 0)
+    rows = [tuple(r) for r in db.execute("SELECT fn_entry, signal, slot, slot_kind FROM qt_connect WHERE kind='ptr' "
+                                         "ORDER BY site")]
+    assert rows == [(fn, "MainWindow::progress(int,int)", "0x140001800", "slot"),
+                    (0x140002000, "QAction::triggered", "0x140001a00", "functor")]
+    out = qtools.qt_metaobjects(ctx, connections=True)
+    assert "signal MainWindow::progress(int,int) -> slot 0x0000000140001800" in out
+    assert "signal QAction::triggered -> functor 0x0000000140001a00" in out
+    cls = qtools.qt_metaobjects(ctx, class_="MainWindow")
+    assert "signal MainWindow::progress(int,int)" in cls and "QAction::triggered" not in cls
+    assert "pointer connects 2 of 2 call sites resolved" in qt.ui_line(st, bid)
+    assert qt.store_connects(st, bid, {"results": []}, sites) == (0, 2)
+    assert qt.import_qualname("?connectImpl@QObject@@CA?AVConnection@QMetaObject@@XZ") == "QObject::connectImpl"
+    assert qt.import_qualname("??0QFoo@Bar@@QEAA@XZ") == "Bar::QFoo::QFoo"
+    assert qt.import_qualname("??1QFoo@@UEAA@XZ") == "QFoo::~QFoo"
+    assert qt.import_qualname("malloc") == ""
 
 
 def test_worker_helpers():

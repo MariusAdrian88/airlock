@@ -90,6 +90,12 @@ def _find_classes(bd: Bound, ident: str) -> list[dict]:
     return exact or [r for r in rows if want in r["name"].lower()]
 
 
+def _slot_class(db, bid: int, addr: int) -> str:
+    r = db.execute("SELECT c.name FROM qt_method m JOIN qt_class c ON c.binary_id=m.binary_id AND "
+                   "c.meta_addr=m.meta_addr WHERE m.binary_id=? AND m.addr=? LIMIT 1", (bid, addr)).fetchone()
+    return r[0] if r else ""
+
+
 def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
     """String-based connects (resolved to classes where the text is unique enough) and the call sites of
     the pointer-to-member ``connectImpl``; with ``cls`` only those that name one of its signals or slots."""
@@ -123,12 +129,31 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
         fn = bd.store.function_at(bid, r["fn_entry"])
         lines.append(f"{_prefix(bd, several)}{left} -> {right} in {bd.addr(r['fn_entry'])}"
                      + (f" {fn.qualified_name}" if fn is not None else ""))
-    if cls is None:
-        for r in db.execute("SELECT fn_entry, site FROM qt_connect WHERE binary_id=? AND kind='ptr' "
-                            "ORDER BY fn_entry, site", (bid,)):
-            fn = bd.store.function_at(bid, r["fn_entry"])
-            lines.append(f"{_prefix(bd, several)}pointer connect call at {bd.addr(r['site'])} in "
-                         f"{bd.addr(r['fn_entry'])}" + (f" {fn.qualified_name}" if fn is not None else ""))
+    own_names = {x.split("(")[0] for x in own}
+    rows = db.execute("SELECT fn_entry, site, signal, slot, slot_kind FROM qt_connect WHERE binary_id=? AND kind='ptr' "
+                      "ORDER BY fn_entry, site", (bid,)).fetchall()
+    if cls is not None:
+        short = cls["name"]
+        rows = [r for r in rows if (r["signal"] or "").startswith(short + "::")
+                or (r["slot_kind"] in ("slot", "signal") and r["slot"].startswith("0x")
+                    and _slot_class(db, bid, int(r["slot"], 16)) == short)]
+    unresolved = 0
+    for r in rows:
+        fn = bd.store.function_at(bid, r["fn_entry"])
+        where = f"in {bd.addr(r['fn_entry'])}" + (f" {fn.qualified_name}" if fn is not None else "")
+        if not r["signal"]:
+            unresolved += 1
+            continue
+        right = r["slot"]
+        if right.startswith("0x"):
+            sf = bd.store.function_at(bid, int(right, 16))
+            right = f"{r['slot_kind']} {bd.addr(int(right, 16))}" + (
+                f" {sf.qualified_name}" if sf is not None and sf.name_state != "auto" else "")
+        else:
+            right = f"{r['slot_kind']} {right}".strip()
+        lines.append(f"{_prefix(bd, several)}signal {r['signal']} -> {right} at {bd.addr(r['site'])} {where}")
+    if unresolved and cls is None:
+        lines.append(f"{_prefix(bd, several)}{unresolved} pointer connect call sites not resolved")
     return lines
 
 

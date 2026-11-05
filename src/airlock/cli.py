@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -96,17 +97,30 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
     if not args.install:
         print("airlock: give the Delphi install folder (the one with bin and Redist)", file=sys.stderr)
         return 2
+    from airlock.server import delphimap, delphimega
     bits = [4, 8] if args.bits == "both" else [int(args.bits) // 8]
+    say = print if args.verbose else None
     built = 0
     for psize in bits:
+        pairs = [(Path(b), Path(m)) for b, m in args.map or [] if delphimap.pair_psize(Path(b)) == psize]
+        work = None
         try:
-            r = delphisigs.build(args.install[0], out, psize, progress=print if args.verbose else None,
-                                 jobs=args.jobs)
-        except delphisigs.SigError as e:
+            if args.units:
+                work = args.work or (out / "work")
+                mega = delphimega.build(args.install[0], work / f"win{psize * 8}", psize, say)
+                pairs.append((mega.binary, mega.map))
+                print(f"{psize * 8}-bit units package: {mega.units} units, {len(mega.excluded)} left out, "
+                      f"{mega.rounds} rounds, {mega.seconds:.0f} s")
+            r = delphisigs.build(args.install[0], out, psize, progress=say, jobs=args.jobs, pairs=pairs)
+        except (delphisigs.SigError, delphimega.MegaError) as e:
             print(f"{psize * 8}-bit: {e}")
             continue
+        finally:
+            if work is not None and not args.keep_work:
+                shutil.rmtree(work / f"win{psize * 8}", ignore_errors=True)
         built += 1
-        print(f"{r.path}: compiler {r.compiler}, {r.psize * 8}-bit, {r.packages} packages, {r.names} names, "
+        extra = f", {r.mapped} from maps" if pairs else ""
+        print(f"{r.path}: compiler {r.compiler}, {r.psize * 8}-bit, {r.packages} packages, {r.names} names{extra}, "
               f"{r.routines} distinct routines, {r.path.stat().st_size // 1024} KB, {r.seconds:.0f} s")
     return 0 if built else 1
 
@@ -156,6 +170,13 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--bits", choices=["32", "64", "both"], default="both", help="build: platform (default both)")
     g.add_argument("--out", type=Path, default=None, help="folder of the databases (default: delphi_sigdb_dir)")
     g.add_argument("--jobs", type=int, default=4, help="build: worker processes")
+    g.add_argument("--units", action="store_true",
+                   help="build: also build a package of all compiled units (.dcu) with dcc and read its map file "
+                        "(names of the routines the packages do not export; takes many minutes)")
+    g.add_argument("--map", nargs=2, action="append", metavar=("BINARY", "MAP"),
+                   help="build: add the routine names of a binary and its linker map (-GD); repeatable")
+    g.add_argument("--work", type=Path, default=None, help="build --units: work folder (default: a folder work in the output folder)")
+    g.add_argument("--keep-work", action="store_true", help="build --units: keep the package and map files")
     g.add_argument("-v", "--verbose", action="store_true")
     g.set_defaults(fn=_cmd_delphi_sigs)
 

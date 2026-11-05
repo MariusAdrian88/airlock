@@ -142,6 +142,8 @@ def import_binary(args: dict[str, Any]) -> dict[str, Any]:
             raise WorkerError("import_failed", f"Ghidra could not import {src}. "
                                                "Unsupported format or no matching language.")
         gp.saveAs(program, "/", name, True)
+        if gp.getRootFolder().getFile(name) is None:
+            raise WorkerError("import_failed", f"'{name}' is not in the Ghidra project after the import.")
         e = Entry(name, program, analysed=False)
         SESSION.programs[name] = e
         lang = program.getLanguage()
