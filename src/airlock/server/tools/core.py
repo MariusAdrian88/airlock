@@ -1073,6 +1073,9 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         label = fn_desc(bd, fn)
         if dotnet.is_managed(b, fn):
             notes += dotnet_meta.link_notes(st, b.id, fn.entry)      # implements / overrides / impl / override
+            if direction == "to":
+                from airlock.server.tools import dotnet as dotnet_tools
+                notes += dotnet_tools.wired_notes(ctx, bd, fn.entry)      # wired: <control>.<Event> (<caption>)
         if fn.space != "ram":  # imported function: callers reach it through its IAT slot
             slots = [i["address"] for i in st.imports_by_name(b.id, fn.name)
                      if i["address"] is not None]

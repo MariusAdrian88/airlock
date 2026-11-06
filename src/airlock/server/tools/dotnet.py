@@ -8,7 +8,9 @@ stays a plain ``module!entry``. Decompiled C# is a reconstruction: the first lin
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import threading
 from pathlib import Path
 
 from airlock.index.store import Binary
@@ -341,8 +343,8 @@ def dotnet_events(ctx: ServerContext, form: str = "", component: str = "", event
             wpf, note = _wpf_rows(ctx, bd, art, form)
         except Exception as e:  # noqa: BLE001
             wpf, note = [], f"wpf: not read ({type(e).__name__}: {e})"
-        if note:
-            facts.append((f"{bd.binary.name}: " if multi else "") + note)
+        for ln in note.splitlines():
+            facts.append((f"{bd.binary.name}: " if multi else "") + ln)
         for r in got + wpf:
             tags[id(r)] = bd.binary.name
         rows += got + wpf
@@ -368,8 +370,90 @@ def dotnet_events(ctx: ServerContext, form: str = "", component: str = "", event
     return _page(ctx, lines, "dotnet_events", args, "", budget, "code")
 
 
-def _wpf_rows(ctx: ServerContext, bd: Bound, art: Path, form: str) -> tuple[list[ui.UiRow], str]:
-    """The WPF rows of a binary (BAML through ilspycmd 11), and one fact line when they cannot be read."""
+_WPF_MEMO: dict[str, tuple[list[ui.UiRow], str]] = {}     # all BAML rows of an assembly, when read in full
+_WPF_JOBS: dict[str, threading.Thread] = {}                # background reads (started when a binary is ready)
+_WPF_LOCK = threading.Lock()
+
+
+def _wpf_rows(ctx: ServerContext, bd: Bound, art: Path, form: str,
+              patience: float | None = None) -> tuple[list[ui.UiRow], str]:
+    """The WPF rows of a binary (BAML through ilspycmd 11), and fact lines when they cannot be read. Serves the
+    background read when it exists (waits up to ``patience`` seconds for it, None = until it ends)."""
+    key = f"{art}|{art.stat().st_mtime_ns}"
+    with _WPF_LOCK:
+        job = _WPF_JOBS.get(key)
+        got = _WPF_MEMO.get(key)
+    if got is None and job is not None and job.is_alive() and threading.current_thread() is not job:
+        job.join(patience)
+        with _WPF_LOCK:
+            got = _WPF_MEMO.get(key)
+        if got is None and patience is not None:
+            return [], ""
+    if got is not None:
+        return got
+    res = _read_wpf(ctx, bd, art, form)
+    if not form.strip() and not res[1]:
+        with _WPF_LOCK:
+            _WPF_MEMO[key] = res
+    return res
+
+
+def prefetch_wpf(ctx: ServerContext, project: str, binary_id: int) -> None:
+    """Start the BAML decompile of a ready managed binary on a background thread (the cache serves the
+    first ``dotnet_events`` call)."""
+    st = ctx.indexer.store(project)
+    b = st.get_binary_by_id(binary_id)
+    if b is None or b.toolchain != "dotnet":
+        return
+    art = ctx.indexer.paths(project).artifacts / b.sha256
+    if not art.is_file() or ctx.config.ilspycmd is None:
+        return
+    key = f"{art}|{art.stat().st_mtime_ns}"
+
+    def work() -> None:
+        try:
+            if ui.baml_names(art):
+                st2 = ctx.indexer.store(project)          # stores are per thread
+                b2 = st2.get_binary_by_id(binary_id)
+                if b2 is not None:
+                    _wpf_rows(ctx, Bound(project, st2, b2), art, "")
+        except Exception as e:  # noqa: BLE001  a prefetch is an extra; the tool reads on demand
+            logging.getLogger("airlock").debug("BAML prefetch of %s failed: %s", b.name, e)
+
+    with _WPF_LOCK:
+        if key in _WPF_JOBS or key in _WPF_MEMO:
+            return
+        t = threading.Thread(target=work, name=f"airlock-baml-{b.name}", daemon=True)
+        _WPF_JOBS[key] = t
+    t.start()
+
+
+def wired_notes(ctx: ServerContext, bd: Bound, token: int, limit: int = 4) -> list[str]:
+    """``wired: <control>.<Event> (<caption>) in <form>`` for each control that a method token is wired to."""
+    art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
+    rows: list[ui.UiRow] = []
+    try:
+        rows += ui.winforms_rows(art)
+        rows += _wpf_rows(ctx, bd, art, "", patience=3.0)[0]
+    except Exception:  # noqa: BLE001  an extra line
+        pass
+    out: list[str] = []
+    for r in rows:
+        if r.token != token:
+            continue
+        if r.ctype == "CommandBinding":
+            ln = f"wired: command {r.command or '-'} {r.event} in {r.form.rsplit('.', 1)[-1]}"
+        else:
+            cap = f' ("{r.caption}")' if r.caption else ""
+            ln = f"wired: {r.control or '-'}.{r.event}{cap} in {r.form.rsplit('.', 1)[-1]}"
+        if ln not in out:
+            out.append(ln)
+    if len(out) > limit:
+        out = out[:limit] + [f"wired: +{len(out) - limit} more"]
+    return out
+
+
+def _read_wpf(ctx: ServerContext, bd: Bound, art: Path, form: str) -> tuple[list[ui.UiRow], str]:
     names = ui.baml_names(art)
     if not names:
         return [], ""
