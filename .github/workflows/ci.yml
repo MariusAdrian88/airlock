@@ -1,0 +1,26 @@
+# Runs the unit tests on every push and pull request. No Ghidra is installed,
+# so the tests marked "ghidra" skip.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run the tests
+        run: uv run --python ${{ matrix.python }} --extra dev pytest -q

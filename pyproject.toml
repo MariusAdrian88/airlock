@@ -37,5 +37,7 @@ packages = ["src/airlock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests import each other as "tests.<module>"; "pytest" (not "python -m pytest") needs the repo root on the path
+pythonpath = ["."]
 # Parallel by default (pytest-xdist), at most 8 workers. Ghidra runs (--binary/--xbin) run serially.
 addopts = "-n auto --maxprocesses=8"
