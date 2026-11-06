@@ -13,7 +13,6 @@ from airlock.server.registry import tool
 from airlock.server import targets as tg
 from airlock.server.tools.common import budget_for
 
-MAX_MEMBER_LINES = 500
 
 
 def _session(ctx: ServerContext) -> ProjectPaths | str:
@@ -137,17 +136,14 @@ def function_map(ctx: ServerContext, scope: str = "", cluster: str = "", limit: 
         st = ctx.indexer.store(pp.name)
         ev = cl.Evidence(st)
         members = [m for m in c.ranked() if member_bin is None or m.key[0] == member_bin]
-        shown = members[:MAX_MEMBER_LINES]
         top = f"{c.id} {c.label}".rstrip() + f": {len(members)} fns ({c.named} named)"
         if member_bin is not None:
             top += f" in {cs.bin_name(member_bin)}"
         lines = [top]
-        for m in shown:
+        for m in members:
             e = ev.of(m.key[0], m.fid)
             lines.append(f"[{cs.bin_name(m.key[0])}] {m.qname} {cs.addr(m)} callers {m.callers} "
                          f"callees {m.callees}" + (f"  evidence: {e}" if e else ""))
-        if len(members) > len(shown):
-            lines.append(f"… {len(members) - len(shown)} more members not listed (lowest importance).")
         return _page(lines, 1, int(limit), bud, args)
     rows = [c for c in cl.ordered(cs) if pred is None or pred(c)]
     if not rows:            # widen: the whole map answers better than nothing

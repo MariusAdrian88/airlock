@@ -165,6 +165,10 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
 @tool("qt_metaobjects", "List Qt classes with signals, slots, properties and the functions behind them, or show one class and its connections.")
 def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LIMIT, connections: bool = False,
                    binary: str = "", cursor: str = "", budget: int = 0) -> str:
+    if cursor:      # a known cursor carries its own arguments
+        return _page([], budget_for(ctx, budget), "qt_metaobjects",
+                     {"binary": binary, "class_": class_, "limit": limit, "connections": connections},
+                     cursor)
     if limit < 1:
         return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary, class_)
@@ -173,8 +177,6 @@ def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LI
     bounds, several, ident = sc
     bud = budget_for(ctx, budget)
     args = {"binary": binary, "class_": ident, "limit": limit, "connections": connections}
-    if cursor:
-        return _page([], bud, "qt_metaobjects", args, cursor)
     lines: list[str] = []
     if connections and not ident:
         for bd in bounds:
@@ -201,10 +203,7 @@ def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LI
                 if r["nenums"]:
                     line += f" enums {r['nenums']}"
                 lines.append(line)
-        shown = lines[:limit]
-        if len(lines) > limit:
-            shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}")
-        return fit_lines(shown, bud, "code", tool="qt_metaobjects", args=args)[0]
+        return fit_lines(lines, bud, "code", tool="qt_metaobjects", args=args, max_lines=limit)[0]
     hits = [(bd, c) for bd in bounds for c in _find_classes(bd, ident)]
     if not hits:
         return f"error not_found: no Qt class '{ident}'."

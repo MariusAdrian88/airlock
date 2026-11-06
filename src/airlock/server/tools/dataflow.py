@@ -61,15 +61,16 @@ def _ranges(values: list[int]) -> str:
 
 
 @tool("switch_tables", "Show the switch tables the decompiler recovered in a function: case values to target addresses.")
-def switch_tables(ctx: ServerContext, function: str, binary: str = "", cursor: str = "", budget: int = 0) -> str:
+def switch_tables(ctx: ServerContext, function: str = "", binary: str = "", cursor: str = "",
+                  budget: int = 0) -> str:
+    args = {"binary": binary, "function": function}
+    if cursor:
+        return _page([], budget_for(ctx, budget), "switch_tables", args, cursor)
     got = _function(ctx, binary, function)
     if isinstance(got, str):
         return got
     bd, fn, note = got
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "function": function}
-    if cursor:
-        return _page([], bud, "switch_tables", args, cursor)
     r = _call(ctx, bd, "switch_tables", {"entry": fn.entry})
     if isinstance(r, str):
         return r
@@ -91,8 +92,11 @@ def switch_tables(ctx: ServerContext, function: str, binary: str = "", cursor: s
 # ── trace_values ───────────────────────────────────────────────────────────
 
 @tool("trace_values", "Trace a variable or parameter of a function through decompiler def-use chains and into callees.")
-def trace_values(ctx: ServerContext, function: str, variable: str = "", param: int = 0, depth: int = 2,
+def trace_values(ctx: ServerContext, function: str = "", variable: str = "", param: int = 0, depth: int = 2,
                  binary: str = "", cursor: str = "", budget: int = 0) -> str:
+    args = {"binary": binary, "function": function, "variable": variable, "param": param, "depth": depth}
+    if cursor:
+        return _page([], budget_for(ctx, budget), "trace_values", args, cursor)
     if not variable.strip() and param < 1:
         return ("error bad_args: needs variable= (a name from the decompiled C, e.g. local_10 or iVar2) or "
                 "param= (1 for the first parameter).")
@@ -103,9 +107,6 @@ def trace_values(ctx: ServerContext, function: str, variable: str = "", param: i
         return got
     bd, fn, note = got
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "function": function, "variable": variable, "param": param, "depth": depth}
-    if cursor:
-        return _page([], bud, "trace_values", args, cursor)
     r = _call(ctx, bd, "trace_values", {"entry": fn.entry, "variable": variable.strip() or None,
                                         "param": param or None, "depth": depth})
     if isinstance(r, str):
@@ -133,8 +134,11 @@ def parse_value(text: str) -> int | None:
 
 
 @tool("constants", "Find the functions that use an immediate constant such as a magic number or a record tag.")
-def constants(ctx: ServerContext, value: str, limit: int = 30, binary: str = "", cursor: str = "",
-              budget: int = 0) -> str:
+def constants(ctx: ServerContext, value: str = "", limit: int = 30, binary: str = "",
+              cursor: str = "", budget: int = 0) -> str:
+    args = {"binary": binary, "value": str(value), "limit": limit}
+    if cursor:
+        return _page([], budget_for(ctx, budget), "constants", args, cursor)
     v = parse_value(str(value))
     if v is None:
         return "error bad_args: value must be a number like 0x4d5a or 1234."
@@ -149,9 +153,6 @@ def constants(ctx: ServerContext, value: str, limit: int = 30, binary: str = "",
     if not bounds:
         return "error not_native: no native binary to search."
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "value": str(value), "limit": limit}
-    if cursor:
-        return _page([], bud, "constants", args, cursor)
     several = len(bounds) > 1
     lines: list[str] = []
     for bd in bounds:
@@ -168,7 +169,5 @@ def constants(ctx: ServerContext, value: str, limit: int = 30, binary: str = "",
             lines.append(f"{pre}{nm} {bd.addr(entry)} uses {n} first {bd.addr(first)}")
     if not lines:
         return f"no function uses {hex(v)} as an immediate."
-    shown = lines[:limit]
-    if len(lines) > limit:
-        shown.append(f"… {len(lines) - limit} more functions beyond limit={limit}")
-    return fit_lines([f"{hex(v)} used by {len(lines)} functions", *shown], bud, "code", tool="constants", args=args)[0]
+    return fit_lines([f"{hex(v)} used by {len(lines)} functions", *lines], bud, "code",
+                     tool="constants", args=args, max_lines=limit + 1, page=limit)[0]

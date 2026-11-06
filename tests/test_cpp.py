@@ -389,8 +389,12 @@ def test_rtti_classes_tool(tmp_path, built):
                for ln in out)
     assert f"0x{a['vt_der']:0{2 * b.ps}x}" in "\n".join(out)
     assert cpp_tools.rtti_classes(ctx, "base").splitlines()[0].startswith("Ns::CBase vtable")
-    assert len(cpp_tools.rtti_classes(ctx, limit=2).splitlines()) == 3
-    assert "3 more classes" in cpp_tools.rtti_classes(ctx, limit=2)
+    paged = cpp_tools.rtti_classes(ctx, limit=2).splitlines()
+    assert len(paged) == 3 and paged[-1].startswith("… 3 more lines. cursor=")
+    rest = cpp_tools.rtti_classes(ctx, limit=2, cursor=paged[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(rest) == 3 and rest[-1].startswith("… 1 more lines. cursor=")   # 2 per page again
+    last = cpp_tools.rtti_classes(ctx, limit=2, cursor=rest[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(last) == 1 and not last[0].startswith("…")
     assert cpp_tools.rtti_classes(ctx, "zzz").startswith("no RTTI class matches")
     assert cpp_tools.rtti_classes(ctx, limit=0).startswith("error bad_args")
 

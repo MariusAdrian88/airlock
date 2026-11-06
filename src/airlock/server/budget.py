@@ -6,7 +6,7 @@ import math
 import secrets
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 CHARS_PER_TOKEN = {"code": 3.5, "prose": 4.0}
@@ -38,6 +38,27 @@ def normalize_args(tool: str, args: dict[str, Any] | None) -> str:
     return tool + ":" + json.dumps(clean, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def clean_args(args: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (args or {}).items() if k not in _IGNORED_ARGS and v is not None}
+
+
+def _show(key: str, value: Any) -> str:
+    if isinstance(value, int) and not isinstance(value, bool) and (
+            "offset" in key or "addr" in key or key in ("start", "end")):
+        return f"{key}=0x{value:x}"
+    return f"{key}={value}"
+
+
+def note_kept(cur: "Cursor", args: dict[str, Any] | None) -> None:
+    """A valid cursor carries its own arguments. If the caller passed other values, say so
+    in one line (a note above the result); empty values count as not passed."""
+    diff = [_show(k, cur.args[k]) for k, v in clean_args(args).items()
+            if v != "" and k in cur.args and cur.args[k] != v]
+    if diff:
+        from airlock.server.registry import add_note
+        add_note(f"(cursor kept its arguments: {', '.join(diff)})")
+
+
 @dataclass
 class Cursor:
     id: str
@@ -45,6 +66,8 @@ class Cursor:
     lines: list[str] | None = None   # remaining lines (list-style tools)
     offset: int = 0                  # char offset into an external text (function tool)
     identity: tuple | None = None    # e.g. (binary, entry, fn_version)
+    page: int = 0                    # lines per page the cursor was issued with (0 = budget only)
+    args: dict[str, Any] = field(default_factory=dict)   # the arguments it was issued for
 
 
 class CursorStore:
@@ -69,18 +92,22 @@ class CursorStore:
                 self._items.popitem(last=False)
             return cid
 
-    def create_lines(self, tool: str, args: dict[str, Any] | None, lines: Sequence[str]) -> str:
-        return self._put(key=normalize_args(tool, args), lines=list(lines))
+    def create_lines(self, tool: str, args: dict[str, Any] | None, lines: Sequence[str],
+                     page: int = 0) -> str:
+        return self._put(key=normalize_args(tool, args), lines=list(lines), page=page,
+                         args=clean_args(args))
 
     def create_text(self, tool: str, args: dict[str, Any] | None, offset: int,
                     identity: tuple | None = None) -> str:
-        return self._put(key=normalize_args(tool, args), offset=offset, identity=identity)
+        return self._put(key=normalize_args(tool, args), offset=offset, identity=identity,
+                         args=clean_args(args))
 
     def get(self, cid: str | None, tool: str, args: dict[str, Any] | None = None,
             identity: tuple | None = None) -> Cursor:
         """Look up a cursor; raises CursorError (use .message) when unknown, mismatched or stale.
 
-        If `args` is given they must match the ones the cursor was issued for.
+        A known cursor wins over `args`: other values are noted, the cursor's own are used
+        (`Cursor.args`).
         """
         redo = ""     # the call without cursor is the only way on; the error says why
         with self._lock:
@@ -89,13 +116,19 @@ class CursorStore:
                 raise CursorError("bad_cursor", f"cursor '{cid}' is unknown or expired", redo)
             if not cur.key.startswith(tool + ":"):
                 raise CursorError("bad_cursor", f"cursor '{cid}' belongs to another tool", redo)
-            if args is not None and cur.key != normalize_args(tool, args):
-                raise CursorError("bad_cursor", f"cursor '{cid}' was issued for different arguments", redo)
             if identity is not None and cur.identity is not None and cur.identity != identity:
                 raise CursorError("stale_cursor",
                                   f"cursor '{cid}' is stale, the function changed since it was issued", redo)
             self._items.move_to_end(cur.id)
-            return cur
+        if args is not None:
+            note_kept(cur, args)
+        return cur
+
+    def peek(self, cid: str | None, tool: str) -> Cursor | None:
+        """The cursor if known and of this tool, else None (no errors, no note)."""
+        with self._lock:
+            cur = self._items.get(cid or "")
+            return cur if cur is not None and cur.key.startswith(tool + ":") else None
 
     def drop(self, cid: str) -> None:
         with self._lock:
@@ -139,18 +172,22 @@ def _split(lines: Sequence[str], budget: int, kind: str,
 
 def fit_lines(lines: Iterable[str], budget: int, kind: str = "prose", *,
               tool: str = "", args: dict[str, Any] | None = None,
-              store: CursorStore | None = None, max_lines: int = 0) -> tuple[str, int]:
+              store: CursorStore | None = None, max_lines: int = 0,
+              page: int = 0) -> tuple[str, int]:
     """Cut `lines` at a line boundary to fit `budget` tokens (and `max_lines` if > 0).
 
     Returns (text, remaining_line_count). When lines remain, the text ends with
     `… N more lines. cursor=<id>` and the rest is stored under that cursor.
     At least one line is always emitted so a resumed cursor always progresses.
+    The cursor remembers the page size (`page`, default `max_lines`), so a resume
+    needs nothing but the cursor id.
     """
     seq = list(lines)
     head, rem = _split(seq, budget, kind, max_lines)
     if not rem:
         return "\n".join(head), 0
-    cid = (STORE if store is None else store).create_lines(tool, args, seq[len(head):])
+    cid = (STORE if store is None else store).create_lines(
+        tool, args, seq[len(head):], page or max_lines)
     return "\n".join(head + [footer(rem, cid)]), rem
 
 
@@ -182,5 +219,6 @@ def resume_lines(cursor_id: str, budget: int, kind: str = "prose", *, tool: str,
     st = STORE if store is None else store
     cur = st.get(cursor_id, tool, args)
     st.drop(cursor_id)
-    return fit_lines(cur.lines or [], budget, kind, tool=tool, args=args, store=st,
-                     max_lines=max_lines)
+    page = cur.page or max_lines
+    return fit_lines(cur.lines or [], budget, kind, tool=tool, args=cur.args, store=st,
+                     max_lines=page, page=page)

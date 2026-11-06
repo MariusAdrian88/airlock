@@ -48,8 +48,9 @@ def test_errors():
     cid = st.create_lines("t", {"a": 1}, ["x"])
     with pytest.raises(CursorError):
         st.get(cid, "other")
-    with pytest.raises(CursorError):
-        st.get(cid, "t", {"a": 2})
+    # a known cursor wins over different arguments: it keeps its own
+    cur = st.get(cid, "t", {"a": 2})
+    assert cur.lines == ["x"] and cur.args == {"a": 1}
     assert st.get(cid, "t", {"a": 1, "cursor": cid, "budget": 5}).lines == ["x"]
 
 
@@ -86,3 +87,27 @@ def test_text_cursor_and_stale():
 
 def test_normalize():
     assert normalize_args("t", {"b": 1, "a": 2, "z": None}) == normalize_args("t", {"a": 2, "b": 1, "cursor": "c"})
+
+
+def test_cursor_wins_over_other_arguments_and_notes():
+    from airlock.server import registry
+    st = CursorStore()
+    lines = [f"line {i:03d} " + "x" * 30 for i in range(100)]
+    text, _ = fit_lines(lines, 100, "prose", tool="t", args={"offset": 0x40, "q": "a"}, store=st)
+    cid = text.split("cursor=")[1]
+    notes: list[str] = []
+    token = registry._NOTES.set(notes)
+    try:
+        # cursor alone and cursor plus the same arguments: no note
+        assert st.get(cid, "t", {"cursor": cid}).args == {"offset": 0x40, "q": "a"}
+        st.get(cid, "t", {"offset": 0x40, "q": "a", "cursor": cid})
+        assert notes == []
+        # different arguments: the cursor's own are kept and one line says so
+        text2, _ = resume_lines(cid, 100, "prose", tool="t", args={"offset": 0, "q": "a"}, store=st)
+    finally:
+        registry._NOTES.reset(token)
+    assert notes == ["(cursor kept its arguments: offset=0x40)"]
+    cid2 = text2.split("cursor=")[1]
+    assert st.get(cid2, "t").args == {"offset": 0x40, "q": "a"}     # the next cursor keeps them too
+    with pytest.raises(CursorError):                                  # unknown stays an error
+        st.get("c_dead", "t", {"offset": 0})

@@ -82,7 +82,8 @@ def test_search_prefixes_and_merge(xctx):
 
 
 def test_search_limit_and_binary(xctx):
-    assert core.search(xctx, "doc", kind="function", limit=3).splitlines()[0] == "search 'doc': 3 hits"
+    paged = core.search(xctx, "doc", kind="function", limit=3).splitlines()
+    assert paged[0] == "search 'doc': 4 hits" and paged[-1].startswith("… 1 more lines. cursor=")
     one = core.search(xctx, "doc", binary="engine.dll", kind="function").splitlines()
     assert one[1:] == ["function LoadDoc 0x10001000 user,64B", "function SaveDoc 0x10001100 auto,32B"]
 
@@ -177,7 +178,8 @@ def test_callgraph_callees_hop(xctx):
     ]
     # depth limit unchanged
     short = core.callgraph(xctx, "main.exe!main", depth=1).splitlines()
-    assert short[1:] == ["  Helper (0x00401100)", "  LoadDoc (0x00401300) [thunk]"]
+    assert short[1:] == ["  Helper (0x00401100) [2 callees below]",
+                         "  LoadDoc (0x00401300) [thunk] [1 callees below]"]
 
 
 def test_callgraph_callers_hop(xctx):

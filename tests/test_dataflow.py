@@ -99,6 +99,11 @@ def test_constants_output(ctx):
     out = df.constants(ctx, "0x4d5a").splitlines()
     assert out[0] == "0x4d5a used by 2 functions"
     assert out[1].endswith("uses 3 first 0x%08x" % (entry + 4)) and out[2] == "(no function) 0x00401234 uses 1"
+    cut = df.constants(ctx, "0x4d5a", limit=1).splitlines()       # a cut result ends with a cursor
+    assert cut[0] == "0x4d5a used by 2 functions" and len(cut) == 3
+    assert cut[-1].startswith("… 1 more lines. cursor=c_")
+    nxt = df.constants(ctx, "0x4d5a", limit=1, cursor=cut[-1].rsplit("cursor=", 1)[1])
+    assert nxt == "(no function) 0x00401234 uses 1"
     assert df.constants(ctx, "0x10").startswith("error bad_args")
     assert df.constants(ctx, "abc").startswith("error bad_args")
     script(ctx, {"constants": {"rows": [], "total": 0, "secs": 0}})

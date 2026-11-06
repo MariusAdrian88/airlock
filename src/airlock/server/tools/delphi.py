@@ -91,6 +91,9 @@ def _quote(text: str, n: int = 50) -> str:
 @tool("delphi_classes", "List Delphi classes recovered from VMTs: name, parent, unit, vmt address, method counts.")
 def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT, binary: str = "",
                    cursor: str = "", budget: int = 0) -> str:
+    args = {"binary": binary, "query": query, "limit": limit}
+    if cursor:      # a known cursor carries its own arguments
+        return _page([], budget_for(ctx, budget), "delphi_classes", args, cursor)
     if limit < 1:
         return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary)
@@ -98,9 +101,6 @@ def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIM
         return sc
     bounds, several, _ = sc
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "query": query, "limit": limit}
-    if cursor:
-        return _page([], bud, "delphi_classes", args, cursor)
     q = query.strip().lower()
     lines: list[str] = []
     have = 0
@@ -127,10 +127,7 @@ def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIM
         if have == 0:
             return "no Delphi classes: no VMT found (a Delphi version older than 2009 with another layout, or packed)."
         return f"no Delphi class matches '{query}' ({have} classes)."
-    shown = lines[:limit]
-    if len(lines) > limit:
-        shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}")
-    return fit_lines(shown, bud, "code", tool="delphi_classes", args=args)[0]
+    return fit_lines(lines, bud, "code", tool="delphi_classes", args=args, max_lines=limit)[0]
 
 
 # ── delphi_forms ───────────────────────────────────────────────────────────
@@ -160,14 +157,15 @@ def _have_forms(bounds: list[Bound], several: bool, n: int = 12) -> str:
 @tool("delphi_forms", "List Delphi DFM forms, or show one form's component tree: name, class, caption, event count.")
 def delphi_forms(ctx: ServerContext, form: str = "", binary: str = "", cursor: str = "",
                  budget: int = 0) -> str:
+    if cursor:
+        return _page([], budget_for(ctx, budget), "delphi_forms", {"binary": binary, "form": form},
+                     cursor)
     sc = _scope(ctx, binary, form)
     if isinstance(sc, str):
         return sc
     bounds, several, form = sc
     bud = budget_for(ctx, budget)
     args = {"binary": binary, "form": form}
-    if cursor:
-        return _page([], bud, "delphi_forms", args, cursor)
     lines: list[str] = []
     if not form:
         for bd in bounds:
@@ -231,6 +229,9 @@ def _event_line(bd: Bound, r, show_form: bool) -> str:
 @tool("delphi_events", "Show the event handlers of a Delphi form or component: event, handler method, address, function.")
 def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binary: str = "",
                   cursor: str = "", budget: int = 0) -> str:
+    args = {"binary": binary, "form": form, "component": component}
+    if cursor:
+        return _page([], budget_for(ctx, budget), "delphi_events", args, cursor)
     if not form.strip() and not component.strip():
         return "error bad_args: needs form (class or resource name) or component (name)."
     sc = _scope(ctx, binary, form or component)
@@ -238,9 +239,6 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
         return sc
     bounds, several, ident = sc
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "form": form, "component": component}
-    if cursor:
-        return _page([], bud, "delphi_events", args, cursor)
     lines: list[str] = []
     base = ("SELECT e.prop, e.handler, e.owner, e.addr, c.name AS cname, c.class AS cclass, "
             "f.class AS fclass FROM dl_event e JOIN dl_component c ON c.binary_id=e.binary_id AND "

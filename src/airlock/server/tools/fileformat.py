@@ -117,16 +117,16 @@ def _dump(ctx: ServerContext, data: bytes, offset: int, length: int, label: str,
 
 
 @tool("ole_streams", "List the streams of an OLE file with sizes, or hexdump one stream.")
-def ole_streams(ctx: ServerContext, path: str, stream: str = "", cursor: str = "",
+def ole_streams(ctx: ServerContext, path: str = "", stream: str = "", cursor: str = "",
                 budget: int = 0) -> str:
+    args = {"path": path, "stream": stream}
+    if cursor:      # a known cursor carries its own arguments
+        return _page(ctx, [], "ole_streams", args, cursor, budget, "code" if stream else "prose")
     p = resolve_path(ctx, path)
     if isinstance(p, str):
         return p
-    args = {"path": path, "stream": stream}
     if stream:
         return _stream_dump(ctx, p, stream, 0, ff.MAX_DUMP, "ole_streams", args, cursor, budget)
-    if cursor:
-        return _page(ctx, [], "ole_streams", args, cursor, budget)
     lines = ff.ole_tree_lines(p)
     if isinstance(lines, str):
         return lines
@@ -134,16 +134,16 @@ def ole_streams(ctx: ServerContext, path: str, stream: str = "", cursor: str = "
 
 
 @tool("hexdump", "Hexdump bytes of a file or an OLE stream, 16 per line with ASCII.")
-def hexdump(ctx: ServerContext, path: str, offset: int = 0, length: int = 256, stream: str = "",
+def hexdump(ctx: ServerContext, path: str = "", offset: int = 0, length: int = 256, stream: str = "",
             cursor: str = "", budget: int = 0) -> str:
+    args = {"path": path, "offset": offset, "length": length, "stream": stream}
+    if cursor:
+        return _page(ctx, [], "hexdump", args, cursor, budget, "code")
     p = resolve_path(ctx, path)
     if isinstance(p, str):
         return p
-    args = {"path": path, "offset": offset, "length": length, "stream": stream}
     if stream:
         return _stream_dump(ctx, p, stream, offset, length, "hexdump", args, cursor, budget)
-    if cursor:
-        return _page(ctx, [], "hexdump", args, cursor, budget, "code")
     src = ff.FileSrc(p)
     if offset < 0 or (offset >= src.size and src.size > 0):
         return f"error bad_args: offset 0x{offset:x} is past the end ({src.size} bytes)."
@@ -159,9 +159,9 @@ def hexdump(ctx: ServerContext, path: str, offset: int = 0, length: int = 256, s
 
 
 @tool("file_diff", "Diff two files: changed byte ranges with context, per stream for OLE files.")
-def file_diff(ctx: ServerContext, path_a: str, path_b: str, stream: str = "", cursor: str = "",
-              budget: int = 0) -> str:
-    args = {"path_a": path_a, "path_b": path_b, "stream": stream}
+def file_diff(ctx: ServerContext, path_a: str = "", path_b: str = "", stream: str = "", cursor: str = "",
+              budget: int = 0, offset: int = 0) -> str:
+    args = {"path_a": path_a, "path_b": path_b, "stream": stream, "offset": offset}
     if cursor:
         return _page(ctx, [], "file_diff", args, cursor, budget, "code")
     pa = resolve_path(ctx, path_a)
@@ -174,7 +174,7 @@ def file_diff(ctx: ServerContext, path_a: str, path_b: str, stream: str = "", cu
     note = "(stream ignored: not two OLE files) " if stream and not both_ole else ""
     if not both_ole:
         a, b = ff.FileSrc(pa), ff.FileSrc(pb)
-        res = ff.diff_sources(a, b)
+        res = ff.diff_sources(a, b, start=offset)
         head = f"{note}diff {pa.name} {a.size}B vs {pb.name} {b.size}B: "
         if not res.range_count:
             return head + "identical."
@@ -185,7 +185,7 @@ def file_diff(ctx: ServerContext, path_a: str, path_b: str, stream: str = "", cu
         if isinstance(da, str) or isinstance(db, str):
             return da if isinstance(da, str) else db  # type: ignore[return-value]
         a, b = ff.BytesSrc(da), ff.BytesSrc(db)
-        res = ff.diff_sources(a, b)
+        res = ff.diff_sources(a, b, start=offset)
         head = f"diff stream {stream}: {a.size}B vs {b.size}B: "
         if not res.range_count:
             return head + "identical."
@@ -195,14 +195,14 @@ def file_diff(ctx: ServerContext, path_a: str, path_b: str, stream: str = "", cu
 
 
 @tool("record_guess", "Guess record layouts in a data file: strides, length prefixes, strings, columns.")
-def record_guess(ctx: ServerContext, path: str, stream: str = "", offset: int = 0, cursor: str = "",
-                 budget: int = 0) -> str:
-    p = resolve_path(ctx, path)
-    if isinstance(p, str):
-        return p
+def record_guess(ctx: ServerContext, path: str = "", stream: str = "", offset: int = 0,
+                 cursor: str = "", budget: int = 0) -> str:
     args = {"path": path, "stream": stream, "offset": offset}
     if cursor:
         return _page(ctx, [], "record_guess", args, cursor, budget, "code")
+    p = resolve_path(ctx, path)
+    if isinstance(p, str):
+        return p
     if stream:
         data = ff.read_ole_stream(p, stream)
         if isinstance(data, str):

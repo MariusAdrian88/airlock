@@ -2216,9 +2216,44 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
   found through data references from code and typed as `PascalString255`; the decompiler then shows the
   label (`p_Segoe_UI_0051e150`). Identifiers are not taken as ShortStrings: code also points at RTTI
   names and at type info records (kind byte, then the name), which read as a ShortString **[verified]**.
-  On a 32-bit Delphi program the step found 5811 literals and retyped 76 parameters in 1.7 s; the
-  sampled routine showed its literal before already. A literal pushed for a variadic routine (`UStrCatN`)
-  stays missing from the C there, because the decompiler does not show that stack argument.
+  On a 32-bit Delphi program the step found 5811 literals and retyped 76 parameters in 1.7 s.
+- String literals, pass version 2 (`COLLECTOR_VERSION` 5). Additions, each **[verified]** on a Delphi 12
+  x64 program, a Delphi 2009+ x86 program and an x86 program built with Delphi 7-2007 (Ghidra 12.1.4):
+  - Stack arguments: the walk follows `PUSH lit` (x86; offset 4 + 4 per later push), a register that is
+    pushed, and `MOV [RSP+d],reg` (x64; offset d + 8) to the call and retypes the callee's stack parameter
+    at that offset under the same rules. The walk allows 16 instructions.
+  - Stores: a literal stored to a local or a field already prints as `L"..."` once the characters are
+    typed (`*(wchar_t **)(param_2 + 0x30) = L"Phys"`); nothing else is needed. Where it did not, Ghidra had
+    disassembled the literal as code (`SUB AL,0x0` for `","`, shown as `&LAB_00418a28`). The step clears
+    such instructions when none starts before the header, no function holds them and nothing outside
+    flows into them, then types the string (596 runs on the x64 program, 75 on the x86 one).
+  - Concatenation routines (`UStrCatN`, `LStrCatN`, `WStrCatN`): found by their calls, not by name: at
+    least 3 calls, and 80% of all, pass a count in EDX and exactly that many pieces (x86: pushes, a call in
+    between takes its own stack arguments; x64: R8, R9, `[RSP+0x20]`...). On x64 the routine gets a
+    variadic signature (not when user-defined) and the decompiler then lists every piece in order:
+    `FUN_00414620(param_2,5,local_180[0],L"-",local_188,L",",local_190)`. On x86 the routine pops its
+    own variable argument list; Ghidra keeps purge 0, the stack tracking drifts and a variadic signature
+    brought back the pieces at 12 of 102 calls (in reverse order); a per-call stack depth change
+    (`CallDepthChangeInfo.setStackDepthChange`) did not help. So on x86 the step writes a PRE comment at
+    each call that has a literal piece, in concatenation order (first pushed first):
+    `/* concat ? + L"exiftool -@ \"" + ? + L"\"" */`. The decompiler prints PRE comments by default, EOL
+    comments not. A PRE comment someone else wrote is kept; the step replaces only its own (`concat `).
+  - Delphi 2007 and older: `AnsiString` literals have the header `i32 refCnt -1, i32 length` (no code page
+    or element size) and `WideString` literals are `u32 byte length`, wide characters, `u16 0` (no
+    reference count; Delphi 2009+ uses the same shape, 61 of them in the x64 program). Headers are 4-byte
+    aligned. Because both shapes occur in other data, a literal counts only when an instruction references
+    its characters; the short ANSI header is tried only when fewer than 16 modern headers exist, the
+    program holds a Delphi RTL registry path (`Software\Borland\Locales` and successors, ANSI or UTF-16),
+    and at least 16 referenced literals remain. Wide text that reads as pairs of ASCII bytes is refused.
+    Three MFC / Qt programs: nothing found, nothing changed.
+  - Refresh: the program records the pass version (options `airlock`, `delphi_strings`), and
+    `analysis_profile` includes it only when present. A project at collector 4 reruns only this pass on
+    open, so decompiles of non-Delphi programs stay cached.
+  - Measured on 20 functions per program with string use (same functions before and after): literal
+    addresses still printed as a hex constant or label 1 -> 0 on each program; literal references with no
+    text in the C 6 -> 2 (x86), 6 -> 2 (x64), 2 -> 2 (old); the rest are pointer variables loaded through
+    another pointer, not literals passed. Time of the step 2.6 -> 6-9 s (x86), 6 -> 13-22 s (x64), 0.1 ->
+    1-3 s (old, 1 MB).
 
 ### .NET
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -344,7 +345,9 @@ def test_search(ctx):
     assert core.search(ctx, "zzzz") == "no hits for 'zzzz'"
     assert core.search(ctx, "x", kind="class").startswith("error unbound:")   # forwarded to rtti_classes
     assert core.search(ctx, "x", kind="bogus").startswith("error bad_args:")
-    assert len(core.search(ctx, "file", limit=2).splitlines()) == 3
+    paged = core.search(ctx, "file", limit=2).splitlines()
+    assert paged[0] == "search 'file': 3 hits" and len(paged) == 4
+    assert paged[-1].startswith("… 1 more lines. cursor=")
 
 
 def _synthetic_search_store(ctx):
@@ -442,7 +445,7 @@ def test_search_kind_quotas_with_surplus(ctx):
     strs = [(0x604000 + 16 * i, "ascii", f"read text {i}") for i in range(30)]
     _balance_store(ctx, 30, 30, strs)
     # quotas 4/2/2, the 2 unassigned slots go to functions
-    out = core.search(ctx, "read", limit=10).splitlines()[1:]
+    out = core.search(ctx, "read", limit=10).splitlines()[1:11]
     assert [ln.split()[0] for ln in out] == ["function"] * 6 + ["import"] * 2 + ["string"] * 2
 
 
@@ -470,10 +473,12 @@ def test_search_kind_string_has_no_quotas(ctx):
 def test_search_limit_and_cursor_with_quotas(ctx):
     _balance_store(ctx, 30, 30, [(0x608000 + 16 * i, "ascii", f"read text {i}") for i in range(30)])
     out = core.search(ctx, "read", limit=10)
-    assert out.splitlines()[0] == "search 'read': 10 hits"
-    assert len(out.splitlines()) == 11
+    assert out.splitlines()[0] == "search 'read': 90 hits"     # the real count, not the page
+    assert len(out.splitlines()) == 12 and out.splitlines()[-1].startswith("… 80 more lines. cursor=")
+    nxt = core.search(ctx, cursor=out.rsplit("cursor=", 1)[1].strip())    # the cursor holds the page size
+    assert len(nxt.splitlines()) == 11 and nxt.splitlines()[-1].startswith("… 70 more lines.")
     small = core.search(ctx, "read", limit=3).splitlines()
-    assert [ln.split()[0] for ln in small[1:]] == ["function", "import", "string"]
+    assert [ln.split()[0] for ln in small[1:4]] == ["function", "import", "string"]
     cut = core.search(ctx, "read", limit=10, budget=60)
     assert "cursor=" in cut
     cur = cut.rsplit("cursor=", 1)[1].split()[0].rstrip(".")
@@ -512,7 +517,17 @@ def test_xrefs_raw_address_and_from(ctx):
     assert core.xrefs(ctx, "nosuch").startswith("error not_found:")
     assert core.xrefs(ctx, "0x00500000").splitlines()[0].endswith("no references")
     lim = core.xrefs(ctx, "main", direction="from", limit=1).splitlines()
-    assert lim[-1].startswith("… limit 1 reached")
+    assert lim[0].startswith("xrefs from main (0x00401000), 4 refs")      # the real count, no "+"
+    assert lim[-1].startswith("… 3 more lines. cursor=")
+    nxt = core.xrefs(ctx, cursor=lim[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(nxt) == 2 and nxt[-1].startswith("… 2 more lines. cursor=")   # page size of the cursor
+
+
+def test_xrefs_hard_cap_has_plus_and_cursor(ctx, monkeypatch):
+    monkeypatch.setattr(core, "XREFS_FETCH", 2)
+    out = core.xrefs(ctx, "main", direction="from", limit=1).splitlines()
+    assert out[0].startswith("xrefs from main (0x00401000), 2 refs") and out[0].endswith("data+")
+    assert out[-1].startswith("… 1 more lines. cursor=")
 
 
 def test_callgraph(ctx):
@@ -526,12 +541,27 @@ def test_callgraph(ctx):
         "  CreateFileW (0x00401300) [thunk]",
     ]
     up = core.callgraph(ctx, "FUN_00401200", direction="callers", depth=1).splitlines()
-    assert up[1:] == ["  CMainFrame::OnFoo (0x00401100)", "  main (0x00401000)"][::-1] or \
-        sorted(up[1:]) == sorted(["  CMainFrame::OnFoo (0x00401100)", "  main (0x00401000)"]) \
-        or "  main (0x00401000)" in up
+    assert sorted(up[1:]) == sorted(["  CMainFrame::OnFoo (0x00401100) [1 callers below]",
+                                     "  main (0x00401000) [1 callers below]"])
     leaf = core.callgraph(ctx, "CreateFileW", depth=2).splitlines()
     assert leaf[-1] == "  (none)"
     assert core.callgraph(ctx, "main", direction="x").startswith("error bad_args:")
+
+
+def test_callgraph_fanout_cut_names_node_and_pages_rest(ctx, monkeypatch):
+    monkeypatch.setattr(core, "CALLGRAPH_FANOUT", 1)
+    out = core.callgraph(ctx, "main", depth=1).splitlines()
+    cut = out[-1]
+    assert re.match(r"^  … \d+ more callees of main \(0x00401000\) not shown\. cursor=c_\w+$", cut)
+    rest = core.callgraph(ctx, cursor=cut.rsplit("cursor=", 1)[1]).splitlines()
+    assert rest and all("(0x" in ln for ln in rest)
+    assert len(out) - 2 + len(rest) >= 3        # shown + paged = all callees of main
+
+
+def test_callgraph_depth_cut_marks_nodes_with_more_below(ctx):
+    out = core.callgraph(ctx, "main", depth=1).splitlines()
+    assert "  CMainFrame::OnFoo (0x00401100) [1 callees below]" in out
+    assert not any(ln.startswith("  CreateFileW") and "below" in ln for ln in out)
 
 
 def test_function_decompile_annotates_and_caches(ctx):
@@ -587,7 +617,9 @@ def test_function_lines_and_cursor(ctx):
     n = int(head.split()[2].split("-")[0])
     assert second.splitlines()[1].startswith(f"  x{n - 1} =")
     assert core.function(ctx, "main", cursor="c_dead").startswith("error bad_cursor:")
-    assert core.function(ctx, "OnFoo", cursor=cid, budget=100).startswith("error bad_cursor:")
+    # a known cursor carries its own arguments: another target does not matter
+    assert core.function(ctx, "OnFoo", cursor=cid, budget=100).startswith("// lines ")
+    assert core.function(ctx, cursor=cid, budget=100).startswith("// lines ")     # the cursor alone
     part = core.function(ctx, "main", lines="2-3").splitlines()
     assert len(part) == 3 and part[0].startswith("// lines 2-3 of 200,")
     assert part[1].startswith("  x1 =")
@@ -747,10 +779,10 @@ def test_function_outline_false_pages_and_cursors(ctx):
     cid = _cursor(p1)
     p2 = core.function(ctx, "main", cursor=cid, budget=400, outline=False)
     assert p2.startswith("// lines ")
-    # a cursor never crosses detail modes
+    # a cursor keeps its detail mode, whatever the call says
     assert core.function(ctx, "main", cursor=_cursor(core.function(
         ctx, "main", budget=400, outline=False)), budget=400,
-        detail="full").startswith("error bad_cursor:")
+        detail="full").startswith("// lines ")
 
 
 def test_function_outline_footer_cursor(ctx):

@@ -341,7 +341,11 @@ def test_tools_single_binary(tmp_path):
     s = rt.string_tables(ctx, "bravo")
     assert s.splitlines() == ["string table entries: 1", '99 | "bravo text"']
     assert '127 | "last of block"' in rt.string_tables(ctx, "127")
-    assert rt.string_tables(ctx, limit=2).count("\n") == 3 or "more matches" in rt.string_tables(ctx, limit=2)
+    pg = rt.string_tables(ctx, limit=2).splitlines()
+    assert pg[0].startswith("string table entries: ") and len(pg) == 4
+    assert "more lines. cursor=c_" in pg[-1]
+    nx = rt.string_tables(ctx, limit=2, cursor=pg[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(nx) >= 1 and not nx[0].startswith("error")
     assert rt.string_tables(ctx, "zzz").startswith("no string-table")
     r = rt.pe_resources(ctx)
     assert "DIALOG 129 lang=0x0409" in r and "RCDATA 5 lang=0x0000" in r and "MENU 128" in r

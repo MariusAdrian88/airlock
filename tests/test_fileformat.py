@@ -153,6 +153,43 @@ def test_file_diff_raw_merge_and_tail(env):
     assert call(c, "file_diff", path_a="a.dat", path_b="a.dat").endswith("identical.")
 
 
+def test_file_diff_many_ranges_page_by_cursor(env, monkeypatch):
+    c, src, _ = env
+    a = bytearray(4000)
+    b = bytearray(a)
+    for i in range(10):
+        b[i * 100] = 1
+    (src / "a.dat").write_bytes(a)
+    (src / "b.dat").write_bytes(bytes(b))
+    out = call(c, "file_diff", path_a="a.dat", path_b="b.dat", budget=120)
+    assert "10 ranges" in out and "cursor=" in out        # a cut diff has a real cursor
+    seen = [ln for ln in out.splitlines() if ln.startswith("0x")]
+    for _ in range(20):
+        m = re.search(r"cursor=(c_\w+)", out.splitlines()[-1])
+        if not m:
+            break
+        out = call(c, "file_diff", path_a="a.dat", path_b="b.dat", budget=120, cursor=m.group(1))
+        seen += [ln for ln in out.splitlines() if ln.startswith("0x")]
+    assert len(seen) == 10
+
+
+def test_file_diff_range_cap_names_offset_to_continue(env, monkeypatch):
+    from airlock.server import fileformat as ffm
+    monkeypatch.setattr(ffm, "MAX_RANGES", 3)
+    c, src, _ = env
+    a = bytearray(4000)
+    b = bytearray(a)
+    for i in range(10):
+        b[i * 100] = 1
+    (src / "a.dat").write_bytes(a)
+    (src / "b.dat").write_bytes(bytes(b))
+    out = call(c, "file_diff", path_a="a.dat", path_b="b.dat")
+    last = out.splitlines()[-1]
+    assert "7 more ranges after 0x000000c9" in last and last.endswith("offset=0xc9")
+    out2 = call(c, "file_diff", path_a="a.dat", path_b="b.dat", offset=0xc9)
+    assert out2.splitlines()[1].startswith("0x0000012c")
+
+
 def test_record_guess_fixed_stride(env):
     c, src, _ = env
     rnd = random.Random(3)
@@ -597,3 +634,26 @@ def test_record_guess_pcm16_and_noisy_samples(env):
     text = ("Chào mừng bạn đến với trình hướng dẫn, bạn có thể lập trình %d lần\n" % 0).encode()
     vi = b"".join(("Chào mừng bạn số %d: ứng dụng tập trung trong các vòng đời %d\n" % (i, i * 7 % 13)).encode() for i in range(300))
     assert "sample stream" not in _rg(env, "vi.txt", vi)
+
+
+def test_file_diff_cursor_wins_over_arguments(env, monkeypatch):
+    c, src, _ = env
+    a = bytearray(4000)
+    b = bytearray(a)
+    for i in range(10):
+        b[i * 100] = 1
+    (src / "a.dat").write_bytes(a)
+    (src / "b.dat").write_bytes(bytes(b))
+    first = call(c, "file_diff", path_a="a.dat", path_b="b.dat", budget=60)
+    cid = re.search(r"cursor=(c_\w+)", first.splitlines()[-1]).group(1)
+    alone = call(c, "file_diff", cursor=cid, budget=60)           # the cursor alone
+    assert alone.splitlines()[0].startswith("0x") and "error" not in alone
+    cid = re.search(r"cursor=(c_\w+)", alone.splitlines()[-1]).group(1)
+    same = call(c, "file_diff", path_a="a.dat", path_b="b.dat", cursor=cid, budget=60)
+    assert "cursor kept" not in same and "error" not in same
+    cid = re.search(r"cursor=(c_\w+)", same.splitlines()[-1]).group(1)
+    other = call(c, "file_diff", path_a="a.dat", path_b="b.dat", offset=0x50, cursor=cid, budget=60)
+    assert other.splitlines()[0] == "(cursor kept its arguments: offset=0x0)"
+    assert "error" not in other
+    assert call(c, "file_diff", path_a="a.dat", path_b="b.dat", cursor="c_dead").startswith(
+        "error bad_cursor: cursor 'c_dead' is unknown or expired")

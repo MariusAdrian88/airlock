@@ -20,14 +20,15 @@ from airlock.server.tools.common import Bound, bind_binary, budget_for, normaliz
 
 
 def _page(ctx: ServerContext, lines: list[str], name: str, args: dict, cursor: str, budget: int,
-          kind: str = "prose", key: str = "token_budget") -> str:
+          kind: str = "prose", key: str = "token_budget", max_lines: int = 0,
+          page: int = 0) -> str:
     bud = budget_for(ctx, budget, key)
     if cursor:
         try:
             return resume_lines(cursor, bud, kind, tool=name, args=args)[0]
         except CursorError as e:
             return e.message
-    return fit_lines(lines, bud, kind, tool=name, args=args)[0]
+    return fit_lines(lines, bud, kind, tool=name, args=args, max_lines=max_lines, page=page)[0]
 
 
 def _scope(ctx: ServerContext, binary: str) -> list[Bound] | str:
@@ -88,16 +89,13 @@ def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: s
         head.append(f"{bd.binary.name}: {t} types, {m} methods, {p} pinvokes, {c} com")
         pfx = f"[{bd.binary.name}] " if multi else ""
         items += [pfx + ln for ln in dn.list_lines(bd.store, bd.binary.id, query, k)]
-    shown = items[:limit]
     what = " ".join(x for x in (f"query '{query.strip()}'" if query.strip() else "",
                                 f"kind {k}" if k else "") if x)
     lines = ["dotnet_types " + "; ".join(head) + (f" | {what}: {len(items)} matches" if what else "")]
-    lines += shown
-    if len(items) > limit:
-        lines.append(f"… {len(items) - limit} more")
-    elif not items:
+    lines += items
+    if not items:
         lines.append("no matches")
-    return _page(ctx, lines, "dotnet_types", args, "", budget)
+    return _page(ctx, lines, "dotnet_types", args, "", budget, max_lines=limit + 1, page=limit)
 
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.+`-]")
@@ -105,7 +103,7 @@ _SAFE = re.compile(r"[^A-Za-z0-9_.+`-]")
 
 @tool("dotnet_decompile", "Decompile one .NET type to C# with ilspycmd (a reconstruction), optionally "
                           "only one member.")
-def dotnet_decompile(ctx: ServerContext, type: str, member: str = "", binary: str = "",
+def dotnet_decompile(ctx: ServerContext, type: str = "", member: str = "", binary: str = "",
                      cursor: str = "", budget: int = 0) -> str:
     args = {"type": type, "member": member, "binary": binary}
     if cursor:

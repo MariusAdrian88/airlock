@@ -16,7 +16,9 @@ from . import fixups
 from . import session as S
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 4  # 4: Delphi string literals (delphistr); bump when extract/decompile row semantics or post-analysis fixups change
+COLLECTOR_VERSION = 5  # 4: Delphi string literals (delphistr); 5: delphistr v2. Bump when extract/decompile row semantics or post-analysis fixups change
+PROFILE_COLLECTOR = 4  # the collector part of analysis_profile; raise with COLLECTOR_VERSION unless only delphistr changed
+STRINGS_ONLY_FROM = {4}  # stored collector versions that need only the Delphi string pass rerun
 PROGRESS_INTERVAL_S = 1.0
 
 
@@ -159,7 +161,8 @@ def import_binary(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def analysis_profile(program: Any) -> str:
-    """Short sha256 over Ghidra version, collector version and the analyzer option values."""
+    """Short sha256 over Ghidra version, collector version, the analyzer option values and, for a
+    Delphi program, the version of the string pass (so a new pass invalidates only Delphi decompiles)."""
     from ghidra.app.plugin.core.analysis import AutoAnalysisManager  # type: ignore
     from ghidra.framework import Application  # type: ignore
     from ghidra.program.model.listing import Program  # type: ignore
@@ -167,8 +170,12 @@ def analysis_profile(program: Any) -> str:
     AutoAnalysisManager.getAnalysisManager(program).initializeOptions()
     opts = program.getOptions(Program.ANALYSIS_PROPERTIES)
     values = {str(n): str(opts.getValueAsString(n)) for n in opts.getOptionNames()}
-    blob = json.dumps({"ghidra": str(Application.getApplicationVersion()),
-                       "collector": COLLECTOR_VERSION, "options": values}, sort_keys=True)
+    prof: dict[str, Any] = {"ghidra": str(Application.getApplicationVersion()),
+                            "collector": PROFILE_COLLECTOR, "options": values}
+    own = program.getOptions("airlock")
+    if own.contains("delphi_strings"):
+        prof["delphi_strings"] = int(own.getInt("delphi_strings", 0))
+    blob = json.dumps(prof, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -317,7 +324,11 @@ def apply_fixups(args: dict[str, Any]) -> dict[str, Any]:
         with S.transaction(program, "airlock fixups"):
             GhidraScriptUtil.acquireBundleHostReference()
             try:
-                stats = fixups.apply_all(program, monitor, args.get("parameter_id") is not False)
+                if args.get("have_collector") in STRINGS_ONLY_FROM:   # only the Delphi string pass changed
+                    from . import delphistr
+                    stats = {"delphi_strings": delphistr.apply_delphi_strings(program, monitor)}
+                else:
+                    stats = fixups.apply_all(program, monitor, args.get("parameter_id") is not False)
             finally:
                 GhidraScriptUtil.releaseBundleHostReference()
         e.analysis_profile = analysis_profile(program)

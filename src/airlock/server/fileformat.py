@@ -25,7 +25,7 @@ CHUNK = 1 << 20           # diff compare unit
 SUB = 4096                # diff refine unit inside a differing chunk
 GAP = 8                   # changed ranges closer than this many bytes are merged
 CONTEXT = 4               # context bytes before/after a changed range
-MAX_RANGES = 4000         # ranges kept per compared pair; the rest is only counted
+MAX_RANGES = 50000        # ranges kept per compared pair (paged by cursor); the rest is only counted
 MAX_SHOWN_BYTES = 16      # bytes of a changed range shown per side
 MAX_DUMP = 16 * 1024      # bytes rendered by one hexdump / ole stream call
 GUESS_WINDOW = 1 << 20    # bytes analysed by record_guess
@@ -194,7 +194,7 @@ def _diff_positions(a: bytes, b: bytes, base: int) -> Iterator[int]:
             yield base + s + i
 
 
-def diff_sources(a: Src, b: Src, gap: int = GAP) -> DiffResult:
+def diff_sources(a: Src, b: Src, gap: int = GAP, start: int = 0) -> DiffResult:
     ranges: list[DiffRange] = []
     count = 0
     changed = 0
@@ -212,12 +212,14 @@ def diff_sources(a: Src, b: Src, gap: int = GAP) -> DiffResult:
             truncated = True
 
     common = min(a.size, b.size)
-    for off in range(0, common, CHUNK):
+    for off in range((max(0, start) // CHUNK) * CHUNK, common, CHUNK):
         n = min(CHUNK, common - off)
         ca, cb = a.read(off, n), b.read(off, n)
         if ca == cb:
             continue
         for pos in _diff_positions(ca, cb, off):
+            if pos < start:
+                continue
             changed += 1
             if cur_s >= 0 and pos - cur_e <= gap:
                 cur_e = pos + 1
@@ -264,7 +266,9 @@ def range_lines(res: DiffResult, a: Src, b: Src, indent: str = "") -> list[str]:
             parts.append(f"{tag}: {hx(pre)} [{_bytes_fmt(mid)}] {hx(post)}".replace("  ", " "))
         out.append(f"{indent}0x{r.start:08x}-0x{r.end - 1:08x} {ln}B  " + "  ".join(parts))
     if res.truncated:
-        out.append(f"{indent}… {res.range_count - len(res.ranges)} more ranges not listed")
+        nxt = res.ranges[-1].end if res.ranges else 0
+        out.append(f"{indent}… {res.range_count - len(res.ranges)} more ranges after "
+                   f"0x{nxt:08x} not listed. offset=0x{nxt:x}")
     return out
 
 

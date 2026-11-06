@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1136 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1148 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -502,6 +502,16 @@ Failure patterns (round 4):
   Haiku v 6 (r5_b 11); both name `actFlushTableswithreadlock` and quote the SQL. t14 Sonnet v 11 calls
   (1 `bad_cursor`), Haiku v 22 (r5_b ~ 17); both read the `<|||>` line format and the `<{{{>` / `<}}}>`
   escapes from the C.
+  Pass version 2 (`COLLECTOR_VERSION` 5, DESIGN §11 "String literals, pass version 2") closes the gaps
+  left open: stack arguments are retyped (`PUSH lit`, `MOV [RSP+d],reg`); literals Ghidra had
+  disassembled as code are cleared and typed; concatenation routines are found by their calls and get a
+  variadic signature on x64 (the C lists every piece) or a PRE comment with the pieces at each x86 call;
+  Delphi 2007 and older `AnsiString` literals and `WideString` literals (all versions) are detected,
+  only where code references them. Stores to locals and fields needed nothing once the data is typed.
+  **[verified]** on the x64 and x86 programs above and on an open-source Delphi 7-2007 program: on 20
+  sampled functions per program no literal is left as a hex constant (1 before on each); a project at
+  collector 4 reruns only this pass on open (end-to-end on a copy of the x64 project). Open: on x86 the
+  pieces stay out of the call itself (comment only); Free Pascal programs were not checked.
 - Binary named by project name: Haiku passed `binary=ohm` (4 errors in t7/t8); the error lists the one binary, but
   with a single binary the tool could just use it.
 - Other errors are wrong tool choices: `delphi_classes` on a Qt project, `dotnet_types kind=methods`,

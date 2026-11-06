@@ -17,7 +17,7 @@ from airlock.index.store import CODE_EDGES, CrossRef, Function, StringHit, Xref
 from airlock.projects import read_manifest, read_sections
 from airlock.server.bulk import BG_TIMEOUT
 from airlock.server.budget import (
-    STORE, CursorError, estimate_tokens, fit_lines, fit_text, resume_lines,
+    STORE, CursorError, estimate_tokens, fit_lines, fit_text, note_kept, resume_lines,
 )
 from airlock.server.context import ServerContext
 from airlock.server.cview import (
@@ -37,6 +37,7 @@ _HEX = re.compile(r"^[0-9a-fA-F]+$")
 MAX_DEPTH = 6
 CALLGRAPH_FANOUT = 15
 CALLGRAPH_MAX_LINES = 500
+CALLGRAPH_FULL = 5000   # the whole list of one cut node, behind a cursor
 
 
 def _cursor_page(cursor: str, tool_name: str, budget: int, max_lines: int = 0) -> str:
@@ -46,8 +47,10 @@ def _cursor_page(cursor: str, tool_name: str, budget: int, max_lines: int = 0) -
         return e.message
 
 
-def _page(lines: list[str], tool_name: str, args: dict, budget: int, max_lines: int = 0) -> str:
-    return fit_lines(lines, budget, "code", tool=tool_name, args=args, max_lines=max_lines)[0]
+def _page(lines: list[str], tool_name: str, args: dict, budget: int, max_lines: int = 0,
+          page: int = 0) -> str:
+    return fit_lines(lines, budget, "code", tool=tool_name, args=args, max_lines=max_lines,
+                     page=page)[0]
 
 
 # ── open_binary / list_binaries ────────────────────────────────────────────────
@@ -164,7 +167,7 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
            limit: int = 20, cursor: str = "", budget: int = 0) -> str:
     bud = budget_for(ctx, budget)
     if cursor:
-        return _cursor_page(cursor, "search", bud)
+        return _cursor_page(cursor, "search", bud, max(1, min(int(limit), 200)))
     if not query.strip():
         return "error bad_args: query is empty."
     fixed, note = normalize_kind(kind, (*_SEARCH_KINDS, *_UNINDEXED_KINDS))
@@ -187,7 +190,7 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     multi = len(bounds) > 1
     limit = max(1, min(int(limit), 200))
     # Fetch more than `limit` per kind: dedup drops rows, and ranking needs candidates.
-    fetch = limit * 5 + 20
+    fetch = max(SEARCH_FETCH, limit * 5 + 20)
     groups: dict[str, list[tuple[tuple[int, ...], str]]] = {}
     seq = 0
     for bd in bounds:
@@ -196,16 +199,20 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     for g in groups.values():
         g.sort(key=lambda x: x[0])
     if kind == "any":
-        merged = _balance(groups, limit)
+        first = _balance(groups, limit)       # page 1 keeps the mix of kinds; the rest follows
+        seen = set(first)
+        rest = [ln for k, _ in _QUOTA for _, ln in groups.get(k, []) if ln not in seen]
+        merged = first + rest
     else:
-        merged = [ln for _, ln in groups.get(kind, [])[:limit]]
+        merged = [ln for _, ln in groups.get(kind, [])]
     if not merged:
         return f"no hits for '{query}'"
+    capped = any(len(g) >= fetch for g in groups.values())     # a hard cap: the count is a floor
     args = {"binary": binary, "query": query, "kind": kind, "limit": limit}
-    head = f"search '{query}': {len(merged)} hits"
+    head = f"search '{query}': {len(merged)}{'+' if capped else ''} hits"
     if skipped:
         head += f" ({skipped} binaries not ready, skipped)"
-    return _page([head, *merged], "search", args, bud)
+    return _page([head, *merged], "search", args, bud, limit + 1, limit)
 
 
 def _qt_method_hits(bd: Bound, query: str, fetch: int,
@@ -317,6 +324,9 @@ def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
 
 
 _QUOTA = (("function", 0.4), ("import", 0.2), ("string", 0.2), ("note", 0.2))
+
+
+SEARCH_FETCH = 200
 
 
 def _balance(groups: dict[str, list[tuple[tuple[int, ...], str]]], limit: int) -> list[str]:
@@ -628,6 +638,15 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
              outline: bool = True, retry: bool = False,
              outline_depth: int = OUTLINE_DEFAULT_DEPTH) -> str:
     bud = budget_for(ctx, budget, "function_budget")
+    if cursor:      # a known cursor carries its own arguments
+        cur = STORE.peek(cursor, "function")
+        if cur is not None and cur.args:
+            note_kept(cur, {"binary": binary, "target": target, "view": view, "lines": lines,
+                            "detail": detail, "depth": outline_depth})
+            ca = cur.args
+            binary, target, view = ca.get("binary", ""), ca.get("target", ""), ca.get("view", view)
+            lines, detail = ca.get("lines", ""), ca.get("detail", detail)
+            outline_depth = ca.get("depth", outline_depth)
     if not target.strip():
         return "error bad_target: target is empty."
     if view not in ("c", "asm", "both", "signature"):
@@ -773,13 +792,16 @@ def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
     return "-"
 
 
+XREFS_FETCH = 1000
+
+
 @tool("xrefs", "List references to (or from) a function or address, one line each with the "
                "referencing function and kind.")
 def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str = "to",
           kind: str = "", limit: int = 50, cursor: str = "", budget: int = 0) -> str:
     bud = budget_for(ctx, budget)
     if cursor:
-        return _cursor_page(cursor, "xrefs", bud)
+        return _cursor_page(cursor, "xrefs", bud, max(1, min(int(limit), 1000)))
     if not target.strip():
         return "error bad_target: target is empty."
     if direction not in ("to", "from"):
@@ -793,7 +815,8 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         if kinds is None:
             return (f"error bad_args: unknown kind '{kind}' "
                     "(kinds: call, jump, read, write, data, import, dynamic, table).")
-    limit = max(1, min(int(limit), 1000))
+    page = max(1, min(int(limit), 1000))
+    limit = XREFS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
     if isinstance(tr, str):
         return tr
@@ -886,7 +909,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         who = (x.src_fn.qualified_name if x.src_fn else
                sb.store.import_label(imp) if imp else "-")
         entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
-    over = len(entries) > limit
+    over = len(entries) > limit      # a hard cap: the real count is unknown
     entries = entries[:limit]
     counts: dict[str, int] = {}
     for k, _ in entries:
@@ -900,11 +923,9 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         summary = "no references"
     out = [f"xrefs {direction} {label}, {summary}{'+' if over else ''}", *notes]
     out += [ln for _, ln in entries]
-    if over:
-        out.append(f"… limit {limit} reached")
     args = {"binary": binary, "target": target, "direction": direction, "kind": kind,
             "limit": limit}
-    return _page(out, "xrefs", args, bud)
+    return _page(out, "xrefs", args, bud, page + 1 + len(notes), page)   # header and notes
 
 
 def _cross_target(bd: Bound, x: CrossRef) -> str:
@@ -965,25 +986,26 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     dyn: set[tuple[int, int]] = set()   # (binary id, entry) of hops that are run-time loaded
     ptr: set[tuple[int, int]] = set()   # (binary id, entry) of hops through a function pointer
 
-    def children(cb: Bound, fn: Function) -> list[tuple[Bound, Function | None, str, int | None]]:
+    def children(cb: Bound, fn: Function, lim: int = CALLGRAPH_FANOUT + 1
+                 ) -> list[tuple[Bound, Function | None, str, int | None]]:
         """(bound, function, hop mark, raw address): local edges first, then links into
         other binaries (callees: an import slot or thunk to the exporting function; callers:
         importing thunks and the callers of their import slots)."""
         s_ = cb.store
         step = s_.callees if direction == "callees" else s_.callers
         kids: list[tuple[Bound, Function | None, str, int | None]] = [
-            (cb, c, "", None) for c in step(fn, CALLGRAPH_FANOUT + 1)]
+            (cb, c, "", None) for c in step(fn, lim)]
         if pointers:
             seen_p = {c.id for _, c, _, _ in kids if c is not None}
             pstep = s_.ptr_callees if direction == "callees" else s_.ptr_callers
-            for c in pstep(fn, CALLGRAPH_FANOUT + 1):
+            for c in pstep(fn, lim):
                 if c.id not in seen_p:
                     seen_p.add(c.id)
                     ptr.add((cb.binary.id, c.entry))
                     kids.append((cb, c, "", None))
         if direction == "callees":
             hops: set[tuple[int, int]] = set()
-            for x in s_.cross_from_function(fn, CALLGRAPH_FANOUT + 1):
+            for x in s_.cross_from_function(fn, lim):
                 if (x.dst_binary, x.dst_entry) in hops:   # thunk and its slot: one hop
                     continue
                 hops.add((x.dst_binary, x.dst_entry))
@@ -993,14 +1015,14 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                 kids.append((db, x.dst_fn, f"→ [{db.binary.name}] ", x.dst_entry))
         else:
             seen = {c.id for _, c, _, _ in kids if c is not None}
-            for x in s_.cross_to_function(fn, CALLGRAPH_FANOUT + 1):
+            for x in s_.cross_to_function(fn, lim):
                 sb = bound_of(cb, x.src_binary)
                 if x.src_fn is not None and x.src_fn.entry == x.src_addr:
                     srcs = [x.src_fn]   # a thunk: its own callers come with expanding it
                 else:                   # an import slot: the functions that call through it
                     srcs = [r_.src_fn for r_ in sb.store.xrefs_to_address(
                         x.src_binary, x.src_addr, CODE_EDGES,
-                        CALLGRAPH_FANOUT + 1) if r_.src_fn]
+                        lim) if r_.src_fn]
                 for f_ in srcs:
                     if f_.id not in seen:
                         seen.add(f_.id)
@@ -1020,10 +1042,11 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
         return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "") + suffix
 
     def walk(cb: Bound, fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
-        walk_kids(children(cb, fn), left, indent, path)
+        walk_kids(children(cb, fn), left, indent, path, fn_desc(cb, fn),
+                  lambda: children(cb, fn, CALLGRAPH_FULL))
 
     def walk_kids(kids: list[tuple[Bound, Function | None, str, int | None]], left: int,
-                  indent: int, path: frozenset[int]) -> None:
+                  indent: int, path: frozenset[int], node: str, full) -> None:
         for kb, c, mark, raw in kids[:CALLGRAPH_FANOUT]:
             if len(out) >= CALLGRAPH_MAX_LINES:
                 state["truncated"] = True
@@ -1036,19 +1059,31 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                 out.append(f"{pad}{lab} [cycle]")
             elif c.id in expanded:
                 out.append(f"{pad}{lab} [seen]")
-            else:
+            elif left > 1:
                 out.append(f"{pad}{lab}")
-                if left > 1:
-                    expanded.add(c.id)
-                    walk(kb, c, left - 1, indent + 1, path | {c.id})
+                expanded.add(c.id)
+                walk(kb, c, left - 1, indent + 1, path | {c.id})
+            else:   # the depth limit stops here: say whether more lies below
+                n_below = len(children(kb, c))
+                more = f"{CALLGRAPH_FANOUT}+" if n_below > CALLGRAPH_FANOUT else str(n_below)
+                out.append(f"{pad}{lab}" + (f" [{more} {direction} below]" if n_below else ""))
         if len(kids) > CALLGRAPH_FANOUT:
-            out.append(f"{'  ' * indent}… more than {CALLGRAPH_FANOUT} {direction} not shown")
+            allk = full()
+            lines = [label(kb, c, mark, raw) for kb, c, mark, raw in allk]
+            cid = STORE.create_lines("callgraph", {"binary": binary, "target": target,
+                                     "direction": direction, "depth": depth, "node": node,
+                                     "scope": "list"}, lines, 0)
+            out.append(f"{'  ' * indent}… {len(allk) - CALLGRAPH_FANOUT} more {direction} "
+                       f"of {node} not shown. cursor={cid}")
 
     if imp is not None:   # callers of an import: its calling functions in every binary that has it
         mark = "[{}] "
         callers = tg.import_callers(imp, CALLGRAPH_FANOUT + 1) if direction == "callers" else []
+        def all_callers():
+            return [(cb, f, mark.format(cb.binary.name) if imp.multi else "", None)
+                    for cb, f in tg.import_callers(imp, CALLGRAPH_FULL)]
         walk_kids([(cb, f, mark.format(cb.binary.name) if imp.multi else "", None)
-                   for cb, f in callers], depth, 1, frozenset())
+                   for cb, f in callers], depth, 1, frozenset(), imp.label, all_callers)
     else:
         assert root is not None
         walk(bd, root, depth, 1, frozenset({root.id}))
@@ -1100,7 +1135,7 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     out = [head, *merged]
     args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
             "limit": limit}
-    return _page(out, "strings", args, bud, page + 1)    # +1: the header line
+    return _page(out, "strings", args, bud, page + 1, page)    # +1: the header line
 
 
 STRINGS_FETCH = 500

@@ -326,7 +326,6 @@ def string_tables(ctx: ServerContext, query: str = "", limit: int = 50, binary: 
         by: dict[int, dict[int, str]] = {}
         for r in rows:
             by.setdefault(r["string_id"], {})[r["lang"]] = r["text"]
-        n = 0
         for sid in sorted(by):
             lg = _pick_lang(set(by[sid]), lang)
             if lg < 0:
@@ -334,15 +333,12 @@ def string_tables(ctx: ServerContext, query: str = "", limit: int = 50, binary: 
             text = by[sid][lg]
             if q and not ((qid is not None and sid == qid) or q.lower() in text.lower()):
                 continue
-            n += 1
             total += 1
-            if n <= limit:
-                lines.append(f"{_tag(bd, multi)}{sid} | {preview(text, 200)}")
-        if n > limit:
-            lines.append(f"{_tag(bd, multi)}… {n - limit} more matches beyond limit={limit}")
+            lines.append(f"{_tag(bd, multi)}{sid} | {preview(text, 200)}")
     if not lines:
         return f"no string-table entries match '{q}'" if q else "no string tables"
-    return _page([f"string table entries: {total}", *lines], bud, "string_tables", args)
+    return fit_lines([f"string table entries: {total}", *lines], bud, "prose", tool="string_tables",
+                     args=args, max_lines=limit + 1, page=limit)[0]
 
 
 @tool("version_info", "Show the version resource: file and product version, company, product name, "

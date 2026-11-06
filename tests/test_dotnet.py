@@ -250,7 +250,9 @@ def test_dotnet_types_output(tmp_path, managed_dll):
     assert com[1].startswith("com Demo.Native.IFoo interface")
     assert dt.dotnet_types(ctx, query="zzz").splitlines()[-1] == "no matches"
     cap = dt.dotnet_types(ctx, kind="method", limit=2).splitlines()
-    assert len(cap) == 4 and cap[-1].startswith("… 6 more")
+    assert len(cap) == 4 and cap[-1].startswith("… 6 more lines. cursor=c_")
+    nxt = dt.dotnet_types(ctx, kind="method", limit=2, cursor=cap[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(nxt) == 3 and nxt[-1].startswith("… 4 more lines. cursor=c_")
     assert dt.dotnet_types(ctx, kind="bogus").startswith("error bad_args:")
     assert dt.dotnet_types(ctx, binary="nativelib.dll").startswith("error not_dotnet:")
 

@@ -543,6 +543,10 @@ def test_delphi_classes_tool(proj):
     assert len(out) == 1 and out[0].startswith("TMainForm : TBaseForm unit MainUnit vmt 0x")
     assert "published 5 virtual 3 fields 2" in out[0]
     assert len(dtools.delphi_classes(ctx).splitlines()) == 6
+    pg = dtools.delphi_classes(ctx, limit=2).splitlines()           # a cut result ends with a cursor
+    assert len(pg) == 3 and pg[-1].startswith("… 4 more lines. cursor=c_")
+    nx = dtools.delphi_classes(ctx, limit=2, cursor=pg[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert len(nx) == 3 and nx[-1].startswith("… 2 more lines. cursor=c_")
     assert dtools.delphi_classes(ctx, query="zzz").startswith("no Delphi class matches")
 
 

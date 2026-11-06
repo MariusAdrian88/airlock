@@ -353,7 +353,8 @@ def apply_all(program: Any, monitor: Any = None, parameter_id: bool = True) -> d
        fastcall first, which is wrong for plain this-calls);
     4. functions still without a convention are classified from their instructions;
     5. Delphi string literals typed as strings and the integer parameters that receive them retyped as
-       string pointers, so the decompiler prints ``L"text"`` (``delphistr``; nothing on other programs)."""
+       string pointers, so the decompiler prints ``L"text"``; concatenation calls get a variadic signature
+       (x64) or a comment with the pieces (x86) (``delphistr``; nothing on other programs)."""
     from . import delphistr
     out: dict[str, Any] = {"call_fixups": apply_call_fixups(program)}
     out["unknown_before"] = round(unknown_share(program), 3)

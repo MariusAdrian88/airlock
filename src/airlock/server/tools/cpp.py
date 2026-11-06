@@ -17,7 +17,6 @@ from airlock.server.selectors import parse_address
 from airlock.server.tools.common import Bound, bind_many, budget_for
 
 DEFAULT_LIMIT = 50
-MAX_VTABLES = 8                 # vtables listed for one class name
 
 
 def _ready(ctx: ServerContext, bd: Bound) -> None:
@@ -64,6 +63,9 @@ def _prefix(bd: Bound, several: bool) -> str:
 @tool("rtti_classes", "List C++ classes recovered from MSVC RTTI: name, vtable address, slot count, base classes.")
 def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT, binary: str = "",
                  cursor: str = "", budget: int = 0) -> str:
+    args = {"binary": binary, "query": query, "limit": limit}
+    if cursor:      # a known cursor carries its own arguments
+        return _page([], budget_for(ctx, budget), "rtti_classes", args, cursor)
     if limit < 1:
         return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary)
@@ -71,9 +73,6 @@ def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT
         return sc
     bounds, several = sc
     bud = budget_for(ctx, budget)
-    args = {"binary": binary, "query": query, "limit": limit}
-    if cursor:
-        return _page([], bud, "rtti_classes", args, cursor)
     q = query.strip().lower()
     rows: list[tuple[str, str]] = []
     total = 0
@@ -97,10 +96,8 @@ def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT
         if have == 0:
             return "no RTTI classes: the binary has no MSVC RTTI (built without /GR) or no C++ classes."
         return f"no RTTI class matches '{query}' ({have} classes)."
-    shown = [ln for _, ln in rows[:limit]]
-    if total > limit:
-        shown.append(f"… {total - limit} more classes beyond limit={limit}.")
-    return fit_lines(shown, bud, "code", tool="rtti_classes", args=args)[0]
+    return fit_lines([ln for _, ln in rows], bud, "code", tool="rtti_classes", args=args,
+                     max_lines=limit)[0]
 
 
 # ── vtable ─────────────────────────────────────────────────────────────────
@@ -125,7 +122,11 @@ def _vtable_lines(bd: Bound, several: bool, vtable: int, name: str, mark: int | 
 
 
 @tool("vtable", "Show the slots of a C++ vtable: index, target address and function name, by class name or address.")
-def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", budget: int = 0) -> str:
+def vtable(ctx: ServerContext, target: str = "", binary: str = "", cursor: str = "",
+           budget: int = 0) -> str:
+    args = {"binary": binary, "target": target}
+    if cursor:
+        return _page([], budget_for(ctx, budget, "function_budget"), "vtable", args, cursor)
     t = target.strip()
     if not t:
         return "error bad_target: target is empty: a class name or an address is needed."
@@ -134,9 +135,6 @@ def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", 
         return sc
     bounds, several = sc
     bud = budget_for(ctx, budget, "function_budget")
-    args = {"binary": binary, "target": target}
-    if cursor:
-        return _page([], bud, "vtable", args, cursor)
     lines: list[str] = []
     addr = parse_address(t)
     if addr is not None:
@@ -179,11 +177,8 @@ def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", 
             close = _close_names(bounds, want)
             return (f"error not_found: no class '{t}' with a vtable."
                     + (f" close names: {', '.join(close)}." if close else ""))
-        for bd, nm, va in hits[:MAX_VTABLES]:
+        for bd, nm, va in hits:
             lines += _vtable_lines(bd, several, va, nm, None)
-        if len(hits) > MAX_VTABLES:
-            rest = ", ".join(bd.addr(va) for bd, _nm, va in hits[MAX_VTABLES:MAX_VTABLES + 20])
-            lines.append(f"… {len(hits) - MAX_VTABLES} more vtables of this class: {rest}")
     return fit_lines(lines, bud, "code", tool="vtable", args=args)[0]
 
 
@@ -261,14 +256,14 @@ def _bases_of(bd: Bound, name: str) -> list[str]:
 @tool("mfc_message_maps", "List MFC message maps and automation (dispatch, interface, event) maps: per class, each entry with handler function.")
 def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cursor: str = "",
                      budget: int = 0) -> str:
+    args = {"binary": binary, "target": target}
+    if cursor:
+        return _page([], budget_for(ctx, budget, "function_budget"), "mfc_message_maps", args, cursor)
     sc = _scope(ctx, binary)
     if isinstance(sc, str):
         return sc
     bounds, several = sc
     bud = budget_for(ctx, budget, "function_budget")
-    args = {"binary": binary, "target": target}
-    if cursor:
-        return _page([], bud, "mfc_message_maps", args, cursor)
     t = target.strip()
     lines: list[str] = []
     if not t:

@@ -365,6 +365,10 @@ def test_tool_list_and_class(proj):
     lines = out.splitlines()
     assert any(ln.startswith("MainWindow : Base") and "signals 2 slots 2" in ln and "mapped 2" in ln for ln in lines)
     assert any(ln.startswith("Plain ") for ln in lines)
+    pg = qtools.qt_metaobjects(ctx, limit=1).splitlines()        # a cut result ends with a cursor
+    assert len(pg) == 2 and pg[-1].startswith("… %d more lines. cursor=c_" % (len(lines) - 1))
+    nx = qtools.qt_metaobjects(ctx, limit=1, cursor=pg[-1].rsplit("cursor=", 1)[1]).splitlines()
+    assert nx[0] != pg[0] and not nx[0].startswith(("error", "…"))
     det = qtools.qt_metaobjects(ctx, class_="MainWindow")
     assert "MainWindow : Base" in det and "dispatcher 0x" in det
     assert "[2] public void onOpenClicked() -> 0x0000000140001800 MainWindow::onOpenClicked" in det.replace("  ", " ") \
