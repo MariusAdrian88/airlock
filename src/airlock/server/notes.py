@@ -7,7 +7,9 @@ Notes live in the ``note`` table keyed by (binary, space, entry); this module fo
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 import sqlite3
+import uuid
 
 from airlock.index.store import Function, Store
 
@@ -43,16 +45,43 @@ def note_text(row: sqlite3.Row, limit: int = LINE_CHARS) -> str:
     return format_note(row["summary"], row["tags"], row["confidence"], limit)
 
 
-def function_lines(st: Store, fn: Function, limit: int = SHOWN_IN_FUNCTION) -> list[str]:
-    """``// note #id ...`` lines for the top of a function view, newest first."""
+OTHER_HEAD = ("// notes from other sessions (unverified, not checked against this code; "
+              "confidence as written by the author):")
+
+
+def new_author() -> str:
+    """Author label of one server process (= one session): stored with every note it writes."""
+    return "s-" + uuid.uuid4().hex[:8]
+
+
+def _day(row: sqlite3.Row) -> str:
+    return (row["created_at"] or "")[:10]
+
+
+def function_lines(st: Store, fn: Function, limit: int = SHOWN_IN_FUNCTION,
+                   author: str | None = None) -> tuple[list[str], list[str]]:
+    """(``// note #id ...`` lines for the top of a function view, lines for after the code), newest
+    first. Notes of this session (`author`) go on top; notes of any other session (older label such as
+    "agent" included) go after the code under one header, with their date and their own confidence."""
     rows = st.notes_for(fn.binary_id, fn.space, fn.entry)
     if not rows:
-        return []
-    shown = list(reversed(rows))[:limit]
-    out = [f"// note #{r['id']} {note_text(r)}" for r in shown]
-    if len(rows) > len(shown):
-        out.append(f"// +{len(rows) - len(shown)} older notes (search kind=note)")
-    return out
+        return [], []
+    mine = [r for r in reversed(rows) if author is not None and r["author"] == author]
+    other = [r for r in reversed(rows) if author is None or r["author"] != author]
+    head = [f"// note #{r['id']} {note_text(r)}" for r in mine[:limit]]
+    if len(mine) > limit:
+        head.append(f"// +{len(mine) - limit} older notes (search kind=note)")
+    tail: list[str] = []
+    if other:
+        tail = [OTHER_HEAD] + [
+            f"// note #{r['id']} {_day(r)} {note_text(r)}".replace("  ", " ") for r in other[:limit]]
+        if len(other) > limit:
+            tail.append(f"// +{len(other) - limit} older notes (search kind=note)")
+    return head, tail
+
+
+def _day_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def mirror_lines(st: Store, fn: Function, pending: str | None = None) -> list[str]:
@@ -60,7 +89,7 @@ def mirror_lines(st: Store, fn: Function, pending: str | None = None) -> list[st
     note not stored yet, already formatted by ``note_text``)."""
     rows = st.notes_for(fn.binary_id, fn.space, fn.entry)
     keep = MIRROR_LINES - (1 if pending else 0)
-    out = [f"- {note_text(r, 300)}" for r in rows[-keep:]] if keep > 0 else []
+    out = [f"- {note_text(r, 300)} (agent note {_day(r)}, unverified)" for r in rows[-keep:]] if keep > 0 else []
     if pending:
-        out.append(f"- {pending}")
+        out.append(f"- {pending} (agent note {_day_now()}, unverified)")
     return out

@@ -555,6 +555,8 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
                     break
             transient = d.get("status") == "error" and _infra_error(d.get("error"))
         except WorkerError as e:
+            if e.code == "busy" and e.message.startswith("the worker is indexing"):
+                return None, worker_error(e)    # ensure_open already waited session_wait_s
             if round_ == 2 or e.code not in ("worker_exited", "busy", "no_program") and not _infra_error(e.message):
                 return None, worker_error(e)
             transient = True
@@ -759,7 +761,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     for h in cpp.hints_for(st, b.id, fn.entry) + uijoin.function_hints(st, b.id, fn.entry) \
             + delphi.hints_for(st, b.id, fn.entry) + qt.hints_for(st, b.id, fn.entry):
         note = f"{note}; {h}" if note else h        # RTTI / message map / menu / dialog names: hints only
-    nl = notes.function_lines(st, fn)       # agent notes: "// note #id ..." above the code
+    nl, other_notes = notes.function_lines(st, fn, author=ctx.author)   # own notes above the code, others after
     if nl:
         note = chr(10).join(([note] + nl) if note else [nl[0][3:], *nl[1:]])
     if view == "signature":
@@ -770,7 +772,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
                                       "external" if fn.is_external else None) if x)
         out = ([note] if note else []) + [
             f"{bd.addr(fn.entry, fn.space)} {sig} [{flags}] callers {callers}"]
-        return "\n".join(out)
+        return "\n".join(out + other_notes)
     if fn.is_external:      # no code to show: its callers are the useful answer
         return _import_refs(ctx, target, binary, bud)
     args = {"binary": binary, "target": target, "view": view, "lines": lines, "detail": detail}
@@ -780,7 +782,8 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
                 return resume_lines(cursor, bud, "code", tool="function", args=args)[0]
             except CursorError as e:
                 return e.message
-        return _asm_response(ctx, bd, fn, note, view, span, lines, detail, retry, bud, args)
+        return _with_tail(_asm_response(ctx, bd, fn, note, view, span, lines, detail, retry, bud, args),
+                          other_notes)
     oargs = {**args, "outline": 1, "depth": outline_depth}
     identity = (b.id, fn.entry, fn.version, b.analysis_profile)
     offset = 0
@@ -804,8 +807,15 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         head = (f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)}: {len(all_lines)} lines, "
                 f"~{estimate_tokens(full, 'code')} tokens (budget {bud}), outline:")
         olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head, outline_depth)
-        return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
-    return _function_page(full, bud, span, lines, offset, note, args, identity)
+        return _with_tail(fit_lines(olines, bud, "code", tool="function", args=oargs)[0], other_notes)
+    return _with_tail(_function_page(full, bud, span, lines, offset, note, args, identity), other_notes)
+
+
+def _with_tail(out: str, tail: list[str]) -> str:
+    """Notes of other sessions go after the code, on the last page only (a page with a cursor line has more)."""
+    if not tail or out.startswith("error") or "more lines. cursor=" in out.rsplit(chr(10), 1)[-1]:
+        return out
+    return out + chr(10) + chr(10).join(tail)
 
 
 RAW_MAX = 200
@@ -937,7 +947,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
                     "(kinds: call, jump, code, read, write, data, import, dynamic, table).")
     page = max(1, min(int(limit), 1000))
     limit = XREFS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
-    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
+    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)   # a read never writes
     if isinstance(tr, str):
         return tr
     swapped = ""

@@ -924,3 +924,18 @@ def test_strings_capped_result_has_cursor_and_bad_cursor_falls_back(ctx, monkeyp
     again = core.strings(ctx, "FILE", cursor="40", limit=40, budget=100000)
     assert not again.startswith("error") and "(cursor 40 unknown, searched anew)" in again
     assert core.strings(ctx, cursor="40").startswith("error bad_cursor")
+
+
+def test_function_busy_worker_error_is_not_retried_after_the_wait(ctx):
+    calls = []
+
+    def busy(project):
+        calls.append(project)
+        raise WorkerError("busy", "the worker is indexing project 'x' (x_exe); about 40 s left there, waited 120 s.")
+
+    ctx.indexer.resume_project("proj")        # the one-off resume work uses the real ensure_open
+    ctx.indexer.ensure_open = busy
+    t0 = time.monotonic()
+    out = core.function(ctx, "main")
+    assert out.startswith("error busy: the worker is indexing project 'x'") and "\n" not in out
+    assert len(calls) == 1 and time.monotonic() - t0 < 1.5      # ensure_open waited already: no second round

@@ -261,7 +261,7 @@ class BulkScheduler:
         with self._lock:
             self._current = item
         d = ix.config.defaults
-        ix.ensure_open(item.project)
+        ix.ensure_open(item.project, wait_s=0)
         while True:  # drop events of earlier passes
             try:
                 self._events.get_nowait()

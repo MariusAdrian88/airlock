@@ -131,8 +131,18 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
     return "\n".join([
         f"project {slug} created at {pp.root}",
         f"option {key}: {len(selected)} files ({len(pes)} executables), {code / _MB:.1f} MB code",
-        f"root {root_f.rel_path}: {root_note}; {rest} other executables "
-        f"({sum(1 for q, s in states.items() if q != root_f.rel_path and s == 'queued')} queued)",
+        f"root {root_f.rel_path}: {root_note}; {rest} other executables{_state_counts(pes, root_f, states)}",
         f"deny rules for the clean folder written in {pp.clean}",
         *(dirty_lines(pp) if bound is None else [bound]),
     ])
+
+
+def _state_counts(pes: list, root_f, states: dict[str, str]) -> str:
+    """` (1 importing, 2 queued)`: the states of the other executables (the queue may already have
+    started the first file, so "queued" alone is not the whole picture). Empty for none."""
+    counts: dict[str, int] = {}
+    for f in pes:
+        if f.rel_path != root_f.rel_path:
+            st = states.get(f.rel_path, "queued")
+            counts[st] = counts.get(st, 0) + 1
+    return f" ({', '.join(f'{n} {s}' for s, n in counts.items())})" if counts else ""

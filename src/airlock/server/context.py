@@ -9,7 +9,7 @@ import threading
 from airlock import logs
 from airlock.config import Config
 from airlock.projects import ProjectPaths
-from airlock.server import roles
+from airlock.server import notes, roles
 from airlock.server.indexer import Indexer
 from airlock.worker.client import WorkerClient
 
@@ -24,6 +24,7 @@ class ServerContext:
     indexer: Indexer = field(init=False)
     session: roles.SessionState = field(default_factory=roles.SessionState)
     profile_role: str | None = None  # role of an explicit --profile, else None
+    author: str = field(default_factory=notes.new_author)   # note author label of this session
     focus: dict[str, int] = field(default_factory=dict)  # project -> binary id viewed last (7.3 rule 9)
 
     def __post_init__(self) -> None:

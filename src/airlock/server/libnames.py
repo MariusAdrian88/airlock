@@ -64,6 +64,39 @@ def relabel(text: str, per_binary: list[tuple[dict[int, str], int]]) -> str:
     return _TOKEN.sub(sub, text)
 
 
+_CONCAT = re.compile(r"(?<![A-Za-z0-9_])fpc_ansistr_concat_multi(?:/\*[^*]*\*/)?\(")
+_INT = re.compile(r"\s*(?:0x[0-9a-fA-F]+|[1-9]\d*|0)\s*")
+
+
+def concat_parts(text: str) -> str:
+    """``fpc_ansistr_concat_multi(dst, arr, 3, 0)`` takes the HIGH index of the open array as third argument:
+    the call joins 4 strings. Shows ``3/*4 parts*/`` so that the number is not read as a count."""
+    if "fpc_ansistr_concat_multi" not in text:
+        return text
+    ins: list[tuple[int, str]] = []
+    for m in _CONCAT.finditer(text):
+        depth, commas, end = 0, [], None
+        for i in range(m.end() - 1, len(text)):
+            ch = text[i]
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            elif ch == "," and depth == 1:
+                commas.append(i)
+        if end is None or len(commas) < 2:
+            continue
+        third = text[commas[1] + 1:(commas[2] if len(commas) > 2 else end)]
+        if _INT.fullmatch(third) and "parts*/" not in third:
+            ins.append((commas[1] + 1 + len(third.rstrip()), f"/*{int(third, 0) + 1} parts*/"))
+    for pos, note in sorted(ins, reverse=True):
+        text = text[:pos] + note + text[pos:]
+    return text
+
+
 class Display:
     """The display transform of one tool call: relabels with the hits of the ONE binary the call is bound
     to (``Bound`` objects made during the call, see ``registry.note_bound``). A call bound to several
@@ -92,11 +125,11 @@ class Display:
 
     def __call__(self, text: str) -> str:
         if "FUN_" not in text:
-            return text
+            return concat_parts(text)
         try:
             key = tuple(sorted((id(st), b.id) for st, b in self.bounds))
             if key != self._key or not self._per:
                 self._per, self._key = self._resolve(), key
-            return relabel(text, self._per)
+            return concat_parts(relabel(text, self._per))
         except Exception:  # noqa: BLE001  an extra: the plain output stays
             return text

@@ -653,7 +653,7 @@ def resolve(ix: Any, project: str, store: Store, b: Binary) -> tuple[int, int]:
     pend = dispatch_pending(store, b.id)
     if not pend:
         return 0, 0
-    ix.ensure_open(project)
+    ix.ensure_open(project, wait_s=0)
     nm = {r[0]: r[1] for r in store.db.execute(
         "SELECT meta_addr, nmethods FROM qt_class WHERE binary_id=?", (b.id,))}
     for p in pend:
@@ -662,7 +662,7 @@ def resolve(ix: Any, project: str, store: Store, b: Binary) -> tuple[int, int]:
                   and not store.db.execute("SELECT 1 FROM function WHERE binary_id=? AND space='ram' AND entry=?",
                                            (b.id, p["metacall"])).fetchone()})
     if mcs:
-        r = ix.worker.request("create_functions", {"program": program, "addresses": mcs}, timeout=3600)
+        r = ix.worker.request("create_functions", {"program": program, "addresses": mcs, "known_code": True}, timeout=3600)
         if r.get("created"):
             ix.reextract_code(store, b, program)
     res = ix.worker.request("qt_dispatch", {"program": program, "classes": pend}, timeout=3600)

@@ -428,7 +428,7 @@ def annotate(ctx: ServerContext, target: str, summary: str, tags: str = "", conf
             rename_info = {"fn_id": fn.id, "name": res["name"], "namespace": res["namespace"],
                            "signature": res.get("signature"), "calling_conv": res.get("calling_conv")}
     nid = st.add_note(fn.binary_id, fn.space, fn.entry, summary, tag_text, confidence or None,
-                      "agent", _now(), rename_info, ids)
+                      ctx.author, _now(), rename_info, ids)
     _refresh_map(ctx, bd)
     fresh = st.get_function(fn.id) or fn
     out = ([note] if note else []) + [f"note #{nid} saved on {fresh.qualified_name} "
@@ -533,7 +533,7 @@ def _do_patch(ctx: ServerContext, bd: Bound, space: str, offset: int, fn: Functi
                + (f" (restore of note #{restores})" if restores else "")
                + (f" why: {why.strip()}" if why.strip() else ""))
     nid = st.add_note(bd.binary.id, key.space if key else space, key.entry if key else res["address"],
-                      summary, "patch", None, "agent", _now(), None, ids)
+                      summary, "patch", None, ctx.author, _now(), None, ids)
     _refresh_map(ctx, bd)
     name = f" in {key.qualified_name}" if key else ""
     out = (f"patched {res['length']} bytes at {where}{name}: old {res['old']}, new {res['new']}; "

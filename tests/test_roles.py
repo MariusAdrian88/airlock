@@ -315,3 +315,13 @@ def test_projects_counts_binaries_from_the_index_when_the_manifest_has_none(tmp_
     st.db.close()
     s = P.summarize(pp)
     assert (s.ready, s.queued, s.errors) == (2, 1, 1)
+
+
+def test_project_create_state_counts():
+    class F:
+        def __init__(self, r): self.rel_path = r
+    root, a, b = F("A.exe"), F("B.dll"), F("C.dll")
+    states = {"A.exe": "queued", "B.dll": "importing", "C.dll": "queued"}
+    assert pc._state_counts([root, a, b], root, states) == " (1 importing, 1 queued)"
+    assert pc._state_counts([root, b], root, states) == " (1 queued)"
+    assert pc._state_counts([root], root, states) == ""

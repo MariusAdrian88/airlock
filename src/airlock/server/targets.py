@@ -21,7 +21,7 @@ from airlock.server.context import ServerContext
 from airlock.server.graph import dll_stem, norm_import
 from airlock.server.selectors import (alias_functions, default_name_address, MAX_CANDIDATES, MAX_CLOSE,
                                       close_functions, close_text, parse_address, resolve_function)
-from airlock.server.tools.common import Bound, Scope, bind_scope
+from airlock.server.tools.common import Bound, Scope, bind_scope, preview
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _CLUSTER_ID = re.compile(r"^(?:[cm]\d+|util)$", re.I)
@@ -352,7 +352,7 @@ def import_callers(t: ImportTarget, limit: int) -> list[tuple[Bound, Function]]:
 # -- resolution ----------------------------------------------------------------------------------
 
 def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
-                   aggregate: bool = False) -> Target | str:
+                   aggregate: bool = False, create: bool = True) -> Target | str:
     """Resolve ``target`` (see ``_resolve``), then apply the session focus (DESIGN 7.3 rule 9):
     a name that is ``error ambiguous`` across the binaries of a project resolves in the binary
     the session looked at last when that binary has exactly one such function, and a function
@@ -363,8 +363,10 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
             fr = _focused(ctx, binary, target, kinds, aggregate)
             if fr is not None:
                 return fr
-        if r.startswith("error not_found: no function at or containing") and FUNCTION in kinds:
+        if create and r.startswith("error not_found: no function at or containing") and FUNCTION in kinds:
             made = _create_on_demand(ctx, binary, target)
+            if isinstance(made, str):
+                return made
             if made is not None:
                 _set_focus(ctx, made.bound)
                 return made
@@ -410,7 +412,33 @@ def code_address(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, i
     return code[0], value, sc
 
 
-def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | None:
+HEADER_MAX = 12     # bytes of a Delphi string header (reference count, length, code page)
+
+
+def _string_covering(bd: Bound, value: int) -> StringHit | None:
+    """The indexed string that covers ``value`` (it starts there or earlier and runs past it)."""
+    row = bd.store.db.execute("SELECT id FROM string WHERE binary_id=? AND address<=? ORDER BY address DESC LIMIT 1",
+                              (bd.binary.id, value)).fetchone()
+    s = bd.store.get_string(row[0]) if row else None
+    if s is not None:
+        size = len(s.value) * (2 if s.encoding.startswith("utf16") else 1) + 2
+        if value < s.address + size:
+            return s
+    nxt = bd.store.db.execute("SELECT id FROM string WHERE binary_id=? AND address>? AND address<=? "
+                              "ORDER BY address LIMIT 1", (bd.binary.id, value, value + HEADER_MAX)).fetchone()
+    return bd.store.get_string(nxt[0]) if nxt else None       # the length / reference count header before a Delphi string
+
+
+def _data_line(bd: Bound, value: int, what: str) -> str:
+    """One error line for an address that holds data: what it is and who references it."""
+    st, bid = bd.store, bd.binary.id
+    refs = list(st.xrefs_to_address(bid, value, None, 3))
+    who = ", ".join(f"{x.src_fn.qualified_name if x.src_fn else '-'} {bd.addr(x.src_addr)}" for x in refs)
+    return (f"error not_found: no function at {bd.addr(value)}; it is {what}"
+            + (f", referenced from {who}" if who else ", with no references"))
+
+
+def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | str | None:
     """An address in an executable block of one binary where Ghidra has no function (a Qt vtable slot, a handler
     no static table names): create the function with the worker op ``create_functions`` (the same op as the
     bulk pass), read back just that function and its edges and return it with a fact line. None when the session may not
@@ -423,27 +451,40 @@ def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionT
     if ca is None:
         return None
     bd, value, sc = ca
+    s = _string_covering(bd, value)
+    if s is not None:      # Delphi keeps string literals in CODE: a string (or the middle of one) is no function
+        return _data_line(bd, value, f"the string {preview(s.value, 40)}" if s.address == value
+                          else f"inside or just before the string {preview(s.value, 40)} at {bd.addr(s.address)}")
     ix = ctx.indexer
     program = ix.program_of(bd.store, bd.binary)
+    entry = value
+    note = f"no Ghidra function at {bd.addr(value)}; created one from the code there"
     try:
         ix.ensure_open(bd.project)
         r = ctx.worker.request("create_functions", {"program": program, "addresses": [value]}, timeout=600)
+        det = (r.get("data") or {}).get(hex(value))
+        if det is not None:
+            return _data_line(bd, value, f"data ({det})")
         if not r.get("created"):
             return None
+        outer = (r.get("resolved") or {}).get(hex(value))
+        if outer is not None:
+            entry = int(outer, 16)
+            note = (f"{bd.addr(value)} is inside the code that starts at {bd.addr(entry)}; no Ghidra function "
+                    f"there, created one from that start")
         conv = r.get("conventions") or {}
         try:
             if sum(int(n) for n in conv.values()) > 1:   # the pass touched other functions: read them all
                 raise ValueError("conventions changed")
-            ix.extract_new_functions(bd.store, bd.binary, program, [value])
+            ix.extract_new_functions(bd.store, bd.binary, program, [entry])
         except Exception:  # noqa: BLE001  the whole binary is read instead
             ix.reextract_code(bd.store, bd.binary, program)
     except Exception:  # noqa: BLE001  the not_found line stands
         return None
-    fn = bd.store.function_at(bd.binary.id, value)
+    fn = bd.store.function_at(bd.binary.id, entry)
     if fn is None:
         return None
-    return FunctionTarget(bd, fn, f"no Ghidra function at {bd.addr(value)}; created one from the code there",
-                          None if sc.explicit else f"binary {bd.binary.name}")
+    return FunctionTarget(bd, fn, note, None if sc.explicit else f"binary {bd.binary.name}")
 
 
 def _set_focus(ctx: ServerContext, bd: Bound) -> None:
@@ -871,6 +912,8 @@ def _by_address(sc: Scope, raw: str, ks: frozenset[str]) -> Target | str:
         data = [bd for bd in sc.bounds if bd.store.xrefs_to_address(bd.binary.id, value, None, 1)
                 or bd.store.xrefs_from_address(bd.binary.id, value, None, 1)
                 or classfwd.find_classes([bd], value)]
+        if not data:             # no binary references it: the binaries that hold a string there
+            data = [bd for bd in sc.bounds if bd.store.string_at(bd.binary.id, value) is not None]
         if len(data) == 1:
             return AddressTarget(data[0], space, value, f"binary {data[0].binary.name}")
         if data:

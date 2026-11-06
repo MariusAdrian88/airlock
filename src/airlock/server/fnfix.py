@@ -18,7 +18,7 @@ from typing import Any, Callable
 from airlock.index.store import Store
 from airlock.worker.protocol import WorkerError
 
-FIX_VERSION = 5          # 5: route table handlers; 4: MFC dispatch map handlers; 3: Delphi property accessors; 2: Delphi method and event addresses
+FIX_VERSION = 6          # 6: direct call targets in no function; 5: route table handlers; 4: MFC dispatch map handlers; 3: Delphi property accessors; 2: Delphi method and event addresses
 BATCH = 500           # addresses per worker call: one transaction and one save each (the op accepts 20000)
 RESTARTED = ("worker_exited", "timeout")     # errors after which the worker process is gone
 
@@ -36,8 +36,8 @@ def stale(store: Store, binary_id: int) -> bool:
 
 
 def candidates(store: Store, binary_id: int) -> list[int]:
-    """Sorted addresses of message map handlers, vtable slot targets and Delphi methods (published and
-    virtual) and DFM event handlers that are no function entry of the binary."""
+    """Sorted addresses of message map handlers, vtable slot targets, Delphi methods (published and
+    virtual), DFM event handlers and direct call targets that are no function entry of the binary."""
     sql = ("SELECT DISTINCT {col} FROM {tab} WHERE binary_id=?1 AND {col} IS NOT NULL AND {col} NOT IN "
            "(SELECT entry FROM function WHERE binary_id=?1 AND space='ram')")
     out: set[int] = set()
@@ -45,7 +45,25 @@ def candidates(store: Store, binary_id: int) -> list[int]:
     for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target"), (code_methods, "addr"),
                      ("dl_event", "addr"), ("mfc_map_entry", "pfn"), ("mfc_map_entry", "pfn_set")):
         out.update(r[0] for r in store.db.execute(sql.format(tab=tab, col=col), (binary_id,)))
+    out.update(_call_targets(store, binary_id))
     return sorted(out)
+
+
+def _call_targets(store: Store, binary_id: int) -> list[int]:
+    """Direct call targets (edges of kind ``call`` with no function) that lie in no function body."""
+    import bisect
+
+    fns = store.db.execute("SELECT entry, COALESCE(size, 0) FROM function WHERE binary_id=? AND space='ram' "
+                           "AND is_external=0 ORDER BY entry", (binary_id,)).fetchall()
+    ent = [f[0] for f in fns]
+    out = []
+    for (t,) in store.db.execute("SELECT DISTINCT dst_addr FROM edge WHERE binary_id=? AND kind='call' "
+                                 "AND dst_fn IS NULL", (binary_id,)).fetchall():
+        i = bisect.bisect_right(ent, t) - 1
+        if i >= 0 and fns[i][0] <= t < fns[i][0] + fns[i][1]:
+            continue
+        out.append(t)
+    return out
 
 
 def _merge(total: dict[str, Any], r: dict[str, Any]) -> None:
@@ -80,7 +98,7 @@ def run(store: Store, binary_id: int, worker: Any, program: str,
         chunk, rest = pending[:BATCH], pending[BATCH:]
         try:
             r = worker.request("create_functions", {"program": program, "addresses": chunk,
-                                                    "conventions": not rest}, timeout=3600)
+                                                    "conventions": not rest, "known_code": True}, timeout=3600)
         except WorkerError as e:
             if e.code not in RESTARTED or retried or recover is None:
                 raise

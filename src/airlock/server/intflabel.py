@@ -130,7 +130,7 @@ def _index(cls: Any) -> tuple[dict[str, dict[int, tuple[str, list[str]]]], dict[
     bd = SimpleNamespace(store=store, psize=cls.psize, addr=lambda a, *_: f"0x{a:0{cls.psize * 2}x}",
                          binary=SimpleNamespace(id=cls.bid, toolchain="fpc" if cls.fpc else "delphi"))
     try:
-        idx = classintf.index(bd)
+        idx = classintf.cached_index(bd)
     except Exception:  # noqa: BLE001  an index without the Delphi tables
         idx = ({}, {})
     try:

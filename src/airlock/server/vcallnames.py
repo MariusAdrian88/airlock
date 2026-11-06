@@ -87,9 +87,34 @@ def _first_param(c_text: str) -> str | None:
     return p[0] if p else None
 
 
+def skip_comments(c_text: str) -> int:
+    """Offset of the first character after the leading comments (``/* .. */`` blocks, ``//`` lines) and blanks:
+    the plate comment and the notes block come before the signature and may hold ``(`` and ``{``."""
+    i, n = 0, len(c_text)
+    while i < n:
+        if c_text[i].isspace():
+            i += 1
+        elif c_text.startswith("/*", i):
+            j = c_text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        elif c_text.startswith("//", i):
+            j = c_text.find(chr(10), i)
+            i = n if j < 0 else j + 1
+        else:
+            break
+    return i
+
+
+def mask_head(c_text: str) -> str:
+    """``c_text`` with the leading comments (plate comment, notes block) blanked out, same length and line breaks:
+    nothing a note says is read as code (a ``(`` in the signature search, a ``name = x;`` line, a stub name)."""
+    n = skip_comments(c_text)
+    return c_text if n == 0 else "".join(ch if ch == chr(10) else " " for ch in c_text[:n]) + c_text[n:]
+
+
 def _params(c_text: str) -> list[str]:
     """Names of the parameters in the header of the decompiled function."""
-    head = c_text.split("{", 1)[0]
+    head = c_text[skip_comments(c_text):].split("{", 1)[0]
     i = head.find("(")
     if i < 0:
         return []
@@ -279,6 +304,7 @@ _VMTREF = re.compile(r"&\s*\w*?_?([0-9a-fA-F]{6,16})\b(?!/\*)")
 def annotate(c_text: str, cls: Classes) -> str:
     """``c_text`` with a comment after every virtual-call stub name, dynamic-call name and VMT address."""
     ins: list[tuple[int, str]] = []
+    text0, c_text = c_text, mask_head(c_text)          # analysis on the masked text, the comments go in the original
     rs: Resolver | None = None
     from airlock.server.intflabel import intf_label       # interface calls: IMT slot, not a class slot
     for m in _STUB.finditer(c_text):
@@ -325,8 +351,8 @@ def annotate(c_text: str, cls: Classes) -> str:
         if name:
             ins.append((m.end(), f"/*{name}*/"))
     for pos, text in sorted(ins, reverse=True):
-        c_text = c_text[:pos] + text + c_text[pos:]
-    return c_text
+        text0 = text0[:pos] + text + text0[pos:]
+    return text0
 
 
 class DbClasses:

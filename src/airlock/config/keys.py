@@ -124,6 +124,9 @@ KEYS: tuple[Key, ...] = (
     Key("decompile_cpu_max", "float", 0.75, "Decompiler",
         "Share of the processors that the background pass uses while nothing else runs. Must not be below decompile_cpu_min.",
         "Raise it to finish the pass sooner.", lo=0, hi=1, lo_open=True),
+    Key("session_wait_s", "int", 120, "Decompiler",
+        "Time, in seconds, that a request waits when the worker analyses another project. Then it fails with the expected wait. 0 means no waiting.",
+        "Raise it when you open a project while a large program of another project is analysed.", lo=0),
 
     Key("analysis_timeout_min", "int", 60, "Analysis",
         "Time limit, in minutes, for the analysis of one binary.",

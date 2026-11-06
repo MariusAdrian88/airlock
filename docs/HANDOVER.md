@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1365 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1386 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -726,3 +726,70 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
   (md5 of all edge rows with `src_fn`/`dst_fn`, and of all function rows) before and after a full `reextract_code` run.
   Fallback to the full read: `extract_at` fails, finds no function, or `create_functions` changed the calling
   convention of more than one function. No version key changed. Tests: `tests/test_r9d.py`.
+
+## Round 10 fix A: interface index cost, notes in the C header, concat part count (R1, R5, R8a)
+
+- R1: a cached `function` call on a Delphi program with interface tables took 29.2 s (HeidiSQL, 272 `virtual_impls`
+  calls, 273 `_owners` full joins). `classintf.index` now passes `owners`, a prebuilt parent->children map and a
+  prebuilt `(vmt, slot)` virtual-row map into `virtual_impls` (new `_kids`, `_virtuals`), and memoises the result per
+  `(vmt, vslot)`. `classintf.cached_index(bd)` keeps the index in a module cache (6 entries) keyed by index file path and
+  binary id; the stamp is (count / max rowid / sum addr of `dl_method`, count + sum of version + crc32 of the names of
+  the non-`FUN_` functions), so a re-parse or a rename drops it. `intflabel._index` uses it. **[verified]** same
+  `function TMainForm.actFlushExecute` call on a copy of the heidi base: call 1 0.5 s (index build included), call 2
+  0.2 s (before 33.0 s and 29.2 s). Tests: `tests/test_r10a_intf_cache.py` (count of owner joins = 1 per index build, no
+  class-table query on a cached call, invalidation).
+- R5: `vcallnames._params` read the first `(` before the first `{` of the whole C, which is inside the plate comment
+  when a note holds `(`. New `vcallnames.skip_comments` / `mask_head`: `annotate` works on the text with the leading
+  comments blanked (same length), and inserts into the original. A note can no longer add parameters, aliases or stubs.
+  The other C-text parsers (`intflabel`, libnames) get the masked text through `annotate`; `classfwd` and `pascalconv`
+  do not parse C text. Test: `test_note_with_parenthesis_keeps_the_receiver_class`.
+- R8a: `libnames.concat_parts` (run by `Display`) shows `fpc_ansistr_concat_multi(dst, arr, 3/*4 parts*/, 0)`.
+- No version key changed (display and server-side cache only).
+
+## Round 10 fix C: notes of other sessions, session reads during another project's analysis (R6, R7, R8b, R8c)
+
+- R6: notes had `author="agent"` for every session. `ServerContext.author` is now `s-<8 hex>` per process
+  (`notes.new_author`), stored by `annotate` and `patch_bytes`. `notes.function_lines` returns (own lines, other lines):
+  own notes stay above the code; notes of any other author (old `agent` rows included) go after the code, under one
+  header "notes from other sessions (unverified ...)", with date and the author's own confidence (never changed).
+  Plate-comment mirror lines now end `(agent note <date>, unverified)`. `search kind=note` lines are unchanged (open point:
+  no origin there). The design (DESIGN.md note model) says only "author = session/agent label", so this fits it.
+  Not done: the check "a note names a callee the C contradicts". Tests: `test_notes_of_other_sessions_come_after_the_code_marked_unverified`.
+- R7: new config key `session_wait_s` (default 120). `Indexer.ensure_open` waits for a running job of another project
+  (event wait, 2 s steps), then raises `busy` with "about N s left there, waited W s". The queue (`_run_queue`) yields
+  between jobs to waiting sessions and for 30 s after a session that waited (`_yield_needed`, `_waiters`, `_hold`).
+  `_get_decompiled` does not retry that busy error (the wait is the retry). Cached C already needed no worker; the
+  round-9 P1 rule (bulk pass only for the bound project) is untouched. Tests: `test_session_read_waits_for_other_project_job`,
+  `test_queue_yields_to_waiting_session_between_jobs`, `test_function_busy_worker_error_is_not_retried_after_the_wait`.
+  Internal callers (bulk, Qt, `refresh_fixups`, `create_missing_functions`) pass `wait_s=0` and never wait
+  (`test_internal_callers_never_wait_for_the_worker`). Real Ghidra: a session read waited 31.0 s for the analysis of a
+  new project, then returned the C (before: `error busy` after 6.2 s). The yield between 2 jobs was not seen with real
+  Ghidra (one-binary project). Open point: a real analysis of one big binary is one job, so the wait can still reach
+  `session_wait_s`.
+- R8b: `index_status` says "background pass waits until a session opens <project>" (session bound to another project),
+  "waiting for analysis" (queue busy), else "about to start".
+- R8c: the old count compared the manifest state of the other files with "queued", but the queue starts the first
+  (sorted) file at once, so the other file was "importing", not queued. `project_create` now prints the states: `(1 importing, 2 queued)`.
+- Version keys: none.
+
+## Round 10 fix B: on-demand creation never damages the project (R2, R3, R4)
+
+- R2: `create_functions` keeps defined data (strings, pointers) that starts at the address unless a call or jump
+  reference points there or the caller sets `known_code` (fnfix and the Qt pass do; on-demand calls do not). The
+  server refuses a string, the middle of a string or the Delphi string header (12 bytes before it) before it asks
+  the worker: `error not_found: no function at 0x..; it is the string "..", referenced from ..`. `xrefs` calls
+  `resolve_target(..., create=False)`: a read never writes. In a multi-binary project a string address is a data
+  target, not a not_found.
+- R3: a trial disassembly that makes no function is undone (instructions and references of the disassembled
+  address set). An address with no call reference first looks for the nearest call target before it (at most
+  0x4000 bytes, 3 tries, none across a function) and creates that routine; if its body holds the address the answer
+  is that routine ("0x.. is inside the code that starts at 0x..; no Ghidra function there, created one from that
+  start"), otherwise the trial is removed. Jump references to an address do not make it an entry.
+- R4: `fnfix.candidates` adds direct call targets (edge kind `call`, no function, not inside a body).
+  `FIX_VERSION` 5 -> 6. After the pass `create_functions` runs Ghidra's `ScalarOperandAnalyzer` over the new
+  bodies, so string literals loaded only by new functions get their `data` references.
+- Verified on a copy of the TS.exe base (`probe.py` in the round-10 scratch folder): fix pass created 92 of 132
+  candidates (98 orphan call targets before); `function 0x004c19f4` and `0x004c1c00` resolve to the writer
+  0x004c1984 (6.7 s, then 0.0 s); `function 0x004c1df8`/`0x004c1930` give the string line, no new function;
+  `strings Settings` shows `0x004c1df8 "[Settings]" <- FUN_004c1984`; `xrefs 0x004c1d84` shows 1 data ref.
+- Tests: `tests/test_r10b.py`. Not run: ExifToolGUI (n6) re-check.

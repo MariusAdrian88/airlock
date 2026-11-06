@@ -304,6 +304,9 @@ def test_pass_waits_for_the_analysis_queue(pass_ctx):
     assert ix.bulk.progress("proj", bid).state == "waiting"
     line = admin.index_status(ctx)
     assert "background pass waiting for analysis" in line
+    ix.current = "other"        # a session bound to another project: the real reason differs
+    assert "background pass waits until a session opens proj" in admin.index_status(ctx)
+    ix.current = "proj"
     idle[0] = True
     assert ix.bulk.wait_idle()
     assert ctx.worker.count("bulk_decompile") == 1

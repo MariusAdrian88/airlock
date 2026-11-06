@@ -169,7 +169,7 @@ every key, once, with the right default.
 Keys: `config_version`; locations `ghidra_dir`, `jdk_dir`, `ilspycmd`,
 `index_dir`, `projects_root`; response size `token_budget`, `function_budget`,
 `max_budget`, `detail`; decompiler `decompile_timeout_s`, `decompile_timeout_max_s`, `bulk_decompile`,
-`bulk_decompile_timeout_s`, `decompile_cpu_min`, `decompile_cpu_max`;
+`bulk_decompile_timeout_s`, `decompile_cpu_min`, `decompile_cpu_max`, `session_wait_s`;
 analysis `analysis_timeout_min`, `analysis_s_per_code_mb`, `jvm_max_memory`;
 `mermaid`, `mirror_notes_to_ghidra`; tools `allow_writes`, `disabled_sets`,
 `disabled_tools`.
@@ -958,7 +958,12 @@ Details settled in M3:
 - `comment` takes an exact address; a function name means its entry. A plate comment keeps the airlock
   notes block.
 - `annotate` stores a note keyed by function entry (any number per function, newest listed first, up to
-  5 shown as `// note #id [confidence] summary (tags: ...)` above `function` output). With
+  5 shown as `// note #id [confidence] summary (tags: ...)` above `function` output; only notes of THIS session.
+  `note.author` holds a per-process label `s-<8 hex>`; older rows say `agent` and count as another session.
+  Notes of other sessions come after the code (last page, also after `view=signature`/`asm`) under
+  `// notes from other sessions (unverified, not checked against this code; confidence as written by the
+  author):`, each as `// note #id <date> [confidence] summary`; the confidence is never changed. Plate-comment
+  mirror lines end with `(agent note <date>, unverified)`) [verified: tests/test_annotate.py]. With
   `mirror_notes_to_ghidra` the newest 10 notes are mirrored into the function's plate comment between
   `--- airlock notes ---` and `--- end airlock notes ---` lines, together with the optional rename in one
   transaction; without rename and mirror no Ghidra write happens. `search kind=note` (and `any`) finds
@@ -2479,7 +2484,7 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   identical bodies (empty virtual stubs, accessors) that the matcher drops on purpose when one proc matches
   more than `MAX_COPIES` functions. **[verified]** index of FPC 3.2.2 Lazarus and console programs (32 and 64-bit) names 48% to 57% of all functions (`idr:` hints). FPC x86 indirect calls `CALL [reg+disp]` get a stub with the Free Pascal `register` convention (`delphistr.vcall_args`: EAX Self, EDX/ECX when loaded just before the call and not used for the vmt address, pushes right before the loads), named `vmt_<offset>_<regs>_<pushes>` and tagged `airlock:concat vcall <key>`; without it a hidden result pointer is not an argument for the decompiler. The same pass runs for 32-bit Delphi (`delphistr` VERSION 6, collector 11): vmt load into another register skipped, byte/word register arguments (`DL`, `CL`), `PUSH EBP` and prologue pushes ignored, `stdcall`/`safecall` calls with the vmt load in the window get a stack-only stub (`vmt_<offset>_s_<pushes>`), `cdecl` (`ADD ESP,n` after the call) none; the decompiler drops the stub address after a vcall stub name. **[verified]** on 32-bit Delphi programs: calls that lost a register or stack argument in the C, 5 of 17, 6 of 20, 9 of 254 and 10 of 237 before, none after. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
   `fpc_ansistr_concat_multi`) from Ghidra's own symbol loader.
-- Pascal register convention (32-bit Delphi and Free Pascal): arguments in EAX, EDX, ECX (Self first), the rest on the stack pushed left to right, the callee pops (`RET n`). Ghidra's `__register` (borlanddelphi spec) orders the stack parameters by offset, i.e. reversed; Free Pascal programs use the Visual Studio spec and no EAX parameter. `pascalconv.apply_register_prototypes` writes custom storage for each such function (registers, then stack slots from the highest offset down), see HANDOVER "Round 7 fixes (r7c)". **[verified]** `TBase.Num(X,Y,Z,W)` decompiles as `(param_3 * param_4 + param_2) - param_5`. Decompiled virtual calls show the slot and the resolved method (`vcallnames`): `vmt_508_adc_0/*TFormMain vslot 310 -> ...*/`.
+- Pascal register convention (32-bit Delphi and Free Pascal): arguments in EAX, EDX, ECX (Self first), the rest on the stack pushed left to right, the callee pops (`RET n`). Ghidra's `__register` (borlanddelphi spec) orders the stack parameters by offset, i.e. reversed; Free Pascal programs use the Visual Studio spec and no EAX parameter. `pascalconv.apply_register_prototypes` writes custom storage for each such function (registers, then stack slots from the highest offset down), see HANDOVER "Round 7 fixes (r7c)". **[verified]** `TBase.Num(X,Y,Z,W)` decompiles as `(param_3 * param_4 + param_2) - param_5`. Decompiled virtual calls show the slot and the resolved method (`vcallnames`): `vmt_508_adc_0/*TFormMain vslot 310 -> ...*/`. The interface index behind the interface labels (`classintf.cached_index`) is built once per binary and class-table/name stamp, not per call (**[verified]** HeidiSQL cached `function` 29.2 s -> 0.2 s); leading comments (plate, notes) are masked before the C is parsed; `fpc_ansistr_concat_multi(.., 3/*4 parts*/, ..)` shows the part count (the argument is the high index).
 - Dynamic methods and receivers (`vcallnames`, round 8): a call of the dynamic dispatchers (`@CallDynaInst`, `@CallDynaClass`, `@FindDynaInst`, `@FindDynaClass`) is followed by `/*dynamic <index> -> Class.Method*/`; the signed 16-bit index is the immediate that the code loads into SI/ESI/RSI before the call, and the method comes from the dynamic method table (`vmtDynamicTable`, `dl_method` kind `dynamic`, slot = index; the class chain is walked). **[verified]** `O.Dyn('x')` on a Delphi test program: `/*dynamic -1 -> TBase.Dyn*/`; the 64-bit load register is **[verify]**. The class of a receiver comes from the nearest earlier store (constructor call with a VMT argument), from all stores into a global in other functions, or from the classes that all callers pass to a parameter; VMT addresses in the C are followed by the class name (`&DAT_0042807c/*TDog*/`).
 - Strings: `AnsiString` / `UnicodeString` literals are `{u16 codePage; u16 elemSize; (u32 pad on 64-bit);
   SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in
@@ -2602,3 +2607,16 @@ code is taken from it.
 - Round 8 target rules (§7.3 additions): a bare Qt/Delphi method name that is unique in the scope resolves to `Class::name` with a fact line (several: `error ambiguous`); `main`/`WinMain`/`wWinMain`/`PASCALMAIN`/`program` of a Delphi or FPC binary without a function of that name is the program body (Delphi: the entry point function; FPC: field 5 of the `TEntryInformation` record that the entry point passes to `FPC_EXE_ENTRY`). **[verified]** FPC 3.2.2 x86 and x64. A function-only tool given an address in an executable block with no function creates it (`create_functions`, dirty role, `allow_writes` on) and says so. `xrefs kind=code` = call + jump kinds. `strings` with no pattern lists all strings. `delphi_events` with `form` and `component` filters inside the form. File tools use the analysed copy when only the file name matches one binary.
 
 - Round 9 (D): `strings` retries in the other mode when nothing matches (literal with a regex character incl. `\` -> regex; regex -> literal text) and says so in the header. `search main|WinMain|wWinMain|PASCALMAIN|program` adds the program-body line for Delphi/FPC. Function creation on demand (§7.3) reads back only the new function: worker op `extract_at` returns its row, the edges from its body and the body ranges; the store replaces and relinks only those edges. **[verified]** 41 s -> 8.6 s on a binary of 31k functions, identical index tables to a full re-read.
+
+
+### Session reads while another project is analysed (round 10, R7)
+
+The worker has one open project. A read that needs the worker (uncached decompile) for a project other than
+the one of the running queue job waits in `Indexer.ensure_open` up to `session_wait_s` (default 120, 0 = no
+wait); the queue does not start a job of another project while such a session waits and for 30 s after it got
+the worker (`_yield_needed`). After the bound: `error busy: the worker is indexing project 'X' (prog); about N s
+left there, waited W s.`; `function` does not retry that error. Internal callers (bulk pass, Qt pass, fixup refresh, function recovery) call `ensure_open(wait_s=0)` and never wait. **[verified]** a session read waited 31 s for the analysis of a new project, then returned the C. Cached C and index data never need the worker.
+`index_status` says `background pass waits until a session opens <project>` when the bulk pass waits for a
+session bound to that project, and `waiting for analysis` only while the queue is busy.
+`project_create` shows the real states of the other executables: `(1 importing, 2 queued)`.
+- Round 10 (B), function creation (§7.3): never from `xrefs`; never over a string, the middle of a string or its Delphi header (error line with the string and its references); a failed trial is undone; an address with no call reference inside the flow of an earlier call target resolves to that routine (created from its start). The fix pass also creates direct call targets that lie in no function (`FIX_VERSION` 6) and adds operand data references for the new code. **[verified]** TS.exe: 92 functions created, the writer at 0x004c1984 is found from an interior address, its strings show their references.

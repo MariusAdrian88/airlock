@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from airlock import __version__, ghidra_install, logs
+from airlock.projects import slugify
 from airlock.server import roles
 from airlock.config.catalog import CATALOG
 from airlock.server.context import ServerContext
@@ -125,7 +126,13 @@ def _decomp_text(ix, p: str, st, b, counts) -> str:
     if bp.state == "running":
         text += f", {bp.rate:.1f} fn/s, threads {bp.threads} of {bp.processors}"
     elif bp.state in ("waiting", "planning"):
-        text += ", background pass waiting for analysis"
+        cur = getattr(ix, "current", None)
+        if cur and slugify(cur) != p:       # a session is bound to another project: the pass waits for it
+            text += f", background pass waits until a session opens {p}"
+        elif not ix.queue_idle():
+            text += ", background pass waiting for analysis"
+        else:
+            text += ", background pass about to start"
     elif bp.state in ("error", "interrupted"):
         text += f", background pass {bp.state}: {bp.message}"
     return text

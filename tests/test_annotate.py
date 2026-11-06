@@ -229,7 +229,7 @@ def test_patch_bytes_note_invalidation_and_restore(ctx):
     assert w[0] == "patch_bytes" and w[1]["hex"] == "909090" and w[1]["address"] == 0x401001
     assert st.get_function(fn.id).version == fn.version + 1           # decompile and asm are recomputed
     note = st.get_note(1)
-    assert note["tags"] == "patch" and note["author"] == "agent" and note["entry"] == MAIN
+    assert note["tags"] == "patch" and note["author"] == ctx.author and note["entry"] == MAIN
     assert "old=8bff55 new=909090 why: skip the check" in note["summary"]
     assert "// note #1" in core.function(ctx, "main")
     back = an.patch_bytes(ctx, restore=1)                                # the note's old bytes come back
@@ -294,3 +294,29 @@ def test_migration_adds_note_table(tmp_path):
     s2 = sm.Store(p)
     assert s2.db.execute("SELECT COUNT(*) FROM note").fetchone()[0] == 0
     s2.close()
+
+
+def test_notes_of_other_sessions_come_after_the_code_marked_unverified(ctx):
+    an.annotate(ctx, "main", "mine: sets up", confidence="medium")
+    st, fn = _fn(ctx, MAIN)
+    st.add_note(fn.binary_id, fn.space, fn.entry, "calls ShowMessage with the label", "", "high",
+                "s-other", "2026-11-05T10:00:00Z")
+    st.add_note(fn.binary_id, fn.space, fn.entry, "old label note", "", None, "agent", "2026-10-01T10:00:00Z")
+    for view in ("c", "signature"):
+        lines = core.function(ctx, "main", view=view).splitlines()
+        assert lines[0].lstrip("/ ").startswith("note #1 [medium] mine: sets up"), lines[:2]
+        k = next(i for i, ln in enumerate(lines) if ln.startswith("// notes from other sessions (unverified"))
+        assert k > 0 and not any("ShowMessage" in ln for ln in lines[:k])
+        assert "// note #2 2026-11-05 [high] calls ShowMessage with the label" in lines[k + 1:]
+        assert "// note #3 2026-10-01 old label note" in lines[k + 1:]
+    asm = core.function(ctx, "main", view="asm").splitlines()
+    assert asm[-3].startswith("// notes from other sessions")
+    other = core.function(_other_session(ctx), "main").splitlines()    # the first note is now another session's
+    k = next(i for i, ln in enumerate(other) if ln.startswith("// notes from other sessions"))
+    assert not any("mine: sets up" in ln for ln in other[:k])
+    assert any("// note #1 " in ln and "[medium] mine: sets up" in ln for ln in other[k + 1:])
+
+
+def _other_session(ctx):
+    ctx.author = "s-another"
+    return ctx

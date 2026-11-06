@@ -235,6 +235,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+SESSION_WAIT_S = 120     # default of `session_wait_s`
+SESSION_HOLD_S = 30.0    # the queue yields this long to a session that had to wait
+
+
 class Indexer:
     def __init__(self, config: Config, worker: Any) -> None:
         self.config = config
@@ -251,6 +255,8 @@ class Indexer:
         self._mf_lock = threading.RLock()
         self._switch = threading.Lock()      # the worker's open project changes under this lock only
         self._resumed: set[str] = set()
+        self._waiters: dict[str, int] = {}     # project -> sessions waiting in ensure_open (guarded by _lock)
+        self._hold: dict[str, float] = {}      # project -> monotonic time until which its session goes first
         # callbacks(project, binary_id) run after a binary became ready and was linked
         self.ready_hooks: list[Callable[[str, int], None]] = []
         worker.on_event(self._on_event)
@@ -519,7 +525,7 @@ class Indexer:
             program = store.get_meta(f"program:{b.id}")
             if not program:
                 continue
-            self.ensure_open(project)
+            self.ensure_open(project, wait_s=0)
             res = self.worker.request("apply_fixups", {
                 "program": program, "have_collector": int(have) if have else None,
                 "parameter_id": bool(self.config.defaults.get("decompiler_parameter_id", True)),
@@ -571,12 +577,12 @@ class Indexer:
             fnfix.record(store, b.id, {"requested": 0, "created": 0, "skipped": 0, "failed": 0,
                                        "reasons": {}})
             return 0
-        self.ensure_open(project)
+        self.ensure_open(project, wait_s=0)
         t0 = time.monotonic()
         plog = logs.project_log(self.paths(project).logs)
 
         def recover() -> None:      # the worker process died: reopen the program, read what was saved
-            self.ensure_open(project)
+            self.ensure_open(project, wait_s=0)
             self.reextract_code(store, b, program)
 
         try:
@@ -733,6 +739,9 @@ class Indexer:
     def _run_queue(self) -> None:
         """The one queue thread: one binary at a time, import -> analyse -> extract."""
         while True:
+            end = time.monotonic() + SESSION_WAIT_S + SESSION_HOLD_S
+            while self._yield_needed() and time.monotonic() < end:   # a bound session's reads go first
+                time.sleep(0.1)
             job = self._next_job()
             if job is None:
                 return
@@ -1152,26 +1161,74 @@ class Indexer:
 
     # -- worker session for decompile --------------------------------------
 
-    def ensure_open(self, project: str) -> None:
+    def ensure_open(self, project: str, wait_s: int | None = None) -> None:
         """Make sure the worker has Ghidra running and this project open (the worker
-        may have been restarted since open_binary). Raises WorkerError."""
-        w = self.worker
+        may have been restarted since open_binary). While the queue job of ANOTHER project owns the
+        worker, the call waits up to ``wait_s`` (default: config ``session_wait_s``; internal callers pass 0 and
+        never wait; only session reads wait; the queue yields to them between jobs), then raises
+        WorkerError("busy") with the expected wait. Raises WorkerError."""
         slug = slugify(project)
-        with self._switch:
-            # The queue job owns the worker's open project from its import to its last step;
-            # switching it away would make the job import into or read from the wrong project.
-            with self._lock:
-                job = self._running
-            if job is not None and job.project != slug and not job.finished.is_set():
-                raise WorkerError("busy", f"the worker is indexing project '{job.project}' "
-                                          f"({job.program})")
-            w.ensure_ghidra()
-            s = w.request("status", timeout=30)
-            paths = self.paths(project)
-            cur = s.get("project")
-            if not cur or Path(cur["path"]) != paths.ghidra or cur["name"] != GHIDRA_PROJECT_NAME:
-                w.request("open_project", {"path": str(paths.ghidra), "name": GHIDRA_PROJECT_NAME},
-                          timeout=300)
+        start = time.monotonic()
+        limit = max(0, int(self.config.defaults.get("session_wait_s", SESSION_WAIT_S) or 0)
+                    if wait_s is None else int(wait_s))
+        waited = False
+        try:
+            while True:
+                with self._switch:
+                    # The queue job owns the worker's open project from its import to its last step;
+                    # switching it away would make the job import into or read from the wrong project.
+                    with self._lock:
+                        job = self._running
+                    blocked = job is not None and job.project != slug and not job.finished.is_set()
+                    if not blocked:
+                        self._open_here(project, slug)
+                        if waited:      # the queue lets this session finish its reads first
+                            with self._lock:
+                                self._hold[slug] = time.monotonic() + SESSION_HOLD_S
+                        return
+                    assert job is not None
+                    left = start + limit - time.monotonic()
+                    if left <= 0:
+                        raise WorkerError("busy", f"the worker is indexing project '{job.project}' "
+                                                  f"({job.program}); about {self._eta_s(job)} s left there"
+                                                  f", waited {round(time.monotonic() - start)} s.")
+                    if not waited:
+                        waited = True
+                        with self._lock:
+                            self._waiters[slug] = self._waiters.get(slug, 0) + 1
+                job.finished.wait(min(left, 2.0))
+        finally:
+            if waited:
+                with self._lock:
+                    self._waiters[slug] -= 1
+
+    def _eta_s(self, job: Job) -> int:
+        try:
+            return int(self.queue_status(job.project).remaining_s)
+        except Exception:  # noqa: BLE001  an estimate only
+            return 0
+
+    def _open_here(self, project: str, slug: str) -> None:
+        w = self.worker
+        w.ensure_ghidra()
+        s = w.request("status", timeout=30)
+        paths = self.paths(project)
+        cur = s.get("project")
+        if not cur or Path(cur["path"]) != paths.ghidra or cur["name"] != GHIDRA_PROJECT_NAME:
+            w.request("open_project", {"path": str(paths.ghidra), "name": GHIDRA_PROJECT_NAME},
+                      timeout=300)
+
+    def _yield_needed(self) -> bool:
+        """True while a session waits for (or just got) the worker for a project and the next queue job
+        belongs to another project: the session's reads go first."""
+        now = time.monotonic()
+        with self._lock:
+            if not self._queue:
+                return False
+            active = {p for p, n in self._waiters.items() if n > 0} | {p for p, t in self._hold.items() if t > now}
+            if not active:
+                return False
+            return min(self._queue, key=lambda j: j.priority).project not in active
 
     def _other_busy(self, slug: str) -> bool:
         """True while the queue holds a running or waiting job of another project."""

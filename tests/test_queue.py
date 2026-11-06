@@ -578,6 +578,7 @@ def test_other_project_cannot_take_the_worker_from_a_running_job(tmp_path):
     ix.enqueue("proj", entries)
     assert entered.wait(20)
     w.calls.clear()
+    ctx.config.defaults["session_wait_s"] = 0          # no waiting: the refusal comes at once
     with pytest.raises(WorkerError) as e:
         ix.ensure_open("other")
     assert e.value.code == "busy" and "proj" in e.value.message
@@ -614,3 +615,75 @@ def test_resume_of_another_project_waits_for_the_running_job(tmp_path):
     idle(ctx)
     ix.resume_project("other")
     assert "other" in ix._resumed
+
+
+def test_session_read_waits_for_other_project_job(tmp_path):
+    ctx, entries = make_project(tmp_path, SPECS[:1])
+    ix, w = ctx.indexer, ctx.worker
+    ctx.indexer.paths("other", create=True)
+    w.gate.clear()
+    ix.enqueue("proj", entries)
+    wait_for(lambda: states(ctx)["zz/first.dll"] == "importing")
+    # the wait is bounded: no wait at all fails at once with the expected wait in one fact line
+    ctx.config.defaults["session_wait_s"] = 0
+    with pytest.raises(WorkerError) as ei:
+        ix.ensure_open("other")
+    assert ei.value.code == "busy" and ei.value.message.startswith("the worker is indexing project 'proj'")
+    assert "s left there" in ei.value.message and "\n" not in ei.value.message
+    # a session that can wait gets the worker as soon as the job is done
+    ctx.config.defaults["session_wait_s"] = 30
+    done: list = []
+    t = threading.Thread(target=lambda: done.append(ix.ensure_open("other")), daemon=True)
+    t.start()
+    wait_for(lambda: ix._waiters.get("other") == 1)
+    assert not done
+    w.gate.set()
+    t.join(30)
+    assert done == [None] and not ix._waiters.get("other")
+    assert ix._hold["other"] > time.monotonic()      # the queue yields to this session for a while
+
+
+def test_queue_yields_to_waiting_session_between_jobs(tmp_path):
+    ctx, entries = make_project(tmp_path, SPECS[:2])
+    ix = ctx.indexer
+    assert not ix._yield_needed()
+    with ix._lock:
+        ix._queue.append(type("J", (), {"project": "proj", "priority": 1})())
+        ix._waiters["other"] = 1
+    assert ix._yield_needed()
+    with ix._lock:
+        ix._waiters["proj"] = 1       # the session waits for the project of the next job: no yield
+    assert not ix._yield_needed()
+    with ix._lock:
+        ix._queue.clear()
+
+
+def test_internal_callers_never_wait_for_the_worker(tmp_path):
+    ctx, entries = make_project(tmp_path, SPECS[:1])
+    ix, w = ctx.indexer, ctx.worker
+    ix.paths("other", create=True)
+    ctx.config.defaults["session_wait_s"] = 60
+    hold, entered = threading.Event(), threading.Event()
+    orig = w.request
+
+    def slow_import(op, args=None, timeout=0):
+        if op == "import_binary":
+            entered.set()
+            assert hold.wait(20)
+        return orig(op, args, timeout)
+
+    w.request = slow_import
+    ix.enqueue("proj", entries)
+    assert entered.wait(20)
+    t0 = time.monotonic()
+    with pytest.raises(WorkerError) as ei:
+        ix.ensure_open("other", wait_s=0)           # bulk pass, resume, fixups, Qt: no wait
+    assert ei.value.code == "busy" and time.monotonic() - t0 < 1.0 and not ix._waiters.get("other")
+    import inspect
+    from airlock.server import bulk, qt as qtmod
+    assert "wait_s=0" in inspect.getsource(bulk.BulkScheduler._run)
+    assert "wait_s=0" in inspect.getsource(qtmod)
+    src = inspect.getsource(type(ix))
+    assert src.count("self.ensure_open(project, wait_s=0)") == 3
+    hold.set()
+    idle(ctx)
