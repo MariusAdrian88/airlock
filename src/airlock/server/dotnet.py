@@ -596,6 +596,33 @@ def _rva_off(secs: list[tuple[int, int, int]], rva: int) -> int | None:
 
 
 _STATE_NAME = re.compile(r"^(.*)\+<([^>]+)>d__\d+$")
+_LAMBDA_NAME = re.compile(r"^<([^>]+)>(b__[\w]+)$")
+_LOCAL_FN_NAME = re.compile(r"^<([^>]+)>(g__[\w]+?)\|[\w]+$")
+
+
+def origin_name(store: Any, fn: Any) -> str | None:
+    """The source method behind a compiler-generated one: ``Ns.Type::Outer (async MoveNext)`` for the
+    ``MoveNext`` of ``Ns.Type+<Outer>d__3``, ``Ns.Type::Outer (lambda b__12_1)`` for ``<Outer>b__12_1``
+    (also in a ``<>c`` or display class), ``(local function g__Name)`` for local functions; None otherwise."""
+    ns, name = fn.namespace or "", fn.name or ""
+    if name == "MoveNext":
+        m = _STATE_NAME.match(ns)
+        if m is None:
+            return None
+        kind = "MoveNext"
+        try:
+            links = store.body_links(fn, False, 1)
+        except Exception:  # noqa: BLE001  an index without body edges
+            links = []
+        if links:
+            kind = links[0][1].split()[0] + " MoveNext"
+        return f"{m.group(1)}::{m.group(2)} ({kind})"
+    host = re.sub(r"\+<>c.*$", "", ns)
+    for rx, what in ((_LAMBDA_NAME, "lambda"), (_LOCAL_FN_NAME, "local function")):
+        m = rx.match(name)
+        if m:
+            return f"{host}::{m.group(1)} ({what} {m.group(2)})"
+    return None
 
 
 def _user_string_text(us: Any, offset: int) -> str | None:

@@ -1568,6 +1568,11 @@ restart.
     slot, a trailing `(+N classes)` or `(Name)` is ignored), and the IDR / signature names of
     `idr: Unit.Proc` (with or without the unit). Matching is case-insensitive; several functions
     (overloads) are `error ambiguous` with the addresses; one function resolves with a note line.
+    Managed (.NET) overloads of one `Type::Name` in one binary are not an error: `function` shows the
+    overload list and the first body, `xrefs` and `callgraph` merge them, one block per overload. The type
+    part of `Type.Name` / `Type::Name` may be a unique suffix. A Ghidra function over the IL body of a
+    managed method in a mixed-mode binary is that method (fact line `IL body of ...`). Metadata tokens
+    print as 8 hex digits in every architecture.
     A raw address that is no function (typed kind `address`, i.e. `xrefs`) in a project with several
     binaries and no binary given is looked up in every ready binary: one binary with references or a
     Delphi/FPC class there wins (note `binary x.exe`), several give `error ambiguous` with

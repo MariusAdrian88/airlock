@@ -65,6 +65,10 @@ def _scope(ctx: ServerContext, binary: str) -> list[Bound] | str:
     return bounds
 
 
+_KIND_ALIASES = {"implementations": "impl", "implementation": "impl", "implements": "impl",
+                 "interface": "impl", "interfaces": "impl", "methods": "method"}
+
+
 @tool("dotnet_types", "List .NET types, methods, P/Invokes, fields with layouts, properties, events and "
                       "interface implementations or overrides from metadata (kind selects the list).")
 def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: str = "",
@@ -73,6 +77,9 @@ def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: s
     if cursor:
         return _page(ctx, [], "dotnet_types", args, cursor, budget)
     k = kind.strip().lower()
+    if k in _KIND_ALIASES:
+        k, note = _KIND_ALIASES[k], f"(kind: {kind.strip()} read as {_KIND_ALIASES[k]})"
+        add_note(note)
     if k and k not in dn.KINDS:
         k, note = normalize_kind(kind, dn.KINDS)
         if not k:

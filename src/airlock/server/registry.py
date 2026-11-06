@@ -127,9 +127,13 @@ def not_implemented_error(name: str) -> str:
     return f"error not_implemented: {name} is planned for {ms} and not available yet."
 
 
-def _refusal(ctx: Any, name: str) -> str | None:
-    """The role gate; an unbound refusal lists the projects (the choice is the agent's)."""
+def _refusal(ctx: Any, name: str, args: tuple = (), kwargs: dict | None = None) -> str | None:
+    """The role gate; an unbound refusal lists the projects (the choice is the agent's).
+    ``list_binaries`` with a project name reads that project without a bound session."""
     refusal = roles.gate(ctx.session, name)
+    if refusal == roles.UNBOUND_ERROR and name == "list_binaries" and (
+            (kwargs or {}).get("project") or (args and args[0])):
+        return None
     if refusal == roles.UNBOUND_ERROR:
         try:
             return roles.unbound_error(ctx.indexer.projects())
@@ -141,7 +145,7 @@ def _refusal(ctx: Any, name: str) -> str | None:
 def call(ctx: Any, name: str, *args: Any, **kwargs: Any) -> str:
     """Direct (non-MCP) call with the same gate as the MCP path; never raises for a tool that
     exists in the catalog but has no implementation yet."""
-    refusal = _refusal(ctx, name)
+    refusal = _refusal(ctx, name, args, kwargs)
     if refusal is not None:
         return refusal
     impl = IMPLEMENTED.get(name)
@@ -161,7 +165,7 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
               for p in list(sig.parameters.values())[1:]]
 
     async def bound(*args: Any, **kwargs: Any) -> str:
-        refusal = _refusal(ctx, impl.name)
+        refusal = _refusal(ctx, impl.name, args, kwargs)
         if refusal is not None:
             return refusal
         if "from" in kwargs:      # `from` is a Python keyword: tools name the parameter `from_`

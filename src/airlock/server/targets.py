@@ -18,10 +18,11 @@ from typing import Iterable
 from airlock.index.store import CODE_EDGES, Function, StringHit, Xref
 from airlock.server import classfwd
 from airlock.server.context import ServerContext
+from airlock.server import dotnet_meta
 from airlock.server.graph import dll_stem, norm_import
 from airlock.server.selectors import (alias_functions, default_name_address, MAX_CANDIDATES, MAX_CLOSE,
                                       close_functions, close_text, parse_address, resolve_function,
-                                      by_selector, describe, is_managed, prefer_token)
+                                      by_selector, describe, fmt_addr, is_managed, managed_named, managed_overloads, parse_selector, prefer_token)
 from airlock.server.tools.common import Bound, Scope, bind_scope, preview
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -366,7 +367,7 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
     a name that is ``error ambiguous`` across the binaries of a project resolves in the binary
     the session looked at last when that binary has exactly one such function, and a function
     resolved in a multi-binary project becomes the new focus."""
-    r = _resolve(ctx, binary, target, kinds, aggregate)
+    r = _il_forward(ctx, _resolve(ctx, binary, target, kinds, aggregate))
     if isinstance(r, str):
         if r.startswith("error ambiguous"):
             fr = _focused(ctx, binary, target, kinds, aggregate)
@@ -383,6 +384,55 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
     if isinstance(r, FunctionTarget):
         _set_focus(ctx, r.bound)
     return r
+
+
+_NATIVE_THUNK = re.compile(r"^native thunk (0x[0-9a-f]+(?:, 0x[0-9a-f]+)*)$")
+
+
+def _il_forward(ctx: ServerContext, r: Target | str) -> Target | str:
+    """Mixed-mode (C++/CLI) binaries: a Ghidra pseudo-function over the IL body of a managed method is that
+    method (one fact line); a method token whose "native thunk" is such an IL body drops the wrong thunk line."""
+    if not isinstance(r, FunctionTarget):
+        return r
+    bd, fn = r.bound, r.fn
+    if bd.binary.toolchain != "dotnet" or bd.binary.format == "dotnet" or fn.is_external:
+        return r
+    try:
+        art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
+        ps = bd.binary.pointer_size
+        if fn.space == "ram" and not is_managed(fn):
+            tok = dotnet_meta.il_token_at(bd.store, bd.binary, art, fn.entry)
+            f = bd.store.function_at(bd.binary.id, tok) if tok else None
+            if f is not None:
+                return FunctionTarget(bd, f, f"IL body of {f.qualified_name} ({fmt_addr(f.entry, ps)}) at "
+                                      f"{fmt_addr(fn.entry, ps)}", r.binary_note)
+        elif is_managed(fn) and r.note:
+            m = _NATIVE_THUNK.match(r.note)
+            if m:
+                addrs = [int(a, 16) for a in m.group(1).split(", ")]
+                if all(dotnet_meta.il_token_at(bd.store, bd.binary, art, a) == fn.entry for a in addrs):
+                    return FunctionTarget(bd, fn, f"IL body of {fn.qualified_name} ({fmt_addr(fn.entry, ps)}) at "
+                                          + ", ".join(fmt_addr(a, ps) for a in addrs), r.binary_note)
+    except Exception:  # noqa: BLE001  the forward is an extra
+        return r
+    return r
+
+
+def overload_set(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, list[Function]] | None:
+    """The managed overloads of one ``Type::Name`` that ``target`` leaves open, all in one binary; None when
+    the candidates differ in type, name or binary (that stays ``error ambiguous``)."""
+    sc = bind_scope(ctx, binary, target)
+    if isinstance(sc, str):
+        return None
+    found: list[tuple[Bound, list[Function]]] = []
+    for bd in sc.bounds:
+        name, _p = parse_selector(sc.bare)
+        if managed_named(bd.store, bd.binary.id, name):
+            ov = managed_overloads(bd.store, bd.binary.id, sc.bare)
+            if not ov:
+                return None
+            found.append((bd, ov))
+    return (found[0][0], found[0][1]) if len(found) == 1 else None
 
 
 def code_address(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, int, Scope] | None:

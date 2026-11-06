@@ -1000,3 +1000,70 @@ def resolve_field(ctx: Any, binary: str, target: str) -> tuple[str, str] | str |
         shown = ", ".join(f"[{bn[r['binary_id']]}] {r['tname']}::{fname} 0x{r['token']:08x}" for r in hits[:6])
         return f"error ambiguous: '{target}' matches {len(hits)} fields: {shown}."
     return bn[hits[0]["binary_id"]], f"0x{hits[0]['token']:08x}"
+
+
+# -- IL bodies under Ghidra pseudo-functions (mixed-mode binaries) --------------------------------
+
+ILMAP_VERSION = "1"       # meta key ``dn_ilmap:<binary id>`` = version + JSON; own key, not DOTNET_VERSION
+
+
+def _il_ranges_from(path: Any) -> list[tuple[int, int, int]]:
+    """(start RVA, end RVA, method token) of every MethodDef with an IL body (header + code)."""
+    pe = dn._open(path)
+    md = pe.net.mdtables
+    data = pe.__data__
+    secs = dn._rva_map(pe)
+    out = []
+    for i, r in enumerate(md.MethodDef.rows, 1):
+        rva = r.Rva
+        if not rva or not getattr(r.ImplFlags, "miIL", False):
+            continue
+        off = dn._rva_off(secs, rva)
+        body = dn.il_body(data, off) if off is not None else None
+        if body is not None:
+            out.append((int(rva), int(rva) + body[1] + len(body[0]), dn.METHOD_TOKEN | i))
+    return sorted(out)
+
+
+_ilmap_cache: dict[tuple[str, int], list[tuple[int, int, int]]] = {}
+
+
+def il_ranges(store: Any, b: Any, artifact: Any) -> list[tuple[int, int, int]]:
+    """IL body ranges (RVA) of a managed binary, kept in the index meta on first use."""
+    import json
+    key = f"dn_ilmap:{b.id}"
+    ck = (str(store.path), b.id)
+    if ck in _ilmap_cache:
+        return _ilmap_cache[ck]
+    raw = store.get_meta(key) or ""
+    rows: list[tuple[int, int, int]] | None = None
+    if raw.startswith(ILMAP_VERSION + ":"):
+        try:
+            rows = [tuple(x) for x in json.loads(raw[len(ILMAP_VERSION) + 1:])]
+        except ValueError:
+            rows = None
+    if rows is None:
+        try:
+            rows = _il_ranges_from(artifact)
+        except Exception as e:  # noqa: BLE001  not a managed image: no map
+            logging.getLogger(__name__).info("IL map of %s: %s", b.name, e)
+            rows = []
+        with store.db:
+            store.set_meta(key, ILMAP_VERSION + ":" + json.dumps(rows, separators=(",", ":")))
+    _ilmap_cache[ck] = rows
+    return rows
+
+
+def il_token_at(store: Any, b: Any, artifact: Any, addr: int, end: int | None = None) -> int | None:
+    """Token of the method whose IL body holds ``addr`` (image base + RVA), else None. With ``end`` the
+    whole range [addr, end) must lie in the body."""
+    base = int(b.image_base or 0)
+    rva = addr - base
+    if rva <= 0:
+        return None
+    for lo, hi, tok in il_ranges(store, b, artifact):
+        if lo <= rva < hi:
+            return tok if end is None or end - base <= hi else None
+        if lo > rva:
+            break
+    return None
