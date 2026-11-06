@@ -16,6 +16,10 @@ Pure PE bytes (``cpp.Image``), no worker and no Ghidra. Called by ``cpp.derive_b
   natural alignment, 32 bytes in 32-bit and 64 in 64-bit; the table ends with ``lpszName`` NULL and
   ``nPropOffset`` -1.
 * ``AFX_INTERFACEMAP``: base, ``pEntry``. Entry: ``piid`` (P, a GUID), ``nOffset`` (P); ends with NULL / -1.
+* ``AFX_CONNECTIONMAP``: the same two pointers and the same entry (``piid`` of an outgoing interface,
+  ``nOffset`` of the ``CConnectionPoint`` member). The shape cannot tell it from an interface map; the vtable
+  can: ``GetConnectionMap`` is the slot right before ``GetInterfaceMap`` in every ``CCmdTarget`` vtable
+  (``mark_connections``).
 * ``AFX_EVENTSINKMAP``: base, ``lpEntries``, ``lpEntryCount``. Entry: an ``AFX_DISPMAP_ENTRY`` followed by
   ``nCtrlIDFirst`` and ``nCtrlIDLast`` (u32); ends like a dispatch map.
 """
@@ -34,8 +38,8 @@ NEAR = 0x4000                    # the vtable of a class is the closest one this
 MAX_DISP = 4096
 CALL_TO_STORE = 28              # bytes between the base constructor call and the vtable store
 MAX_INTF = 64
-KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT = "dispatch", "interface", "event"
-EXTRA_KINDS = (KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT)
+KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT, KIND_CONNECTION = "dispatch", "interface", "event", "connection"
+EXTRA_KINDS = (KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT, KIND_CONNECTION)
 _IDENT = re.compile(rb"^[A-Za-z_][A-Za-z0-9_]{1,79}$")
 _DISP_NAME = re.compile(r"^(?:[A-Za-z_][\w$ .]{0,119})?$")
 
@@ -213,7 +217,7 @@ def _disp_entries(img: cpp.Image, ents: int, stride_extra: int) -> list[tuple] |
         if name == 0 and off == allones:
             return out if out else None
         if name:
-            nm = img.cstr(name, 130)
+            nm = disp_name(img, name)
             if nm is None or not _DISP_NAME.match(nm) or not img.is_data(name):
                 return None
         elif not flags & 1 and not stride_extra:
@@ -228,6 +232,24 @@ def _disp_entries(img: cpp.Image, ents: int, stride_extra: int) -> list[tuple] |
         extra = raw[size:] if stride_extra else b""
         out.append((name, did, params, vt, pfn, pfn_set, off, flags, extra))
     return None
+
+
+def disp_name(img: cpp.Image, va: int) -> str | None:
+    """Name of a dispatch entry: ``LPCTSTR``, so ANSI in an ANSI build and UTF-16 in a Unicode build. A
+    one-letter ANSI reading followed by NUL is tried as UTF-16 (letter, NUL, letter, NUL, ...)."""
+    nm = img.cstr(va, 130)
+    if nm is not None and len(nm) == 1:
+        raw = img.read(va, 260)
+        if raw is not None and raw[1:2] == b"\x00":
+            end = next((i for i in range(0, len(raw) - 1, 2) if raw[i:i + 2] == b"\x00\x00"), -1)
+            if end > 2:
+                try:
+                    wide = raw[:end].decode("utf-16-le")
+                except UnicodeDecodeError:
+                    return nm
+                if _DISP_NAME.match(wide):
+                    return wide
+    return nm
 
 
 def _head(img: cpp.Image, addr: int, n: int) -> tuple[int, ...] | None:
@@ -267,7 +289,7 @@ def parse_eventmap(img: cpp.Image, addr: int) -> list[MapEntry] | None:
 
 def _disp_entry(img: cpp.Image, seq: int, e: tuple) -> MapEntry:
     name, did, params, vt, pfn, pfn_set, off, flags, tail = e
-    nm = img.cstr(name, 130) if name else ""
+    nm = disp_name(img, name) if name else ""
     extra = []
     if tail:
         first, last = struct.unpack("<II", tail)
@@ -321,6 +343,21 @@ def kind_of(img: cpp.Image, addr: int, msg_addrs: set[int], cache: dict[int, tup
     return res
 
 
+def mark_connections(img: cpp.Image, getters: list[int | None], msg_addrs: set[int],
+                     cache: dict[int, tuple[str, list[MapEntry]] | None]) -> None:
+    """Re-label connection maps in ``cache``. ``getters`` are the map addresses returned by the consecutive
+    virtual functions of one vtable (None where a slot is no getter). ``GetConnectionMap`` sits right before
+    ``GetInterfaceMap`` in a ``CCmdTarget`` vtable and both return the same structure, so two different
+    interface-shaped maps in adjacent slots are (connection map, interface map). **[verified]** on the 64-bit
+    MFC 4.2 DLL: ``COleControl`` slot 15 has one entry (``IPropertyNotifySink``), slot 16 the control's interfaces."""
+    for a, b in zip(getters, getters[1:]):
+        if a is None or b is None or a == b:
+            continue
+        ka, kb = kind_of(img, a, msg_addrs, cache), kind_of(img, b, msg_addrs, cache)
+        if ka and kb and ka[0] == KIND_INTERFACE and kb[0] == KIND_INTERFACE:
+            cache[a] = (KIND_CONNECTION, ka[1])
+
+
 # ── names ──────────────────────────────────────────────────────────────────
 
 _VT = {0: "void", 2: "short", 3: "long", 4: "float", 5: "double", 6: "currency", 7: "date", 8: "BSTR",
@@ -362,6 +399,8 @@ _IIDS = {
     "00000126-0000-0000-c000-000000000046": "IRunnableObject",
     "00000127-0000-0000-c000-000000000046": "IViewObject2",
     "b196b284-bab4-101a-b69c-00aa00341d07": "IConnectionPointContainer",
+    "b196b286-bab4-101a-b69c-00aa00341d07": "IConnectionPoint",
+    "9bfbbc02-eff1-101a-84ed-00aa00341d07": "IPropertyNotifySink",
     "b196b283-bab4-101a-b69c-00aa00341d07": "IProvideClassInfo",
     "b196b288-bab4-101a-b69c-00aa00341d07": "IOleControl",
     "b196b28b-bab4-101a-b69c-00aa00341d07": "ISpecifyPropertyPages",
@@ -415,15 +454,39 @@ class Mfc:
 _CALL_AFTER_PUSH = re.compile(rb"(?:\x68(....)|\x6a(.)).{0,6}?\xe8(....)", re.S)
 
 
+_ID64 = re.compile(rb"(?:\xba(....)|\x41\xb8(....)).{0,14}?\xe8(....)", re.S)
+_LEA_RIP = re.compile(rb"[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d](....)", re.S)
+
+
+def _stores_vtable(lea: bytes, tail: bytes) -> bool:
+    """``tail`` (the bytes after ``lea reg, [rip+d]``) starts, within 4 bytes, with ``mov [reg2], reg`` (mod 00,
+    no SIB or disp32): the store of the vtable pointer to offset 0 of the object."""
+    reg = ((lea[2] >> 3) & 7) | ((lea[0] & 4) << 1)
+    for k in range(0, 5):
+        if k + 2 < len(tail) and tail[k] in (0x48, 0x49, 0x4C, 0x4D) and tail[k + 1] == 0x89:
+            md = tail[k + 2]
+            if md & 0xC0 == 0 and md & 7 not in (4, 5) and ((md >> 3) & 7) | ((tail[k] & 4) << 1) == reg:
+                return True
+    return False
+
+
 def ctor_dialogs(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -> dict[int, int]:
-    """vtable -> dialog resource id passed to the base constructor (32-bit): the constructor pushes the
-    id, calls ``CDialog::CDialog`` and then stores the vtable pointer. The id must be a dialog of the
-    binary, and the call target must be shared by at least two classes."""
-    if img.psize != 4 or not dialog_ids:
+    """vtable -> dialog resource id passed to the base constructor: the constructor loads the id, calls
+    ``CDialog::CDialog`` and then stores the vtable pointer. The id must be a dialog of the binary, and the
+    call target must be shared by at least two classes. 32-bit: ``push id`` and ``mov [reg], vtable``;
+    64-bit: ``mov edx, id`` (or ``mov r8d, id``) and ``lea reg, [rip+vtable]; mov [reg2], reg``."""
+    if not dialog_ids:
         return {}
+    found = _ctor_dialogs32(img, vtables, dialog_ids) if img.psize == 4 else _ctor_dialogs64(img, vtables, dialog_ids)
+    targets: dict[int, int] = {}
+    for _imm, tgt in found.values():
+        targets[tgt] = targets.get(tgt, 0) + 1
+    return {vt: imm for vt, (imm, tgt) in found.items() if targets[tgt] >= 2}
+
+
+def _ctor_dialogs32(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -> dict[int, tuple[int, int]]:
     code = [(s.va, s.data) for s in img.sections if s.executable]
     found: dict[int, tuple[int, int]] = {}
-    targets: dict[int, int] = {}
     for vt in vtables:
         pat = struct.pack("<I", vt)
         for va, data in code:
@@ -446,9 +509,30 @@ def ctor_dialogs(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -
                 i = data.find(pat, i + 1)
             if vt in found:
                 break
-    for _imm, tgt in found.values():
-        targets[tgt] = targets.get(tgt, 0) + 1
-    return {vt: imm for vt, (imm, tgt) in found.items() if targets[tgt] >= 2}
+    return found
+
+
+def _ctor_dialogs64(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -> dict[int, tuple[int, int]]:
+    want = set(vtables)
+    found: dict[int, tuple[int, int]] = {}
+    for va, data in ((s.va, s.data) for s in img.sections if s.executable):
+        for lm in _LEA_RIP.finditer(data):
+            i = lm.start()
+            vt = (va + i + 7 + struct.unpack("<i", lm.group(1))[0]) & 0xFFFFFFFFFFFFFFFF
+            if vt not in want or vt in found or not _stores_vtable(data[i:i + 3], data[i + 7:i + 14]):
+                continue
+            lo = max(0, i - 96)
+            seg = data[lo:i]
+            best = None
+            for m in _ID64.finditer(seg):
+                if len(seg) - m.end() > CALL_TO_STORE:                # the call of an earlier function
+                    continue
+                imm = struct.unpack("<I", m.group(1) or m.group(2))[0]
+                if imm in dialog_ids:
+                    best = (imm, (va + lo + m.end() + struct.unpack("<i", m.group(3))[0]) & 0xFFFFFFFFFFFFFFFF)
+            if best:
+                found[vt] = best
+    return found
 
 
 def _dialog_ids(path: Path | None) -> dict[int, str]:
@@ -467,6 +551,52 @@ def _dialog_ids(path: Path | None) -> dict[int, str]:
     return out
 
 
+_DIALOGISH = re.compile(r"Dialog|Page|FormView|Sheet|Wizard")
+_SYM_IDENT = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def symbol_class(symbols: dict[int, str], fns: Iterable[int], framework: set[str]) -> str | None:
+    """The class name that most functions of ``fns`` (handlers, virtual functions) carry as namespace, when
+    it is clear: at least two functions, at least two thirds of the namespaced ones, an identifier, and no
+    framework class (the inherited virtual functions belong to the base)."""
+    votes: dict[str, int] = {}
+    for f in dict.fromkeys(fns):
+        ns = symbols.get(f)
+        if ns and ns not in framework and _SYM_IDENT.match(ns) and not ns.startswith(cpp.ANON_PREFIX):
+            votes[ns] = votes.get(ns, 0) + 1
+    if not votes:
+        return None
+    best = max(votes, key=votes.get)                                  # type: ignore[arg-type]
+    return best if votes[best] >= 2 and votes[best] * 3 >= 2 * sum(votes.values()) else None
+
+
+def map_dialog(entries: list[cpp.MsgEntry], ctrls: dict[int, set[int]]) -> int | None:
+    """The one dialog whose controls include every command / notification id of a map (single ids only; at
+    least one id above IDHELP). None when no dialog or several fit."""
+    ids = {e.id for e in entries if e.message in (0x111, 0x4E) and e.id == e.last_id
+           and e.id not in (0, 0xFFFF, 0xFFFFFFFF)}
+    if not any(i > 9 for i in ids):
+        return None
+    fit = [d for d, c in ctrls.items() if ids <= c]
+    return fit[0] if len(fit) == 1 else None
+
+
+def _dialog_ctrls(path: Path | None) -> dict[int, set[int]]:
+    """Numeric dialog resource id -> ids of its controls."""
+    if path is None:
+        return {}
+    try:
+        from airlock.server import peres
+        parsed = peres.parse_file(path)
+    except Exception:  # noqa: BLE001  an extra
+        return {}
+    out: dict[int, set[int]] = {}
+    for did, _lang, dlg in (parsed.dialogs if parsed else []):
+        if str(did).isdigit():
+            out.setdefault(int(did), set()).update(c.ctrl_id for c in dlg.controls)
+    return out
+
+
 def _base_map(img: cpp.Image, gt: Getters, addr: int) -> int | None:
     b = img.ptr(addr)
     if not b:
@@ -477,9 +607,11 @@ def _base_map(img: cpp.Image, gt: Getters, addr: int) -> int | None:
 
 
 def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[int]],
-            maps: list[cpp.MsgMap], artifact: Path | None = None) -> Mfc:
+            maps: list[cpp.MsgMap], artifact: Path | None = None,
+            symbols: dict[int, str] | None = None) -> Mfc:
     """Names anonymous message map classes in place (``maps``) and returns the class rows and the
-    dispatch / interface / event sink maps."""
+    dispatch / interface / event / connection maps. ``symbols``: function entry -> class (namespace) the
+    disassembler gave it (a PDB, exports, renames); the evidence for ``symbol_class``."""
     gt = Getters(img)
     msg_addrs = {m.map_addr for m in maps}
     by_addr = {m.map_addr: m for m in maps}
@@ -489,6 +621,8 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
     def extra_in(fns: Iterable[int]) -> list[tuple[int, str, list[MapEntry]]]:
         out: list[tuple[int, str, list[MapEntry]]] = []
         seen: set[int] = set()
+        fns = list(fns)
+        mark_connections(img, [gt.of(f) for f in fns], msg_addrs, cache)
         for f in fns:
             a = gt.of(f)
             if a is None or a in seen:
@@ -532,6 +666,7 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
     owner = decide_owners(groups)
     owned = {id(g) for g in owner.values()}
     for g in groups:
+        mark_connections(img, [gt.of(f) for f in g.fns], msg_addrs, cache)
         for a in dict.fromkeys(x for x in (gt.of(f) for f in g.fns) if x is not None):
             if a in by_addr:
                 g.maps.setdefault("msg", []).append(a)
@@ -570,23 +705,57 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
         if m is not None and m.cls.startswith(cpp.ANON_PREFIX):
             m.cls = g.rc.name
 
+    # the disassembler's own class name for the handlers and virtual functions: the clearest evidence
+    sym_map: dict[int, Group] = {}                      # anonymous map -> group named from symbols
+    if symbols:
+        taken = {m.cls for m in maps} | {c.name for c in classes} | {r.name for r in rcs.values()}
+        for g in sorted(groups, key=lambda x: x.start):
+            if g.rtti or id(g) in owned:
+                continue
+            for a in g.maps.get("msg", ()):
+                m = by_addr[a]
+                if m.cls.startswith(cpp.ANON_PREFIX) and holders[a] == 1:
+                    nm = symbol_class(symbols, [e.handler for e in m.entries] + g.fns, {r.name for r in rcs.values()})
+                    if nm and nm not in taken:
+                        taken.add(nm)
+                        m.cls = nm
+                        sym_map[a] = g
+                        break
+
     dialogs = _dialog_ids(artifact)
     gdlg = ctor_dialogs(img, {g.start for g in groups if not g.rtti}, set(dialogs))
     dlg_map: dict[int, Group] = {}                      # anonymous map -> dialog group naming it
     used: dict[str, int] = {}
+
+    def dialog_name(did: int) -> str:
+        cap = ident(dialogs.get(did, ""))
+        nm = f"Dialog_{cap}" if cap else f"Dialog_{did}"
+        used[nm] = used.get(nm, 0) + 1
+        return nm if used[nm] == 1 else f"{nm}_{did}"
+
     for g in sorted(groups, key=lambda x: x.start):
         if g.rtti or g.start not in gdlg:
             continue
         for a in g.maps.get("msg", ()):
             m = by_addr[a]
             if m.cls.startswith(cpp.ANON_PREFIX) and holders[a] == 1:
-                did = gdlg[g.start]
-                cap = ident(dialogs.get(did, ""))
-                nm = f"Dialog_{cap}" if cap else f"Dialog_{did}"
-                used[nm] = used.get(nm, 0) + 1
-                m.cls = nm if used[nm] == 1 else f"{nm}_{did}"
+                m.cls = dialog_name(gdlg[g.start])
                 dlg_map[a] = g
                 break
+    # a dialog class whose constructor was not recognised: the dialog that holds every control id of its map
+    ctrls = _dialog_ctrls(artifact) if dialogs else {}
+    for g in sorted(groups, key=lambda x: x.start):
+        if g.rtti or id(g) in owned or g.start in gdlg or not _DIALOGISH.search(g.rc.name):
+            continue
+        for a in g.maps.get("msg", ()):
+            m = by_addr[a]
+            if m.cls.startswith(cpp.ANON_PREFIX) and holders[a] == 1:
+                did = map_dialog(m.entries, ctrls)
+                if did is not None:
+                    gdlg[g.start] = did
+                    m.cls = dialog_name(did)
+                    dlg_map[a] = g
+                    break
     inherit_map: dict[int, Group] = {}                  # anonymous map -> group of a class derived from rc
     for g in sorted(groups, key=lambda x: x.start):
         if g.rtti or id(g) in owned:
@@ -604,7 +773,7 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
         if g.rtti:
             continue
         own_map = next((a for a in g.maps.get("msg", ()) if owner_of.get(a) is g or dlg_map.get(a) is g
-                                                                or inherit_map.get(a) is g), 0)
+                                                                or inherit_map.get(a) is g or sym_map.get(a) is g), 0)
         is_owner = id(g) in owned
         if not (is_owner or own_map):
             continue
@@ -618,7 +787,8 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
         dlg = str(gdlg[g.start]) if g.start in gdlg else ""
         res.classes.append(MfcClass(label, g.start, g.rc.addr if is_owner else 0,
                                     g.rc.size if is_owner else 0, g.rc.schema if is_owner else 0, base,
-                                    own_map, dlg, "rc" if is_owner else ("dialog" if dlg else "inherited")))
+                                    own_map, dlg, "rc" if is_owner else ("symbols" if sym_map.get(own_map) is g
+                                                                 else ("dialog" if dlg else "inherited"))))
         for kind in EXTRA_KINDS:
             for a in g.maps.get(kind, ()):
                 k = cache[a]

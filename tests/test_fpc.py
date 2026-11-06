@@ -15,7 +15,7 @@ from airlock import projects
 from airlock.server import delphi
 from airlock.server.cpp import Image
 from airlock.server.tools import delphi as dtools
-from test_delphi import Pe, _ss, comp, dfm, prop
+from test_delphi import TEXT_VA, Pe, _ss, comp, dfm, prop
 from test_tools import make_ctx
 
 MARKER = b"FPC 3.2.2 [2021/05/15] for i386 - Win32\0"
@@ -36,9 +36,12 @@ class FpcPe(Pe):
                virtuals: int = 0, fields: tuple[tuple[str, int, str], ...] = (), props: tuple = (),
                via_cell: bool = False, typeinfo: bool = True, messages: tuple[int, ...] = (),
                strmsgs: tuple[str, ...] = (), interfaces: tuple[tuple[str, int, int], ...] = (),
-               managed: tuple[tuple[int, int], ...] = ()) -> int:
+               managed: tuple[tuple[int, int], ...] = (), intf_rtti: dict | None = None,
+               intf_thunks: dict | None = None) -> int:
         """``props``: ``(name, getter, setter)``, an accessor is ``("code", method)``, ``("virt", slot)`` (the slot
-        counts from the first virtual method), ``("field", offset)`` or None."""
+        counts from the first virtual method), ``("field", offset)`` or None. ``intf_rtti``: {GUID text: (interface
+        name, method names)}, writes the interface type info with its method table and thunk slots from 3 on;
+        ``intf_thunks``: {GUID text: (class method names)}, thunk slots without type info."""
         ps = self.ps
         vmt = self.alloc((START + virtuals + 1) * ps, 16)
         self.vmts[name] = vmt
@@ -105,7 +108,22 @@ class FpcPe(Pe):
                 sref = self.alloc(ps)
                 self.put(sref, self.p(sstr))
                 vt = self.alloc(ps * nm)
-                self.put(vt, b"".join(self.p(self.stub(f"{name}.{gtext}.{k}")) for k in range(nm)))
+                impl: dict[int, int] = {}
+                if gtext in (intf_rtti or {}):
+                    iname, mnames = intf_rtti[gtext]
+                    nm = 3 + len(mnames)
+                    vt = self.alloc(ps * nm)
+                    names = [self.cstring(m) for m in mnames]
+                    ent = b"".join(self.p(0) + bytes([0, 0]) + struct.pack("<H", 0) + self.p(0) + self.p(n)
+                                   for n in names)
+                    blob = (bytes([14]) + _ss(iname) + self.p(0) + bytes([1]) + self.get_guid(gtext) + _ss("unit1")
+                            + struct.pack("<HHH", 0, len(mnames), len(mnames)) + ent)
+                    self.put(self.alloc(len(blob), 1), blob)
+                    impl = {3 + i: self.stub(f"{name}.impl{3 + i}") for i in range(len(mnames))}
+                for i, mname in enumerate((intf_thunks or {}).get(gtext, ())):
+                    impl[3 + i] = self.code.get(f"{name}.{mname}") or self.stub(f"{name}.{mname}")
+                self.put(vt, b"".join(self.p(self.thunk(f"{name}.{gtext}.{k}", impl[k]) if k in impl
+                                             else self.stub(f"{name}.{gtext}.{k}")) for k in range(nm)))
                 ents += self.p(gref) + self.p(vt) + self.p(off) + self.p(sref) + struct.pack("<I", 0).ljust(ps, b"\0")
             tab = self.alloc(ps + len(ents), ps)
             self.put(tab, self.p(len(interfaces)) + ents)
@@ -133,6 +151,21 @@ class FpcPe(Pe):
         self.put(vmt, b"".join(self.p(w) for w in words)
                  + b"".join(self.p(self.stub(f"{name}.v{i}")) for i in range(virtuals)))
         return vmt
+
+    @staticmethod
+    def get_guid(gtext: str) -> bytes:
+        d1, d2, d3 = (int(x, 16) for x in (gtext[1:9], gtext[10:14], gtext[15:19]))
+        return struct.pack("<IHH", d1, d2, d3) + bytes.fromhex(gtext[20:24] + gtext[25:37])
+
+    def thunk(self, name: str, target: int) -> int:
+        """``sub eax, 0x24`` (``sub rcx, 0x24``), then ``jmp target``: what FPC puts in an interface vtable."""
+        va = self.base + TEXT_VA + self.tpos
+        head = bytes([0x83, 0xE8, 0x24]) if self.ps == 4 else bytes([0x48, 0x83, 0xE9, 0x24])
+        code = head + bytes([0xE9]) + struct.pack("<i", target - (va + len(head) + 5))
+        self.text[self.tpos:self.tpos + len(code)] = code
+        self.tpos += 16
+        self.code[name] = va
+        return va
 
     def finish(self) -> None:
         for at, cls in self.late:
@@ -342,6 +375,27 @@ def test_fpc_message_interface_and_init_tables(tmp_path, psize):
     fields = [(f.name, f.offset, f.type) for f in base.fields]
     assert fields == [("FName", psize, ""), ("", 2 * psize, "interface"), ("IGreeter", 3 * psize, "interface"),
                       ("IUnknown", 4 * psize, "interface")]            # the managed AnsiString at psize is a published field
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_fpc_interface_method_names(tmp_path, psize):
+    g1, g2, g3 = ("{B4F1A2C3-1111-2222-3333-444455556666}", "{AABBCCDD-0000-1111-2222-333344445555}",
+                  "{11111111-2222-3333-4444-555566667777}")
+    pe = FpcPe(psize)
+    pe.fclass("TObject", None, "System", psize, virtuals=13)
+    pe.fclass("TBase", "TObject", "BaseUnit", 6 * psize, virtuals=14, published=("Ping",),
+              interfaces=((g1, 0, 3 * psize), (g2, 4, 4 * psize), (g3, 5, 5 * psize)),
+              intf_rtti={g1: ("IGreeter", ("Greet", "Count"))}, intf_thunks={g2: ("Ping",)})
+    pe.write(tmp_path / "a.exe")
+    classes, _forms = delphi.parse_file(tmp_path / "a.exe", None, {g2: "IPlain"})
+    base = {c.name: c for c in classes}["TBase"]
+    names = [(m.slot, m.name) for m in base.methods if m.kind == "interface"]
+    assert [n for _s, n in names[:5]] == [f"{g1}.QueryInterface", f"{g1}._AddRef", f"{g1}._Release",
+                                          f"{g1}.Greet", f"{g1}.Count"]       # type info method table
+    assert names[5:9] == [(0, "IPlain.QueryInterface"), (1, "IPlain._AddRef"), (2, "IPlain._Release"),
+                          (3, "IPlain.Ping")]                                # thunk jumps to a published method
+    assert [n for _s, n in names[9:]] == [f"{g3}.{x}" for x in ("QueryInterface", "_AddRef", "_Release", "#3", "#4")]
+    assert pe.code[f"TBase.{g1}.3"] != pe.code["TBase.impl3"]                # the slot is the thunk, not the target
 
 
 @pytest.mark.parametrize("psize", [4, 8])

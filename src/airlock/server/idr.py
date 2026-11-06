@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 10              # 10: Free Pascal databases; bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 11              # 11: short Delphi sigdb matches need a long match of their unit; 10: Free Pascal databases; bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -57,6 +57,8 @@ HEAD = 1024                          # bytes of a function read once; longer pro
 ANCHOR_MAX = 48                      # a proc is keyed by a window of fixed bytes starting before this offset
 WINDOWS = (16, 12, 8, 6, 4)                 # window lengths, longest first
 CTX_MIN_VOTES = 1                    # callers that must give a callee the same name (call-context pass)
+UNIT_MIN_LONG = 20                   # long matches a binary needs before the unit rule applies (a tiny test binary has none)
+SHORT_FIXED = 48                     # a match with fewer compared bytes needs a long match of the same unit
 PAD_SLACK = 16                       # a proc dump ends with up to 15 padding bytes that Ghidra leaves out
 
 _KB_NAME = re.compile(r"^(sys)?kb(\d+)\.bin$", re.IGNORECASE)
@@ -200,6 +202,7 @@ class Kb:
         self.combos: list[tuple[int, int]] = []
         self.total = 0                  # proc records in the file
         self.skipped = 0                # code procs dropped (too few unmasked bytes)
+        self.unit_support = False       # short matches need a long match of their unit (``_drop_unsupported``)
 
     def add(self, name: str, dump: bytes, reloc: bytes, calls: tuple = ()) -> None:
         n = len(dump)
@@ -418,7 +421,52 @@ def _match(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]
         if names:
             out[entry] = names
             kept[entry] = ok
+    if kb.unit_support:
+        _drop_unsupported(kb, out, kept)
     return out, kept
+
+
+def unit_of(name: str) -> str:
+    """The unit of a routine name ``Unit.Class.Method`` (``Vcl.Dbgrids.TDBGridColumns.Add`` -> ``vcl.dbgrids``;
+    generic arguments dropped; a name with one dot is ``Unit.Proc``)."""
+    plain: list[str] = []
+    depth = 0
+    for ch in name:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            plain.append(ch)
+    parts = "".join(plain).split(".")
+    if len(parts) >= 2:
+        parts = parts[:-1]
+    while len(parts) > 1 and len(parts[-1]) > 1 and parts[-1][0] in "TIE" and parts[-1][1].isupper():
+        parts = parts[:-1]
+    return ".".join(parts).lower()
+
+
+def _drop_unsupported(kb: Kb, out: dict[int, list[str]], kept: dict[int, list[int]]) -> None:
+    """A short match (under ``SHORT_FIXED`` compared bytes) keeps only the names whose unit also has a long
+    match in the binary, and loses the match when none is left. A routine of the runtime is linked with
+    its unit, so a unit that has no long match in the binary is not in it: the short code is then a routine
+    of the program that has the same bytes (a getter, a ``Destroy`` that frees one field, the
+    ``Finalization`` of a unit). Measured with the oracle (DESIGN 11): wrong names down by 4%, right names
+    unchanged, names of the program's own routines halved."""
+    best = {e: max(kb.procs[i].fixed for i in idxs) for e, idxs in kept.items()}
+    long_ = [e for e in out if best[e] >= SHORT_FIXED]
+    if len(long_) < UNIT_MIN_LONG:
+        return
+    units = {unit_of(n) for e in long_ for n in out[e]}
+    for e in [e for e in out if best[e] < SHORT_FIXED]:
+        names = [n for n in out[e] if unit_of(n) in units]
+        if not names:
+            del out[e]
+            del kept[e]
+            continue
+        out[e] = names
+        keep = set(names)
+        kept[e] = [i for i in kept[e] if kb.procs[i].name in keep]
 
 
 def call_context(kb: Kb, img: Image, entries: set[int], kept: dict[int, list[int]], known: set[int]

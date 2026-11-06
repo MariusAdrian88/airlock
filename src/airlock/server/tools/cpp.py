@@ -217,8 +217,8 @@ def _dispatch_line(bd: Bound, r) -> str:
     """One line of a dispatch / interface / event sink map entry."""
     kind = r["kind"]
     fn = lambda a: (f"{bd.addr(a)} {_fn_name(bd, a)}").rstrip()      # noqa: E731
-    if kind == mfc.KIND_INTERFACE:
-        return f"interface {r['name']} offset 0x{r['id']:x}"
+    if kind in (mfc.KIND_INTERFACE, mfc.KIND_CONNECTION):
+        return f"{kind} {r['name']} offset 0x{r['id']:x}"
     did = "auto" if r["id"] == -1 else str(r["id"])
     extra = r["extra"]
     if kind == mfc.KIND_EVENT:
@@ -253,7 +253,7 @@ def _bases_of(bd: Bound, name: str) -> list[str]:
     return out
 
 
-@tool("mfc_message_maps", "List MFC message maps and automation (dispatch, interface, event) maps: per class, each entry with handler function.")
+@tool("mfc_message_maps", "List MFC message maps and automation (dispatch, interface, event, connection) maps: per class, each entry with handler function.")
 def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cursor: str = "",
                      budget: int = 0) -> str:
     args = {"binary": binary, "target": target}

@@ -49,7 +49,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 5          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names
+DELPHI_VERSION = 6          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names; 6: FPC interface method names
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
@@ -678,12 +678,129 @@ def _fpc_intf_entries(img: Image, tab: int) -> list[tuple[int, int, int, int, in
     return out
 
 
+FPC_TKINTERFACE = 14       # type kind of a COM interface (``tkInterface``)
+MAX_INTF_CHAIN = 16
+
+
+def _fpc_intf_typeinfo(img: Image, guid: bytes) -> int | None:
+    """Type info (``tkInterface``) of the interface with this GUID: ``kind, ShortString name, ^parent, u8 flags,
+    GUID``. The class tables point to no type info, so the GUID is searched in the data and the bytes before
+    it are checked."""
+    ps = img.psize
+    if len(guid) != 16 or guid == bytes(16):
+        return None
+    for s in img.sections:
+        if s.executable:
+            continue
+        i = s.data.find(guid)
+        while i >= 0:
+            at = s.va + i
+            for ln in range(1, 65):
+                ti = at - 1 - ps - ln - 2
+                hdr = img.read(ti, 2)
+                if hdr and hdr[0] == FPC_TKINTERFACE and hdr[1] == ln and _sstr(img, ti + 1) is not None:
+                    return ti
+            i = s.data.find(guid, i + 1)
+    return None
+
+
+def _fpc_intf_own(img: Image, ti: int) -> tuple[int, list[str], int | None] | None:
+    """(method count, method names, parent type info) of the interface type info at ``ti`` (FPC 3.2:
+    ``kind, name, ^^parent, flags, GUID, unit, TPropData, TIntfMethodTable``; FPC 3.0 has no method table, the
+    count is then -1). A method entry is ``^^result, u8 cc, u8 kind, u16 params, sizeint stack, ^name``, then
+    per parameter ``^^type, u16 flags, ^name, ^locs`` and ``^locs`` of the result."""
+    ps = img.psize
+    nm = _sstr_raw(img, ti + 1)
+    if nm is None:
+        return None
+    p = ti + 2 + nm[1]
+    cell = img.ptr(p)
+    parent = img.ptr(cell) if cell else None
+    un = _sstr_raw(img, p + ps + 17)
+    if un is None:
+        return None
+    q = p + ps + 18 + un[1]
+    n = _u16(img, q)
+    if n is None or n > MAX_PROPS:
+        return None
+    q += 2
+    for _ in range(n):
+        got = _fpc_prop_info(img, q)
+        if got is None:
+            return None
+        q += got[4]
+    cnt, rcnt = _u16(img, q), _u16(img, q + 2)
+    if cnt is None or rcnt is None or cnt > MAX_VIRTUAL:
+        return None
+    q += 4
+    if rcnt == 0xFFFF:
+        return cnt, [""] * cnt, parent
+    names: list[str] = []
+    for _ in range(cnt):
+        res, head = img.ptr(q), img.read(q + ps, 4)
+        np_ = img.ptr(q + 2 * ps + 4)
+        name = _sstr(img, np_) if np_ else None
+        if res is None or head is None or name is None:
+            return None
+        names.append(name)
+        q += 3 * ps + 4 + struct.unpack("<H", head[2:4])[0] * (3 * ps + 2) + (ps if res else 0)
+    return cnt, names, parent
+
+
+def _fpc_intf_names(img: Image, guid: bytes) -> list[str]:
+    """Method names of an interface by vtable slot (the parents' methods first), "" where unknown."""
+    ti = _fpc_intf_typeinfo(img, guid)
+    chain: list[list[str]] = []
+    seen: set[int] = set()
+    while ti and ti not in seen and len(chain) < MAX_INTF_CHAIN:
+        seen.add(ti)
+        k = img.read(ti, 1)
+        got = _fpc_intf_own(img, ti) if k and k[0] == FPC_TKINTERFACE else None
+        if got is None:
+            break
+        cnt, names, parent = got
+        if cnt < 0:
+            return []
+        chain.append(names)
+        ti = parent or 0
+    out: list[str] = []
+    for names in reversed(chain):
+        out.extend(names)
+    return out
+
+
+# ``sub`` instructions in front of the ``jmp`` of an interface thunk: (opcode bytes, length)
+_THUNK_PREFIXES = ((bytes([0x83, 0x6C, 0x24, 0x04]), 5), (bytes([0x81, 0x6C, 0x24, 0x04]), 8),   # sub [esp+4], n
+                   (bytes([0x48, 0x83]), 4), (bytes([0x48, 0x81]), 7),                           # sub rcx, n
+                   (bytes([0x83]), 3), (bytes([0x81]), 6), (bytes([0x2D]), 5))                   # sub eax, n
+
+
+def _fpc_thunk_target(img: Image, addr: int) -> int | None:
+    """Where an interface method thunk jumps: ``sub eax, off`` / ``sub [esp+4], off`` / ``sub rcx, off``, then
+    ``jmp rel32``. A slot without a thunk (offset 0) is its own target."""
+    b = img.read(addr, 16)
+    if not b:
+        return None
+    i = 0
+    for pat, size in _THUNK_PREFIXES:
+        if b.startswith(pat):
+            i = size
+            break
+    if b[i:i + 1] != bytes([0xE9]):
+        return addr if i == 0 else None
+    rel = struct.unpack("<i", b[i + 1:i + 5])[0]
+    return (addr + i + 5 + rel) & ((1 << (8 * img.psize)) - 1)
+
+
 def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], vtables: set[int],
-                    guid_names: dict[str, str]) -> tuple[list[DlMethod], list[DlField]]:
+                    guid_names: dict[str, str], known: dict[int, str] | None = None
+                    ) -> tuple[list[DlMethod], list[DlField]]:
     """Interfaces a class implements. Methods (kind ``interface``) are the code pointers of each interface
     vtable, named ``Interface.Method`` (``QueryInterface`` / ``_AddRef`` / ``_Release`` for the first three
     slots of a COM interface) or ``Interface.#n``; the field is the interface pointer at ``IOffset`` in the
-    object. The interface is named from ``guid_names`` / ``KNOWN_GUIDS`` or is its GUID text."""
+    object. The interface is named from ``guid_names`` / ``KNOWN_GUIDS`` or is its GUID text. Other slots are named,
+    in order, from the interface type info (FPC 3.2 with ``{$M+}``: method names), else from the class method the
+    slot's thunk jumps to (``known``: {code address: name} of the class and its ancestors), else ``#n``."""
     ps = img.psize
     methods: list[DlMethod] = []
     fields: list[DlField] = []
@@ -695,13 +812,25 @@ def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], v
         label = KNOWN_GUIDS.get(guid.upper(), "") or guid_names.get(guid.upper(), "") or guid or f"intf_{vt:x}"
         j = bisect_right(bounds, vt)
         stop = bounds[j] if j < len(bounds) else vt + MAX_VIRTUAL * ps
-        k = 0
-        while vt + k * ps < stop and k < MAX_VIRTUAL:
-            t = img.ptr(vt + k * ps)
+        slots: list[int] = []
+        while vt + len(slots) * ps < stop and len(slots) < MAX_VIRTUAL:
+            t = img.ptr(vt + len(slots) * ps)
             if t is None or not img.is_code(t):
                 break
-            methods.append(DlMethod("interface", k, f"{label}.{FPC_COM_SLOTS[k] if ref and k < 3 else '#' + str(k)}", t))
-            k += 1
+            slots.append(t)
+        rtti = _fpc_intf_names(img, img.read(img.ptr(ref), 16) or b"") if ref and img.ptr(ref) else []
+        if rtti and len(rtti) + 3 == len(slots):
+            rtti = list(FPC_COM_SLOTS) + rtti
+        if len(rtti) != len(slots):
+            rtti = []
+        for k, t in enumerate(slots):
+            if ref and k < 3:
+                nm = FPC_COM_SLOTS[k]
+            else:
+                tgt = _fpc_thunk_target(img, t)
+                nm = rtti[k] if rtti else ""
+                nm = nm or (known or {}).get(tgt if tgt is not None else -1, "") or f"#{k}"
+            methods.append(DlMethod("interface", k, f"{label}.{nm}", t))
         if typ == 0:
             fields.append(DlField(label, off, "interface"))
     return methods, fields
@@ -803,11 +932,13 @@ def parse_fpc_classes(img: Image, vslots: dict[str, dict[int, str]] | None = Non
         if tab:
             intf[vmt] = _fpc_intf_entries(img, tab)
     vtables = {e[1] for ents in intf.values() for e in ents}
+    _fpc_name_virtuals(by_vmt, vslots)
     for vmt, ents in intf.items():
-        ms, fs = _fpc_interfaces(img, ents, vtables, guid_names or {})
+        known = {m.addr: m.name for a in reversed(ancestors(by_vmt[vmt], by_vmt)) for m in a.methods
+                 if m.name and m.kind in ("published", "virtual", "message-str")}
+        ms, fs = _fpc_interfaces(img, ents, vtables, guid_names or {}, known)
         by_vmt[vmt].methods.extend(ms)
         by_vmt[vmt].fields.extend(fs)
-    _fpc_name_virtuals(by_vmt, vslots)
     for c in by_vmt.values():             # a property whose accessor an ancestor already declares belongs to it
         up_p = {(m.kind, m.addr) for a in ancestors(c, by_vmt)[1:] for m in a.methods if m.kind in PROP_KINDS}
         if up_p:

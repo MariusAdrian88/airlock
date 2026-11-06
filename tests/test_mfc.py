@@ -28,13 +28,17 @@ def runtime_class(b: Builder, name: str, size: int, base: int = 0, create: int =
     return b.data(raw)
 
 
-def disp_entries(b: Builder, entries: list[tuple], tail: tuple | None = None) -> int:
-    """entries: (name | None, dispid, params | None, vt, pfn, pfn_set, offset, flags)."""
+def disp_entries(b: Builder, entries: list[tuple], tail: tuple | None = None, wide: bool = False) -> int:
+    """entries: (name | None, dispid, params | None, vt, pfn, pfn_set, offset, flags). ``wide``: UTF-16 names
+    (a Unicode build: ``LPCTSTR``)."""
     fmt = mfc._fmt(b.ps)
     allones = 2 ** (8 * b.ps) - 1
     raw = b""
     for name, did, params, vt, pfn, pfs, off, flags in entries + [(None, -1, None, 0xFF, 0, 0, allones, 0)]:
-        n = b.data(name.encode() + b"\0", 1) if name is not None else 0
+        if name is None:
+            n = 0
+        else:
+            n = b.data(name.encode("utf-16-le") + b"\0\0", 2) if wide else b.data(name.encode() + b"\0", 1)
         pr = b.data(params + b"\0", 1) if params else 0
         raw += struct.pack(fmt, n, did, pr, vt, pfn, pfs, off, flags)
         if tail is not None:
@@ -42,8 +46,8 @@ def disp_entries(b: Builder, entries: list[tuple], tail: tuple | None = None) ->
     return b.data(raw)
 
 
-def dispmap(b: Builder, entries: list[tuple], base: int = 0) -> int:
-    ents = disp_entries(b, entries)
+def dispmap(b: Builder, entries: list[tuple], base: int = 0, wide: bool = False) -> int:
+    ents = disp_entries(b, entries, wide=wide)
     cnt = b.data(struct.pack("<I", 0xFFFFFFFF), 4)
     stock = b.data(struct.pack("<I", 0), 4)
     return b.data(b.ptr(base) + b.ptr(ents) + b.ptr(cnt) + b.ptr(stock))
@@ -69,6 +73,19 @@ def dialog_ctor(b: Builder, dialog_id: int, vtable: int, target: int) -> int:
     call_at = va + 3 + 5 + 2
     return b.code(b"\xff\x75\x08" + b"\x68" + struct.pack("<I", dialog_id) + b"\x8b\xce" + b"\xe8"
                   + struct.pack("<i", target - (call_at + 5)) + b"\xc7\x06" + struct.pack("<I", vtable) + b"\xc3")
+
+
+def dialog_ctor64(b: Builder, dialog_id: int, vtable: int, target: int, reg_form: int = 0) -> int:
+    """mov r8, rdx; mov edx, id; mov rcx, rbx; call target; lea rax,[rip+vtable]; mov [rbx], rax; ret (64-bit);
+    reg_form 1: the id goes to r8d (mov r8d, id) instead of edx."""
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    head = (b"\x4c\x8b\xc2" + b"\xba" + struct.pack("<I", dialog_id) if reg_form == 0
+            else b"\x48\x8b\xd6" + b"\x41\xb8" + struct.pack("<I", dialog_id))
+    call_at = va + len(head) + 3
+    body = head + b"\x48\x8b\xcb" + b"\xe8" + struct.pack("<i", target - (call_at + 5))
+    lea_at = va + len(body)
+    body += b"\x48\x8d\x05" + struct.pack("<i", vtable - (lea_at + 7)) + b"\x48\x89\x03" + b"\xc3"
+    return b.code(body)
 
 
 def build(ps: int):
@@ -106,6 +123,9 @@ def build(ps: int):
     if ps == 4:
         dialog_ctor(b, 1000, vt_dlg, base_ctor)
         dialog_ctor(b, 1001, vt_dlg2, base_ctor)
+    else:
+        dialog_ctor64(b, 1000, vt_dlg, base_ctor)
+        dialog_ctor64(b, 1001, vt_dlg2, base_ctor)
     return b, dict(msg_foo=msg_foo, msg_bar=msg_bar, msg_dlg=msg_dlg, msg_dlg2=msg_dlg2, msg_rtti=msg_rtti,
                    disp_foo=disp_foo, disp_rtti=disp_rtti, int_foo=int_foo, ev_dlg=ev_dlg, rc_foo=rc_foo,
                    rc_dlg=rc_dlg, vt_foo=vt_foo, vt_bar=vt_bar, vt_dlg=vt_dlg, vt_dlg2=vt_dlg2, h=h)
@@ -141,18 +161,14 @@ def test_anonymous_classes_get_names(built):
     assert by_addr[a["msg_foo"]] == "CFoo"
     assert by_addr[a["msg_dlg"]] == "CDlg"
     assert by_addr[a["msg_bar"]] == f"anon_CFoo_{a['msg_bar']:0{w}x}"          # derived: base from CRuntimeClass
-    if b.ps == 4:
-        assert by_addr[a["msg_dlg2"]] == "Dialog_About_Box"                     # dialog 1001 of the constructor
-    else:
-        assert by_addr[a["msg_dlg2"]] == f"anon_CDlg_{a['msg_dlg2']:0{w}x}"     # no constructor scan in 64-bit
+    assert by_addr[a["msg_dlg2"]] == "Dialog_About_Box"                         # dialog 1001 of the constructor
     rows = {c.name: c for c in res.classes}
     assert rows["CFoo"].source == "rc" and rows["CFoo"].size == 100 and rows["CFoo"].rc == a["rc_foo"]
     assert rows["CDlg"].base == "CFoo"                                          # no base map: the base CRuntimeClass
     bar = rows[f"anon_CFoo_{a['msg_bar']:0{w}x}"]
     assert bar.source == "inherited" and bar.base == "CFoo" and bar.rc == 0 and bar.map_addr == a["msg_bar"]
-    if b.ps == 4:
-        assert rows["CDlg"].dialog == "1000" and rows["Dialog_About_Box"].dialog == "1001"
-        assert rows["Dialog_About_Box"].base == "CDlg"
+    assert rows["CDlg"].dialog == "1000" and rows["Dialog_About_Box"].dialog == "1001"
+    assert rows["Dialog_About_Box"].base == "CDlg" and rows["Dialog_About_Box"].source == "dialog"
 
 
 def test_dispatch_map_entries(built):
@@ -209,6 +225,34 @@ def test_ctor_dialogs_needs_two_classes_and_known_ids():
     assert mfc.ctor_dialogs(Builder(8).image(), [], {1}) == {}
 
 
+def test_ctor_dialogs_64bit_forms():
+    b = Builder(8)
+    base = b.stub()
+    vt1, vt2, vt3, vt4 = (b.vtable(None, [b.stub()]) for _ in range(4))
+    dialog_ctor64(b, 1000, vt1, base)
+    dialog_ctor64(b, 1001, vt2, base, reg_form=1)                       # id in r8d
+    dialog_ctor64(b, 77, vt3, b.stub())                                 # unknown id, own target
+    # the id and call sit far before the vtable store: the call of another function, not this constructor's
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    far = b"\xba" + struct.pack("<I", 1000) + b"\xe8" + struct.pack("<i", base - (va + 10)) + b"\x90" * 60
+    lea_at = va + len(far)
+    b.code(far + b"\x48\x8d\x05" + struct.pack("<i", vt4 - (lea_at + 7)) + b"\x48\x89\x03\xc3")
+    img = b.image()
+    got = mfc.ctor_dialogs(img, [vt1, vt2, vt3, vt4], {1000, 1001, 77})
+    assert got == {vt1: 1000, vt2: 1001}
+    assert mfc.ctor_dialogs(img, [vt1, vt2], {1000}) == {}
+
+
+def test_symbol_class_needs_clear_votes():
+    fw = {"CWnd"}
+    sym = {1: "CMyWnd", 2: "CMyWnd", 3: "CWnd", 4: "CWnd", 5: "Other"}
+    assert mfc.symbol_class(sym, [1, 2, 3, 4, 99], fw) == "CMyWnd"           # framework namespaces do not vote
+    assert mfc.symbol_class(sym, [1, 3], fw) is None                         # a single vote
+    assert mfc.symbol_class(sym, [1, 2, 5], fw) == "CMyWnd"                  # 2 of 3
+    assert mfc.symbol_class({1: "A", 2: "A", 3: "B", 4: "B"}, [1, 2, 3, 4], fw) is None
+    assert mfc.symbol_class({1: "std::x", 2: "std::x"}, [1, 2], fw) is None  # not an identifier
+
+
 def test_names_helpers():
     assert mfc.ident("&Save As...") == "Save_As"
     assert mfc.ident("File\tCtrl+S") == "File"
@@ -216,6 +260,162 @@ def test_names_helpers():
     assert mfc.vts_name(0x45) == "double&" and mfc.vts_name(0x4E) == "LPCSTR" and mfc.vts_name(8) == "BSTR"
     assert mfc.guid_name(IDISPATCH) == "IDispatch"
     assert mfc.guid_name(bytes(range(16))).startswith("{03020100-0504-0706-0809-0A0B0C0D0E0F")
+
+
+PROP_NOTIFY = struct.pack("<IHH8s", 0x9BFBBC02, 0xEFF1, 0x101A, bytes.fromhex("84ed00aa00341d07"))
+
+
+def build_conn(ps: int):
+    """COleThing (rc; vtable slots: connection map, interface map), CRttiOle (RTTI; same two slots),
+    CLone (rc; only an interface map)."""
+    b = Builder(ps)
+    conn = intmap(b, [(PROP_NOTIFY, 0x30)])
+    iface = intmap(b, [(IDISPATCH, 16)])
+    conn2 = intmap(b, [(PROP_NOTIFY, 0x40), (IDISPATCH, 0x48)])
+    iface2 = intmap(b, [(IDISPATCH, 16), (IDISPATCH, 24)])
+    iface3 = intmap(b, [(PROP_NOTIFY, 8)])                      # an interface map: nothing precedes it
+    rc1 = runtime_class(b, "COleThing", 80)
+    vt1 = b.vtable(None, [b.getter(rc1), b.stub(), b.getter(conn), b.getter(iface)])
+    td = b.td(".?AVCRttiOle@@")
+    vt2 = b.vtable(b.col(td, b.chd([(td, 0)])), [b.stub(), b.getter(conn2), b.getter(iface2)])
+    rc3 = runtime_class(b, "CLone", 40)
+    b.vtable(None, [b.getter(rc3), b.stub(), b.getter(iface3)])
+    return b, dict(conn=conn, iface=iface, conn2=conn2, iface2=iface2, iface3=iface3, vt1=vt1, vt2=vt2)
+
+
+@pytest.fixture(params=[4, 8], ids=["x86", "x64"])
+def conn_built(request):
+    b, a = build_conn(request.param)
+    return b, a, b.image()
+
+
+def test_connection_maps_are_told_from_interface_maps(conn_built):
+    b, a, img = conn_built
+    classes, slots, maps = cpp.parse_image(img)
+    res = mfc.analyse(img, classes, slots, maps, None)
+    got = sorted((m.cls, m.kind, m.addr) for m in res.maps)
+    assert got == sorted([("COleThing", "connection", a["conn"]), ("COleThing", "interface", a["iface"]),
+                          ("CRttiOle", "connection", a["conn2"]), ("CRttiOle", "interface", a["iface2"]),
+                          ("CLone", "interface", a["iface3"])])
+    conn = next(m for m in res.maps if m.addr == a["conn"])
+    assert [(e.name, e.id) for e in conn.entries] == [("IPropertyNotifySink", 0x30)]
+    both = next(m for m in res.maps if m.addr == a["conn2"])
+    assert [e.name for e in both.entries] == ["IPropertyNotifySink", "IDispatch"]
+
+
+def test_mark_connections_needs_two_different_adjacent_maps(conn_built):
+    b, a, img = conn_built
+    cache: dict = {}
+    mfc.mark_connections(img, [a["iface"], a["iface"]], set(), cache)           # the same map twice
+    mfc.mark_connections(img, [None, a["iface3"], None], set(), cache)
+    assert mfc.kind_of(img, a["iface"], set(), cache)[0] == "interface"
+    assert mfc.kind_of(img, a["iface3"], set(), cache)[0] == "interface"
+    mfc.mark_connections(img, [a["conn"], a["iface"]], set(), cache)
+    assert mfc.kind_of(img, a["conn"], set(), cache)[0] == "connection"
+
+
+def test_tool_shows_connection_maps(tmp_path, conn_built):
+    b, a, img = conn_built
+    ctx = make_ctx(tmp_path)
+    bid = fill(ctx)
+    st = ctx.indexer.store("proj")
+    st.db.execute("UPDATE binary SET pointer_size=? WHERE id=?", (b.ps, bid))
+    st.db.commit()
+    classes, slots, maps = cpp.parse_image(img)
+    cpp.store_rows(st, bid, classes, slots, maps, mfc.analyse(img, classes, slots, maps, None))
+    summary = cpp_tools.mfc_message_maps(ctx).splitlines()
+    assert any(ln.startswith("COleThing connection map 0x") and ln.endswith("entries 1") for ln in summary)
+    out = cpp_tools.mfc_message_maps(ctx, "COleThing").splitlines()
+    i = next(k for k, ln in enumerate(out) if " connection map " in ln)
+    assert out[i + 1] == "connection IPropertyNotifySink offset 0x30"
+    j = next(k for k, ln in enumerate(out) if " interface map " in ln)
+    assert out[j + 1] == "interface IDispatch offset 0x10"
+
+
+def test_unicode_dispatch_names(conn_built):
+    b, a, img = conn_built
+    b = Builder(a and b.ps)
+    h = b.stub()
+    dm = dispmap(b, [("RefreshView", 1, None, 0, h, 0, 0, 0), ("A", 2, bytes([3]), 0, h, 0, 0, 0),
+                     ("Count", 3, None, 3, 0, 0, 0x20, 0)], wide=True)
+    ents = mfc.parse_dispmap(b.image(), dm)
+    assert [e.name for e in ents] == ["RefreshView", "A", "Count"]       # a one-letter name stays one letter
+    assert ents[1].extra == "args long" and ents[2].extra == "offset 0x20"
+    ansi = dispmap(b, [("Ab", 1, None, 0, h, 0, 0, 0), ("C", 2, None, 0, h, 0, 0, 0)])
+    assert [e.name for e in mfc.parse_dispmap(b.image(), ansi)] == ["Ab", "C"]
+
+
+# ── names from symbols and dialog resources ───────────────────────────────
+
+def test_symbol_names_the_derived_class(built):
+    b, a, img = built
+    classes, slots, maps = cpp.parse_image(img)
+    h = a["h"]
+    sym = {h["close"]: "CBarWnd", h["size"]: "CBarWnd", h["open"]: "CFoo"}      # CFoo owns a runtime class
+    res = mfc.analyse(img, classes, slots, maps, None, sym)
+    by_addr = {m.map_addr: m.cls for m in maps}
+    assert by_addr[a["msg_bar"]] == "CBarWnd" and by_addr[a["msg_foo"]] == "CFoo"
+    row = next(c for c in res.classes if c.name == "CBarWnd")
+    assert row.source == "symbols" and row.base == "CFoo" and row.map_addr == a["msg_bar"]
+
+
+def test_one_symbol_vote_is_not_enough(built):
+    b, a, img = built
+    classes, slots, maps = cpp.parse_image(img)
+    res = mfc.analyse(img, classes, slots, maps, None, {a["h"]["close"]: "CBarWnd"})
+    assert {m.map_addr: m.cls for m in maps}[a["msg_bar"]].startswith("anon_CFoo_")
+    assert all(c.source != "symbols" for c in res.classes)
+
+
+def build_join(ps: int):
+    """CDialog (rc, its own map) and a class derived from it whose map handles control 600; no constructor."""
+    b = Builder(ps)
+    h = b.stub()
+    msg0 = b.msgmap([(WM_COMMAND, 0, 1, 1, 12, h)])
+    msg_d = b.msgmap([(WM_COMMAND, 0, 600, 600, 12, h), (WM_COMMAND, 0, 1, 1, 12, h)])
+    msg_f = b.msgmap([(WM_COMMAND, 0, 600, 600, 12, h)])
+    rc = runtime_class(b, "CDialog", 100)
+    b.vtable(None, [b.getter(rc), b.stub(), b.getter(msg0)])
+    b.vtable(None, [b.getter(rc), b.stub(), b.getter(msg_d)])
+    rc2 = runtime_class(b, "CFrameWnd", 100)                    # not a dialog: no join
+    b.vtable(None, [b.getter(rc2), b.stub(), b.getter(b.msgmap([(WM_COMMAND, 0, 7, 7, 12, h)]))])
+    b.vtable(None, [b.getter(rc2), b.stub(), b.getter(msg_f)])
+    return b, msg_d, msg_f
+
+
+@pytest.mark.parametrize("ps", [4, 8], ids=["x86", "x64"])
+def test_dialog_class_named_by_its_control_ids(ps, monkeypatch):
+    monkeypatch.setattr(mfc, "_dialog_ids", lambda path: {1000: "Main", 1001: "About &Box..."})
+    monkeypatch.setattr(mfc, "_dialog_ctrls", lambda path: {1000: {1, 2, 500}, 1001: {1, 2, 600}})
+    b, msg_d, msg_f = build_join(ps)
+    img = b.image()
+    classes, slots, maps = cpp.parse_image(img)
+    res = mfc.analyse(img, classes, slots, maps, None)
+    by_addr = {m.map_addr: m.cls for m in maps}
+    assert by_addr[msg_d] == "Dialog_About_Box"
+    assert by_addr[msg_f].startswith("anon_CFrameWnd_")                   # base is no dialog class: no join
+    row = next(c for c in res.classes if c.name == "Dialog_About_Box")
+    assert row.dialog == "1001" and row.source == "dialog" and row.base == "CDialog"
+
+
+@pytest.mark.parametrize("ctrls", [{1000: {1, 600}, 1001: {1, 600}}, {1000: {1, 2}, 1001: {1, 3}}],
+                         ids=["two dialogs fit", "none fits"])
+def test_dialog_join_needs_exactly_one_dialog(ctrls, monkeypatch):
+    monkeypatch.setattr(mfc, "_dialog_ids", lambda path: {1000: "Main", 1001: "About"})
+    monkeypatch.setattr(mfc, "_dialog_ctrls", lambda path: ctrls)
+    b, msg_d, _ = build_join(4)
+    img = b.image()
+    classes, slots, maps = cpp.parse_image(img)
+    mfc.analyse(img, classes, slots, maps, None)
+    assert {m.map_addr: m.cls for m in maps}[msg_d].startswith("anon_CDialog_")
+
+
+def test_map_dialog_rules():
+    ents = lambda *ids: [cpp.MsgEntry(WM_COMMAND, 0, i, i, 12, 0) for i in ids]      # noqa: E731
+    assert mfc.map_dialog(ents(600, 1), {5: {1, 600}}) == 5
+    assert mfc.map_dialog(ents(1, 2), {5: {1, 2}}) is None                  # only IDOK..IDHELP
+    assert mfc.map_dialog([cpp.MsgEntry(WM_SIZE, 0, 0, 0, 19, 0)], {5: {1}}) is None
+    assert mfc.map_dialog([cpp.MsgEntry(WM_COMMAND, 0, 600, 700, 12, 0)], {5: {600}}) is None   # a range
 
 
 # ── store, tool ────────────────────────────────────────────────────────────

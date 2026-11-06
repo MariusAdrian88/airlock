@@ -152,15 +152,67 @@ def _resolve_function(program: Any, entry: Any) -> Any:
     return f
 
 
-def _unstub_calls(program: Any, rows: list[list[Any]]) -> None:
-    """A call to an airlock stub is recorded as a call of the routine the stub stands for (the C text
-    keeps the stub's name)."""
+def _unstub_calls(program: Any, rows: list[list[Any]], c_text: str) -> str:
+    """A call to an airlock stub becomes a call of the routine the stub stands for: the row target is
+    the routine's entry and the C text names the routine, not the stub (``Name_3`` -> ``Name``). Returns
+    the new C text; the offsets of all rows move with it."""
     rng = stubs.stub_range(program)
     if rng is None:
-        return
+        return c_text
+    fm = program.getFunctionManager()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    edits: list[tuple[list[Any], str]] = []
     for r in rows:
-        if r[0] == "call" and r[4] is not None and stubs.in_range(rng, r[4]):
-            r[4] = stubs.real_callee(program, r[4])
+        if r[0] != "call" or r[4] is None or not stubs.in_range(rng, r[4]):
+            continue
+        tag = stubs.real_target(program, r[4])
+        if tag is None:
+            continue
+        entry, n = tag
+        old = c_text[r[1]:r[2]]
+        suffix = f"_{n}"
+        if old.endswith(suffix) and len(old) > len(suffix):
+            new = old[:-len(suffix)]
+        else:
+            fn = fm.getFunctionAt(space.getAddress(entry))
+            new = str(fn.getName()) if fn is not None else old
+        r[4] = entry
+        if new != old:
+            edits.append((r, new))
+    if not edits:
+        return c_text
+    # rebuild the text left to right; every row after an edit moves by the length change
+    edits.sort(key=lambda x: x[0][1])
+    parts: list[str] = []
+    pos = 0
+    delta = 0
+    shifts: list[tuple[int, int]] = []        # (old end offset, cumulative delta after it)
+    for r, new in edits:
+        parts.append(c_text[pos:r[1]])
+        parts.append(new)
+        pos = r[2]
+        delta += len(new) - (r[2] - r[1])
+        shifts.append((r[2], delta))
+    parts.append(c_text[pos:])
+
+    def moved(off: int) -> int:
+        d = 0
+        for end, cum in shifts:
+            if off >= end:
+                d = cum
+            else:
+                break
+        return off + d
+
+    edited = {id(r): new for r, new in edits}
+    for r in rows:
+        new = edited.get(id(r))
+        s0, e0 = r[1], r[2]
+        r[1] = moved(s0)
+        r[2] = moved(e0) if new is None else r[1] + len(new)
+        if new is not None:
+            r[5] = new[:MAX_TOKEN_TEXT]
+    return "".join(parts)
 
 
 def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
@@ -187,7 +239,7 @@ def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
             out["status"] = "ok"
             out["c_text"] = c_text
             out["ast"] = _ast_rows(res.getCCodeMarkup(), res.getHighFunction(), c_text)
-            _unstub_calls(e.program, out["ast"])
+            out["c_text"] = c_text = _unstub_calls(e.program, out["ast"], c_text)
         callee_entries = sorted({r[4] for r in out["ast"] if r[0] == "call" and r[4] is not None})
     if with_version:
         from ghidra.framework import Application  # type: ignore

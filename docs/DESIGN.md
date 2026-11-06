@@ -1170,6 +1170,22 @@ rise of wrong names is at most 0.4 points in every run. Routines of at least 24 
 +0.0 to +0.2. The call-context pass names 900 to 1,200 routines per VCL program at 97 to 98% right; the accessors 90
 to 530 more at 96 to 99%. The console programs gain most (68% -> 88%): their routines are mostly RTL helpers that
 callers reach.
+**Unit rule for short matches** (`idr._drop_unsupported`, `IDR_VERSION` 11, Delphi sigdb only). A match under
+`SHORT_FIXED` (48) compared bytes keeps only the names whose unit (`idr.unit_of`: `Vcl.Dbgrids.TX.M` -> `vcl.dbgrids`)
+also has a match of at least 48 compared bytes in the binary; a name with no such unit is dropped, and the match with
+it. A routine of the runtime is linked with its unit, so a unit without any long match is not in the program, and
+the short code is a routine of the program that has the same bytes (an accessor, a `Destroy` that frees one field,
+the `Finalization` of a unit). The rule applies from 20 long matches (`UNIT_MIN_LONG`; a tiny test binary has none).
+Call-context votes use the pruned matches. **[verified]** Oracle on 10 sample programs (compilers 31, 34, 36, 37; VCL and
+FireDAC; 32 and 64 bit; map as truth), stage `+props`, library routines, all programs together: wrong 6,923 -> 6,678
+(3.80% -> 3.66%, -3.5%), right 152,893 -> 152,929 (83.84% -> 83.86%); routines of at least 24 bytes: wrong 4.28% -> 4.16%,
+right 92.18% -> 92.20%; routines of the program itself that got a runtime name: 23 -> 16 (the rest come from the
+call-context or accessor pass, or share a unit with a long match). Thresholds tried (24 / 32 / 48 / 64, code stage):
+wrong 6,621 -> 6,525 / 6,418 / 6,376 / 6,240, right -16 / +3 / -20 / -137: 48 is the last one that keeps the right names.
+Not kept: dropping short matches with many alias names (42% wrong, but 59% right) or without a named caller (5% wrong
+against 9%: too weak). Free Pascal: the same rule made the oracle worse (gui 32-bit right 83.3% -> 82.9%, wrong 0.2% ->
+0.3%; FPC unit names do not follow the Delphi shape), so it is off for `fpc-*.sigdb` files.
+
 Property accessors (section 11 "Delphi") come as hints, not as `idr_hits`. The oracle shows each stage: `sigdb`
 (code), `+calls`, `+props` (accessors by convention) and, for the last two, how many routines the stage named and
 how many of those are right.
@@ -2016,18 +2032,31 @@ program classes of an MFC application are built without `/GR`, so `find_msgmaps`
   tables can sit in between). A binary that keeps them apart falls back to "the only vtable of the class".
   Checked against RTTI as ground truth (the RTTI vtables treated as anonymous) on several programs and DLLs:
   almost all owners were right; the misses were framework classes whose own vtable was not found.
-- **Names** (`msgmap_entry.class` is rewritten, derived data): the runtime class name for the owner;
-  `Dialog_<caption>` (`_<id>` when the caption repeats) for a class whose constructor passes a dialog
-  resource id to the base constructor; `anon_<Base>_<map address>` for a class that inherits the
-  runtime class of `<Base>` (so the base is known); `anon_<map address>` when nothing identifies it. A map
-  reachable from several vtables goes to the owner whose runtime class is an ancestor of the others, and
-  is left alone when that is not unique.
-- **Dialog id from the constructor** (32-bit only): the constructor pushes the id and calls the
-  `CDialog` constructor, then stores the vtable pointer. Found by locating the `mov [reg], imm32` with the
-  vtable address in code and reading the 96 bytes before it for `push imm; ...; call rel32` with the call at
-  most 28 bytes before the store; the id must be a dialog resource of the binary and the call target must
-  be shared by at least two classes. **[verified]** on a program with dozens of dialog classes (the captions
-  match the class purpose). 64-bit constructors (`lea rax,[rip+d]`) are not scanned.
+- **Names** (`msgmap_entry.class` is rewritten, derived data), in this order: the runtime class name for the
+  owner; the class (namespace) that the disassembler gave the functions of the class (`symbols`: a PDB,
+  exports, renames; `mfc.symbol_class`: handlers of the map and the vtable slots, at least two votes and two
+  thirds of the namespaced functions, framework classes and non-identifiers do not vote); `Dialog_<caption>`
+  (`_<id>` when the caption repeats) for a class whose constructor passes a dialog resource id to the base
+  constructor, or (base runtime class named *Dialog, *Page, *FormView, *Sheet or *Wizard) a class whose map
+  handles single `WM_COMMAND` / `WM_NOTIFY` ids that exactly one dialog resource contains, one of them above
+  IDHELP (`mfc.map_dialog`); `anon_<Base>_<map address>` for a class that inherits the runtime class of
+  `<Base>` (so the base is known); `anon_<map address>` when nothing identifies it. A map reachable from
+  several vtables goes to the owner whose runtime class is an ancestor of the others, and is left alone when
+  that is not unique. `mfc_class.source`: `rc` | `symbols` | `dialog` | `inherited` | `routes`. **[verified]**
+  on a 32-bit static MFC program: the dialog classes get their names; the derived classes left over are
+  window sub-classes (CEdit / CStatic / CListBox / CWnd bases) with no command ids and no string in their
+  constructors that names them; no source in the binary names them (RTTI is absent, and so are file-name
+  strings in a release build).
+- **Dialog id from the constructor**: the constructor loads the id, calls the `CDialog` constructor, then
+  stores the vtable pointer. 32-bit: locate the `mov [reg], imm32` with the vtable address in code and read
+  the 96 bytes before it for `push imm; ...; call rel32` with the call at most 28 bytes before the store.
+  64-bit: locate `lea reg, [rip+d]` that resolves to the vtable, followed within 4 bytes by `mov [reg2], reg`
+  (the store to offset 0), and read the 96 bytes before it for `mov edx, imm32` (or `mov r8d, imm32`) ...
+  `call rel32` with the call at most 28 bytes before the `lea`. The id must be a dialog resource of the
+  binary and the call target must be shared by at least two classes. **[verified]** 32-bit on a program with
+  dozens of dialog classes (the captions match the class purpose). The 64-bit form follows the MSVC x64
+  constructor shape and is covered by unit tests only **[verify]** (no 64-bit MFC program without RTTI
+  was at hand: every 64-bit MFC binary found has RTTI).
 - **`mfc_class`** (schema v14): `name`, `vtable_addr` (the `GetRuntimeClass` slot), `rc_addr`, `obj_size`,
   `schema`, `base` (the owner of the base message map, else the base runtime class), `map_addr`,
   `dialog` (resource id), `source` (`rc` | `dialog` | `inherited` | `routes`, see "Route tables").
@@ -2090,7 +2119,10 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
   1). 32 bytes in 32-bit, 64 bytes in 64-bit (padding after `lDispID`, `vt` and `flags`). **[verified]** in
   32-bit on a program (method names, ids 1..N, `double&` out parameters, `BSTR` returns) and on an ActiveX
   control (`DISP_PROPERTY_NOTIFY` entries). The 64-bit layout is the same struct with 8-byte pointers
-  **[verify]**: no 64-bit binary with a non-empty dispatch map was at hand (unit tests cover the layout).
+  **[verified]** on a 64-bit MFC ActiveX control of Windows (a Unicode build, 13 entries: one property with
+  getter and setter, 12 methods; the table ends with the NULL / -1 entry, every `pfn` is a code address, the
+  `VTS_*` bytes read as plausible argument lists, `lDispID` is -1 for all). `lpszName` is an `LPCTSTR`: **UTF-16
+  in a Unicode build** (a name read as ANSI shows one letter), `mfc.disp_name` reads both **[verified]**.
 - Kind of an entry: `flags & 1` stock property (name empty, id from the stock table `STOCK_DISPIDS`);
   `pfn` and no `pfnSet`: method (`VTS_*` argument bytes: 2 short, 3 long, 4 float, 5 double, 8 BSTR,
   9 IDispatch*, 11 BOOL, 12 VARIANT, 0x4E `VTS_BSTR` = LPCSTR, 0x40 or'ed = by reference; `vt` is the
@@ -2100,12 +2132,23 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
 - `AFX_INTERFACEMAP`: base map, `pEntry` -> `{ piid (ptr to a GUID), nOffset (size_t) }` ending with
   `{ NULL, -1 }`. Shown as `interface IDispatch offset 0x10`; known IIDs (table `_IIDS`) by name, else the
   GUID. **[verified]** in 32-bit (IDispatch, IUnknown, OLE document interfaces) and on the 64-bit MFC DLLs.
+- `AFX_CONNECTIONMAP` (connection points): the same two pointers and the same entry as the interface map
+  (`piid` of an outgoing interface, `nOffset` of the `CConnectionPoint` member), so the shape cannot tell
+  them apart. The vtable can: in a `CCmdTarget` vtable `GetConnectionMap` is the slot right before
+  `GetInterfaceMap` (slot 15 and 16 after `GetRuntimeClass` is slot 0 of the group), so two different
+  interface-shaped maps in adjacent slots are (connection map, interface map) (`mfc.mark_connections`; a lone
+  interface-shaped map stays an interface map). Shown as `connection IPropertyNotifySink offset 0x2c8`, rows
+  `kind` = `connection`. **[verified]** on the 64-bit MFC 4.2 DLLs: `COleControl` has one connection entry
+  (`IPropertyNotifySink`) in the slot before its interface map (a long list of OLE interfaces); the same adjacent pair
+  appears nowhere else. The empty `CCmdTarget` map is not stored (a map needs an entry).
 - `AFX_EVENTSINKMAP`: base, `lpEntries`, `lpEntryCount`; entry = `AFX_DISPMAP_ENTRY` + `nCtrlIDFirst` +
   `nCtrlIDLast` (u32), ends like a dispatch map. Shown as `event dispid 7 ctrl 1000 -> handler`.
   **[verified]** in 32-bit (a dialog hosting a browser control) and on the 64-bit MFC DLLs.
 - Rows: `mfc_map_entry(binary_id, class, kind, map_addr, seq, name, id, vt, flags, pfn, pfn_set, extra)`,
-  `kind` = dispatch | interface | event; `extra` holds the argument types, the data offset or the
+  `kind` = dispatch | interface | event | connection; `extra` holds the argument types, the data offset or the
   control ids. `pfn` and `pfn_set` are candidates for the missing-function pass (`fnfix`, `FIX_VERSION` 4).
+- `CPP_VERSION` 4 (connection maps, 64-bit constructors, symbol and dialog-join names, UTF-16 dispatch names)
+  makes old projects derive again on open; no schema change (`kind` is free text).
 - Old projects: `CPP_VERSION` 2 makes `cpp.ensure_project` derive again on open (about 0.1 s per
   megabyte, no re-analysis); the schema migration only creates the two tables.
 
@@ -2288,7 +2331,7 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   IOffset; ^ShortString GUID text; u32 IType}` of 5 words (the last is padded: 20 bytes in 32-bit, 40 in
   64-bit). Rows `interface` (the code pointers of each interface vtable up to the next vtable or the first
   non-code word, named `Interface.Method`: `QueryInterface`/`_AddRef`/`_Release` for the first three slots
-  of a COM interface, else `#n`; an interface is named from `fpcsigs` GUID names, `IUnknown`/`IDispatch`, or
+  of a COM interface, then the method name of the interface type info (FPC 3.2 with `{$M+}`: `TIntfMethodTable` after the unit name and the property table, found by the GUID bytes; entry `^^result, u8 cc, u8 kind, u16 params, sizeint stack, ^name`, then per parameter `^^type, u16 flags, ^name, ^locs`; parents first), else the named class method that the slot's thunk (`sub eax|rcx|[esp+4], off; jmp code`) jumps to, else `#n`; an interface is named from `fpcsigs` GUID names, `IUnknown`/`IDispatch`, or
   is its GUID text) and one field per interface (name = interface, offset = `IOffset`, type `interface`).
   The init table (`vmtInitTable`, FPC 3.2): `kind, ShortString name`, then packed `ptr terminator, i32
   size, ptr, ptr, i32 count` and `{^^typeinfo; sizeint offset}` entries: managed fields (fields without a
@@ -2324,7 +2367,7 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   console program (32-bit) 86.5% right (94.6%), 0.1% wrong, 13.4% none (all three after the call-context pass;
   by code alone 80.4% / 79.4% / 79.4%). The `none` routines are mostly tiny or
   identical bodies (empty virtual stubs, accessors) that the matcher drops on purpose when one proc matches
-  more than `MAX_COPIES` functions. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
+  more than `MAX_COPIES` functions. **[verified]** index of FPC 3.2.2 Lazarus and console programs (32 and 64-bit) names 48% to 57% of all functions (`idr:` hints). FPC x86 indirect calls `CALL [reg+disp]` get a stub with the Free Pascal `register` convention (`delphistr.vcall_args`: EAX Self, EDX/ECX when loaded just before the call and not used for the vmt address, pushes right before the loads), named `vmt_<offset>_<regs>_<pushes>` and tagged `airlock:concat vcall <key>`; without it a hidden result pointer is not an argument for the decompiler. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
   `fpc_ansistr_concat_multi`) from Ghidra's own symbol loader.
 - Strings: `AnsiString` / `UnicodeString` literals are `{u16 codePage; u16 elemSize; (u32 pad on 64-bit);
   SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in

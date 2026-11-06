@@ -36,7 +36,7 @@ from airlock.index.store import Binary, Store
 
 log = logging.getLogger("airlock")
 
-CPP_VERSION = 3                   # 3: route tables (routes.py); 2: names for classes without RTTI, dispatch maps
+CPP_VERSION = 4                   # 4: connection maps, 64-bit dialog constructors, symbol / dialog class names, UTF-16 dispatch names; 3: route tables (routes.py); 2: names for classes without RTTI, dispatch maps
 CPP_META = "cpp_version"          # meta key prefix; the full key is ``cpp_version:<binary id>``
 
 MAX_SLOTS = 1024                  # slots read per vtable
@@ -670,7 +670,10 @@ def derive_binary(store: Store, binary_id: int, artifact: Path) -> tuple[int, in
         return 0, 0, 0
     classes, slots, maps = parse_image(img)
     from airlock.server import mfc                                  # lazy: mfc imports this module
-    extra = mfc.analyse(img, classes, slots, maps, artifact)         # renames anonymous maps in place
+    symbols = {r["entry"]: r["namespace"] for r in store.db.execute(
+        "SELECT entry, namespace FROM function WHERE binary_id=? AND namespace IS NOT NULL AND namespace<>''",
+        (binary_id,))}
+    extra = mfc.analyse(img, classes, slots, maps, artifact, symbols)   # renames anonymous maps in place
     store_rows(store, binary_id, classes, slots, maps, extra)
     return len(classes), len(slots), sum(len(m.entries) for m in maps)
 

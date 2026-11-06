@@ -173,3 +173,43 @@ def test_fpc_x64_literals():
 def test_fpc_x86_literals_use_the_delphi_header():
     buf = strrec("Animal: ", elem=1, cp=0) + strrec("Unicode", elem=2, cp=1200)
     assert [t for _a, _k, _n, t in D.scan_strrec(buf)] == ["Animal: ", "Unicode"]
+
+
+def _vc(base, disp=0x64):
+    return D.Ins("CALL", mem=(base, disp), call=True, writes=frozenset({"ESP"}))
+
+
+def test_fpc_marker():
+    assert D.fpc_marker(b"\0FPC 3.2.2 [2021/05/15] for i386 - Win32\0")
+    assert D.fpc_marker(b"FPC 3.0.4 [2017/10/06] for x86_64 - Win64")
+    assert not D.fpc_marker(b"Free Pascal 3.2.2") and not D.fpc_marker(b"FPC 3.2 [")
+
+
+def test_vcall_args_hidden_result_pointer():
+    # mov eax,[ebp-4]; lea edx,[ebp-0x1c]; mov ecx,[ebp-4]; mov ecx,[ecx]; call [ecx+0x64]  (nearest first)
+    before = [D.Ins("MOV", dst="ECX", writes=frozenset({"ECX"})), D.Ins("MOV", dst="ECX", writes=frozenset({"ECX"})),
+              D.Ins("LEA", dst="EDX", writes=frozenset({"EDX"})), D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}))]
+    assert D.vcall_args(_vc("ECX"), before) == (("EAX", "EDX"), 0)      # ECX holds the vmt, it is no argument
+    assert D.vcall_args(_vc("ESI"), before) == (("EAX", "EDX", "ECX"), 0)
+    assert D.vcall_key(0x64, ("EAX", "EDX"), 0) == "64.AD.0"
+    assert D.vcall_name("64.AD.0") == "vmt_64_ad_0"
+
+
+def test_vcall_args_stack_and_limits():
+    push = D.Ins("PUSH", src="EBX", writes=frozenset({"ESP"}))
+    other_call = D.Ins("CALL", call=True, writes=frozenset({"ESP"}))
+    edx = D.Ins("MOV", dst="EDX", writes=frozenset({"EDX"}))
+    assert D.vcall_args(_vc("EAX"), [push, push]) == (("EAX",), 2)                      # no register argument
+    assert D.vcall_args(_vc("EAX"), [push, other_call, edx, push]) == (("EAX",), 1)    # search ends at a call
+    assert D.vcall_args(_vc("EDX"), [edx]) == (("EAX",), 0)                           # EDX is the vmt pointer
+    assert D.vcall_args(_vc("EAX"), [D.Ins("JMP", jump=True), edx]) == (("EAX",), 0)
+
+
+def test_vcall_args_push_of_an_outer_call_is_not_counted():
+    # push 0xffff (for the concat call that follows); stores of the pieces; lea edx; mov eax; call [eax+0x64]
+    push = D.Ins("PUSH", imm=0xFFFF, writes=frozenset({"ESP"}))
+    store = D.Ins("MOV", mem=("EBP", -0x18), src="EAX")
+    lea = D.Ins("LEA", dst="EDX", writes=frozenset({"EDX"}))
+    selfload = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}))
+    assert D.vcall_args(_vc("ECX"), [selfload, lea, store, push]) == (("EAX", "EDX"), 0)
+    assert D.vcall_args(_vc("ECX"), [selfload, push, lea]) == (("EAX", "EDX"), 1)   # a push inside the setup counts

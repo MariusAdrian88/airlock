@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1210 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1240 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -103,15 +103,18 @@ M2 was checked end to end on a fresh analysis of the acceptance target
 (2026-11-05): resource and C++ tables, missing-function creation and the UI
 join all run at analysis time; estimate within 20% of the real time.
 
-1. MFC classes without RTTI are named from `CRuntimeClass`, the dialog id of the constructor and the
-   inherited runtime class (DESIGN "MFC classes without RTTI"). Left: a class with none of these stays
-   `anon_<map>`; `ctor_dialogs` reads 32-bit constructors only; a derived class that inherits a library
-   `CRuntimeClass` is named `anon_<Base>_<map>`, not by its own name.
+1. MFC classes without RTTI are named from `CRuntimeClass`, symbols (namespace of the handlers), the dialog id
+   of the constructor (32-bit and 64-bit), the dialog that holds the map's control ids, and the inherited
+   runtime class (DESIGN "MFC classes without RTTI"). Left: a class with none of these stays `anon_<map>`;
+   a derived class of a non-dialog base without symbols (window sub-classes of CEdit / CStatic / CWnd with no
+   command ids) is named `anon_<Base>_<map>`: the binary holds no other source of its own name. The 64-bit
+   constructor scan is covered by unit tests only (no 64-bit MFC program without RTTI was at hand).
 2. About 27% of visible functions are in `unclassified` clusters (mostly
    unnamed program code); `function_map` prints the coverage line.
-3. MFC dispatch, interface and event sink maps are decoded (`mfc_message_maps`, DESIGN "MFC dispatch,
-   interface and event sink maps"). Left: the 64-bit `AFX_DISPMAP_ENTRY` layout is not verified on a
-   real binary (unit tests only); `AFX_CONNECTIONMAP` (connection points) is not decoded.
+3. MFC dispatch, interface, event sink and connection maps are decoded (`mfc_message_maps`, DESIGN "MFC
+   dispatch, interface and event sink maps"). The 64-bit `AFX_DISPMAP_ENTRY` layout and the connection map
+   are verified on real 64-bit binaries. Left: a connection map of a class whose `GetConnectionMap` is an
+   `_AFXDLL` call into the MFC DLL is not seen (the getter is outside the image).
 
 Fixed on 2026-11-05 (issues 3-6, core agent):
 - Same name in several binaries (DESIGN 7.3 rule 9): `name@binary` qualifier, the session focus
@@ -275,7 +278,7 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   x86_64-win64, stripped and with `-g`) through the real worker: classes, fields with types, published methods,
   form tree, events to handlers and string literals with references. Tests: `tests/test_fpc.py`. FPC RTL / LCL signature databases
   (`fpcsigs`, `delphi-sigs fpc-build` / `fpc-oracle`, DESIGN §11), message / interface / init tables and
-  virtual slot names (`DELPHI_VERSION` 5, `IDR_VERSION` 10) are done. Open: other FPC versions (2.x, trunk) are not checked. Strings: Ghidra's own handling already finds the
+  virtual slot names (`DELPHI_VERSION` 5, `IDR_VERSION` 10) are done. Interface method names (`DELPHI_VERSION` 6): the FPC 3.2 interface type info (`{$M+}`) holds a method table, read by GUID; the thunk target of a slot is the second source (a published or named virtual method of the class). **[verified]** FPC 3.2.2 i386-win32 and x86_64-win64: `Greet` / `Count` for slots 3 and 4 of a `{$M+}` interface; an interface without type info keeps `#n`. **[verified]** live (Ghidra 12.1.4, `index` of two Lazarus form programs and two console programs, 32 and 64-bit, stripped, through the real indexer): the FPC sigdb `ensure` path names 675 of 1329 (t1 32-bit), 700 of 1447 (t1 64-bit), 5888 of 10320 (Lazarus 32-bit) and 6225 of 11173 (Lazarus 64-bit) functions, shown as `idr:` hints by `function`; four programs index in 244 s. FPC x86 `CALL [reg+disp]` (virtual / interface calls) gets a stub per (vmt offset, register arguments, stack arguments) with the `register` convention (EAX Self, EDX, ECX, rest on the stack; `delphistr` VERSION 5, collector 10): before, a hidden result pointer (`LEA EDX,[local]`) was lost and the decompiler printed `uStack_10 = 0` where the value is the result of the virtual call; after, the C reads `vmt_64_ad_0(self,&uStack_20); uStack_10 = uStack_20;` (x64 was right already: its `RDX` is a known parameter). Open: only FPC 3.2.2 is checked. FPC 3.0.4 could not be installed: its Inno Setup installer refuses to run beside FPC 3.2.2 (it asks to uninstall it) and unpacking it needs an extractor that was not allowed. Strings: Ghidra's own handling already finds the
   literals and their references (ANSI and UTF-16), also in 64-bit; the 64-bit FPC string header has 8-byte
   `refCount` / `length` (24 bytes before the data) and `delphistr._STRREC` (4-byte refcount) does not match it.
 - IDR names (`server/idr.py`, `tests/test_idr.py`, DESIGN §11 "Delphi"): optional, config key `idr_kb_dir`
@@ -523,7 +526,7 @@ Failure patterns (round 4):
   (x86 and x64) is pointed, by a primary CALL_OVERRIDE_UNCONDITIONAL reference, at a 1-byte stub function in the block
   `airlock_stubs` with custom storage for exactly its n pieces, so the C lists every piece in order
   (x86 pushes left to right, so a plain signature came out reversed; x64 varargs lost the stack pieces). The PRE
-  comment remains only where no stub could be made. **[verified]** live (Ghidra 12.1.4, x86 and x64 Delphi programs, opened through the MCP tools): outline / function_map / search / xrefs / callgraph / function show no stub and no `airlock_stubs` block; a caller's callgraph edge goes to the real concat routine; the C lists every piece; renaming the routine renames its stubs (the C then reads `NewName_3/*0x...*/(...)`); a project at collector 7 reruns only the string pass on open. Collector 8: the caps are 255 pieces and 1024 stubs (no sample came near the old 64 / 256); Free Pascal x64 literals (24-byte header `u16 codePage; u16 elemSize; u32 pad; i64 refCount; i64 length`, `scan_strrec64`) are typed and their callee parameters retyped (Free Pascal 32-bit uses the Delphi 12-byte header and needed nothing). FPC concat routines (`fpc_*_concat`: fixed registers; `_multi`: an open array built in a stack array) and the Delphi fixed-register forms (`UStrCat3`, `LStrCat3`) need no stub: the decompiler already lists their pieces (as arguments, or as the stores into the array). `create_functions` refuses an address in the stub block like `set_comment`.
+  comment remains only where no stub could be made. **[verified]** live (Ghidra 12.1.4, x86 and x64 Delphi programs, opened through the MCP tools): outline / function_map / search / xrefs / callgraph / function show no stub and no `airlock_stubs` block; a caller's callgraph edge goes to the real concat routine; the C lists every piece; renaming the routine renames its stubs; a project at collector 7 reruns only the string pass on open. Collector 9 (`delphistr.VERSION` 4, so the Delphi decompiles are recomputed; a project at collector 8 reruns only the string pass): the decompile op rewrites a call of a stub to the routine itself (`decompile._unstub_calls`: the row target is the routine's entry, the C text names the routine and not `Name_3`, all token offsets move with the text), so the C reads `LStrCatN(...)` with the real entry address in the `/*0x...*/` note and never shows a stub name or address; every output that prints C (function, diff, dataflow, bulk pass) takes the one worker result. Piece lists are untouched. Collector 8: the caps are 255 pieces and 1024 stubs (no sample came near the old 64 / 256); Free Pascal x64 literals (24-byte header `u16 codePage; u16 elemSize; u32 pad; i64 refCount; i64 length`, `scan_strrec64`) are typed and their callee parameters retyped (Free Pascal 32-bit uses the Delphi 12-byte header and needed nothing). FPC concat routines (`fpc_*_concat`: fixed registers; `_multi`: an open array built in a stack array) and the Delphi fixed-register forms (`UStrCat3`, `LStrCat3`) need no stub: the decompiler already lists their pieces (as arguments, or as the stores into the array). The array element that a virtual call fills (FPC x86) is right only with the vcall stub above. `create_functions` refuses an address in the stub block like `set_comment`.
 - Binary named by project name: Haiku passed `binary=ohm` (4 errors in t7/t8); the error lists the one binary, but
   with a single binary the tool could just use it.
 - Other errors are wrong tool choices: `delphi_classes` on a Qt project, `dotnet_types kind=methods`,
@@ -533,6 +536,13 @@ Files (tasks, launcher, transcripts, source copies) are in the session scratchpa
 
 ## Next
 
+- Done 2026-11-06 (stub names, sigdb unit rule, Qt recheck): (1) decompiled calls to a concat stub name the real routine
+  and its real address (Collector 9 above; live check on a Delphi program: `UStrCatN_probe/*0x0040515c*/(&local_c,3,param_2,local_10,local_8)`,
+  pieces intact). (2) DESIGN 11 "Unit rule for short matches": wrong library names 3.80% -> 3.66%, right 83.84% -> 83.86%,
+  own routines with a runtime name 23 -> 16; `IDR_VERSION` 11. (3) Qt after the stub filter, on copies of the analysed
+  projects: rpi-imager ptr 5/5, slots 21/21, invokables 60/60, signals 14/19, string pairs 26 (5 by call site + 21 guessed by
+  order since the Qt5 MinGW change); DB Browser ptr 667 sites, 665 resolved (was 640/604), string 316 + 10 guessed = 326.
+  No regression. Left: the unit rule does not help Free Pascal; the oracle programs hold few own routines (9 to 54).
 - Qt: a few virtual member-pointer connects stay `vtable+0x..`: the receiver is a field stored by another function (`this->ui->x` set in a separate `setupUi`), the result of a getter that returns a field, or a class whose virtual lives only in another DLL. No open site needs function pointers stored in structs. Statically linked Qt is not scanned.
 - Delphi: `delphi-sigs kit` makes a small rebuild kit of an install, `delphi-sigs oracle` is the supported
   oracle measurement (DESIGN §11); the sigdb no longer stores records the matcher drops (import stubs), and a

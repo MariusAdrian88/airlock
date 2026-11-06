@@ -65,14 +65,19 @@ def stub_functions(program: Any) -> list[tuple[Any, int, int]]:
     return out
 
 
-def real_callee(program: Any, off: int) -> int:
-    """The routine a stub at offset ``off`` stands for; ``off`` itself when it is no stub."""
+def real_target(program: Any, off: int) -> tuple[int, int] | None:
+    """(routine entry, piece count) of the stub at offset ``off``; None when ``off`` is no stub."""
     rng = stub_range(program)
     if not in_range(rng, off):
-        return off
+        return None
     fn = program.getFunctionManager().getFunctionAt(
         program.getAddressFactory().getDefaultAddressSpace().getAddress(off))
-    tag = parse_tag(fn.getComment()) if fn is not None else None
+    return parse_tag(fn.getComment()) if fn is not None else None
+
+
+def real_callee(program: Any, off: int) -> int:
+    """The routine a stub at offset ``off`` stands for; ``off`` itself when it is no stub."""
+    tag = real_target(program, off)
     return tag[0] if tag is not None else off
 
 

@@ -533,6 +533,7 @@ def read_sigdb(path: Path, label: str = "") -> idr.Kb:
         (n,) = struct.unpack_from("<I", raw, len(MAGIC))
         body = zlib.decompress(raw[len(MAGIC) + 4 + n:])
         kb = idr.Kb(label or path.stem)
+        kb.unit_support = not path.name.startswith("fpc-")     # the unit rule is measured for Delphi only
         p = 0
         count = int(head["count"])
         kb.total = count

@@ -232,9 +232,27 @@ def test_decompile_calls_point_at_the_real_routine():
     p = Program()
     rows = [["call", 0, 4, 0x402010, LO, "RealConcat_3"], ["call", 5, 9, 0x402020, 0x401000, "RealConcat"],
             ["call", 9, 12, 0x402030, None, "x"], ["str_ref", 0, 1, 0, LO, "s"]]
-    decompile._unstub_calls(p, rows)
-    assert [r[4] for r in rows] == [0x401000, 0x401000, None, LO]      # only call rows change; text keeps the stub name
-    assert rows[0][5] == "RealConcat_3"
+    decompile._unstub_calls(p, rows, "abcd efghijkl")
+    assert [r[4] for r in rows] == [0x401000, 0x401000, None, LO]      # only call rows change
+
+
+def test_decompile_text_names_the_real_routine():
+    p = Program()
+    text = "x = RealConcat_3(a, \"s\"); y = RealConcat_3(b); z = q(c);"
+    s1 = text.index("RealConcat_3")
+    s2 = text.index("RealConcat_3", s1 + 1)
+    s3 = text.index("q(")
+    s4 = text.index('"s"')
+    rows = [["call", s1, s1 + 12, 0x402010, LO, "RealConcat_3"],
+            ["str_ref", s4, s4 + 3, 0, 0, '"s"'],
+            ["call", s2, s2 + 12, 0x402020, LO, "RealConcat_3"],
+            ["call", s3, s3 + 1, 0x402030, 0x401000, "q"]]
+    out = decompile._unstub_calls(p, rows, text)
+    assert out == 'x = RealConcat(a, "s"); y = RealConcat(b); z = q(c);'
+    for r in rows:
+        assert out[r[1]:r[2]] == r[5]
+    assert [r[4] for r in rows if r[0] == "call"] == [0x401000] * 3
+    assert "_3" not in out and hex(LO) not in out
 
 
 def test_rename_follows_the_routine(monkeypatch):

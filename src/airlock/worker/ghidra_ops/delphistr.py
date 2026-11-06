@@ -51,7 +51,9 @@ CONCAT_MARK = "concat "  # PRE comments the pass writes start with this; it repl
 STUB_STRIDE = 16
 STUB_SLOTS = 1024         # stubs per program: one per (routine, piece count)
 MAX_STUB_PIECES = 255     # the count of a concatenation call is a byte
-VERSION = 3              # of the pass; stored in the program (options "airlock", delphi_strings)
+MAX_VCALL_STUBS = 512     # stubs for indirect calls of Free Pascal x86 (virtual and interface methods)
+VCALL_WINDOW = 12         # instructions searched backwards for the register arguments of such a call
+VERSION = 5              # of the pass; stored in the program (options "airlock", delphi_strings)
 
 # codePage(2) elemSize(2)=1|2 refCnt(4)=-1: the 8 bytes that end 4 bytes before the characters
 _STRREC = re.compile(rb"(?s)..[\x01\x02]\x00\xff\xff\xff\xff")
@@ -296,6 +298,54 @@ def is_concat(sites: list[tuple[int | None, int]]) -> bool:
     return good >= 3 and good * 5 >= len(sites) * 4
 
 
+_FPC_MARK = re.compile(rb"FPC \d+\.\d+\.\d+ \[")
+
+
+def fpc_marker(buf: bytes) -> bool:
+    """True when ``buf`` holds the version string of the Free Pascal RTL (``FPC 3.2.2 [2021/05/15] for ...``)."""
+    return _FPC_MARK.search(buf) is not None
+
+
+def vcall_args(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int]:
+    """(register arguments, stack arguments) of an indirect call ``CALL [reg + disp]`` of Free Pascal x86, whose
+    ``register`` convention passes ``Self`` in EAX, the next arguments in EDX and ECX (a hidden result pointer
+    of a string result comes first, as ``LEA EDX, [local]``) and the rest on the stack. ``before`` holds the
+    instructions before the call, nearest first; the search ends at the previous call or branch, or at the first
+    instruction that is neither a push nor a load of EAX, EDX or ECX (a push further back belongs to an outer
+    call, as the code page of a string concatenation that the call sits in). A register
+    that the call's own address uses (``MOV ECX, [ECX]`` for the vmt) is not an argument. EAX is always one."""
+    base = call.mem[0] if call.mem else ""
+    wrote: set[str] = set()
+    pushes = 0
+    for x in before[:VCALL_WINDOW]:
+        if x.jump or x.call:
+            break
+        if x.mn == "PUSH":
+            pushes += 1
+        elif x.mem is None and x.writes & {"EAX", "EDX", "ECX"}:
+            wrote |= {"EDX", "ECX"} & x.writes
+        else:
+            break               # a store or another register: what is further back belongs to other code
+    wrote.discard(base)
+    regs = ["EAX"]
+    if wrote:
+        regs.append("EDX")      # a later register argument needs the earlier ones
+        if "ECX" in wrote and base != "EDX":
+            regs.append("ECX")
+    return tuple(regs), pushes
+
+
+def vcall_key(disp: int, regs: tuple[str, ...], pushes: int) -> str:
+    """Identity of a stub for an indirect call; also its tag text."""
+    return f"{disp & 0xFFFFFFFF:x}.{''.join(r[1] for r in regs)}.{pushes}"
+
+
+def vcall_name(key: str) -> str:
+    """Function name of a stub (``vmt_64_ad_0``: vmt offset 0x64, registers EAX and EDX, no stack arguments)."""
+    disp, regs, pushes = key.split(".")
+    return f"vmt_{disp}_{regs.lower()}_{pushes}"
+
+
 def _c_quote(kind: str, text: str, limit: int = 60) -> str:
     t = text if len(text) <= limit else text[:limit] + "..."
     t = t.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
@@ -524,6 +574,7 @@ class _Stubs:
         self.program = program
         self.block: Any = None
         self.by_key: dict[tuple[int, int], Any] = {}
+        self.by_vcall: dict[str, Any] = {}
         self.next_slot = 0
         self.failed = False
         blk = program.getMemory().getBlock(STUB_BLOCK)
@@ -538,7 +589,10 @@ class _Stubs:
                                      int(fn.getEntryPoint().subtract(blk.getStart())) // STUB_STRIDE + 1)
                 if tag.startswith(STUB_TAG):
                     e, n = tag[len(STUB_TAG):].split()
-                    self.by_key[(int(e, 16), int(n))] = fn.getEntryPoint()
+                    if e == "vcall":
+                        self.by_vcall[n] = fn.getEntryPoint()
+                    else:
+                        self.by_key[(int(e, 16), int(n))] = fn.getEntryPoint()
             _rename_stubs(program)      # a routine renamed since the last run: its stubs follow
 
     def _make_block(self) -> bool:
@@ -563,6 +617,50 @@ class _Stubs:
             return False
         self.block = blk
         return True
+
+    def get_vcall(self, key: str, regs: tuple[str, ...], pushes: int) -> Any:
+        """Entry of the stub of an indirect call of Free Pascal x86: ``Self`` and the register arguments in
+        EAX, EDX, ECX, then ``pushes`` stack arguments (the first one pushed is the deepest), result in EAX,
+        the callee pops the stack arguments. None when none can be made."""
+        from ghidra.program.model.address import AddressSet  # type: ignore
+        from ghidra.program.model.data import PointerDataType, Undefined4DataType, VoidDataType  # type: ignore
+        from ghidra.program.model.listing import Function, ParameterImpl, VariableStorage  # type: ignore
+        from ghidra.program.model.symbol import SourceType  # type: ignore
+        from java.util import ArrayList  # type: ignore
+        if key in self.by_vcall:
+            return self.by_vcall[key]
+        if self.failed or len(self.by_vcall) >= MAX_VCALL_STUBS:
+            return None
+        if self.block is None and not self._make_block():
+            self.failed = True
+            return None
+        if self.next_slot >= STUB_SLOTS or (self.next_slot + 1) * STUB_STRIDE > int(self.block.getSize()):
+            return None
+        prog = self.program
+        at = self.block.getStart().add(self.next_slot * STUB_STRIDE)
+        lang = prog.getLanguage()
+        stack = prog.getAddressFactory().getStackSpace()
+        word = Undefined4DataType.dataType
+        try:
+            fn = prog.getFunctionManager().createFunction(vcall_name(key), at, AddressSet(at, at),
+                                                          SourceType.USER_DEFINED)
+            params = ArrayList()
+            for i, r in enumerate(regs):
+                typ = PointerDataType(VoidDataType.dataType, 4) if i == 0 else word
+                params.add(ParameterImpl("self" if i == 0 else f"a{i}", typ,
+                                         VariableStorage(prog, [lang.getRegister(r)]), prog))
+            for i in range(pushes):
+                params.add(ParameterImpl(f"s{i}", word,
+                                         VariableStorage(prog, stack.getAddress(4 + 4 * (pushes - 1 - i)), 4), prog))
+            fn.replaceParameters(params, Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
+            fn.setReturnType(word, SourceType.USER_DEFINED)
+            fn.setStackPurgeSize(4 * pushes)
+            fn.setComment(f"{STUB_TAG}vcall {key}")
+        except Exception:  # noqa: BLE001  the call stays as it is
+            return None
+        self.next_slot += 1
+        self.by_vcall[key] = at
+        return at
 
     def get(self, f: Any, n: int, kinds: set[str], ptr: int) -> Any:
         """Entry of the stub for ``n`` pieces of routine ``f``; None when none can be made."""
@@ -706,6 +804,41 @@ def _comment_concat(program: Any, f: Any, lits: dict[int, tuple[str, int, int]],
         out["comments"] += 1
 
 
+def _override_vcalls(program: Any, stubs: _Stubs, out: dict[str, int]) -> None:
+    """Free Pascal x86: point each ``CALL [reg + disp]`` (virtual and interface methods) at a stub with the
+    registers and stack slots of the ``register`` convention. Without it the decompiler knows no register
+    argument of such a call: a hidden result pointer (``LEA EDX, [local]``) is lost and the local reads as
+    the value stored before the call (``x = 0``)."""
+    from ghidra.program.model.symbol import RefType, SourceType  # type: ignore
+    listing = program.getListing()
+    refman = program.getReferenceManager()
+    for call in listing.getInstructions(True):
+        ft = call.getFlowType()
+        if not ft.isCall() or not ft.isComputed() or _in_stubs(program, call.getAddress()):
+            continue
+        v = _view(call, 4)
+        if v.mem is None or v.mem[0] in ("?", "ESP", "EBP"):
+            continue
+        views, _raw = _before(call, 4, None)
+        regs, pushes = vcall_args(v, views)
+        key = vcall_key(v.mem[1], regs, pushes)
+        at = stubs.get_vcall(key, regs, pushes)
+        if at is None:
+            continue
+        mine = {str(a) for a in stubs.by_vcall.values()}
+        old = [x for x in call.getReferencesFrom() if x.getReferenceType() == RefType.CALL_OVERRIDE_UNCONDITIONAL]
+        if old and not all(str(x.getToAddress()) in mine for x in old):
+            continue            # somebody else's override
+        if old and all(str(x.getToAddress()) == str(at) for x in old):
+            continue            # up to date
+        for x in old:           # a stub of an earlier run with other arguments
+            refman.delete(x)
+        ref = refman.addMemoryReference(call.getAddress(), at, RefType.CALL_OVERRIDE_UNCONDITIONAL,
+                                        SourceType.USER_DEFINED, 0)
+        refman.setPrimary(ref, True)
+        out["vcalls"] += 1
+
+
 def apply_delphi_strings(program: Any, monitor: Any = None) -> dict[str, int]:
     """Define Delphi string literals and retype the call parameters that receive them. Idempotent; must
     run inside a transaction. Programs without Delphi literals cost a byte scan of their blocks."""
@@ -739,7 +872,7 @@ def apply_delphi_strings(program: Any, monitor: Any = None) -> dict[str, int]:
                     lits[a] = (kind, nbytes, 24)
                     texts[a] = text
     out = {"literals": len(lits), "old": 0, "wide": 0, "short": 0, "defined": 0, "cleared": 0, "sites": 0,
-           "params": 0, "stack_params": 0, "concat": 0, "varargs": 0, "overrides": 0, "comments": 0}
+           "params": 0, "stack_params": 0, "concat": 0, "varargs": 0, "overrides": 0, "comments": 0, "vcalls": 0}
     modern = len(lits) >= MIN_LITERALS
     if not modern:
         lits.clear()
@@ -857,5 +990,8 @@ def apply_delphi_strings(program: Any, monitor: Any = None) -> dict[str, int]:
             out["stack_params"] += bool(p.isStackVariable())
         except Exception:  # noqa: BLE001  one odd signature must not stop the pass
             continue
+    if ptr_size == 4 and any(fpc_marker(_block_bytes(b)) for b in mem.getBlocks()
+                             if b.isInitialized() and not b.isOverlay() and str(b.getName()) != STUB_BLOCK):
+        _override_vcalls(program, stubs, out)
     program.getOptions("airlock").setInt("delphi_strings", VERSION)
     return out
