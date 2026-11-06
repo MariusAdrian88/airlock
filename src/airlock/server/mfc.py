@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import struct
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -38,6 +39,7 @@ NEAR = 0x4000                    # the vtable of a class is the closest one this
 MAX_DISP = 4096
 CALL_TO_STORE = 28              # bytes between the base constructor call and the vtable store
 MAX_INTF = 64
+CONN_SLOT = 15                   # GetConnectionMap in a CCmdTarget vtable, counted from GetRuntimeClass
 KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT, KIND_CONNECTION = "dispatch", "interface", "event", "connection"
 EXTRA_KINDS = (KIND_DISPATCH, KIND_INTERFACE, KIND_EVENT, KIND_CONNECTION)
 _IDENT = re.compile(rb"^[A-Za-z_][A-Za-z0-9_]{1,79}$")
@@ -356,6 +358,12 @@ def mark_connections(img: cpp.Image, getters: list[int | None], msg_addrs: set[i
         ka, kb = kind_of(img, a, msg_addrs, cache), kind_of(img, b, msg_addrs, cache)
         if ka and kb and ka[0] == KIND_INTERFACE and kb[0] == KIND_INTERFACE:
             cache[a] = (KIND_CONNECTION, ka[1])
+    # shared MFC (``_AFXDLL``): the class inherits ``GetInterfaceMap`` from the DLL, so no getter follows its own
+    # connection map; the slot number then tells (slot 0 = ``GetRuntimeClass``)
+    if len(getters) > CONN_SLOT + 1 and getters[CONN_SLOT] is not None and getters[CONN_SLOT + 1] is None:
+        k = kind_of(img, getters[CONN_SLOT], msg_addrs, cache)           # type: ignore[arg-type]
+        if k and k[0] == KIND_INTERFACE:
+            cache[getters[CONN_SLOT]] = (KIND_CONNECTION, k[1])           # type: ignore[index]
 
 
 # ── names ──────────────────────────────────────────────────────────────────
@@ -451,23 +459,34 @@ class Mfc:
     maps: list[ExtraMap] = field(default_factory=list)
 
 
-_CALL_AFTER_PUSH = re.compile(rb"(?:\x68(....)|\x6a(.)).{0,6}?\xe8(....)", re.S)
+# zero-width: a `push 0` before `push id` must not swallow the E8 byte inside the id (1000 = 0x3E8)
+_CALL_AFTER_PUSH = re.compile(rb"(?=(?:\x68(....)|\x6a(.)).{0,6}?\xe8(....))", re.S)
 
 
-_ID64 = re.compile(rb"(?:\xba(....)|\x41\xb8(....)).{0,14}?\xe8(....)", re.S)
+_ID64 = re.compile(rb"(?=(?:\xba(....)|\x41\xb8(....)).{0,14}?\xe8(....))", re.S)
 _LEA_RIP = re.compile(rb"[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d](....)", re.S)
 
 
 def _stores_vtable(lea: bytes, tail: bytes) -> bool:
-    """``tail`` (the bytes after ``lea reg, [rip+d]``) starts, within 4 bytes, with ``mov [reg2], reg`` (mod 00,
-    no SIB or disp32): the store of the vtable pointer to offset 0 of the object."""
+    """``tail`` (the bytes after ``lea reg, [rip+d]``) starts, within 4 bytes, with ``mov [mem], reg`` (``mem``:
+    a register, with a SIB byte or a disp8 / disp32; not RIP-relative): the store of the vtable pointer to
+    the object. A heap object gives ``[rbx]``; a stack object, whose constructor was inlined, ``[rsp+40h]``."""
     reg = ((lea[2] >> 3) & 7) | ((lea[0] & 4) << 1)
     for k in range(0, 5):
         if k + 2 < len(tail) and tail[k] in (0x48, 0x49, 0x4C, 0x4D) and tail[k + 1] == 0x89:
             md = tail[k + 2]
-            if md & 0xC0 == 0 and md & 7 not in (4, 5) and ((md >> 3) & 7) | ((tail[k] & 4) << 1) == reg:
+            if md >> 6 == 3 or (md >> 6 == 0 and md & 7 == 5):          # a register, or [rip+d]
+                continue
+            if ((md >> 3) & 7) | ((tail[k] & 4) << 1) == reg:
                 return True
     return False
+
+
+# ``mov dword [mem], imm32`` (C7 /0 imm32; ``mem``: a register, a register plus disp8 / disp32, with or without a SIB
+# byte; not an absolute address). Zero-width, so overlapping candidates are all seen.
+_STORE32 = re.compile(
+    rb"(?=\xC7(?:[\x00-\x03\x06\x07]|\x04.|[\x40-\x43\x45-\x47].|\x44..|[\x80-\x83\x85-\x87]....|\x84.....)(....))",
+    re.S)
 
 
 def ctor_dialogs(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -> dict[int, int]:
@@ -485,30 +504,25 @@ def ctor_dialogs(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -
 
 
 def _ctor_dialogs32(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]) -> dict[int, tuple[int, int]]:
-    code = [(s.va, s.data) for s in img.sections if s.executable]
+    want = set(vtables)
     found: dict[int, tuple[int, int]] = {}
-    for vt in vtables:
-        pat = struct.pack("<I", vt)
-        for va, data in code:
-            i = data.find(pat)
-            while i >= 0:
-                if i >= 2 and data[i - 2] == 0xC7 and data[i - 1] & 0xF8 == 0 and data[i - 1] not in (4, 5):
-                    lo = max(0, i - 2 - 96)
-                    seg = data[lo:i - 2]
-                    best = None
-                    for m in _CALL_AFTER_PUSH.finditer(seg):
-                        if len(seg) - m.end() > CALL_TO_STORE:        # the call of an earlier function
-                            continue
-                        imm = struct.unpack("<I", m.group(1))[0] if m.group(1) else m.group(2)[0]
-                        if imm in dialog_ids:
-                            tgt = (va + lo + m.end() + struct.unpack("<i", m.group(3))[0]) & 0xFFFFFFFF
-                            best = (imm, tgt)
-                    if best:
-                        found[vt] = best
-                        break
-                i = data.find(pat, i + 1)
-            if vt in found:
-                break
+    for va, data in ((s.va, s.data) for s in img.sections if s.executable):
+        for sm in _STORE32.finditer(data):
+            vt = struct.unpack("<I", sm.group(1))[0]
+            if vt not in want or vt in found:
+                continue
+            st = sm.start()
+            lo = max(0, st - 96)
+            seg = data[lo:st]
+            best = None
+            for m in _CALL_AFTER_PUSH.finditer(seg):
+                if len(seg) - m.end(3) > CALL_TO_STORE:               # the call of an earlier function
+                    continue
+                imm = struct.unpack("<I", m.group(1))[0] if m.group(1) else m.group(2)[0]
+                if imm in dialog_ids:
+                    best = (imm, (va + lo + m.end(3) + struct.unpack("<i", m.group(3))[0]) & 0xFFFFFFFF)
+            if best:
+                found[vt] = best
     return found
 
 
@@ -525,11 +539,11 @@ def _ctor_dialogs64(img: cpp.Image, vtables: Iterable[int], dialog_ids: set[int]
             seg = data[lo:i]
             best = None
             for m in _ID64.finditer(seg):
-                if len(seg) - m.end() > CALL_TO_STORE:                # the call of an earlier function
+                if len(seg) - m.end(3) > CALL_TO_STORE:               # the call of an earlier function
                     continue
                 imm = struct.unpack("<I", m.group(1) or m.group(2))[0]
                 if imm in dialog_ids:
-                    best = (imm, (va + lo + m.end() + struct.unpack("<i", m.group(3))[0]) & 0xFFFFFFFFFFFFFFFF)
+                    best = (imm, (va + lo + m.end(3) + struct.unpack("<i", m.group(3))[0]) & 0xFFFFFFFFFFFFFFFF)
             if best:
                 found[vt] = best
     return found
@@ -606,6 +620,48 @@ def _base_map(img: cpp.Image, gt: Getters, addr: int) -> int | None:
     return b
 
 
+SLOTS_BACK = 48          # a vtable start lies at most this many slots before its GetMessageMap slot
+
+
+def _orphan_dialogs(img: cpp.Image, gt: Getters, orphans: list[cpp.MsgMap], dialogs: dict[int, str],
+                    dialog_name, res: Mfc) -> None:
+    """Names dialog classes whose message map belongs to no ``CRuntimeClass`` group. Shared MFC (``_AFXDLL``):
+    ``GetRuntimeClass`` of ``CDialog`` lives in the DLL, a dialog class that does not declare its own
+    ``CRuntimeClass`` has no group at all. Its vtable is the run of code pointers that holds the map getter;
+    the real start is the candidate that a constructor stores (``ctor_dialogs``). Several classes in one run:
+    the map of a vtable is the first getter behind it, and the distance (vtable start to ``GetMessageMap``
+    slot) is the same for every class of one framework, so a pair off the commonest distance is dropped.
+    Without a constructor the class stays anonymous: a class with no name to hint at a dialog is not matched
+    by its control ids alone (a view or a frame may handle the id of a control by chance)."""
+    if not orphans or not dialogs:
+        return
+    ps = img.psize
+    want = {m.map_addr: m for m in orphans}
+    getter_at: dict[int, tuple[int, int]] = {}                      # slot address -> (map, run end)
+    cand: set[int] = set()
+    for start, fns in code_runs(img):
+        for j, f in enumerate(fns):
+            a = gt.of(f)
+            if a in want:
+                getter_at[start + j * ps] = (a, start + len(fns) * ps)
+                cand.update(start + k * ps for k in range(max(0, j - SLOTS_BACK), j + 1))
+    pairs: dict[int, tuple[int, int, int]] = {}                     # vtable -> (map, distance in slots, dialog id)
+    if cand:
+        found = ctor_dialogs(img, cand, set(dialogs))
+        slots_at = sorted(getter_at)
+        for vt, did in found.items():
+            nxt = next((s for s in slots_at if s >= vt), None)
+            if nxt is not None and (nxt - vt) // ps <= SLOTS_BACK:
+                pairs[vt] = (getter_at[nxt][0], (nxt - vt) // ps, did)
+    if pairs:
+        top = Counter(d for _m, d, _i in pairs.values()).most_common(1)[0][0]
+        for vt, (a, d, did) in sorted(pairs.items()):
+            m = want[a]
+            if d == top and m.cls.startswith(cpp.ANON_PREFIX):
+                m.cls = dialog_name(did)
+                res.classes.append(MfcClass(m.cls, vt, 0, 0, 0, "", a, str(did), "dialog"))
+
+
 def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[int]],
             maps: list[cpp.MsgMap], artifact: Path | None = None,
             symbols: dict[int, str] | None = None) -> Mfc:
@@ -659,7 +715,7 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
 
     # classes without RTTI: through the CRuntimeClass slot
     rcs = find_runtime_classes(img)
-    if not rcs:
+    if not rcs and not any(m.kind == "afx" and m.cls.startswith(cpp.ANON_PREFIX) for m in maps):
         return res
     rtti_starts = {c.vtable for c in classes if c.vtable is not None}
     groups = find_groups(img, rcs, gt, rtti_starts)
@@ -756,6 +812,8 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
                     m.cls = dialog_name(did)
                     dlg_map[a] = g
                     break
+    _orphan_dialogs(img, gt, [m for m in maps if m.kind == "afx" and m.cls.startswith(cpp.ANON_PREFIX)
+                              and m.map_addr not in holders], dialogs, dialog_name, res)
     inherit_map: dict[int, Group] = {}                  # anonymous map -> group of a class derived from rc
     for g in sorted(groups, key=lambda x: x.start):
         if g.rtti or id(g) in owned:

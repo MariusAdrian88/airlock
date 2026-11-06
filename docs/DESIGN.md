@@ -2100,15 +2100,36 @@ program classes of an MFC application are built without `/GR`, so `find_msgmaps`
   constructors that names them; no source in the binary names them (RTTI is absent, and so are file-name
   strings in a release build).
 - **Dialog id from the constructor**: the constructor loads the id, calls the `CDialog` constructor, then
-  stores the vtable pointer. 32-bit: locate the `mov [reg], imm32` with the vtable address in code and read
-  the 96 bytes before it for `push imm; ...; call rel32` with the call at most 28 bytes before the store.
-  64-bit: locate `lea reg, [rip+d]` that resolves to the vtable, followed within 4 bytes by `mov [reg2], reg`
-  (the store to offset 0), and read the 96 bytes before it for `mov edx, imm32` (or `mov r8d, imm32`) ...
-  `call rel32` with the call at most 28 bytes before the `lea`. The id must be a dialog resource of the
-  binary and the call target must be shared by at least two classes. **[verified]** 32-bit on a program with
-  dozens of dialog classes (the captions match the class purpose). The 64-bit form follows the MSVC x64
-  constructor shape and is covered by unit tests only **[verify]** (no 64-bit MFC program without RTTI
-  was at hand: every 64-bit MFC binary found has RTTI).
+  stores the vtable pointer. 32-bit: locate the `mov dword [mem], imm32` with the vtable address in code
+  (`mem`: a register, a register plus disp8 or disp32, with or without SIB: a heap object `[esi]` and a stack
+  object `[esp+14h]`, whose constructor the compiler inlined; not an absolute address) and read the 96 bytes
+  before it for `push imm; ...; call rel32` with the call at most 28 bytes before the store. 64-bit: locate
+  `lea reg, [rip+d]` that resolves to the vtable, followed within 4 bytes by `mov [mem], reg` (`[rbx]`,
+  `[rsp+40h]`, `[rbp+d32]`, `[r14+8]`; not RIP-relative, not a register), and read the 96 bytes before it for
+  `mov edx, imm32` (or `mov r8d, imm32`) ... `call rel32` with the call at most 28 bytes before the `lea`.
+  Both scans are zero-width regexes, so a `push 0` before `push 1000` does not swallow the `E8` byte inside
+  the id (1000 = 0x3E8; the old scan missed it). The id must be a dialog resource of the binary and the call
+  target must be shared by at least two classes. **[verified]** 32-bit on a program with dozens of dialog
+  classes (the captions match the class purpose). **[verified]** 64-bit and 32-bit on a test program built
+  here with `/GR-` (Visual Studio Build Tools 2026, MFC 14.51, a Unicode build, `/O2`): three `CDialog`
+  classes, constructed inline on the stack (`mov [rsp+..], rax` / `mov dword [esp+..], vtable`), all three got
+  `Dialog_<caption>` and `mfc_class.dialog` = 201..203 in the 64-bit static, 32-bit static and 64-bit
+  shared-DLL builds. Before the fix the stack form was missed: the class that also handled a menu id stayed
+  `anon_CDialog_<map>`.
+- **Shared MFC (`_AFXDLL`) without RTTI**: `GetRuntimeClass` of `CDialog`, `CFrameWnd` ... lives in the MFC
+  DLL (imported by ordinal), so a class without its own `DECLARE_DYNAMIC` has no `CRuntimeClass` group. Its
+  map stayed `anon_<map>` and had no `mfc_class` row. `mfc._orphan_dialogs`: for each message map that no
+  group holds, the run of code pointers that holds the `GetMessageMap` getter gives the candidate vtable
+  addresses (the 48 slots before the getter); `ctor_dialogs` picks the one a constructor stores with a dialog
+  id; the map of that vtable is the first getter behind it. Several classes sit in one run, and the distance
+  from vtable start to the `GetMessageMap` slot is the same for every class, so pairs off the commonest
+  distance are dropped (a class that inherits the DLL's map would otherwise take its neighbour's map). A
+  class without a seen constructor stays anonymous: control ids alone do not name it (no class name hints at
+  a dialog, and a view or frame may handle a control id by chance). Row: `mfc_class` `source` `dialog`,
+  `base` empty (the base is in the DLL). **[verified]** on the shared-DLL build above (64-bit, 25 KB):
+  3 dialog classes named, the frame class stays `anon_<map>`. `UiIndex.class_dialogs` takes
+  `mfc_class.dialog` first, so `dialogs` and `mfc_message_maps` show `dialog 201 "Alpha Settings"` also for
+  a dialog class that handles a menu id (before: no dialog text, treated as a frame).
 - **`mfc_class`** (schema v14): `name`, `vtable_addr` (the `GetRuntimeClass` slot), `rc_addr`, `obj_size`,
   `schema`, `base` (the owner of the base message map, else the base runtime class), `map_addr`,
   `dialog` (resource id), `source` (`rc` | `dialog` | `inherited` | `routes`, see "Route tables").
@@ -2143,7 +2164,17 @@ on that binary (64-bit) against its source.
   `mov qword [rip+T+16], count` ... `lea r, [rip+entries]; mov [rip+T+8], r`, and the base table goes to
   `[rip+T]` (`lea rax, [rip+B]`, or `call` of the base's getter). Each candidate is kept only when all
   `count` rows are valid (invoke a code address, message 1..0xFFFF or a registered one, first <= last,
-  window messages without code and ids). 32-bit: `mov dword [T+4], entries` / `[T+8], count` **[verify]**.
+  window messages without code and ids). 32-bit: `mov dword [T+4], entries` / `[T+8], count`, the base table
+  `mov [T], imm32` or `call F; ...; mov [T], eax` (`A3 abs32`; `F` is `mov eax, B; ret`). **[verified]** on
+  a look-alike test program built here (a `MessageTarget<Derived, Base>` copy of the WinDirStat pattern, two
+  classes, 3 and 2 entries, `/GR- /O2`, Build Tools 2026): the 32-bit initialiser stores
+  `mov [T+4], entries` and `[T+8], 2` as `C7 05` absolute stores exactly in this form, both tables and all 5
+  entries found, the entry size is 24 bytes, the base of the derived table (`call` form) is the frame table.
+  Two gaps found and fixed (`CPP_VERSION` 5): (1) 64-bit, the compiler may put `mov qword [T+16], n` between
+  `lea rax, [entries]` and `mov [T+8], rax`; the old scan wanted the two next to each other and lost the
+  derived table (now up to 16 bytes between, zero-width scan); (2) 32-bit, a base table that comes from a
+  call was not tied (base 0). 64-bit handlers checked by their `puts` strings: id 4001 -> "frame open" ...
+  all 5 right. 32-bit handlers stay the invoker (only 64-bit invokers are followed).
 - **Class**: `GetRouteTable` (a vtable slot, often folded with `GetStaticRouteTable`, or a `jmp` to it)
   ends in `lea rax, [rip+T]; ... ret`. The vtable starts at the closest address before that slot that
   code loads (`lea r, [rip+X]`), with only code pointers in between. Without RTTI the map keeps the name
@@ -2193,6 +2224,14 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
   `kind` = `connection`. **[verified]** on the 64-bit MFC 4.2 DLLs: `COleControl` has one connection entry
   (`IPropertyNotifySink`) in the slot before its interface map (a long list of OLE interfaces); the same adjacent pair
   appears nowhere else. The empty `CCmdTarget` map is not stored (a map needs an entry).
+  Shared MFC (`_AFXDLL`): a class with `DECLARE_CONNECTION_MAP` but without an interface map inherits
+  `GetInterfaceMap` from the DLL (an import thunk: no getter), so its connection map is the only map and
+  stood as `interface IPropertyNotifySink`. Rule (`mfc.CONN_SLOT` = 15): an interface-shaped map in slot 15 of
+  the vtable (slot 0 = `GetRuntimeClass`) whose next slot is no getter is a connection map. **[verified]** on
+  a test class (`CCmdTarget` with `EnableConnections`, `CONNECTION_PART(IID_IPropertyNotifySink)`) built here
+  with `/GR-`: slot 15 is `GetConnectionMap` in the 64-bit static, 32-bit static and 64-bit shared builds;
+  static builds show `connection IPropertyNotifySink offset 0x48` (64-bit) / `0x24` (32-bit) next to the
+  inherited `interface IDispatch`; the shared build showed `interface` before and shows `connection` now.
 - `AFX_EVENTSINKMAP`: base, `lpEntries`, `lpEntryCount`; entry = `AFX_DISPMAP_ENTRY` + `nCtrlIDFirst` +
   `nCtrlIDLast` (u32), ends like a dispatch map. Shown as `event dispid 7 ctrl 1000 -> handler`.
   **[verified]** in 32-bit (a dialog hosting a browser control) and on the 64-bit MFC DLLs.
@@ -2201,6 +2240,8 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
   control ids. `pfn` and `pfn_set` are candidates for the missing-function pass (`fnfix`, `FIX_VERSION` 4).
 - `CPP_VERSION` 4 (connection maps, 64-bit constructors, symbol and dialog-join names, UTF-16 dispatch names)
   makes old projects derive again on open; no schema change (`kind` is free text).
+- `CPP_VERSION` 5 (stack-object dialog constructors, the `E8`-in-id scan fix, dialog classes and connection maps
+  of shared MFC, route tables with a scheduled count store and a 32-bit base from a call): same, no schema change.
 - Old projects: `CPP_VERSION` 2 makes `cpp.ensure_project` derive again on open (about 0.1 s per
   megabyte, no re-analysis); the schema migration only creates the two tables.
 
@@ -2444,6 +2485,21 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in
   32-bit, 24 in 64-bit (Delphi has 12 in both). ANSI literals carry code page 0 when the source uses
   `{$H+}` without a codepage directive, 1200 for `UnicodeString`.
+- FPC 3.0.4 (i386-win32 and x86_64-win64, stripped and `-g`, console programs with classes, `{$M+}` interfaces,
+  message tables and RTL / FCL units, unpacked without installer): **[verified]** the VMT header (12 words), the 13
+  `TObject` slots, method / field / property / message tables, the ShortString `vmtClassName` and the register
+  convention of virtual calls are the same as in 3.2.2. **[verified]** layout differences, all handled by
+  `delphi.parse_fpc_classes` (`DELPHI_VERSION` 9): the interface table entry `{IID; vtable; IOffset; IIDStr; IType}`
+  points straight at the GUID and the GUID text (3.2.2: at cells that hold the pointers; `_fpc_guid_addr`,
+  `_fpc_text_addr` tell them apart, the first GUID word is never an image address); the init table is `kind, name,
+  u32 size, u32 count, {^typeinfo; sizeint offset}` (3.2.2: terminator, two pointers, cells; `_fpc_init_entries`);
+  `TEntryInformation.PascalMain` is field 3 (3.2.2: field 5) in x86 and the x86_64 start code passes no record
+  (`targets.fpc_pascalmain`: the called entry function holds `xor rcx,rcx; lea rdx,[PASCALMAIN]`). The interface
+  type info (kind 14, name, parent, flags, GUID, unit, property table) has no method table in 3.0.4: `#n` slots
+  stay unless the thunk target is a published or virtual method; the interface is named from the type info when it
+  exists. Signature databases are per exact version (`fpc-3.0.4-32.sigdb`, `-64.sigdb` from `fpc-build`; 11027 /
+  12763 names, 730 / 729 virtual slot names): oracle right 85.7 to 88.3 %, wrong 0.0 to 0.2 % (library routines,
+  call pass), see HANDOVER "Delphi (M6)".
 
 ### .NET
 

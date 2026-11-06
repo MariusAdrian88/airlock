@@ -91,6 +91,51 @@ def build(ps: int):
                    size_inv=main_ents)
 
 
+def test_x64_count_store_between_entries_lea_and_store():
+    """The compiler may schedule the count store between ``lea rax,[entries]`` and ``mov [T+8],rax``."""
+    b = Builder(8)
+    h = b.stub()
+    ents = entries(b, [(WM_COMMAND, 0, 4001, 4001, h, 0), (WM_SIZE, 0, 0, 0, h, 0)])
+    base_ents = entries(b, [(WM_COMMAND, 0, 9, 9, h, 0)])
+    base_tab, tab = b.data(bytes(64)), b.data(bytes(64))
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    out = b""
+
+    def rel(target: int, size: int) -> bytes:
+        return struct.pack("<i", target - (va + len(out) + size))
+    out += b"\x48\x8d\x05" + rel(base_tab, 7)                    # lea rax,[base]
+    out += b"\x48\x89\x05" + rel(tab, 7)                         # mov [T],rax
+    out += b"\x48\x8d\x05" + rel(ents, 7)                        # lea rax,[entries]
+    out += b"\x48\xc7\x05" + rel(tab + 16, 11) + struct.pack("<I", 2)    # mov qword [T+16],2   (in between)
+    out += b"\x48\x89\x05" + rel(tab + 8, 7)                     # mov [T+8],rax
+    b.code(out + b"\xc3")
+    # the base table, also initialised (contiguous form)
+    initialiser(b, base_tab, base_ents, 1, b.data(bytes(32)))
+    tables = {t.entries: t for t in routes.find_tables(b.image())}
+    assert [(r.message, r.id, r.last_id) for r in tables[ents].rows] == [(WM_COMMAND, 4001, 4001), (WM_SIZE, 0, 0)]
+    assert tables[ents].table == tab and tables[ents].base == base_tab
+
+
+def test_x86_base_table_from_a_call():
+    """32-bit: ``call F; push guard; mov [T],eax; mov [T+4],entries; mov [T+8],n`` with ``F`` = ``mov eax,B; ret``
+    (the base class's ``GetStaticRouteTable``)."""
+    b = Builder(4)
+    h = b.stub()
+    base_ents = entries(b, [(WM_COMMAND, 0, 9, 9, h, 0)])
+    ents = entries(b, [(WM_COMMAND, 0, 4001, 4001, h, 0), (WM_SIZE, 0, 0, 0, h, 0)])
+    base_tab, tab = b.data(bytes(32)), b.data(bytes(32))
+    initialiser(b, base_tab, base_ents, 1, 0)
+    getter = b.code(b"\xb8" + struct.pack("<I", base_tab) + b"\xc3")           # mov eax, base_tab; ret
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    st = lambda dst, imm: b"\xc7\x05" + struct.pack("<II", dst, imm)           # noqa: E731
+    code = b"\xe8" + struct.pack("<i", getter - (va + 5)) + b"\x68" + struct.pack("<I", tab + 12)
+    code += b"\xa3" + struct.pack("<I", tab) + st(tab + 4, ents) + st(tab + 8, 2) + b"\xc3"
+    b.code(code)
+    tables = {t.entries: t for t in routes.find_tables(b.image())}
+    assert tables[ents].table == tab and tables[ents].base == base_tab
+    assert tables[base_ents].base == 0
+
+
 @pytest.fixture(params=[4, 8], ids=["x86", "x64"])
 def built(request):
     b, a = build(request.param)

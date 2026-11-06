@@ -33,8 +33,10 @@ WINDOW = 64                      # bytes around the entries store searched for t
 GETTER_SCAN = 96                 # bytes of a function searched for ``return &T``
 
 _RIP = b"[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]"            # modrm of [rip+disp32], any register
-# lea r64, [rip+E] ; mov [rip+P], r64   (same register)
-_LEA_STORE64 = re.compile(b"([\x48\x4c])\x8d(" + _RIP + b")(....)([\x48\x4c])\x89(" + _RIP + b")(....)", re.S)
+# lea r64, [rip+E] ; ... ; mov [rip+P], r64   (same register; up to 16 bytes between: the compiler may put the
+# count store `mov qword [rip+T+16], n` there). Zero-width so that neighbouring candidates are all seen.
+_LEA_STORE64 = re.compile(b"(?=([\x48\x4c])\x8d(" + _RIP + b")(....)(.{0,16}?)([\x48\x4c])\x89(" + _RIP + b")(....))",
+                          re.S)
 _STORE_IMM32 = re.compile(b"\xc7\x05(....)(....)", re.S)                  # mov dword [abs32], imm32
 _LEA_RIP = re.compile(b"[\x48\x4c]\x8d" + _RIP + b"(....)", re.S)
 _MOV_RR = re.compile(b"([\x48\x49\x4c\x4d])([\x8b\x8d])(.)", re.S)
@@ -143,6 +145,24 @@ def _base64(va: int, data: bytes, pos: int, table: int) -> tuple[int, int]:
     return 0, 0
 
 
+_STORE_EAX = re.compile(b"(?:\xa3|\x89[\x05\x0d\x15\x1d\x25\x2d\x35\x3d])(....)", re.S)      # mov [abs32], eax / reg
+
+
+def _base32(img: Image, va: int, data: bytes, pos: int, table: int) -> int:
+    """32-bit: the base table comes from a call (``call F; ...; mov [T], eax``) near the entries store at
+    ``pos``; F, or 0 when there is no such store or call. The last call within 32 bytes before the store wins."""
+    lo, hi = max(0, pos - WINDOW), min(len(data), pos + WINDOW)
+    for m in _STORE_EAX.finditer(data, lo, hi):
+        if struct.unpack("<I", m.group(1))[0] != table:
+            continue
+        for j in range(m.start() - 5, max(lo, m.start() - 32) - 1, -1):
+            if data[j] == 0xE8:
+                t = (va + j + 5 + struct.unpack_from("<i", data, j + 1)[0]) & 0xFFFFFFFF
+                if img.is_code(t):
+                    return t
+    return 0
+
+
 def _code(img: Image):
     return [(s.va, s.data) for s in img.sections if s.executable and s.data]
 
@@ -155,11 +175,12 @@ def find_tables(img: Image) -> list[RouteTable]:
     for va, data in _code(img):
         if ps == 8:
             for m in _LEA_STORE64.finditer(data):
-                if m.group(1) != m.group(4) or (m.group(2)[0] & 0x38) != (m.group(5)[0] & 0x38):
+                if m.group(1) != m.group(5) or (m.group(2)[0] & 0x38) != (m.group(6)[0] & 0x38):
                     continue
                 at = va + m.start()
+                store = at + 7 + len(m.group(4))
                 ents = _rel(at, at + 7, m.group(3))
-                slot = _rel(at + 7, at + 14, m.group(6))
+                slot = _rel(store, store + 7, m.group(7))
                 if ents in found or not img.is_data(ents) or not img.in_image(slot):
                     continue
                 n = _count64(img, va, data, m.start(), slot + 8)
@@ -185,6 +206,10 @@ def find_tables(img: Image) -> list[RouteTable]:
                     tab = dst - 4
                     base = next((imm for a2, imm in near.get(tab, ()) if abs(a2 - at) <= WINDOW), 0)
                     found[ents] = RouteTable(tab, ents, rows, base)
+                    if not base:
+                        call = _base32(img, va, data, at - va, tab)
+                        if call:
+                            calls[ents] = call
     keys = {t.table for t in found.values()}
     for ents, fn in calls.items():
         found[ents].base = _returns(img, fn, keys) or 0

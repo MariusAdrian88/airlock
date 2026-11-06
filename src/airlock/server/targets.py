@@ -389,6 +389,11 @@ def code_address(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, i
         space, value = "ram", default_name_address(sc.bare)
     elif _HEX.match(sc.bare):
         space, value = "ram", int(sc.bare, 16)
+    elif sc.bare.lower() in _PROGRAM_NAMES:       # ``main`` of a Free Pascal program that has no function there
+        mains = {pm for bd in sc.bounds if (pm := _fpc_main_address(ctx, bd)) is not None}
+        if len(mains) != 1:
+            return None
+        space, value = "ram", mains.pop()
     else:
         return None
     if space != "ram" or value is None:
@@ -509,7 +514,7 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         if mr is not None:
             return mr
     if (FUNCTION in ks or IMPORT_FN in ks) and t.lower() in _PROGRAM_NAMES:
-        pr = _program_body(ctx, sc, t)
+        pr = _program_body(ctx, sc, t, ks)
         if pr is not None:
             return pr
     if FEATURE in ks:
@@ -691,10 +696,59 @@ def _bare_method(sc: Scope, name: str, ks: frozenset[str]) -> Target | str | Non
 
 
 _PROGRAM_NAMES = frozenset({"main", "winmain", "wwinmain", "pascalmain", "program"})
-_PASCALMAIN_FIELD = 5       # TEntryInformation.PascalMain, in pointers (verified, FPC 3.2.2 x86 and x64)
+_PASCALMAIN_FIELDS = (5, 3)     # TEntryInformation.PascalMain, in pointers: FPC 3.2.2 field 5, FPC 3.0.4 field 3 (verified)
+_ENTRY_MAIN64 = re.compile(rb"\x48\x31\xc9\x48\x8d\x15(....)", re.S)      # xor rcx,rcx; lea rdx,[rip+d]
 
 
-def _program_body(ctx: ServerContext, sc: Scope, name: str) -> Target | str | None:
+def fpc_pascalmain(img, ep: int) -> int | None:
+    """The address of ``PASCALMAIN`` (the program body) of a Free Pascal program. The entry point passes
+    ``@EntryInformation`` (the last ``mov eax, imm32`` / ``lea rcx, [rip+d]`` before the call) to
+    ``FPC_EXE_ENTRY``; field 5 of that record is ``PascalMain`` in FPC 3.2.2 (x86 and x64) and field 3 in
+    FPC 3.0.4 x86 (**[verified]**). FPC 3.0.4 x64 passes no record: the entry function it calls holds
+    ``xor rcx,rcx; lea rdx,[PASCALMAIN]``."""
+    code = img.read(ep, 0x60) or b""
+    ps = img.psize
+    if ps == 4:
+        m = list(re.finditer(rb"\xb8(....)\xe8", code, re.S))
+        rec = int.from_bytes(m[-1].group(1), "little") if m else None
+    else:
+        m = list(re.finditer(rb"\x48\x8d\x0d(....)", code, re.S))
+        rec = (ep + m[-1].end() + int.from_bytes(m[-1].group(1), "little", signed=True)) if m else None
+    if rec is not None:
+        for f in _PASCALMAIN_FIELDS:
+            pm = img.ptr(rec + f * ps)
+            if pm and img.is_code(pm):
+                return pm
+    if ps == 8:
+        for call in reversed(list(re.finditer(rb"\xe8(....)", code, re.S))):
+            callee = ep + call.end() + int.from_bytes(call.group(1), "little", signed=True)
+            hit = _ENTRY_MAIN64.search(img.read(callee, 0x80) or b"") if img.is_code(callee) else None
+            if hit:
+                pm = callee + hit.end() + int.from_bytes(hit.group(1), "little", signed=True)
+                if img.is_code(pm):
+                    return pm
+    return None
+
+
+def _fpc_main_address(ctx: ServerContext, bd: Bound) -> int | None:
+    """``PASCALMAIN`` of one Free Pascal binary (None for other binaries or when it is not found)."""
+    from airlock.projects import detect
+    from airlock.server.cpp import Image
+
+    b = bd.binary
+    if b.toolchain != "fpc" or b.image_base is None:
+        return None
+    artifact = ctx.indexer.paths(bd.project).artifacts / b.sha256
+    if not artifact.is_file():
+        return None
+    try:
+        rva = detect(artifact).entry_point
+        return fpc_pascalmain(Image.from_pe(artifact), b.image_base + rva) if rva is not None else None
+    except Exception:  # noqa: BLE001  not a readable PE
+        return None
+
+
+def _program_body(ctx: ServerContext, sc: Scope, name: str, ks: frozenset[str] = frozenset()) -> Target | str | None:
     """``main`` / ``WinMain`` / ``PASCALMAIN`` / ``program`` of a Delphi or FPC program (no function of that
     name exists): the program body. Delphi inlines it into the PE entry point function; FPC's entry point
     passes ``@EntryInformation`` (the last ``mov eax, imm32`` / ``lea rcx, [rip+d]`` before the call) to
@@ -703,6 +757,7 @@ def _program_body(ctx: ServerContext, sc: Scope, name: str) -> Target | str | No
     from airlock.server.cpp import Image
 
     found: list[tuple[Bound, Function, str]] = []
+    missing: list[tuple[Bound, int]] = []
     for bd in sc.bounds:
         b = bd.binary
         if b.toolchain not in ("delphi", "fpc") or b.image_base is None:
@@ -722,17 +777,11 @@ def _program_body(ctx: ServerContext, sc: Scope, name: str) -> Target | str | No
         if fn is None:
             continue
         if b.toolchain == "fpc":
-            code = img.read(ep, 0x60) or b""
-            ps = img.psize
-            if ps == 4:
-                m = list(re.finditer(rb"\xb8(....)\xe8", code, re.S))
-                rec = int.from_bytes(m[-1].group(1), "little") if m else None
-            else:
-                m = list(re.finditer(rb"\x48\x8d\x0d(....)", code, re.S))
-                rec = (ep + m[-1].end() + int.from_bytes(m[-1].group(1), "little", signed=True)) if m else None
-            pm = img.ptr(rec + _PASCALMAIN_FIELD * ps) if rec is not None else None
+            pm = fpc_pascalmain(img, ep)
             main = bd.store.function_at(b.id, pm) if pm else None
             if main is None:
+                if pm:                      # Ghidra made no function there: the address resolves like a typed one
+                    missing.append((bd, pm))
                 continue
             found.append((bd, main, "PASCALMAIN"))
         else:
@@ -740,6 +789,8 @@ def _program_body(ctx: ServerContext, sc: Scope, name: str) -> Target | str | No
     if len(found) > 1:
         return ambiguous(name, _cands([(bd, f) for bd, f, _w in found]), len(found))
     if not found:
+        if len(missing) == 1 and len(sc.bounds) == 1:       # no Ghidra function: `_create_on_demand` makes it
+            return err("not_found", f"no function at or containing {missing[0][0].addr(missing[0][1])}{_where(sc)}")
         return None
     bd, fn, what = found[0]
     return FunctionTarget(bd, fn, f"resolved '{name}' to the program body {fn.qualified_name} ({what})",

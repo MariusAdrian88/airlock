@@ -49,7 +49,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 8          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names; 6: FPC interface method names; 7: Delphi dynamic method table (kind 'dynamic'); 8: interface tables (kinds 'interface-tab/-table/-target'), header and empty-stub rows
+DELPHI_VERSION = 9          # 9: FPC 3.0 interface entries (direct pointers), interface names from the type info; 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names; 6: FPC interface method names; 7: Delphi dynamic method table (kind 'dynamic'); 8: interface tables (kinds 'interface-tab/-table/-target'), header and empty-stub rows
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
@@ -706,7 +706,8 @@ def _fpc_guid_text(img: Image, ref: int | None) -> str:
 
 def _fpc_intf_entries(img: Image, tab: int) -> list[tuple[int, int, int, int, int]]:
     """Entries of an interface table: ``sizeuint count``, then ``{ptr ^GUID; ptr vtable; sizeuint IOffset; ptr
-    ^ShortString GUID text; u32 IType}`` (20 bytes in 32-bit, 40 in 64-bit). Returns [(ref, vtable, offset,
+    ^ShortString GUID text; u32 IType}`` (20 bytes in 32-bit, 40 in 64-bit; FPC 3.2 points to cells that hold the
+    GUID and text pointers, FPC 3.0 to the data: the addresses returned are the data). Returns [(guid, vtable, offset,
     text ref, type)], [] when the table does not look like one."""
     ps = img.psize
     n = img.ptr(tab) if ps == 4 else _fpc_u32(img, tab)
@@ -719,8 +720,28 @@ def _fpc_intf_entries(img: Image, tab: int) -> list[tuple[int, int, int, int, in
         typ = _fpc_u32(img, at + 4 * ps)
         if vt is None or off is None or typ is None or typ > 8 or not img.in_image(vt):
             return []
-        out.append((ref or 0, vt, off, sref or 0, typ))
+        out.append((_fpc_guid_addr(img, ref or 0), vt, off, _fpc_text_addr(img, sref or 0), typ))
     return out
+
+
+def _fpc_guid_addr(img: Image, p: int) -> int:
+    """Address of the 16 GUID bytes behind the ``IID`` word of an interface entry. FPC 3.2 stores a pointer to a
+    cell that holds the GUID pointer; FPC 3.0 stores the GUID pointer itself (**[verified]** 3.0.4 and 3.2.2).
+    The first word of a GUID is never an address of the image, so a word that is one is the cell."""
+    cell = img.ptr(p) if p else None
+    return cell if cell and img.in_image(cell) else p
+
+
+def _fpc_text_addr(img: Image, p: int) -> int:
+    """Address of the GUID text (``ShortString``) behind the ``IIDStr`` word: the string itself in FPC 3.0, a
+    cell that holds its pointer in FPC 3.2."""
+    if not p:
+        return 0
+    raw = _sstr_raw(img, p)
+    if raw is not None and raw[0].startswith("{"):
+        return p
+    cell = img.ptr(p)
+    return cell or 0
 
 
 FPC_TKINTERFACE = 14       # type kind of a COM interface (``tkInterface``)
@@ -792,9 +813,9 @@ def _fpc_intf_own(img: Image, ti: int) -> tuple[int, list[str], int | None] | No
     return cnt, names, parent
 
 
-def _fpc_intf_names(img: Image, guid: bytes) -> list[str]:
+def _fpc_intf_names(img: Image, guid: bytes, ti: int | None = None) -> list[str]:
     """Method names of an interface by vtable slot (the parents' methods first), "" where unknown."""
-    ti = _fpc_intf_typeinfo(img, guid)
+    ti = ti or _fpc_intf_typeinfo(img, guid)
     chain: list[list[str]] = []
     seen: set[int] = set()
     while ti and ti not in seen and len(chain) < MAX_INTF_CHAIN:
@@ -852,10 +873,12 @@ def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], v
     tabs: list[int] = []
     bounds = sorted(vtables)
     for ref, vt, off, sref, typ in entries:
-        sp = img.ptr(sref) if sref else None
-        text = (_sstr_raw(img, sp) or ("",))[0] if sp else ""
-        guid = text if text.startswith("{") else _fpc_guid_text(img, img.ptr(ref) if ref else None)
-        label = KNOWN_GUIDS.get(guid.upper(), "") or guid_names.get(guid.upper(), "") or guid or f"intf_{vt:x}"
+        text = (_sstr_raw(img, sref) or ("",))[0] if sref else ""
+        guid = text if text.startswith("{") else _fpc_guid_text(img, ref)
+        raw_guid = (img.read(ref, 16) or b"") if ref else b""
+        ti = _fpc_intf_typeinfo(img, raw_guid) if raw_guid else None     # interfaces with ``{$M+}`` have type info
+        label = (KNOWN_GUIDS.get(guid.upper(), "") or guid_names.get(guid.upper(), "")
+                 or (_sstr(img, ti + 1) if ti else None) or guid or f"intf_{vt:x}")
         j = bisect_right(bounds, vt)
         stop = bounds[j] if j < len(bounds) else vt + MAX_VIRTUAL * ps
         slots: list[int] = []
@@ -864,7 +887,7 @@ def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], v
             if t is None or not img.is_code(t):
                 break
             slots.append(t)
-        rtti = _fpc_intf_names(img, img.read(img.ptr(ref), 16) or b"") if ref and img.ptr(ref) else []
+        rtti = _fpc_intf_names(img, raw_guid, ti) if ti else []
         if rtti and len(rtti) + 3 == len(slots):
             rtti = list(FPC_COM_SLOTS) + rtti
         if len(rtti) != len(slots):
@@ -1051,13 +1074,24 @@ def _fpc_init_fields(img: Image, c: DlClass, tab: int) -> list[DlField]:
         return []
     p = tab + 2 + nm[1] + ps + 4 + 2 * ps
     n = _fpc_u32(img, p)
-    if not n or n > MAX_PUBLISHED:
-        return []
+    if n and n <= MAX_PUBLISHED:
+        got = _fpc_init_entries(img, c, p + 4, n, True)
+        if got:
+            return got
+    # FPC 3.0: ``kind, name, u32 size, u32 count`` then ``{^typeinfo; sizeint offset}`` (direct type info pointers)
+    p = tab + 2 + nm[1] + 4
+    n = _fpc_u32(img, p)
+    return _fpc_init_entries(img, c, p + 4, n, False) if n and n <= MAX_PUBLISHED else []
+
+
+def _fpc_init_entries(img: Image, c: DlClass, at0: int, n: int, cells: bool) -> list[DlField]:
+    """``n`` init table entries ``{type info (a cell that holds it when ``cells``); offset}``; [] if one is bad."""
+    ps = img.psize
     out: list[DlField] = []
     for i in range(n):
-        at = p + 4 + i * 2 * ps
-        cell, off = img.ptr(at), img.ptr(at + ps)
-        ti = img.ptr(cell) if cell else None
+        at = at0 + i * 2 * ps
+        ref, off = img.ptr(at), img.ptr(at + ps)
+        ti = (img.ptr(ref) if ref else None) if cells else ref
         kind = img.read(ti, 1) if ti else None
         if off is None or off >= max(c.size, 1) or not kind:
             return []

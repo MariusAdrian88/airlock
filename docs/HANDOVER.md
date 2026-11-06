@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1346 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1365 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -108,13 +108,16 @@ join all run at analysis time; estimate within 20% of the real time.
    runtime class (DESIGN "MFC classes without RTTI"). Left: a class with none of these stays `anon_<map>`;
    a derived class of a non-dialog base without symbols (window sub-classes of CEdit / CStatic / CWnd with no
    command ids) is named `anon_<Base>_<map>`: the binary holds no other source of its own name. The 64-bit
-   constructor scan is covered by unit tests only (no 64-bit MFC program without RTTI was at hand).
+   constructor scan is now verified on a 64-bit `/GR-` MFC test program (round 10, see "MFC check, 64-bit
+   without RTTI" below). Shared MFC without RTTI: dialog classes are named from the constructor; a frame or
+   view class without a `CRuntimeClass` stays `anon_<map>` (its base lives in the DLL).
 2. About 27% of visible functions are in `unclassified` clusters (mostly
    unnamed program code); `function_map` prints the coverage line.
 3. MFC dispatch, interface, event sink and connection maps are decoded (`mfc_message_maps`, DESIGN "MFC
    dispatch, interface and event sink maps"). The 64-bit `AFX_DISPMAP_ENTRY` layout and the connection map
-   are verified on real 64-bit binaries. Left: a connection map of a class whose `GetConnectionMap` is an
-   `_AFXDLL` call into the MFC DLL is not seen (the getter is outside the image).
+   are verified on real 64-bit binaries. A connection map of a class in a shared-MFC (`_AFXDLL`) program is
+   told from an interface map by its vtable slot (15), see "MFC check" below. Left: a class whose own
+   `GetConnectionMap` is itself a call into the DLL is not seen (the getter is outside the image).
 
 Fixed on 2026-11-05 (issues 3-6, core agent):
 - Same name in several binaries (DESIGN 7.3 rule 9): `name@binary` qualifier, the session focus
@@ -197,9 +200,37 @@ of the entries. Decoded from the initialiser code, tied to the vtable of the `Ge
 base table, handlers followed through the invoker thunk. Stored as `msgmap_entry` rows (kind `routes` in
 `MsgMap`, `mfc_class.source` `routes`), so `menus`, `function` hints and the target names work as for MFC.
 Verified on WinDirStat x64 against its source (CMainFrame 75 routes, base CFrameWnd; CDirStatApp 7, base
-CWinApp). The 32-bit initialiser form is unverified. Class names stay `anon_<entries>` (no RTTI).
+CWinApp). The 32-bit initialiser form is verified on a look-alike test program (see "MFC check" below). Class
+names stay `anon_<entries>` (no RTTI).
 Target tools accept the generated handler names (`Class::OnCommand_<id>_<leaf>`, `targets._mfc_handler_addrs`).
 Tests: `tests/test_routes.py`.
+
+### MFC check, 64-bit without RTTI (round 10, Build Tools 2026 with "C++ ATL/MFC", MFC 14.51)
+
+Test program (own code, open): `CAlphaDlg`, `CBetaDlg`, `CGammaDlg : CDialog` (dialog ids 201..203, control ids
+1001..1004, message maps with `ON_BN_CLICKED`, `ON_WM_TIMER`, `ON_COMMAND`, `ON_EN_CHANGE`), `CMainFrame :
+CFrameWnd` (`ON_WM_CREATE`, `ON_COMMAND` 40001..40004, `ON_COMMAND_RANGE` 40010..40013,
+`ON_UPDATE_COMMAND_UI`), `CAutoThing : CCmdTarget` (dispatch map `ProbeDoWork`, `ProbeReset`, `ProbeValue`;
+connection map `IID_IPropertyNotifySink`). Built `/GR- /O2`, Unicode: 64-bit static MFC, 64-bit shared MFC DLL,
+32-bit static MFC. Sources and build script are in the session scratchpad only (not tracked).
+
+| Check | x64 static | x64 DLL | x86 static |
+|---|---|---|---|
+| message map entries, ids, handlers | 4/2/1/9 correct | same | same |
+| dialog classes named (`ctor_dialogs`) | 3 of 3 (was 2) | 3 of 3 (was 0) | 3 of 3 (was 2) |
+| connection map `IPropertyNotifySink` | yes | yes (was `interface`) | yes |
+| dispatch map names (UTF-16) | 3 of 3 | 3 of 3 | 3 of 3 |
+| frame class | `anon_CFrameWnd_<map>` | `anon_<map>` | `anon_CFrameWnd_<map>` |
+
+Fixed (`CPP_VERSION` 5): stack-object constructors (store with disp8 / disp32 / SIB) for 32- and 64-bit; the
+`push 0; push 1000` scan swallowed the `E8` byte of the id; shared MFC dialog classes (`mfc._orphan_dialogs`);
+connection map by slot 15 (`mfc.CONN_SLOT`); `UiIndex.class_dialogs` trusts `mfc_class.dialog`; route tables:
+count store between `lea` and store (64-bit), base table from a call (32-bit). The 32-bit route initialiser
+form `mov [T+4], entries` / `[T+8], count` is verified on a look-alike test program. Open: a frame or view class
+of a shared-MFC program stays `anon_<map>` (its base is in the DLL; the DLL exports are by ordinal);
+`symbol_class` stays **[verify]** on real data: a 64-bit static build with a full PDB next to the exe (`/Zi`) came
+out of the analysis without any `CAlphaDlg::` namespaces (airlock does not load PDBs), so only unit tests cover it.
+Tests: `tests/test_mfc.py` (stack objects, shared MFC, connection slot, constructor dialog), `tests/test_routes.py`.
 
 ## M2 join (menus, dialogs, message maps)
 
@@ -278,7 +309,7 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   x86_64-win64, stripped and with `-g`) through the real worker: classes, fields with types, published methods,
   form tree, events to handlers and string literals with references. Tests: `tests/test_fpc.py`. FPC RTL / LCL signature databases
   (`fpcsigs`, `delphi-sigs fpc-build` / `fpc-oracle`, DESIGN §11), message / interface / init tables and
-  virtual slot names (`DELPHI_VERSION` 5, `IDR_VERSION` 10) are done. Interface method names (`DELPHI_VERSION` 6): the FPC 3.2 interface type info (`{$M+}`) holds a method table, read by GUID; the thunk target of a slot is the second source (a published or named virtual method of the class). **[verified]** FPC 3.2.2 i386-win32 and x86_64-win64: `Greet` / `Count` for slots 3 and 4 of a `{$M+}` interface; an interface without type info keeps `#n`. **[verified]** live (Ghidra 12.1.4, `index` of two Lazarus form programs and two console programs, 32 and 64-bit, stripped, through the real indexer): the FPC sigdb `ensure` path names 675 of 1329 (t1 32-bit), 700 of 1447 (t1 64-bit), 5888 of 10320 (Lazarus 32-bit) and 6225 of 11173 (Lazarus 64-bit) functions, shown as `idr:` hints by `function`; four programs index in 244 s. FPC x86 `CALL [reg+disp]` (virtual / interface calls) gets a stub per (vmt offset, register arguments, stack arguments) with the `register` convention (EAX Self, EDX, ECX, rest on the stack; `delphistr` VERSION 5, collector 10): before, a hidden result pointer (`LEA EDX,[local]`) was lost and the decompiler printed `uStack_10 = 0` where the value is the result of the virtual call; after, the C reads `vmt_64_ad_0(self,&uStack_20); uStack_10 = uStack_20;` (x64 was right already: its `RDX` is a known parameter). Open: only FPC 3.2.2 is checked. FPC 3.0.4 could not be installed: its Inno Setup installer refuses to run beside FPC 3.2.2 (it asks to uninstall it) and unpacking it needs an extractor that was not allowed. Strings: Ghidra's own handling already finds the
+  virtual slot names (`DELPHI_VERSION` 5, `IDR_VERSION` 10) are done. Interface method names (`DELPHI_VERSION` 6): the FPC 3.2 interface type info (`{$M+}`) holds a method table, read by GUID; the thunk target of a slot is the second source (a published or named virtual method of the class). **[verified]** FPC 3.2.2 i386-win32 and x86_64-win64: `Greet` / `Count` for slots 3 and 4 of a `{$M+}` interface; an interface without type info keeps `#n`. **[verified]** live (Ghidra 12.1.4, `index` of two Lazarus form programs and two console programs, 32 and 64-bit, stripped, through the real indexer): the FPC sigdb `ensure` path names 675 of 1329 (t1 32-bit), 700 of 1447 (t1 64-bit), 5888 of 10320 (Lazarus 32-bit) and 6225 of 11173 (Lazarus 64-bit) functions, shown as `idr:` hints by `function`; four programs index in 244 s. FPC x86 `CALL [reg+disp]` (virtual / interface calls) gets a stub per (vmt offset, register arguments, stack arguments) with the `register` convention (EAX Self, EDX, ECX, rest on the stack; `delphistr` VERSION 5, collector 10): before, a hidden result pointer (`LEA EDX,[local]`) was lost and the decompiler printed `uStack_10 = 0` where the value is the result of the virtual call; after, the C reads `vmt_64_ad_0(self,&uStack_20); uStack_10 = uStack_20;` (x64 was right already: its `RDX` is a known parameter). FPC 3.0.4 (round 10, `tests/test_fpc304.py`): the installers were unpacked with innoextract (no install; `fpc.cfg` made with `fpcmkcfg`, the x86_64 compiler is `ppcrossx64` of the cross package) and three programs built (console classes t1, `{$M+}` interfaces and messages t2, an RTL/FCL program t3) for i386-win32 and x86_64-win64, stripped and with `-g`. **[verified]** same as 3.2.2: version string `FPC 3.0.4 [2017/11/26]` (toolchain `fpc`, `toolchain_ver` 3.0.4), VMT header (12 words, `TObject` has 13 virtual slots, user slots from 13, slot = offset/ps - 12), class tables, published methods, message tables, `FPC_TOBJECT_VSLOTS`, vcall stubs (`vmt_64_ad_0`, `vmt_68_a_0`; x64 `TAnimal vslot 13 -> ...`), class and unit names, 83 / 83 / 133 classes found. **[verified]** differences found and fixed (`DELPHI_VERSION` 9): (1) interface table entries hold the GUID and the GUID text directly (3.2: pointers to cells), so GUID, `QueryInterface` names and type info were lost (`intf_<addr>`); (2) the init table of managed fields is `kind, name, u32 size, u32 count, {^typeinfo; offset}` (3.2 has a terminator and cells), so the managed `AnsiString` / interface fields were missing; (3) `TEntryInformation.PascalMain` is field 3 (3.2.2: field 5) and the x64 start code passes no record (the called entry function holds `xor rcx,rcx; lea rdx,[PASCALMAIN]`), so `function main` failed; (4) an interface with type info is now named from it (`IGreeter`, 3.0.4 and 3.2.2); (5) `function main` of a program where Ghidra made no function at PASCALMAIN (3.2.2 t2 32-bit, found while comparing) creates it on demand. 3.0.4 interface type info has no method table: slots 3 and later stay `#n` unless the thunk target is a published or virtual method. Signature databases (`fpc-build` of the 3.0.4 install, no Lazarus: 11027 names 32-bit in 84 s, 12763 64-bit in 76 s, 730 / 729 virtual slot names): oracle (`fpc-oracle`, `-g` builds, library routines, after the call pass) right / wrong 32-bit t1 87.2 / 0.0, t2 86.6 / 0.0, t3 85.7 / 0.1; 64-bit t1 88.3 / 0.0, t2 87.7 / 0.0, t3 86.5 / 0.2 (routines of at least 24 bytes: 97.8 to 99.0 % 32-bit, 91.3 to 93.5 % 64-bit). Same programs with 3.2.2 (database with the LCL, 25977 / 28279 names): 32-bit 87.5 / 0.1, 86.7 / 0.1, 83.5 / 0.2; 64-bit 87.7 / 0.4, 87.0 / 0.4, 83.9 / 0.6. The databases are per exact version (`idr.files_for`), so 3.2.2 names are never applied to 3.0.4; no 3.0.4 name set was needed beyond `fpc-build`. Live index (Ghidra 12.1.4, six stripped programs per version, 262 s for 3.0.4 and 335 s for 3.2.2): functions named by the sigdb 3.0.4: 779 of 1045, 818 of 1266, 775 of 1054, 815 of 1273, 1462 of 1918, 1528 of 2343 (t1, t2, t3; 32 / 64-bit); 3.2.2: 681 of 1336, 701 of 1448, 676 of 1341, 698 of 1455, 1137 of 2361, 1203 of 2615 (the 3.0.4 RTL is smaller, so the share is higher). ShortString literals: Ghidra finds those of 5 characters or more with references in both versions; 4-character ones (`purr`, `user`, `name`) are found in some builds only (3.0.4 t1 32-bit: missed, 3.2.2: found); no own ShortString pass exists (open). The 3.0.4 programs link `Windows` and `FCL` units (t3) without Lazarus; LCL / Lazarus forms are not checked with 3.0.4 (Lazarus needs 3.2.2). Strings: Ghidra's own handling already finds the
   literals and their references (ANSI and UTF-16), also in 64-bit; the 64-bit FPC string header has 8-byte
   `refCount` / `length` (24 bytes before the data) and `delphistr._STRREC` (4-byte refcount) does not match it.
 - IDR names (`server/idr.py`, `tests/test_idr.py`, DESIGN §11 "Delphi"): optional, config key `idr_kb_dir`

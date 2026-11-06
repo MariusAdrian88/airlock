@@ -36,7 +36,7 @@ from airlock.index.store import Binary, Store
 
 log = logging.getLogger("airlock")
 
-CPP_VERSION = 4                   # 4: connection maps, 64-bit dialog constructors, symbol / dialog class names, UTF-16 dispatch names; 3: route tables (routes.py); 2: names for classes without RTTI, dispatch maps
+CPP_VERSION = 5                   # 5: dialog constructors of stack objects, dialog classes and connection maps of shared MFC (no own CRuntimeClass); 4: connection maps, 64-bit dialog constructors, symbol / dialog class names, UTF-16 dispatch names; 3: route tables (routes.py); 2: names for classes without RTTI, dispatch maps
 CPP_META = "cpp_version"          # meta key prefix; the full key is ``cpp_version:<binary id>``
 
 MAX_SLOTS = 1024                  # slots read per vtable

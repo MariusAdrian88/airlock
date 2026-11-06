@@ -26,8 +26,9 @@ class FpcPe(Pe):
     """A synthetic FPC binary. A class reference points at the start of the VMT: ``size, -size, parent,
     ^className, dyn, method, field, typeInfo, init, auto, intf, msgStr``, then the virtual methods."""
 
-    def __init__(self, psize: int, marker: bool = True) -> None:
+    def __init__(self, psize: int, marker: bool = True, fpc30: bool = False) -> None:
         super().__init__(psize)
+        self.fpc30 = fpc30
         if marker:
             self.put(self.alloc(len(MARKER), 1), MARKER)
         self.late: list[tuple[int, str]] = []
@@ -124,6 +125,8 @@ class FpcPe(Pe):
                     impl[3 + i] = self.code.get(f"{name}.{mname}") or self.stub(f"{name}.{mname}")
                 self.put(vt, b"".join(self.p(self.thunk(f"{name}.{gtext}.{k}", impl[k]) if k in impl
                                              else self.stub(f"{name}.{gtext}.{k}")) for k in range(nm)))
+                if self.fpc30:      # FPC 3.0: the entry points at the GUID and the text, not at cells that hold them
+                    gref, sref = gcell, sstr
                 ents += self.p(gref) + self.p(vt) + self.p(off) + self.p(sref) + struct.pack("<I", 0).ljust(ps, b"\0")
             tab = self.alloc(ps + len(ents), ps)
             self.put(tab, self.p(len(interfaces)) + ents)
@@ -135,9 +138,12 @@ class FpcPe(Pe):
                 self.put(ti, bytes([kind, 0]))
                 cell = self.alloc(ps)
                 self.put(cell, self.p(ti))
-                ents += self.p(cell) + self.p(off)
-            blob = (b"\x0f" + _ss(name) + self.p(0) + struct.pack("<i", size) + self.p(0) + self.p(0)
-                    + struct.pack("<i", len(managed)) + ents)
+                ents += self.p(ti if self.fpc30 else cell) + self.p(off)
+            if self.fpc30:      # FPC 3.0: u32 size, u32 count, then {^typeinfo; offset}
+                blob = b"\x0f" + _ss(name) + struct.pack("<II", size, len(managed)) + ents
+            else:
+                blob = (b"\x0f" + _ss(name) + self.p(0) + struct.pack("<i", size) + self.p(0) + self.p(0)
+                        + struct.pack("<i", len(managed)) + ents)
             ta = self.alloc(len(blob), 1)
             self.put(ta, blob)
             words[8] = ta
@@ -390,12 +396,54 @@ def test_fpc_interface_method_names(tmp_path, psize):
     classes, _forms = delphi.parse_file(tmp_path / "a.exe", None, {g2: "IPlain"})
     base = {c.name: c for c in classes}["TBase"]
     names = [(m.slot, m.name) for m in base.methods if m.kind == "interface"]
-    assert [n for _s, n in names[:5]] == [f"{g1}.QueryInterface", f"{g1}._AddRef", f"{g1}._Release",
-                                          f"{g1}.Greet", f"{g1}.Count"]       # type info method table
+    assert [n for _s, n in names[:5]] == ["IGreeter.QueryInterface", "IGreeter._AddRef", "IGreeter._Release",
+                                          "IGreeter.Greet", "IGreeter.Count"]  # type info: name and method table
     assert names[5:9] == [(0, "IPlain.QueryInterface"), (1, "IPlain._AddRef"), (2, "IPlain._Release"),
                           (3, "IPlain.Ping")]                                # thunk jumps to a published method
     assert [n for _s, n in names[9:]] == [f"{g3}.{x}" for x in ("QueryInterface", "_AddRef", "_Release", "#3", "#4")]
     assert pe.code[f"TBase.{g1}.3"] != pe.code["TBase.impl3"]                # the slot is the thunk, not the target
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_fpc30_interface_entries_point_at_the_data(tmp_path, psize):
+    """FPC 3.0.4 [verified]: ``IID`` and ``IIDStr`` of an interface entry are the GUID and the text, FPC 3.2 has a
+    cell in between. Both read the same; an interface with type info is named from it (``IGreeter``), one
+    without keeps its GUID text."""
+    g1, g2 = "{B4F1A2C3-1111-2222-3333-444455556666}", "{AABBCCDD-0000-1111-2222-333344445555}"
+    rows = {}
+    for tag, old in (("30", True), ("32", False)):
+        pe = FpcPe(psize, fpc30=old)
+        pe.fclass("TObject", None, "System", psize, virtuals=13)
+        pe.fclass("TBase", "TObject", "BaseUnit", 6 * psize, virtuals=14, published=("Ping",),
+                  interfaces=((g1, 0, 3 * psize), (g2, 4, 4 * psize)),
+                  intf_rtti={g1: ("IGreeter", ("Greet", "Count"))}, intf_thunks={g2: ("Ping",)})
+        pe.write(tmp_path / f"a{tag}.exe")
+        classes, _forms = delphi.parse_file(tmp_path / f"a{tag}.exe", None, {})
+        base = {c.name: c for c in classes}["TBase"]
+        rows[tag] = [(m.kind, m.slot, m.name) for m in base.methods if m.kind.startswith("interface")]
+        names = [n for k, _s, n in rows[tag] if k == "interface"]
+        assert names[:5] == ["IGreeter.QueryInterface", "IGreeter._AddRef", "IGreeter._Release", "IGreeter.Greet",
+                             "IGreeter.Count"]
+        assert names[5:] == [f"{g2}.QueryInterface", f"{g2}._AddRef", f"{g2}._Release", f"{g2}.Ping"]
+        assert [(f.name, f.offset) for f in base.fields if f.type == "interface"] == [("IGreeter", 3 * psize),
+                                                                                       (g2, 4 * psize)]
+    assert rows["30"] == rows["32"]
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_fpc30_init_table_of_managed_fields(tmp_path, psize):
+    """FPC 3.0.4 [verified]: ``kind, name, u32 size, u32 count, {^typeinfo; offset}`` (3.2 has a terminator, two
+    pointers and cells around the type info)."""
+    out = {}
+    for tag, old in (("30", True), ("32", False)):
+        pe = FpcPe(psize, fpc30=old)
+        pe.fclass("TObject", None, "System", psize, virtuals=13)
+        pe.fclass("TBase", "TObject", "BaseUnit", 6 * psize, virtuals=14, managed=((psize, 9), (3 * psize, 14)))
+        pe.write(tmp_path / f"a{tag}.exe")
+        classes, _forms = delphi.parse_file(tmp_path / f"a{tag}.exe", None, {})
+        base = {c.name: c for c in classes}["TBase"]
+        out[tag] = [(f.offset, f.type) for f in base.fields]
+    assert out["30"] == out["32"] == [(psize, "AnsiString"), (3 * psize, "interface")]
 
 
 @pytest.mark.parametrize("psize", [4, 8])

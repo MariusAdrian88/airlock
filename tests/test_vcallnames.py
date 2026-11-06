@@ -36,6 +36,17 @@ def test_self_receiver_and_aliases():
     assert "vmt_508_adc_0/*TFormMain vslot 310*/(pvStack_c" in out
 
 
+def test_self_in_eax_of_a_method_without_declared_parameter():
+    """FPC 32-bit methods (3.0.4 and 3.2.2, verified): header ``(void)``, ``pvStack_8 = in_EAX;``."""
+    c = ("void FUN_00401640(void)\n\n{\n  void *in_EAX;\n  void *pvStack_8;\n  \n"
+         "  pvStack_8 = in_EAX;\n  vmt_64_ad_0(pvStack_8,&uStack_48);\n  return;\n}\n")
+    assert "vmt_64_ad_0/*TFormMain vslot 13*/(pvStack_8" in V.annotate(c, Fake())
+
+    class Two(Fake):
+        psize = 8
+    assert "TFormMain" not in V.annotate(c.replace("vmt_64", "vmt_200"), Two())      # 64-bit: no EAX Self
+
+
 def test_field_receiver_names_the_method():
     c = ("void FUN_x(void *param_1)\n{\n  vmt_508_a_0(*(void **)((int)param_1 + 0x4a0));\n}\n")
     assert "vmt_508_a_0/*TButton vslot 310 -> TButton.Click*/(" in V.annotate(c, Fake())

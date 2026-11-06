@@ -218,8 +218,10 @@ class Resolver:
 
     def _free(self, name: str) -> list[int] | None:
         """A variable no store reaches: a parameter or a global."""
-        if name in self.params:
-            k = self.params.index(name)
+        if name in self.params or (name == "in_EAX" and self.cls.psize == 4):
+            # 32-bit ``register`` convention: EAX is the first argument (Self) even where the decompiler
+            # declares no parameter and names the register ``in_EAX`` (FPC 3.0.4 and 3.2.2 methods, verified)
+            k = self.params.index(name) if name in self.params else 0
             if k == 0:
                 s = self.cls.self_class()
                 if s is not None:

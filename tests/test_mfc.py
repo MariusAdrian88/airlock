@@ -530,3 +530,151 @@ def test_name_of_uses_suggestion_only_for_unnamed_functions(proj):  # noqa: F811
     hints = uijoin.function_hints(st, bid, h["open"])
     assert "likely CMainFrame::OnCommand_100_Open" in hints
     assert uijoin.is_unnamed(None) and not uijoin.is_unnamed(st.function_at(bid, h["upd"]))
+
+
+# ── stack objects, shared MFC (no CRuntimeClass of the dialog class), connection slot ──────────────────────
+
+def raw_ctor32(b: Builder, dialog_id: int, vtable: int, target: int, store: bytes) -> int:
+    """push 0; push id; lea ecx,[esp+8]; call target; <store: mov dword [mem], imm32 with the vtable>; ret."""
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    head = b"\x6a\x00" + b"\x68" + struct.pack("<I", dialog_id) + b"\x8d\x4c\x24\x08"
+    call = b"\xe8" + struct.pack("<i", target - (va + len(head) + 5))
+    return b.code(head + call + store + struct.pack("<I", vtable) + b"\xc3")
+
+
+def raw_ctor64(b: Builder, dialog_id: int, vtable: int, target: int, store: bytes) -> int:
+    """mov edx,id; lea rcx,[rsp+40h]; call target; lea rax,[rip+vtable]; <store: mov [mem], rax>; ret."""
+    va = b.text_va + (len(b.text) + 15) // 16 * 16
+    head = b"\xba" + struct.pack("<I", dialog_id) + b"\x48\x8d\x4c\x24\x40"
+    call = b"\xe8" + struct.pack("<i", target - (va + len(head) + 5))
+    lea_at = va + len(head) + len(call)
+    lea = b"\x48\x8d\x05" + struct.pack("<i", vtable - (lea_at + 7))
+    return b.code(head + call + lea + store + b"\xc3")
+
+
+def test_ctor_dialogs_32bit_stack_objects():
+    b = Builder(4)
+    base = b.stub()
+    vts = [b.vtable(None, [b.stub()]) for _ in range(5)]
+    stores = [b"\xc7\x44\x24\x14",                       # mov dword [esp+14h], vtable   (SIB, disp8)
+              b"\xc7\x45\xf8",                           # mov dword [ebp-8], vtable     (disp8)
+              b"\xc7\x86\x00\x01\x00\x00",               # mov dword [esi+100h], vtable  (disp32)
+              b"\xc7\x84\x24\x00\x02\x00\x00",           # mov dword [esp+200h], vtable  (SIB, disp32)
+              b"\xc7\x05\x00\x00\x50\x00"]               # mov dword [500000h], vtable   (absolute: a global, no object)
+    for k, (vt, st) in enumerate(zip(vts, stores)):
+        raw_ctor32(b, 1000 + k, vt, base, st)
+    got = mfc.ctor_dialogs(b.image(), vts, set(range(1000, 1005)))
+    assert got == {vts[0]: 1000, vts[1]: 1001, vts[2]: 1002, vts[3]: 1003}
+
+
+def test_ctor_dialogs_64bit_stack_objects():
+    b = Builder(8)
+    base = b.stub()
+    vts = [b.vtable(None, [b.stub()]) for _ in range(6)]
+    stores = [b"\x48\x89\x44\x24\x40",                   # mov [rsp+40h], rax   (SIB, disp8)
+              b"\x48\x89\x45\xe8",                       # mov [rbp-18h], rax   (disp8)
+              b"\x48\x89\x85\x00\x01\x00\x00",           # mov [rbp+100h], rax  (disp32)
+              b"\x49\x89\x46\x08",                       # mov [r14+8], rax     (REX.B, disp8)
+              b"\x48\x89\x05\x10\x00\x00\x00",           # mov [rip+10h], rax   (a global, no object)
+              b"\x48\x89\xc3"]                           # mov rbx, rax         (register, no store)
+    for k, (vt, st) in enumerate(zip(vts, stores)):
+        raw_ctor64(b, 1000 + k, vt, base, st)
+    got = mfc.ctor_dialogs(b.image(), vts, set(range(1000, 1006)))
+    assert got == {vts[0]: 1000, vts[1]: 1001, vts[2]: 1002, vts[3]: 1003}
+
+
+def build_shared(ps: int):
+    """Shared MFC: dialog classes A, E, B in one run of code pointers, no CRuntimeClass of their own (the slot
+    0 thunk goes into the DLL). A and B have a map at slot 8; E has none (it inherits the DLL's); F is a
+    frame class with a map and no constructor that passes a dialog; G is a dialog class whose constructor
+    is not seen (its map ids are the controls of one dialog, which alone does not name it)."""
+    b = Builder(ps)
+    h = b.stub()
+    map_a = b.msgmap([(WM_COMMAND, 0, 5001, 5001, 12, h)])
+    map_b = b.msgmap([(WM_COMMAND, 0, 5002, 5002, 12, h), (0x113, 0, 0, 0, 40, h)])
+    map_f = b.msgmap([(WM_COMMAND, 0, 40001, 40001, 12, h)])
+    map_g = b.msgmap([(WM_COMMAND, 0, 5003, 5003, 12, h), (WM_COMMAND, 0, 5004, 5004, 12, h)])
+    ga, gb, gf, gg = (b.getter(m) for m in (map_a, map_b, map_f, map_g))
+    thunk = b.stub()
+
+    def slots(getter: int | None) -> list[int]:
+        return [thunk] + [b.stub() for _ in range(7)] + [getter if getter else thunk] + [b.stub() for _ in range(3)]
+
+    runs = slots(ga) + slots(None) + slots(gb)
+    first = b.data(b"".join(b.ptr(x) for x in runs))
+    vt_a, vt_e, vt_b = (first + k * 12 * ps for k in range(3))
+    b.vtable(None, slots(gf))
+    b.vtable(None, slots(gg))
+    base = b.stub()
+    mk = dialog_ctor if ps == 4 else dialog_ctor64
+    mk(b, 1000, vt_a, base)
+    mk(b, 1001, vt_b, base)
+    mk(b, 1003, vt_e, base)
+    return b, dict(map_a=map_a, map_b=map_b, map_f=map_f, map_g=map_g, vt_a=vt_a, vt_b=vt_b)
+
+
+@pytest.mark.parametrize("ps", [4, 8], ids=["x86", "x64"])
+def test_shared_mfc_dialog_classes_are_named(monkeypatch, ps):
+    monkeypatch.setattr(mfc, "_dialog_ids", lambda path: {1000: "Alpha", 1001: "Beta", 1002: "Gamma", 1003: "Eps"})
+    monkeypatch.setattr(mfc, "_dialog_ctrls", lambda path: {1000: {5001}, 1001: {5002}, 1002: {5003, 5004}})
+    b, a = build_shared(ps)
+    img = b.image()
+    classes, slots, maps = cpp.parse_image(img)
+    assert not classes and not mfc.find_runtime_classes(img)
+    res = mfc.analyse(img, classes, slots, maps, None)
+    by_addr = {m.map_addr: m.cls for m in maps}
+    assert by_addr[a["map_a"]] == "Dialog_Alpha" and by_addr[a["map_b"]] == "Dialog_Beta"
+    assert by_addr[a["map_g"]].startswith("anon_")                      # no constructor seen: control ids alone do not name it
+    assert by_addr[a["map_f"]].startswith("anon_")                      # no dialog
+    rows = {c.name: c for c in res.classes}
+    assert (rows["Dialog_Alpha"].vtable, rows["Dialog_Alpha"].dialog, rows["Dialog_Alpha"].source) == \
+        (a["vt_a"], "1000", "dialog")
+    assert (rows["Dialog_Beta"].vtable, rows["Dialog_Beta"].map_addr) == (a["vt_b"], a["map_b"])
+    assert "Dialog_Eps" not in rows and len(rows) == 2                  # E: the next getter is B's, wrong distance
+
+
+def test_shared_mfc_needs_dialog_resources(monkeypatch):
+    monkeypatch.setattr(mfc, "_dialog_ids", lambda path: {})
+    b, a = build_shared(8)
+    img = b.image()
+    classes, slots, maps = cpp.parse_image(img)
+    res = mfc.analyse(img, classes, slots, maps, None)
+    assert all(m.cls.startswith("anon_") for m in maps) and not res.classes
+
+
+def test_constructor_dialog_decides_the_class_dialog(proj):  # noqa: F811
+    """A dialog class that also handles a menu id (a shared command) looks like a frame by its ids; the dialog
+    id its constructor passed (``mfc_class.dialog``) decides."""
+    ctx, st, bid, h = proj
+    assert uijoin.UiIndex(st, bid).class_dialogs("CMainFrame") == []
+    st.db.execute("INSERT INTO mfc_class(binary_id, name, vtable_addr, rc_addr, obj_size, schema, base, map_addr, "
+                  "dialog, source) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (bid, "CMainFrame", 0x1000, 0, 0, 0, "", 0, "102", "dialog"))
+    st.db.commit()
+    ui = uijoin.UiIndex(st, bid)
+    assert ui.class_dialogs("CMainFrame") == ["102"] and ui.class_dialogs("CSettingsDlg") == ["101"]
+    assert ui.class_dialog_text("CMainFrame").startswith("dialog 102")
+
+
+@pytest.mark.parametrize("ps", [4, 8], ids=["x86", "x64"])
+def test_connection_map_without_interface_getter_behind_it(ps):
+    """Shared MFC: the class inherits ``GetInterfaceMap`` (a thunk into the DLL, no getter), so its connection map
+    at slot 15 is alone; the slot number tells it from an interface map."""
+    b = Builder(ps)
+    conn = intmap(b, [(PROP_NOTIFY, 0x30)])
+    lone = intmap(b, [(IDISPATCH, 16)])
+    thunk = b.stub()
+
+    def vt(slot: int, m: int, name: str) -> list[int]:
+        s = [thunk] * 18
+        s[0] = b.getter(runtime_class(b, name, 80))
+        s[slot] = b.getter(m)
+        return s
+
+    b.vtable(None, vt(15, conn, "CSlot15"))
+    b.vtable(None, vt(16, lone, "CSlot16"))                    # GetInterfaceMap: stays an interface map
+    img = b.image()
+    classes, slots, maps = cpp.parse_image(img)
+    res = mfc.analyse(img, classes, slots, maps, None)
+    got = sorted((m.cls, m.kind, m.addr) for m in res.maps)
+    assert got == [("CSlot15", "connection", conn), ("CSlot16", "interface", lone)]

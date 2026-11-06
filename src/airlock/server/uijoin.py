@@ -335,6 +335,12 @@ class UiIndex:
         if cls in self._class_dialogs:
             return self._class_dialogs[cls]
         res: list[str] = []
+        row = self.store.db.execute(                       # the constructor passed the dialog id: it decides
+            "SELECT dialog FROM mfc_class WHERE binary_id=? AND name=? AND dialog<>'' LIMIT 1",
+            (self.bid, cls)).fetchone()
+        if row is not None and row[0] in self.dialog_caption:
+            self._class_dialogs[cls] = [row[0]]
+            return self._class_dialogs[cls]
         ids = self._handled_ids(cls)
         if any(i in self.menu_refs and i not in self.ctrl_refs for i in ids):
             ids = set()                                   # a frame / view / document class
