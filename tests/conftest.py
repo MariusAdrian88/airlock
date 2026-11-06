@@ -22,18 +22,25 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--xbin", action="store", default=None,
                      help="folder with an exe and a DLL it imports (cross-binary Ghidra test); "
                           "pass with = like --binary")
+    parser.addoption("--realdata", action="store_true", default=False,
+                     help="run the real-data suite (-m realdata): downloads pinned open-source targets "
+                          "and runs real Ghidra on them (tests/realdata/README.md)")
+    parser.addoption("--realdata-cache", action="store", default=None,
+                     help="folder for the downloads of the real-data suite "
+                          "(default: <airlock data dir>/realdata)")
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config) -> None:
     # Ghidra integration runs start a JVM per worker and share Ghidra projects: run them serially.
-    if (config.getoption("--binary") or config.getoption("--xbin")) and hasattr(config.option, "numprocesses"):
+    if (config.getoption("--binary") or config.getoption("--xbin") or config.getoption("--realdata")) and hasattr(config.option, "numprocesses"):
         config.option.numprocesses = 0
         config.option.dist = "no"
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "ghidra: needs a Ghidra install and --binary <exe>")
+    config.addinivalue_line("markers", "realdata: downloads open-source targets and runs real Ghidra; needs --realdata")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

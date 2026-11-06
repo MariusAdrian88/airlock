@@ -1,0 +1,44 @@
+{
+ "_note": "Open-source targets only. url is pinned to one release; sha256 is of the downloaded archive. members are extracted into the cache, file is the one analysed.",
+ "targets": [
+  {
+   "name": "winmtr",
+   "toolchain": "msvc-mfc",
+   "license": "GPL-2.0",
+   "version": "WinMTR Redux v1.00 (static MFC)",
+   "url": "https://github.com/White-Tiger/WinMTR/releases/download/v1.0/WinMTR-v100-static.zip",
+   "sha256": "2da85a22a319e87705fa846e949e28b9a23726d161816228d49af402d55ea60e",
+   "file": "WinMTR64.exe",
+   "members": [
+    "WinMTR64.exe"
+   ],
+   "source": "https://github.com/White-Tiger/WinMTR"
+  },
+  {
+   "name": "tilestudio",
+   "toolchain": "delphi-32",
+   "license": "MIT",
+   "version": "Tile Studio 2.55",
+   "url": "https://sourceforge.net/projects/tilestudio/files/tilestudio/2.55/ts-2.55-bin.zip/download",
+   "sha256": "e5b237d6d990f545f218ec082c92a165c3ea636490ecfaf1e01a4d5574a60f8c",
+   "file": "TS.exe",
+   "members": [
+    "TS.exe"
+   ],
+   "source": "https://github.com/Wiering/Tile-Studio"
+  },
+  {
+   "name": "keepass",
+   "toolchain": "dotnet-winforms",
+   "license": "GPL-2.0",
+   "version": "KeePass 2.60",
+   "url": "https://sourceforge.net/projects/keepass/files/KeePass%202.x/2.60/KeePass-2.60.zip/download",
+   "sha256": "63872830ae78a0e9075cd32b61693ce1e719929b3124e4987b1f3dc42f31da74",
+   "file": "KeePass.exe",
+   "members": [
+    "KeePass.exe"
+   ],
+   "source": "https://sourceforge.net/p/keepass/code/"
+  }
+ ]
+}
