@@ -58,7 +58,7 @@ def inspect(root: Path) -> GhidraInstall:
     """Read an install directory. Raises FileNotFoundError if it is not Ghidra."""
     props_file = root / "Ghidra" / "application.properties"
     if not props_file.is_file():
-        raise FileNotFoundError(f"{root} is not a Ghidra installation ({props_file} missing)")
+        raise FileNotFoundError(f"{root} is not a Ghidra installation ({props_file} missing); check ghidra_dir in config.jsonc")
     props = read_properties(props_file)
 
     java_min = props.get("application.java.min")

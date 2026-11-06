@@ -114,7 +114,7 @@ def _start_ghidra(args: dict[str, Any]) -> dict[str, Any]:
     try:
         launcher.start()
     except SystemExit as e:  # PyGhidra reports fatal launch errors via sys.exit
-        raise WorkerError("ghidra_start_failed", f"PyGhidra exited during startup ({e})") from e
+        raise WorkerError("ghidra_start_failed", f"PyGhidra exited during startup ({e}); see logs/worker.log in the data dir; run airlock doctor --start") from e
 
     from ghidra.framework import Application  # type: ignore  # available after start
     from java.lang import System  # type: ignore

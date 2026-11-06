@@ -909,3 +909,21 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
 - Open: sequential layouts have no offsets; inherited implementations through a base class that implements the interface of
   another assembly are matched by name only; the IL listing does not name enum constants (use `dotnet_types kind=field
   query=<enum>`); `xrefs` takes `Type::Field` (other tools do not).
+
+## Install-time fixes (clean install test)
+
+- `server/tools/admin.py`: a `"` inside a `"` f-string (SyntaxError on Python 3.10 and 3.11) is gone.
+  `tests/test_install_fixes.py` parses every `.py` under `src` with `feature_version=(3, 10)`.
+- `doctor`: with `ilspycmd` unset it prints `WARN ilspycmd: not set; optional, for .NET; run airlock doctor --fix`.
+  `doctor --fix` installs it to `<data_dir>/tools/ilspycmd.exe` (`install_ilspycmd`) and writes the key with
+  `config.report.set_value` (same code as `airlock config --set`). Tests use a fake installer.
+  `tool_missing` texts in `tools/dotnet.py` now say `run airlock doctor --fix`.
+- `doctor` without a config file: one WARN with the fix, no duplicate `config` FAIL, the `ghidra` FAIL says
+  `run airlock init --ghidra <path>`; `--fix` says it needs a config first and fixes nothing.
+- `parse_jsonc`: `<path>: invalid JSONC at line N column M: <reason>. Fix the file, or run airlock init --force.`
+- `airlock serve` (dirty role) without `ghidra_dir` prints one line to stderr and still serves: spec, scan, file
+  format and .NET file tools work without Ghidra. `WorkerClient.ensure_ghidra` error names the fix.
+- Stale-config WARN shows the count and the fix only. Fix text added to the Ghidra, JDK, network-drive and
+  `ghidra_start_failed` messages. Sigdbs cannot be downloaded: doctor names `airlock delphi-sigs build|fpc-build`.
+- Bug found by the `--fix` test: `config.edit.set_key` on a one-line config (`{"a": 1}`) wrote broken JSON
+  (indent was `{`). Fixed in `_indent_of`.

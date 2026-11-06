@@ -128,7 +128,9 @@ def _line_start(text: str, pos: int) -> int:
 def _indent_of(text: str, members: list[Member]) -> str:
     if members:
         ls = _line_start(text, members[0].key_start)
-        return text[ls:members[0].key_start]
+        ind = text[ls:members[0].key_start]
+        if ind.strip() == "":           # not the brace of a one-line object
+            return ind
     return "  "
 
 

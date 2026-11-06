@@ -13,6 +13,7 @@ applies again). For location keys, null simply means "not set".
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,11 +83,22 @@ def default_config_text() -> str:
     return generate_template()
 
 
+def _jsonc_where(e: ValueError) -> str:
+    """`line N column M: <reason>` from a json5 error (it starts with `<string>:N `, ends with `at column M`)."""
+    msg = str(e)
+    m = re.match(r"<string>:(\d+)\s+(.*?)(?:\s+at column (\d+))?\s*$", msg, re.S)
+    if not m:
+        return msg
+    line, reason, col = m.groups()
+    return f"line {line}" + (f" column {col}" if col else "") + f": {reason}"
+
+
 def parse_jsonc(text: str, origin: str = "<string>") -> dict[str, Any]:
     try:
         data = json5.loads(text)
     except ValueError as e:
-        raise ConfigError(f"{origin}: invalid JSONC: {e}") from e
+        raise ConfigError(f"{origin}: invalid JSONC at {_jsonc_where(e)}. "
+                          "Fix the file, or run airlock init --force.") from e
     if not isinstance(data, dict):
         raise ConfigError(f"{origin}: top level must be an object")
     return data
@@ -212,7 +224,7 @@ def resolve(merged: dict[str, Any], profile: str | None, source: Path | None) ->
 
     ghidra_dir = _opt_path(eff.get("ghidra_dir"), "ghidra_dir")
     if ghidra_dir is None and role == DIRTY_ROLE:
-        issues.append(Issue("error", "ghidra_dir is not set"))
+        issues.append(Issue("error", "ghidra_dir is not set; run airlock init --ghidra <path>"))
 
     return Config(
         source=source,

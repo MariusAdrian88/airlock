@@ -233,7 +233,7 @@ class WorkerClient:
             return self.ghidra
         cfg = self.config
         if cfg.ghidra_dir is None:
-            raise WorkerError("not_configured", "ghidra_dir is not set in config.jsonc")
+            raise WorkerError("not_configured", "ghidra_dir is not set in config.jsonc; set it with airlock init --ghidra <path>")
         t0 = time.monotonic()
         self.ghidra = self.request("start_ghidra", {
             "install_dir": str(cfg.ghidra_dir),

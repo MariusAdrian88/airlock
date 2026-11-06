@@ -139,14 +139,15 @@ def test_dirty_profile_without_writes_is_kept(tmp_path):
 
 def test_stale_message_text(old):
     msg = stale_message(old.read_text("utf-8"))
-    assert msg.startswith("version 0 < 1; ") and "tools/keys missing (" in msg
+    assert msg.startswith("version 0 < 1; ") and "tools/keys missing; " in msg
     assert msg.endswith("run airlock config upgrade")
     assert stale_message(generate_template()) is None
 
 
 @pytest.fixture
-def doctor_cfg(old):
+def doctor_cfg(old, monkeypatch):
     from airlock import doctor
+    monkeypatch.setattr(doctor, "install_ilspycmd", lambda dest, *a: (False, "no download in tests"))
     return doctor, old
 
 

@@ -25,6 +25,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return 2
     from airlock import logs
     logs.setup_server_logging(cfg.data_dir)         # rotating logs\server.log next to worker.log
+    if cfg.ghidra_dir is None and not cfg.is_clean:
+        print("airlock: ghidra_dir is not set in config.jsonc; set it with airlock init --ghidra <path>",
+              file=sys.stderr)
     serve(cfg, profile_explicit=args.profile is not None)
     return 0
 
