@@ -174,6 +174,28 @@ underscore rule; `Store.set_meta` commits outside a transaction and
 `atomic_write_text` gives each writer its own temp file (the PROJECT.md and
 `database is locked` races).
 
+## Clean-room audit fixes
+
+An audit of the clean-room gate found one real leak and several gaps. Fixed, with tests in
+`tests/test_cleanroom_audit.py`:
+
+- Purpose paragraph: `project_describe` runs the spec filter (`specfilter.check_text`); `render_clean` and
+  `write_maps` drop a purpose that fails it (old rows). A clean `project_open` no longer opens the index: it reads the
+  purpose from `clean\PROJECT.md` and filters it again. `scrub_dirty_path` also handles `..\dirty`, `dirty\` and 8.3 names.
+- Spec filter: 14 new bypass shapes rejected (inline code, table cells, trailing comments, one-line blocks, Python,
+  more Ghidra label forms, 16+ hex bytes as words, 12+ decimal byte values, base64, "at <decimal address>").
+  Interface facts stay allowed (magic values, offsets, polynomials, message IDs, pseudocode in prose). The byte-run
+  limit moved from 8 to 16 bytes (tests in `test_specs.py` changed to match). `spec_export` filters again.
+- Unbound phase: `projects` is redacted before a bind. `project_info` and `program_scan` still show paths when unbound
+  (setup needs them); after either, `project_open(..., "clean")` is refused (`ServerContext.unredacted_shown`).
+- Deny rules: manifest, data folder, original program folder and `config.jsonc` added for Claude Code; the dirty
+  folder gets `Edit(clean/**)`; every JSON file is read back and a missing rule is reported. Codex TOML is still **[verify]**.
+- `spec_read` (clean) refuses a published file with `st_nlink > 1`.
+- Config `require_spec_review` (default false): when true an agent cannot set `final` or publish; a person runs
+  `airlock spec-approve <project> [--prefix P] [--yes]`. No MCP elicitation yet.
+- Open: Bash in Claude Code is not covered by deny rules; the filter is a heuristic; a 16-byte GUID or a 32-digit hash
+  written as hex is rejected as a byte run.
+
 ## Working rules for this project
 
 - Sonnet agents execute; the main session briefs, reviews, runs the full

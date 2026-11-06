@@ -31,6 +31,12 @@ def build_server(config: Config, profile_explicit: bool = False
     ctx = ServerContext(config=config, worker=WorkerClient(config))
     if profile_explicit:
         ctx.profile_role = config.role
+    try:
+        from airlock.server import projectmap
+        for n in projectmap.migrate_clean_maps(config.projects_root):
+            log.warning("clean map of %s held a purpose that fails the filter; removed", n)
+    except Exception as e:  # noqa: BLE001  an extra; the server must start
+        log.warning("clean map check failed: %s", e)
     server = MCPServer(name="airlock", version=__version__, instructions=INSTRUCTIONS)
     for name in config.tools:
         impl = IMPLEMENTED.get(name)

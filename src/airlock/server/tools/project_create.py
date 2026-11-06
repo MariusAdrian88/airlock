@@ -108,7 +108,10 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
         "selected_option": key, "add": _csv(add), "remove": _csv(remove), "files": files,
     })
     write_manifest(pp.manifest, man)
-    write_clean_deny_rules(pp)
+    cfg = ctx.config
+    deny = write_clean_deny_rules(
+        pp, deny_dirs=[cfg.data_dir, scan.root], deny_files=[cfg.source] if cfg.source else [])
+    deny_failed = [x for x in deny if x.startswith("deny rules not applied")]
 
     # Every selected PE file goes on the analysis queue (the indexer updates the manifest states).
     try:
@@ -130,7 +133,7 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
         f"project {slug} created at {pp.root}",
         f"option {key}: {len(selected)} files ({len(pes)} executables), {code / _MB:.1f} MB code",
         f"root {root_f.rel_path}: {root_note}; {rest} other executables{_state_counts(pes, root_f, states)}",
-        f"deny rules for the clean folder written in {pp.clean}",
+        *(deny_failed or [f"deny rules for the clean folder written in {pp.clean}"]),
         *(dirty_lines(pp) if bound is None else [bound]),
     ])
 

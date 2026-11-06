@@ -12,6 +12,7 @@ import struct
 import threading
 import time
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -280,31 +281,70 @@ def _merge_json(path: Path, patch: dict) -> None:
     path.write_text(json.dumps(cur, indent=2) + "\n", "utf-8")
 
 
-def write_clean_deny_rules(pp: ProjectPaths) -> list[str]:
-    """Deny rules in clean/ that keep the clean agent's own file tools out of ../dirty,
-    using the absolute path of the sibling folder. Existing user files are merged
-    (JSON) or left alone (Codex TOML). Returns the files written."""
-    pp.clean.mkdir(parents=True, exist_ok=True)
+def _covers(cur: object, patch: object) -> bool:
+    """True when every entry of ``patch`` is present in ``cur`` with the same value."""
+    if isinstance(patch, dict):
+        return isinstance(cur, dict) and all(k in cur and _covers(cur[k], v) for k, v in patch.items())
+    if isinstance(patch, list):
+        return isinstance(cur, list) and all(x in cur for x in patch)
+    return cur == patch
+
+
+def _applied(path: Path, patch: dict) -> bool:
+    """Read the file back: is every rule of ``patch`` really in it?"""
+    try:
+        return _covers(json5.loads(path.read_text("utf-8-sig")), patch)
+    except (OSError, ValueError):
+        return False
+
+
+def _deny_patches(pp: ProjectPaths, deny_dirs: list[Path], deny_files: list[Path]) -> list[tuple[Path, dict]]:
     rule = _claude_rule_path(pp.dirty)
-    written = []
-    f = pp.clean / ".claude" / "settings.json"
-    _merge_json(f, {"permissions": {"deny": [f"Read({rule}/**)", f"Edit({rule}/**)"]}})
-    written.append(str(f))
-    f = pp.clean / "opencode.json"
-    _merge_json(f, {"permission": {"external_directory": {"*": "deny"}}})
-    written.append(str(f))
+    dirs = [_claude_rule_path(Path(d)) + "/**" for d in deny_dirs]
+    files = [_claude_rule_path(pp.manifest), *(_claude_rule_path(Path(x)) for x in deny_files)]
+    deny = [f"Read({rule}/**)", f"Edit({rule}/**)", *(f"{t}({p})" for p in files + dirs for t in ("Read", "Edit"))]
+    return [(pp.clean / ".claude" / "settings.json", {"permissions": {"deny": deny}}),
+            (pp.clean / "opencode.json", {"permission": {"external_directory": {"*": "deny"}}}),
+            (pp.dirty / ".claude" / "settings.json",
+             {"permissions": {"deny": [f"Edit({_claude_rule_path(pp.clean)}/**)"]}})]
+
+
+def deny_rules_current(pp: ProjectPaths, deny_dirs: Iterable[Path] = (), deny_files: Iterable[Path] = ()) -> bool:
+    """Read back: are all the rules ``write_clean_deny_rules`` writes present in the files?"""
+    return all(_applied(f, patch) for f, patch in _deny_patches(pp, list(deny_dirs), list(deny_files)))
+
+
+def write_clean_deny_rules(pp: ProjectPaths, deny_dirs: Iterable[Path] = (),
+                           deny_files: Iterable[Path] = ()) -> list[str]:
+    """Deny rules that keep the clean agent's file tools away from dirty data, and the dirty agent's
+    file tools out of clean/ (nothing may reach clean/ outside the spec filter).
+
+    Clean side (Claude Code, OpenCode, Codex): the sibling dirty folder, the manifest, and the extra
+    ``deny_dirs`` / ``deny_files`` (the data folder with the logs, the original program folder, the
+    config file). Existing user files are merged (JSON; the user's entries win) or left alone (Codex
+    TOML). Every JSON file is read back: a rule that is not in it is reported as
+    ``deny rules not applied: <file>`` instead of the file name. Returns one line per file."""
+    deny_dirs, deny_files = list(deny_dirs), list(deny_files)
+    pp.clean.mkdir(parents=True, exist_ok=True)
+    pp.dirty.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f, patch in _deny_patches(pp, deny_dirs, deny_files):
+        _merge_json(f, patch)
+        out.append(str(f) if _applied(f, patch) else f"deny rules not applied: {f}")
     f = pp.clean / ".codex" / "config.toml"
     if not f.exists():
-        d = str(pp.dirty.resolve()).replace("\\", "/")
+        denied = [pp.dirty, pp.manifest, *map(Path, deny_dirs), *map(Path, deny_files)]
+        lines = "".join(f'"{str(p.resolve()).replace(chr(92), "/")}{"/**" if p in [pp.dirty, *map(Path, deny_dirs)] else ""}" = "deny"\n'
+                        for p in denied)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(
-            "# airlock: keep the clean session out of the sibling dirty folder. [verify] schema\n"
+            "# airlock: keep the clean session out of dirty data. [verify] schema\n"
             'default_permissions = "airlock-clean"\n\n'
             "[permissions.airlock-clean.filesystem]\n"
-            f'":workspace_roots" = {{ "." = "write" }}\n"{d}/**" = "deny"\n',
+            f'":workspace_roots" = {{ "." = "write" }}\n{lines}',
             "utf-8")
-        written.append(str(f))
-    return written
+        out.append(str(f))
+    return out
 
 
 def hash_file(path: Path, chunk: int = 1 << 20) -> str:

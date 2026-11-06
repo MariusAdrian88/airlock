@@ -171,7 +171,7 @@ Keys: `config_version`; locations `ghidra_dir`, `jdk_dir`, `ilspycmd`,
 `max_budget`, `detail`; decompiler `decompile_timeout_s`, `decompile_timeout_max_s`, `bulk_decompile`,
 `bulk_decompile_timeout_s`, `decompile_cpu_min`, `decompile_cpu_max`, `session_wait_s`;
 analysis `analysis_timeout_min`, `analysis_s_per_code_mb`, `jvm_max_memory`;
-`mermaid`, `mirror_notes_to_ghidra`; tools `allow_writes`, `disabled_sets`,
+`mermaid`, `mirror_notes_to_ghidra`; tools `allow_writes`, `require_spec_review`, `disabled_sets`,
 `disabled_tools`.
 
 ### Tool selection
@@ -1789,18 +1789,27 @@ that fails too; a name the tools print is accepted as a target (`Class::slot` of
 (catalog flag `clean_safe`): in a clean session `projects` shows only name and
 published spec count, and `project_info` only role, project name, version and
 enabled tool names. No paths into `dirty\`, no binary names, no Ghidra paths.
+An unbound session gets the same redacted `projects`. `project_info` and `program_scan` stay
+unredacted before a bind (a dirty user needs them to set up), so a session that called one of
+them cannot bind clean afterwards (`error role_locked`); a clean agent needs a new session.
+A clean `project_open` reads only `clean\` files (the purpose comes from `clean\PROJECT.md`);
+it never opens the index.
 
 The folders still matter to the clients. `project_create` writes deny rules into
 `clean\` so that a client started there cannot read the sibling `dirty\`:
 
 | Client | Deny rules written into `clean\` | Shell blocked? |
 |---|---|---|
-| Claude Code | `.claude\settings.json`: `permissions.deny` with `Read(//<abs>/dirty/**)` and `Edit(//<abs>/dirty/**)` (`//` = absolute from filesystem root, forward slashes; Windows drive form **[verify]**) | no: `cat`/`type` on the path still work; rules cover Read/Grep/Glob and @-mentions |
+| Claude Code | `.claude\settings.json`: `permissions.deny` with `Read`/`Edit` of `//<abs>/dirty/**`, the manifest `airlock-project.jsonc`, the data folder (logs), the original program folder and `config.jsonc` (`//` = absolute from filesystem root, forward slashes; Windows drive form **[verify]**) | no: `cat`/`type` on the path still work; rules cover Read/Grep/Glob and @-mentions |
 | OpenCode | `opencode.json`: `permission.external_directory {"*": "deny"}` (blocks paths outside the launch folder, bash included) **[verify]** | yes, for paths outside the launch folder **[verify]** |
 | Codex | `.codex\config.toml`: permission profile `airlock-clean` denying `<abs>/dirty/**`; exact TOML nesting **[verify]** | per profile **[verify]** |
 
 Existing user files in `clean\` are never overwritten: the JSON files are
-merged, the Codex TOML is skipped when present. Relative `..\dirty` rules are
+merged (the user's entries win), the Codex TOML is skipped when present. After the merge each
+JSON file is read back; a rule that is missing is reported by `project_create` as
+`deny rules not applied: <file>` instead of "written". The dirty folder gets
+`.claude\settings.json` with `Edit(//<abs>/clean/**)`, so the dirty agent's file tools cannot put
+text into `clean\` past the spec filter. Relative `..\dirty` rules are
 not used because their resolution is unconfirmed in all three clients.
 
 - One registration of `airlock serve` per client, with no flags; the server
@@ -1853,10 +1862,35 @@ prefix that are no longer final are withdrawn (file and entry removed).
   binary keeps the rows and clears only `function_id`.
 - Filter details (module `server/specfilter.py`, errors `spec_has_code`,
   `spec_has_ghidra_names`, `spec_has_bytes`, `spec_has_address`; each names the line):
-  N = 8 consecutive hex bytes; "image range" = `[image_base, highest known function or
-  string address + 1 MB]` per binary; any pointer-sized hex literal (8+ digits) is also
-  rejected; fenced code blocks are rejected; small values (field offsets, magic numbers of
-  up to 7 digits) stay allowed. Title and body are both checked. Topics are lowercase path
+  N = 16 consecutive hex bytes (also 4+ adjacent 8-digit hex words, 12+ decimal byte values in
+  a row, a base64 run of 24+ characters with mixed case and digits); "image range" =
+  `[image_base, highest known function or string address + 1 MB]` per binary; a hex literal is
+  rejected only inside an image range (or as a zero-padded 64-bit user-space pointer), and a
+  decimal number only when words such as "at" or "address" mark it as an address. Interface
+  facts stay allowed: magic values and signatures (`4D 5A`, `0x504B0304`), offsets and sizes,
+  constants, polynomials, message IDs, error codes, versions, ports, and pseudocode in prose
+  (numbered steps, `if size > max then fail`). Rejected: fenced blocks, C/C#/Pascal/IL/Python
+  statement shapes (also inside backticks, table cells and after a trailing comment), one-line
+  `if (...) stmt;` and `{ stmt; }` blocks, Ghidra names (`FUN_`, `thunk_FUN_`, `s_..._<addr>`,
+  `switchD_`, `puVar3`, `uStack_`, `field_0x..`). Title and body are both checked, and
+  `spec_export` checks them again, so an old row that fails now is not published (and is
+  withdrawn). The project purpose (`project_describe`) goes through the same filter; the clean
+  map drops a purpose that fails it.
+- Test vectors (allowed, so a clean implementation can check itself): (a) one hex token of exactly 32, 40,
+  64 or 128 digits on a line that holds a digest word (MD5, SHA-1, SHA-256, SHA-512, hash, digest,
+  checksum, HMAC, fingerprint); a spaced byte dump on the same line still fails. (b) A line that starts with
+  `vector:` and holds only `name=<hex>` pairs, each value up to 64 bytes in contiguous hex, for byte-level
+  formats: `vector: in=616263 out=900150983cd24fb0d6963f7d28e17f72`. Other text on the line, a value over 64
+  bytes, or a vector marker in the middle of a line gets no exception. The image-address and Ghidra-name
+  checks stay active on both forms.
+- Old projects: a dirty `project_open` renders `clean\PROJECT.md` again through the filter and refreshes the
+  deny rules when the read-back shows one missing. At server start, `clean\PROJECT.md` of every project whose
+  purpose fails the filter is reset to "(not set yet)" (clean files only, no index).
+- Spec approval: config `require_spec_review` (default `false`). When `true`, `spec_write` with
+  `status=final` and `spec_export` return `error needs_approval` and name
+  `airlock spec-approve <project>`. That CLI command prints the reviewed specs; with `--yes` it
+  sets them to `final` and publishes them. An MCP elicitation path is not built.
+- `spec_read` (clean) refuses a published file with more than one hard link. Topics are lowercase path
   segments (`a-z0-9._-`), which also name the published file.
 - Spec versions are immutable rows (`UNIQUE (topic, version)`); specs, provenance and audit
   are agent data and are never dropped by re-extraction or rebuild of derived rows.

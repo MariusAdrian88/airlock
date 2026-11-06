@@ -104,6 +104,8 @@ def test_new_session_is_unbound(tmp_path):
 
 def test_projects_lists_full_when_not_clean(tmp_path):
     server, ctx, pp = _server(tmp_path)
+    assert _call(server, "projects") == "demo | specs 1"      # unbound: redacted (clean audit, finding 3)
+    ctx.session = roles.SessionState(roles.DIRTY, pp)
     assert _call(server, "projects") == (
         f"demo | root app.exe | binaries 1 ready/1 queued | specs 1 | {pp.root}")
 
@@ -277,7 +279,8 @@ def test_deny_rules(tmp_path):
     P.write_clean_deny_rules(pp)
     rule = "//" + str(pp.dirty.resolve()).replace("\\", "/")
     cs = json.loads((pp.clean / ".claude" / "settings.json").read_text("utf-8"))
-    assert cs == {"permissions": {"deny": [f"Read({rule}/**)", f"Edit({rule}/**)"]}}
+    assert cs["permissions"]["deny"][:2] == [f"Read({rule}/**)", f"Edit({rule}/**)"]
+    assert set(cs) == {"permissions"} and set(cs["permissions"]) == {"deny"}
     assert json.loads((pp.clean / "opencode.json").read_text("utf-8")) == {
         "permission": {"external_directory": {"*": "deny"}}}
     toml = (pp.clean / ".codex" / "config.toml").read_text("utf-8")
@@ -295,9 +298,10 @@ def test_deny_rules_merge_and_keep_existing(tmp_path):
     P.write_clean_deny_rules(pp)
     cs = json.loads(cj.read_text("utf-8"))
     assert cs["x"] == 1 and cs["permissions"]["allow"] == ["Bash(ls)"]
-    assert cs["permissions"]["deny"][0] == "Read(secret)" and len(cs["permissions"]["deny"]) == 3
+    n = len(cs["permissions"]["deny"])
+    assert cs["permissions"]["deny"][0] == "Read(secret)" and n == 5   # + dirty Read/Edit, manifest Read/Edit
     P.write_clean_deny_rules(pp)  # idempotent
-    assert len(json.loads(cj.read_text("utf-8"))["permissions"]["deny"]) == 3
+    assert len(json.loads(cj.read_text("utf-8"))["permissions"]["deny"]) == n
     assert (pp.clean / ".codex" / "config.toml").read_text() == "mine = true\n"
 
 

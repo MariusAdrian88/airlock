@@ -84,6 +84,10 @@ def project_describe(ctx: ServerContext, purpose: str = "") -> str:
         return "error empty_purpose: purpose is empty."
     if len(text) > 1500:
         return f"error too_long: purpose has {len(text)} characters, the limit is 1500."
+    from airlock.server import specfilter, specs as sp
+    refusal = specfilter.check_text(text, sp.image_ranges(st))
+    if refusal:
+        return refusal
     pm.set_purpose(st, text)
     pm.write_maps(pp, st, mermaid=bool(ctx.config.defaults.get("mermaid")))
     return f"purpose set ({len(text)} chars). Maps updated: {pp.dirty / 'PROJECT.md'}, {pp.clean / 'PROJECT.md'}."

@@ -49,6 +49,39 @@ def _cmd_config(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def _cmd_spec_approve(args: argparse.Namespace) -> int:
+    """The person's approval step (config require_spec_review): reviewed specs -> final -> published."""
+    from airlock.config import ConfigError, load_config
+    from airlock.index.store import Store
+    from airlock.projects import find_project
+    from airlock.server import specs as sp
+
+    try:
+        cfg = load_config(args.config, None)
+    except ConfigError as e:
+        print(f"airlock: {e}", file=sys.stderr)
+        return 2
+    pp = find_project(cfg.projects_root, args.project)
+    if pp is None or not pp.index_db.exists():
+        print(f"airlock: no project '{args.project}'", file=sys.stderr)
+        return 2
+    prefix = args.prefix.strip()
+    with Store(pp.index_db) as st:
+        todo = sp.approve(st, prefix, dry_run=not args.yes)
+        if not todo:
+            print("no reviewed specs to approve")
+            return 0
+        for s in todo:
+            print(f"=== {s['topic']} v{s['version']} | {s['title']}\n{s['body'].rstrip()}\n")
+        if not args.yes:
+            print(f"{len(todo)} specs read above. Run again with --yes to approve and publish them.")
+            return 1
+        final, _, gone, refused = sp.publish(st, pp, "person", prefix)
+        print(f"approved {len(todo)}; published {len(final)} specs to {pp.specs}"
+              + (f"; {len(refused)} failed the filter" if refused else "") + (f"; {gone} withdrawn" if gone else ""))
+    return 0
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from airlock.doctor import run
 
@@ -277,6 +310,12 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--overlay", type=Path, default=None, help="project overlay file to include")
     c.add_argument("--profile", choices=["dirty", "clean"], default=None)
     c.set_defaults(fn=_cmd_config)
+
+    a = sub.add_parser("spec-approve", help="read reviewed specs, then set them final and publish them")
+    a.add_argument("project")
+    a.add_argument("--prefix", default="", help="only topics that start with this text")
+    a.add_argument("--yes", action="store_true", help="approve and publish (without it: print the specs only)")
+    a.set_defaults(fn=_cmd_spec_approve)
 
     d = sub.add_parser("doctor", help="check the installation")
     d.add_argument("--profile", default=None)

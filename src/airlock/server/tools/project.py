@@ -13,6 +13,8 @@ from airlock.server.scan import render_scan, scan_program
 @tool("program_scan", "Scan a program folder or executable without Ghidra and show its file "
                       "groups, analysis options with time estimates, and a recommendation.")
 def program_scan(ctx: ServerContext, path: str, root_exe: str = "") -> str:
+    if ctx.session.role == "unbound":
+        ctx.unredacted_shown = True       # file names below: this session can no longer bind clean
     oh, spc = priors(ctx.config.defaults)
     try:
         res = scan_program(Path(path), root_exe or None, spc, oh)
