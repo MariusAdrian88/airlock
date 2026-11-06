@@ -305,3 +305,13 @@ def test_vcall_args_push_of_ebp_is_never_an_argument():
     push_ebp = D.Ins("PUSH", src="EBP", writes=frozenset({"ESP"}))
     ecx = D.Ins("MOV", dst="ECX", src="EBX", writes=frozenset({"ECX"}))
     assert D.vcall_args(_vc("ESI"), [ecx, push_ebp]) == (("EAX", "EDX", "ECX"), 0)
+
+
+def test_vcall_args_base_register_loaded_from_a_local_after_the_arguments():
+    # mov edx,[ebp-0x10]; mov eax,[ebp-8]; lea ecx,[ebp-0xc]; mov ebx,[ebp-8]; mov ebx,[ebx]; call [ebx+0x508]
+    vmt = D.Ins("MOV", dst="EBX", writes=frozenset({"EBX"}), ld=("EBX", 0))
+    local = D.Ins("MOV", dst="EBX", writes=frozenset({"EBX"}), ld=("EBP", -8))
+    lea = D.Ins("LEA", dst="ECX", writes=frozenset({"ECX"}))
+    eax = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}), ld=("EBP", -8))
+    edx = D.Ins("MOV", dst="EDX", writes=frozenset({"EDX"}), ld=("EBP", -0x10))
+    assert D.vcall_args(_vc("EBX", 0x508), [vmt, local, lea, eax, edx]) == (("EAX", "EDX", "ECX"), 0)

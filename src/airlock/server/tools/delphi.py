@@ -38,7 +38,8 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         return f"error not_delphi: {what}; frameworks: {_frameworks(got[0])}."
     for bd in bounds:
         art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
-        delphi.ensure(bd.store, bd.binary, art)
+        cfg = ctx.config
+        delphi.ensure(bd.store, bd.binary, art, cfg.idr_kb_dir, cfg.delphi_sigdb_dir, cfg.warp_dir)
     return bounds, len(bounds) > 1, ident
 
 
@@ -238,8 +239,6 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
     args = {"binary": binary, "form": form, "component": component}
     if cursor:
         return _page([], budget_for(ctx, budget), "delphi_events", args, cursor)
-    if not form.strip() and not component.strip():
-        return "error bad_args: needs form (class or resource name) or component (name)."
     sc = _scope(ctx, binary, form or component)
     if isinstance(sc, str):
         return sc
@@ -264,6 +263,12 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
         lines += ["  " + _event_line(bd, r, False) for r in rows]
         if not rows:
             lines.append("  no event handlers")
+    elif not ident:     # no form and no component: the events of all forms
+        for bd in bounds:
+            for r in bd.store.db.execute(base + "ORDER BY e.form, e.seq, e.prop", (bd.binary.id,)):
+                lines.append(f"{_prefix(bd, several)}" + _event_line(bd, r, True))
+        if not lines:
+            return "error not_found: no event handlers in the forms."
     else:
         want = ident.split(".")[-1].lower()
         fwant = ident.split(".")[0].lower() if "." in ident else ""

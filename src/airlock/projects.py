@@ -212,11 +212,35 @@ class ProjectSummary:
     errors: int
 
 
+def _index_states(pp: ProjectPaths) -> list[str]:
+    """The ``status:<id>`` values of the index store (the truth when the manifest lacks the files)."""
+    import sqlite3
+    if not pp.index_db.is_file():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{pp.index_db.as_posix()}?mode=ro", uri=True, timeout=2)
+        try:
+            return [str(r[0]) for r in db.execute("SELECT value FROM meta WHERE key LIKE 'status:%'")]
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+
+
 def summarize(pp: ProjectPaths) -> ProjectSummary:
-    """Binary counts from the manifest (state ready / error / anything else = queued)."""
+    """Binary counts from the manifest (state ready / error / anything else = queued); from the index
+    store when the manifest lists no binaries."""
     try:
         man = read_manifest(pp.manifest)
     except (OSError, ValueError):
+        man = {}
+    if not any(isinstance(f, dict) and f.get("kind") == "pe" for f in man.get("files") or []):
+        st = _index_states(pp)
+        if st:
+            root = str((man.get("source") or {}).get("root_exe") or "?")
+            ready, errors = st.count("ready"), st.count("error")
+            return ProjectSummary(root, ready, len(st) - ready - errors, errors)
+    if not man:
         return ProjectSummary("?", 0, 0, 0)
     files = [f for f in man.get("files") or [] if isinstance(f, dict) and f.get("kind") == "pe"]
     states = [str(f.get("state", "queued")) for f in files]

@@ -25,11 +25,11 @@ from airlock.server.cview import (
 )
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import add_note, call as call_tool, tool
-from airlock.server.selectors import fmt_addr
-from airlock.server import cpp, delphi, dotnet, notes, qt, uijoin
+from airlock.server.selectors import fmt_addr, parse_address
+from airlock.server import classfwd, cpp, delphi, dotnet, notes, qt, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
-    Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, normalize_kind, preview,
+    Bound, bind_binary, bind_many, bind_scope, bound_of, budget_for, fn_desc, normalize_kind, preview,
 )
 from airlock.worker.protocol import WorkerError
 
@@ -425,6 +425,14 @@ def annotate_calls(c_text: str, nodes, psize: int) -> str:
     return c_text
 
 
+def _vcall_names(c_text: str, bd: Bound, fn: Function) -> str:
+    """Slot (and method) comment after each virtual-call stub name (vcallnames)."""
+    if "vmt_" not in c_text:
+        return c_text
+    from airlock.server import vcallnames
+    return vcallnames.annotate(c_text, vcallnames.DbClasses(bd.store, bd.binary, fn.entry))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -616,7 +624,7 @@ def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None,
         if err:
             return err
         assert c_text is not None
-        c = reduce_c(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize).rstrip(chr(10)), detail)
+        c = reduce_c(_vcall_names(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn).rstrip(chr(10)), detail)
         body = ["// C"] + c.split(chr(10)) + [f"// asm ({len(asm)} lines)"]
     first = 1
     full_asm = asm
@@ -627,6 +635,47 @@ def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None,
             return f"error bad_args: lines {lines} is past the end of the function ({len(full_asm)} lines)."
     head = f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)} asm: lines {first}-{first + len(asm) - 1}"
     out = ([f"// {note}"] if note else []) + ([head] if view == "asm" else []) + body + asm
+    return fit_lines(out, bud, "code", tool="function", args=args)[0]
+
+
+CLASS_REFS = 20
+
+
+def _class_view(ctx: ServerContext, binary: str, target: str, bud: int, cursor: str) -> str | None:
+    """``function`` on the VMT or type info address of a Delphi / FPC class: one fact line, the class row, its
+    virtual slots, its other methods and the references to it. None when the address is no class."""
+    sc = bind_scope(ctx, binary, target)
+    if isinstance(sc, str):
+        return None
+    pa = parse_address(sc.bare)
+    if pa is None and not _HEX.match(sc.bare):
+        return None
+    value = pa[1] if pa is not None else int(sc.bare, 16)
+    hits = classfwd.find_classes(list(sc.bounds), value)
+    if not hits:
+        return None
+    args = {"binary": binary, "target": target}
+    if cursor:
+        try:
+            return resume_lines(cursor, bud, "code", tool="function", args=args)[0]
+        except CursorError as e:
+            return e.message
+    several = len({h.bd.binary.id for h in hits}) > 1
+    out: list[str] = []
+    for h in hits[:3]:
+        bd, st = h.bd, h.bd.store
+        out += [f"// {classfwd.fact(h, value, several)}", classfwd.class_line(h, several),
+                *classfwd.slot_lines(h), *classfwd.method_lines(h)]
+        seen: set[tuple[int, int, str]] = set()
+        refs = []
+        for a in dict.fromkeys(x for x in (h.vmt, h.typeinfo) if x):
+            for x in st.xrefs_to_address(bd.binary.id, a, None, CLASS_REFS + 1):
+                if (x.src_addr, x.dst_addr, x.kind) not in seen:
+                    seen.add((x.src_addr, x.dst_addr, x.kind))
+                    refs.append(x)
+        out.append(f"references {len(refs)}{'+' if len(refs) > CLASS_REFS else ''}")
+        out += [f"  {bd.addr(x.src_addr)}  {x.src_fn.qualified_name if x.src_fn else '-'}  {x.kind}"
+                for x in refs[:CLASS_REFS]]
     return fit_lines(out, bud, "code", tool="function", args=args)[0]
 
 
@@ -666,6 +715,10 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if isinstance(ft, str):
         if ft.startswith("error external:") and view != "signature":    # an import row: no code
             return _import_refs(ctx, target, binary, bud)
+        if ft.startswith("error not_found"):                              # a Delphi / FPC VMT or type info address
+            cv = _class_view(ctx, binary, target, bud, cursor)
+            if cv is not None:
+                return cv
         return ft
     assert isinstance(ft, tg.FunctionTarget)
     bd, fn, note = ft.bound, ft.fn, ft.any_note
@@ -717,7 +770,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if err:
         return err
     assert c_text is not None
-    full = annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize).rstrip("\n")
+    full = _vcall_names(annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn).rstrip("\n")
     full = reduce_c(full, detail)   # after annotation: it needs raw char offsets
     if outline and not cursor and not span and estimate_tokens(full, "code") > bud:
         all_lines = full.split("\n")
@@ -879,8 +932,22 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         s = st.string_at(b.id, value)
         label = bd.addr(value, space) + (f" {preview(s.value, 40)}" if s else "")
         notes.append("no function starts here; showing raw references")
-        xs = (st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
-            b.id, value, kinds, limit + 1)
+        xs = list((st.xrefs_to_address if direction == "to" else st.xrefs_from_address)(
+            b.id, value, kinds, limit + 1))
+        for ch in classfwd.find_classes([bd], value)[:1]:     # a Delphi / FPC VMT or type info: the class's references
+            notes.append(classfwd.fact(ch, value))
+            seen = {(x.src_addr, x.dst_addr, x.kind) for x in xs}
+            if direction == "to":
+                more = [a for a in (ch.vmt, ch.typeinfo) if a and a != value]
+                gets = [(st.xrefs_to_address, a) for a in more]
+            else:
+                gets = ([(st.xrefs_from_address, ch.vmt + i * bd.psize) for i in range(ch.nvirtual)
+                         if ch.vmt + i * bd.psize != value] if value == ch.vmt else [])
+            for fn_, a in gets:
+                for x in fn_(b.id, a, kinds, limit + 1):
+                    if (x.src_addr, x.dst_addr, x.kind) not in seen:
+                        seen.add((x.src_addr, x.dst_addr, x.kind))
+                        xs.append(x)
         refs = [(bd, x) for x in xs]
         links = [(bd, x) for x in st.cross_from_address(b.id, value, 5)]
         if direction == "to" and s is not None and (kinds is None or "table" in kinds):

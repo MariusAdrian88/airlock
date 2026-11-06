@@ -50,6 +50,9 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
         inside = True
         if rc.is_file():
             return rc
+    art = _artifact_copy(ctx, text)
+    if art is not None:
+        return art
     if not inside:
         names = ", ".join(str(r) for r in roots)
         return (f"error outside_project: '{path}' is not inside the program folder or dirty\\work "
@@ -57,6 +60,26 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
     near = _same_name(roots, p.name)
     return (f"error not_found: no file '{path}' under the program folder or dirty\\work"
             + (f". Files with that name: {', '.join(near)}." if near else "."))
+
+
+def _artifact_copy(ctx: ServerContext, text: str) -> Path | None:
+    """The stored copy (``artifacts/<sha256>``) of an analysed binary named by ``text`` (file name or
+    original path), so a project without a readable root can still be dumped; None when no binary matches."""
+    pp = ctx.session.project
+    if pp is None:
+        return None
+    try:
+        st = ctx.indexer.store(pp.name)
+        low = text.replace("\\", "/").lower()
+        for b in st.list_binaries():
+            orig = (b.original_path or "").replace("\\", "/").lower()
+            if low in (b.name.lower(), orig) or (orig and orig.endswith("/" + low)):
+                f = pp.artifacts / b.sha256
+                if f.is_file():
+                    return f
+    except Exception:  # noqa: BLE001  the plain error below reports the problem
+        return None
+    return None
 
 
 MAX_NEAR = 6        # same-name files listed in a not_found error
@@ -149,7 +172,8 @@ def hexdump(ctx: ServerContext, path: str = "", offset: int = 0, length: int = 2
         return f"error bad_args: offset 0x{offset:x} is past the end ({src.size} bytes)."
     n = max(1, min(length, ff.MAX_DUMP))
     chunk = src.read(offset, n)
-    head = f"{p.name} {src.size} bytes, showing 0x{offset:x}-0x{offset + len(chunk):x}"
+    label = Path(path.strip().strip('"')).name if p.parent.name == "artifacts" else p.name
+    head = f"{label} {src.size} bytes, showing 0x{offset:x}-0x{offset + len(chunk):x}"
     tail = []
     if offset + len(chunk) < src.size:
         tail = [f"… more bytes. offset=0x{offset + len(chunk):x}"

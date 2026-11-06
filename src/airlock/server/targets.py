@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from airlock.index.store import CODE_EDGES, Function, StringHit, Xref
+from airlock.server import classfwd
 from airlock.server.context import ServerContext
 from airlock.server.graph import dll_stem, norm_import
-from airlock.server.selectors import (default_name_address, MAX_CANDIDATES, MAX_CLOSE, close_functions, close_text,
-                                      parse_address, resolve_function)
+from airlock.server.selectors import (alias_functions, default_name_address, MAX_CANDIDATES, MAX_CLOSE,
+                                      close_functions, close_text, parse_address, resolve_function)
 from airlock.server.tools.common import Bound, Scope, bind_scope
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -447,6 +448,14 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         bd, f = close[0]
         return FunctionTarget(bd, f, f"resolved '{t}' to {f.qualified_name} (case differs)",
                               None if sc.explicit else f"binary {bd.binary.name}")
+    if FUNCTION in ks or IMPORT_FN in ks:
+        al = [(bd, f) for bd in sc.bounds for f in alias_functions(bd.store, bd.binary.id, t)]
+        if len(al) == 1:       # a name hint a tool printed: rtti, IDR or signature name, `TClass::vslot N`
+            bd, f = al[0]
+            return FunctionTarget(bd, f, f"resolved '{t}' to {f.qualified_name} {bd.addr(f.entry, f.space)}",
+                                  None if sc.explicit else f"binary {bd.binary.name}")
+        if al:
+            return ambiguous(t, _cands(al), len(al))
     return not_found(sc, t, close)
 
 
@@ -635,6 +644,15 @@ def _by_address(sc: Scope, raw: str, ks: frozenset[str]) -> Target | str:
         return FunctionTarget(bd, f, note, f"binary {bd.binary.name}")
     if found:
         return ambiguous(raw, _cands([(bd, f) for bd, f, _n in found]), len(found))
+    if ADDRESS in ks:            # a data address (a VMT, a table): the binaries that reference it or hold its class
+        data = [bd for bd in sc.bounds if bd.store.xrefs_to_address(bd.binary.id, value, None, 1)
+                or bd.store.xrefs_from_address(bd.binary.id, value, None, 1)
+                or classfwd.find_classes([bd], value)]
+        if len(data) == 1:
+            return AddressTarget(data[0], space, value, f"binary {data[0].binary.name}")
+        if data:
+            shown = ", ".join(f"{bd.binary.name}!{bd.addr(value, space)}" for bd in data[:MAX_CANDIDATES])
+            return err("ambiguous", f"'{raw}' has references in {len(data)} binaries: {shown}")
     return err("not_found", f"no function at or containing {raw}{_where(sc)}")
 
 

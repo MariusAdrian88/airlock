@@ -67,12 +67,47 @@ def _noting(fn: Impl) -> Impl:
     return run
 
 
+_BOUND: contextvars.ContextVar[list | None] = contextvars.ContextVar("airlock_bound", default=None)
+
+
+def note_bound(store: Any, binary: Any) -> None:
+    """A tool call bound a binary (``Bound``); the library-name display uses only that binary's hits."""
+    bounds = _BOUND.get()
+    if bounds is not None:
+        bounds.append((store, binary))
+
+
+def _library_names(name: str, fn: Impl) -> Impl:
+    """Read tools show a unique IDR/sigdb/WARP name instead of ``FUN_xxxxxxxx`` (``server/libnames.py``),
+    inside the budget cut (``budget.DISPLAY``: the cut measures the shown text) and on the final text."""
+    from airlock.server import budget, libnames
+    if name not in libnames.RELABEL_TOOLS:
+        return fn
+
+    @functools.wraps(fn)
+    def run(ctx: Any, *args: Any, **kwargs: Any) -> str:
+        if _BOUND.get() is not None:        # nested tool call: the outer call owns the display
+            return fn(ctx, *args, **kwargs)
+        bounds: list = []
+        disp = libnames.Display(ctx, kwargs.get("project"), bounds)
+        t1, t2 = _BOUND.set(bounds), budget.DISPLAY.set(disp)
+        try:
+            out = fn(ctx, *args, **kwargs)
+            if isinstance(out, str) and not out.startswith("error "):
+                out = disp(out)
+        finally:
+            budget.DISPLAY.reset(t2)
+            _BOUND.reset(t1)
+        return out
+    return run
+
+
 def tool(name: str, description: str) -> Callable[[Impl], Impl]:
     if name not in CATALOG:
         raise ValueError(f"tool '{name}' is not in the catalog")
 
     def deco(fn: Impl) -> Impl:
-        IMPLEMENTED[name] = ToolImpl(name, description, _noting(fn))
+        IMPLEMENTED[name] = ToolImpl(name, description, _library_names(name, _noting(fn)))
         return fn
     return deco
 

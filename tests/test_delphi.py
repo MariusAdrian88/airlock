@@ -533,7 +533,9 @@ def test_delphi_events_tool(proj):
     assert "  Button2.OnClick -> NoSuchHandler (not in the published methods)" in out
     comp_out = dtools.delphi_events(ctx, component="Button1").splitlines()
     assert comp_out == [f"TMainForm Button1.OnClick -> TMainForm.Button1Click 0x{a:08x} TMainForm::Button1Click"]
-    assert dtools.delphi_events(ctx).startswith("error bad_args:")
+    allev = dtools.delphi_events(ctx).splitlines()          # no form: the events of all forms
+    assert f"TMainForm Button1.OnClick -> TMainForm.Button1Click 0x{a:08x} TMainForm::Button1Click" in allev
+    assert len(allev) >= 8
     assert dtools.delphi_events(ctx, component="Nope").startswith("error not_found:")
 
 
@@ -664,3 +666,26 @@ def test_runtime_addrs(proj):
     assert pe.code["TComponent.v0_Dtor"] in rt                      # unit System.Classes
     assert pe.code["TMainForm.Button1Click"] not in rt             # unit MainUnit
     assert pe.code["TObject.v0_Dtor"] in rt                         # unit System
+
+
+def test_delphi_tools_keep_idr_names(proj, tmp_path):
+    """A delphi_* tool derives with the configured folders; a call without any folder keeps the names."""
+    from dataclasses import replace
+    ctx, st, bid, pe = proj
+    b = st.get_binary_by_id(bid)
+    art = ctx.indexer.paths("proj").artifacts / b.sha256
+    st.set_meta(f"idr_hits:{bid}", "401000	System.Foo")
+    st.set_meta(f"idr_info:{bid}", "kb: 1 of 2")
+    st.set_meta(f"idr_version:{bid}", "11:123:2")
+    assert not delphi.ensure(st, b, art)                       # configuration not passed: nothing is wiped
+    assert st.get_meta(f"idr_hits:{bid}") == "401000	System.Foo"
+    sig, kb, warp = tmp_path / "sigdb", tmp_path / "kb", tmp_path / "warp"
+    ctx.config = replace(ctx.config, delphi_sigdb_dir=sig, idr_kb_dir=kb, warp_dir=warp)
+    seen = []
+    real = delphi.ensure
+    delphi.ensure = lambda *a, **k: seen.append(a[3:]) or real(*a, **k)
+    try:
+        dtools.delphi_classes(ctx)
+    finally:
+        delphi.ensure = real
+    assert seen[-1] == (kb, sig, warp)                           # the tool passes the configured folders

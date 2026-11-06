@@ -535,11 +535,29 @@ class Indexer:
                 if r.get("done") or r.get("next_offset") is None:
                     break
                 offset = r["next_offset"]
+            if delphi.is_delphi(b) and (int(have) if have else 0) < 12:   # collector 12: ShortString literals
+                self._add_new_strings(store, b.id, program)
             store.rebuild_fts(b.id)
             store.upsert_binary(b.sha256, b.name, analysis_profile=res.get("analysis_profile"))
             store.set_meta(f"collector:{b.id}", str(res.get("collector")))
             n += 1
         return n
+
+    def _add_new_strings(self, store: Store, binary_id: int, program: str) -> int:
+        """Read the strings again and add the rows at addresses that have none (no row is changed)."""
+        have = {r[0] for r in store.db.execute("SELECT address FROM string WHERE binary_id=?", (binary_id,))}
+        added, offset = 0, 0
+        while True:
+            r = self.worker.request("extract", {"program": program, "kind": "strings", "offset": offset,
+                                                "limit": PAGE_SIZE["strings"]}, timeout=900)
+            new = [row for row in map_string_rows(r["columns"], r["rows"]) if row[0] not in have]
+            have.update(row[0] for row in new)
+            if new:
+                store.insert_strings(binary_id, new)
+                added += len(new)
+            if r.get("done") or r.get("next_offset") is None:
+                return added
+            offset = r["next_offset"]
 
     def create_missing_functions(self, project: str, store: Store, b: Binary,
                                  progress: Callable[[int, int], None] | None = None) -> int:

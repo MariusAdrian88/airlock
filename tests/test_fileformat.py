@@ -657,3 +657,13 @@ def test_file_diff_cursor_wins_over_arguments(env, monkeypatch):
     assert "error" not in other
     assert call(c, "file_diff", path_a="a.dat", path_b="b.dat", cursor="c_dead").startswith(
         "error bad_cursor: cursor 'c_dead' is unknown or expired")
+
+
+def test_hexdump_analysed_binary_without_root_file(env):
+    c, src, pp = env
+    pp.artifacts.mkdir(parents=True, exist_ok=True)
+    (pp.artifacts / ("ab" * 32)).write_bytes(b"MZ" + bytes(range(30)))
+    out = call(c, "hexdump", path="app.exe", length=16).splitlines()      # not in the program folder
+    assert out[0] == "app.exe 32 bytes, showing 0x0-0x10"
+    assert out[1].startswith("0x00000000  4d 5a 00 01")
+    assert call(c, "hexdump", path="nope.exe").startswith("error not_found:")

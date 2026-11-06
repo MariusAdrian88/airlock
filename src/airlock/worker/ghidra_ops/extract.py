@@ -167,6 +167,9 @@ def _strings(p: Any) -> Iterator[list[Any]]:
         a = d.getAddress()
         yield [S.space_of(a), S.addr_int(a), _encoding(str(d.getDataType().getName())),
                len(value), value[:MAX_STRING_CHARS]]
+    from .shortstr import referenced_shortstrings     # Pascal ShortString literals that code points at
+    for a, value in referenced_shortstrings(p):
+        yield [S.space_of(a), S.addr_int(a), "ascii", len(value), value[:MAX_STRING_CHARS]]
 
 
 # ── references -> edges ────────────────────────────────────────────────────

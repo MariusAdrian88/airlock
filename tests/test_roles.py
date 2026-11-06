@@ -299,3 +299,19 @@ def test_deny_rules_merge_and_keep_existing(tmp_path):
     P.write_clean_deny_rules(pp)  # idempotent
     assert len(json.loads(cj.read_text("utf-8"))["permissions"]["deny"]) == 3
     assert (pp.clean / ".codex" / "config.toml").read_text() == "mine = true\n"
+
+
+def test_projects_counts_binaries_from_the_index_when_the_manifest_has_none(tmp_path):
+    pp = make_project(tmp_path / "projects", "idx")
+    man = P.new_manifest("idx")
+    man["files"] = []
+    P.write_manifest(pp.manifest, man)
+    ctx = make_ctx(tmp_path)
+    from airlock.index.store import Store
+    pp.data.mkdir(parents=True, exist_ok=True)
+    st = Store(pp.index_db)
+    for i, state in enumerate(("ready", "ready", "error", "analysing")):
+        st.set_meta(f"status:{i + 1}", state)
+    st.db.close()
+    s = P.summarize(pp)
+    assert (s.ready, s.queued, s.errors) == (2, 1, 1)

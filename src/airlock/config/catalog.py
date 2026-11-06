@@ -79,7 +79,7 @@ TOOL_SUMMARIES: dict[str, str] = {
     "struct_define": "Create or replace a struct in the Ghidra project.",
     "patch_bytes": "Write raw bytes into the program. Off by default.",
     "rtti_classes": "List C++ classes recovered from MSVC RTTI.",
-    "vtable": "Show the slots of a C++ vtable.",
+    "vtable": "Show the slots of a C++ vtable or Delphi/FPC VMT: index, target, function and origin, by class name or address.",
     "mfc_message_maps": "List MFC message map entries and their handlers.",
     "qt_metaobjects": "List Qt signals, slots and properties.",
     "delphi_classes": "List Delphi classes recovered from VMT and RTTI.",

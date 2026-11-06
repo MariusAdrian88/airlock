@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from airlock.index.store import Binary, Function, Store
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
-from airlock.server.registry import add_note
+from airlock.server.registry import add_note, note_bound
 from airlock.server.selectors import MAX_CANDIDATES, fmt_addr, resolve_function, split_binary_suffix, split_binary_target
 
 
@@ -18,6 +18,9 @@ class Bound:
     project: str
     store: Store
     binary: Binary
+
+    def __post_init__(self) -> None:
+        note_bound(self.store, self.binary)
 
     @property
     def psize(self) -> int:

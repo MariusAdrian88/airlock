@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import difflib
 
-from airlock.server import cpp, mfc, peres, uijoin
+from airlock.server import classfwd, cpp, mfc, peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.registry import tool
@@ -105,6 +105,7 @@ def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT
 def _close_names(bounds: list[Bound], want: str) -> list[str]:
     names = sorted({r["name"] for bd in bounds for r in bd.store.db.execute(
         "SELECT name FROM rtti_class WHERE binary_id=? AND vtable_addr IS NOT NULL", (bd.binary.id,))})
+    names += [n for n in classfwd.all_names(bounds) if n not in names]
     low = {n.lower(): n for n in names}
     return [low[m] for m in difflib.get_close_matches(want, list(low), n=5, cutoff=0.5)]
 
@@ -121,7 +122,7 @@ def _vtable_lines(bd: Bound, several: bool, vtable: int, name: str, mark: int | 
     return out
 
 
-@tool("vtable", "Show the slots of a C++ vtable: index, target address and function name, by class name or address.")
+@tool("vtable", "Show the slots of a C++ vtable or Delphi/FPC VMT: index, target, function and origin, by class name or address.")
 def vtable(ctx: ServerContext, target: str = "", binary: str = "", cursor: str = "",
            budget: int = 0) -> str:
     args = {"binary": binary, "target": target}
@@ -151,6 +152,8 @@ def vtable(ctx: ServerContext, target: str = "", binary: str = "", cursor: str =
                 (bd.binary.id, r["vtable_addr"])).fetchone()
             mark = (addr[1] - r["vtable_addr"]) // ps if addr[1] != r["vtable_addr"] else None
             lines += _vtable_lines(bd, several, r["vtable_addr"], nm["name"] if nm else "?", mark)
+        for h in classfwd.find_classes(bounds, addr[1]):
+            lines += classfwd.vtable_lines(h, several)
         if not lines:
             return f"error not_found: no vtable at or around {t}."
     else:
@@ -161,24 +164,28 @@ def vtable(ctx: ServerContext, target: str = "", binary: str = "", cursor: str =
                     "SELECT name, vtable_addr FROM rtti_class WHERE binary_id=? AND vtable_addr IS NOT NULL "
                     "AND lower(name)=? ORDER BY vtable_addr", (bd.binary.id, want)):
                 hits.append((bd, r["name"], r["vtable_addr"]))
-        if not hits:
+        dl = classfwd.by_name(bounds, want)
+        if not hits and not dl:
             for bd in bounds:
                 for r in bd.store.db.execute(
                         "SELECT name, vtable_addr FROM rtti_class WHERE binary_id=? AND vtable_addr IS NOT NULL "
                         "AND lower(name) LIKE ? ORDER BY name, vtable_addr LIMIT 20",
                         (bd.binary.id, f"%{want}%")):
                     hits.append((bd, r["name"], r["vtable_addr"]))
-            names = sorted({n for _, n, _ in hits})
+            dl = classfwd.by_name(bounds, want, exact=False)
+            names = sorted({n for _, n, _ in hits} | {h.name for h in dl})
             if len(names) > 1:
                 shown = ", ".join(names[:10])
                 more = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
                 return (f"error ambiguous: '{t}' matches {len(names)} classes: {shown}{more}.")
-        if not hits:
+        if not hits and not dl:
             close = _close_names(bounds, want)
             return (f"error not_found: no class '{t}' with a vtable."
                     + (f" close names: {', '.join(close)}." if close else ""))
         for bd, nm, va in hits:
             lines += _vtable_lines(bd, several, va, nm, None)
+        for h in dl:
+            lines += classfwd.vtable_lines(h, several)
     return fit_lines(lines, bud, "code", tool="vtable", args=args)[0]
 
 

@@ -1375,8 +1375,11 @@ def stale(store: Store, binary_id: int) -> bool:
     return store.get_meta(meta_key(binary_id)) != str(DELPHI_VERSION)
 
 
-def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = None,
-           sig_dir: Path | None = None, warp_dir: Path | None = None) -> bool:
+NOT_GIVEN: Any = object()    # a caller that did not pass the configuration (None means: no folder configured)
+
+
+def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = NOT_GIVEN,
+           sig_dir: Path | None = NOT_GIVEN, warp_dir: Path | None = NOT_GIVEN) -> bool:
     """Derive the Delphi rows of a Delphi binary when missing or from an older DELPHI_VERSION, then the
     IDR names (``idr.ensure``; ``idr_dir`` is the knowledge base folder or None, ``sig_dir`` the folder of
     the signature databases, ``warp_dir`` the WARP libraries). Never raises; True
@@ -1385,13 +1388,16 @@ def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = 
         return False
     done = False
     names = tag = None
-    if is_fpc(binary):
+    given = not (idr_dir is NOT_GIVEN and sig_dir is NOT_GIVEN and warp_dir is NOT_GIVEN)
+    # configuration not passed: keep the stored IDR and FPC names (None passed = really no folder: re-derive)
+    fpc_names = is_fpc(binary) and sig_dir is not NOT_GIVEN
+    if fpc_names:
         from airlock.server import fpcsigs
-        names, tag = fpcsigs.load_names(sig_dir, binary.toolchain_ver or "")
-    if stale(store, binary.id) or (is_fpc(binary) and store.get_meta(f"delphi_names:{binary.id}") != tag):
+        names, tag = fpcsigs.load_names(None if sig_dir is NOT_GIVEN else sig_dir, binary.toolchain_ver or "")
+    if stale(store, binary.id) or (fpc_names and store.get_meta(f"delphi_names:{binary.id}") != tag):
         try:
             derive_binary(store, binary.id, artifact, names)
-            if is_fpc(binary):
+            if fpc_names:
                 with store.db:
                     store.set_meta(f"delphi_names:{binary.id}", tag)
             done = True
@@ -1399,7 +1405,10 @@ def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = 
             log.warning("Delphi analysis of %s failed: %s", binary.name, e)
             return False
     from airlock.server import idr
-    return idr.ensure(store, binary, artifact, idr_dir, sig_dir, warp_dir) or done
+    if not given:
+        return done
+    none = lambda v: None if v is NOT_GIVEN else v  # noqa: E731
+    return idr.ensure(store, binary, artifact, none(idr_dir), none(sig_dir), none(warp_dir)) or done
 
 
 def ensure_project(store: Store, artifacts: Path, idr_dir: Path | None = None, sig_dir: Path | None = None,

@@ -1,13 +1,14 @@
 """Token budgets, line-boundary truncation and in-memory cursors (DESIGN.md section 7)."""
 from __future__ import annotations
 
+import contextvars
 import json
 import math
 import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 CHARS_PER_TOKEN = {"code": 3.5, "prose": 4.0}
 MAX_CURSORS = 256
@@ -142,7 +143,15 @@ def footer(n_more: int, cursor_id: str) -> str:
     return f"… {n_more} more lines. cursor={cursor_id}"
 
 
+DISPLAY: contextvars.ContextVar[Callable[[str], str] | None] = contextvars.ContextVar("airlock_display", default=None)
+
+
 def _cost(line: str, kind: str) -> int:
+    """Tokens of a line as shown: the tool wrapper may set a display transform (library names), so the
+    cut measures what the agent gets while cursors keep the raw lines."""
+    show = DISPLAY.get()
+    if show is not None:
+        line = show(line)
     return estimate_tokens(line + "\n", kind)
 
 

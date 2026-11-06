@@ -55,7 +55,7 @@ MAX_SLOTS = 8192          # stubs per program, all kinds
 MAX_STUB_PIECES = 255     # the count of a concatenation call is a byte
 MAX_VCALL_STUBS = 4096    # stubs for indirect calls of x86 Pascal code (virtual and interface methods)
 VCALL_WINDOW = 12         # instructions searched backwards for the register arguments of such a call
-VERSION = 6              # of the pass; stored in the program (options "airlock", delphi_strings)
+VERSION = 7              # of the pass; stored in the program (options "airlock", delphi_strings)
 
 # codePage(2) elemSize(2)=1|2 refCnt(4)=-1: the 8 bytes that end 4 bytes before the characters
 _STRREC = re.compile(rb"(?s)..[\x01\x02]\x00\xff\xff\xff\xff")
@@ -323,7 +323,8 @@ def vcall_scan(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int, bool
     of EAX, EDX or ECX (a push further back belongs to an outer call, as the code page of a string
     concatenation that the call sits in). A register that the call's own address uses (``MOV ECX, [ECX]`` for
     the vmt) is not an argument; the first write of another base register (Delphi: ``MOV ESI, [EAX]``, then
-    ``CALL [ESI + 8]``; or ``MOV EBX, EAX``) is skipped. A register whose nearest load is a byte or word load
+    ``CALL [ESI + 8]``; or ``MOV EBX, EAX``) is skipped, and after a vmt load (``MOV EBX, [EBX]``) the writes
+    that feed it (``MOV EBX, [EBP-8]``) too. A register whose nearest load is a byte or word load
     (``MOV DL, 1``) is named ``DL`` / ``DX`` (``CL`` / ``CX``). A push of EBP is never an argument (EBP is the
     frame pointer, or a variable that a frameless function saves), nor are the pushes of EBX, ESI, EDI at the
     far end when the search stops at the frame set-up or a branch (the prologue saves them). The last value
@@ -346,6 +347,9 @@ def vcall_scan(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int, bool
         elif not vmt_seen and base not in ("EAX", "EDX", "ECX") and x.mn == "MOV" and x.dst == base                 and x.mem is None:
             vmt_seen = True     # the vmt load (or a copy of Self): no argument, the search goes on
             vmt_load = x.ld is not None and x.ld[1] == 0
+        elif (vmt_load and vmt_seen and x.mn == "MOV" and x.dst == base and x.mem is None
+              and base not in ("EAX", "EDX", "ECX")):
+            pass                # the chain before a vmt load: ``MOV EBX, [EBP-8]`` that feeds ``MOV EBX, [EBX]``
         elif x.mem is None and x.writes & {"EAX", "EDX", "ECX"}:
             if x.mn == "MOV" and x.dst == base and x.ld == (base, 0):
                 vmt_load = True         # MOV EAX, [EAX]
@@ -1088,5 +1092,8 @@ def apply_delphi_strings(program: Any, monitor: Any = None) -> dict[str, int]:
         fpc = any(fpc_marker(_block_bytes(b)) for b in mem.getBlocks()
                   if b.isInitialized() and not b.isOverlay() and str(b.getName()) != STUB_BLOCK)
         _override_vcalls(program, stubs, out, delphi=not fpc)
+        from . import pascalconv
+        out.update(pascalconv.apply_register_prototypes(
+            program, lambda fn: str(fn.getComment() or "").startswith(STUB_TAG), monitor))
     program.getOptions("airlock").setInt("delphi_strings", VERSION)
     return out

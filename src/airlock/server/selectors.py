@@ -132,6 +132,83 @@ def close_text(names: list[str], more: bool) -> str:
     return "close names: " + ", ".join(names) + (" …" if more else "")
 
 
+_VSLOT = re.compile(r"^(.+?)\s*::\s*vslot\s+(\d+)\b.*$", re.I)
+
+
+def _class_keys(head: str) -> list[tuple[str, str]]:
+    """(unit, class) readings of ``head`` (``apphelpers.TAppSettings``, ``TAppSettings``): the whole text as a
+    class name, and the text after the last dot with the rest as the unit."""
+    out = [("", head)]
+    unit, dot, cls = head.rpartition(".")
+    if dot and unit and cls:
+        out.append((unit, cls))
+    return out
+
+
+def alias_addrs(store: Store, binary_id: int, target: str) -> list[int]:
+    """Entries of the functions that the name hints of the tools call ``target``: ``Unit.Class.Method`` /
+    ``Class.Method`` / ``Class::Method`` of Delphi and FPC (published, RTTI, property accessors, named
+    virtual methods), ``TClass::vslot N`` (Delphi VMT or C++ vtable slot) and the IDR / signature names
+    (``Unit.Proc``, with or without the unit). Case-insensitive; sorted; empty when nothing matches."""
+    text = target.strip()
+    if not text:
+        return []
+    q = store.db.execute
+    found: set[int] = set()
+    try:
+        m = _VSLOT.match(text)
+        if m:
+            want, slot = m.group(1).strip().lower(), int(m.group(2))
+            for r in q("SELECT m.addr FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND c.vmt=m.vmt "
+                       "WHERE m.binary_id=? AND m.kind='virtual' AND m.slot=? AND (lower(c.name)=? OR "
+                       "lower(c.unit || '.' || c.name)=?)", (binary_id, slot, want, want)):
+                found.add(int(r[0]))
+            for r in q("SELECT s.target FROM vtable_slot s JOIN rtti_class c ON c.binary_id=s.binary_id AND "
+                       "c.vtable_addr=s.vtable_addr WHERE s.binary_id=? AND s.slot=? AND lower(c.name)=?",
+                       (binary_id, slot, want)):
+                found.add(int(r[0]))
+            return sorted(found)
+        name = text.split("(", 1)[0].strip()
+        low = name.lower()
+        from airlock.server.delphi import accessor_name        # late: delphi imports the store
+        for sep in ("::", "."):
+            head, s, meth = name.rpartition(sep)
+            if not (s and head.strip() and meth.strip()):
+                continue
+            meth = meth.strip().lower()
+            for unit, cls in _class_keys(head.strip()):
+                sql = ("SELECT m.kind, m.name, m.addr FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id "
+                       "AND c.vmt=m.vmt WHERE m.binary_id=? AND lower(c.name)=?")
+                args: list = [binary_id, cls.lower()]
+                if unit:
+                    sql += " AND lower(c.unit)=?"
+                    args.append(unit.lower())
+                for r in q(sql, args):
+                    if r[1] and (r[1].lower() == meth or (r[0] in ("prop-get", "prop-set")
+                                                          and accessor_name(r[0], r[1]).lower() == meth)):
+                        found.add(int(r[2]))
+        from airlock.server import idr
+        for entry, names in idr.hits(store, binary_id).items():
+            for n in names.split(" | "):
+                n = re.sub(r"\s*\(\+\d+\)$", "", n).strip().lower()
+                if n and (n == low or n.endswith("." + low)):
+                    found.add(entry)
+                    break
+    except Exception:  # noqa: BLE001  an index without the framework tables
+        return sorted(found)
+    return sorted(found)
+
+
+def alias_functions(store: Store, binary_id: int, target: str) -> list[Function]:
+    """``alias_addrs`` as functions (an address inside a function is skipped)."""
+    out: list[Function] = []
+    for a in alias_addrs(store, binary_id, target):
+        f = store.function_at(binary_id, a)
+        if f is not None and f not in out:
+            out.append(f)
+    return out
+
+
 def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
     """Resolve ``target`` to a function of the binary.
 
@@ -174,6 +251,15 @@ def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
     if exact and len(close) == 1:
         f = close[0]
         return Resolved(function=f, note=f"resolved '{target}' to {f.qualified_name} (case differs)")
+    al = alias_functions(store, binary_id, target)
+    if len(al) == 1:
+        f = al[0]
+        return Resolved(function=f, note=f"resolved '{target}' to {f.qualified_name} {fmt_addr(f.entry, psize, f.space)}")
+    if al:
+        shown = al[:MAX_CANDIDATES]
+        more = f" (+{len(al) - len(shown)} more)" if len(al) > len(shown) else ""
+        return _error("ambiguous", f"'{target}' matches {len(al)} functions: "
+                      + ", ".join(fmt_addr(f.entry, psize, f.space) for f in shown) + more)
     names = [f"{f.qualified_name} {fmt_addr(f.entry, psize, f.space)}" for f in close[:MAX_CLOSE]]
     return _error("not_found", f"no function named '{target}'", close_text(names, len(close) > MAX_CLOSE))
 

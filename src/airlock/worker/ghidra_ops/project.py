@@ -17,9 +17,9 @@ from . import session as S
 from . import stubs
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 11  # 11: Delphi x86 indirect calls get the same stubs (delphistr VERSION 6); 10: Free Pascal x86 indirect calls get register-convention stubs (delphistr VERSION 5); 9: decompiled calls to a concat stub name the real routine (delphistr VERSION 4); 8: Free Pascal x64 string literals (24-byte header), stub caps raised; 7: airlock stubs left out of extract/disassemble/decompile rows; 4: Delphi string literals (delphistr); 5: delphistr v2; 6: concat calls get stub signatures. Bump when extract/decompile row semantics or post-analysis fixups change
+COLLECTOR_VERSION = 13  # 13: 32-bit Pascal functions get the full register prototype, stack arguments in source order (pascalconv, delphistr VERSION 7); 12: the string index lists the Pascal ShortString literals that code points at (shortstr); 11: Delphi x86 indirect calls get the same stubs (delphistr VERSION 6); 10: Free Pascal x86 indirect calls get register-convention stubs (delphistr VERSION 5); 9: decompiled calls to a concat stub name the real routine (delphistr VERSION 4); 8: Free Pascal x64 string literals (24-byte header), stub caps raised; 7: airlock stubs left out of extract/disassemble/decompile rows; 4: Delphi string literals (delphistr); 5: delphistr v2; 6: concat calls get stub signatures. Bump when extract/decompile row semantics or post-analysis fixups change
 PROFILE_COLLECTOR = 4  # the collector part of analysis_profile; raise with COLLECTOR_VERSION unless only delphistr changed
-STRINGS_ONLY_FROM = {4, 5, 6, 7, 8, 9, 10}  # stored collector versions that need only the Delphi string pass rerun
+STRINGS_ONLY_FROM = {4, 5, 6, 7, 8, 9, 10, 11, 12}  # stored collector versions that need only the Delphi string pass rerun
 PROGRESS_INTERVAL_S = 1.0
 
 

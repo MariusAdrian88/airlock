@@ -981,7 +981,7 @@ Details settled in M3:
 | Tool | Parameters | Returns |
 |---|---|---|
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
-| `vtable` | `target` (class name or address) | slots: index, address, function name |
+| `vtable` | `target` (class name or address; C++ RTTI, Delphi, FPC) | slots: index, address, function name, origin |
 | `mfc_message_maps` | `target?` (class) | no class: the classes that have a message map (with the class's dialog) and the dispatch / interface / event sink maps; a class: message, control id, handler function per entry (`as OnCommand_57600_Open` when the function has no name of its own), `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one), then its automation maps: `method Name(long, LPCSTR) -> void dispid 2 -> 0x... fn`, `property Name BSTR dispid 5 get 0x... set 0x...`, `stock BackColor dispid -501 long`, `interface IDispatch offset 0x10`, `event dispid 7 ctrl 1000 -> 0x...` |
 | `qt_metaobjects` | `class_?`, `limit=50`, `connections=false`, `binary?` | no class: one line per Qt class (parent, signal/slot/property counts, methods mapped); a class: signals, slots, invokable methods and constructors with index, parameter types and names, flags and the function behind each; properties (notify signal), enums, `Q_CLASSINFO`, connections that name its signals or slots. `connections=true`: all string connects and `connectImpl` call sites. Done in M8 |
 
@@ -1006,6 +1006,19 @@ helper names count as runtime (`runtime: Delphi`).
 
 The format code is written from the format description (no code copied; DelphiReSym was not used).
 64-bit Delphi binaries use the standard Win64 calling convention.
+
+**Library names at call sites** (`server/libnames.py`, round 7 item 6). A function that is still `FUN_xxxxxxxx` but has exactly one
+IDR / sigdb / WARP name in `idr_hits` is shown under that name in the output of the read tools in `libnames.RELABEL_TOOLS`
+(`function`, bulk and dataflow views, `callgraph`, `xrefs`, `search`, `function_map`, ...): display only, done in the tool wrapper
+(`registry._library_names`) on the finished text. A call `FUN_x(` becomes `Unit.Proc/*0x..*/(`; other tokens become `Unit.Proc`.
+Chosen over renaming in Ghidra because it needs no worker run, no undo and follows `IDR_VERSION` at once; a user or agent rename
+removes the token, so it always wins. Ambiguous hits (a `|` list, `(+N)`, or the same name at several addresses) stay `FUN_`.
+Names that differ only in case (`FPC_X | fpc_x`) count as one name. Only the hits of the ONE binary a call is bound to are used
+(`Bound` objects made during the call, `registry.note_bound`; a single-binary project needs no bound): an address means a function only
+inside its own binary, so output bound to several binaries (cross-binary `callgraph`, `search` over all) keeps `FUN_`. The budget cut
+measures the shown text (`budget.DISPLAY` in `_cost`), and cursors keep the raw lines, so output stays inside the budget and no line is lost.
+**[verified]** on a 36964-function Delphi project: 153161 `FUN_` tokens in the cached C, 72879 after; `FileExists` caller shows
+`System.Sysutils.FileExists/*0x0047b330*/(...)`.
 
 **IDR names for the RTL and VCL** (`server/idr.py`, optional). The IDR project (crypto2011/IDR, MIT)
 publishes knowledge bases: the compiled code of the RTL and VCL units of one Delphi release with the
@@ -1537,6 +1550,26 @@ restart.
    named 'X' [in N ready binaries]. Use search …`, `error ambiguous: 'X' matches
    N functions: bin!name 0x…, …. Retry with binary!name or binary!address.`,
    `error bad_target: 'X' is <kind>, but this tool takes <kinds>. <next step>.`
+
+10. **Name hints are targets, and data addresses find their binary.** Every name a tool prints for a
+    function resolves as a target (`selectors.alias_functions`, after the exact and case-insensitive
+    name): `Unit.Class.Method` / `Class.Method` / `Class::Method` of Delphi and FPC (published, RTTI
+    and property accessor names, named virtual slots), `TClass::vslot N` (Delphi VMT or C++ vtable
+    slot, a trailing `(+N classes)` or `(Name)` is ignored), and the IDR / signature names of
+    `idr: Unit.Proc` (with or without the unit). Matching is case-insensitive; several functions
+    (overloads) are `error ambiguous` with the addresses; one function resolves with a note line.
+    A raw address that is no function (typed kind `address`, i.e. `xrefs`) in a project with several
+    binaries and no binary given is looked up in every ready binary: one binary with references or a
+    Delphi/FPC class there wins (note `binary x.exe`), several give `error ambiguous` with
+    `binary!0xaddr` candidates. The VMT, type info or an address inside the virtual slots of a
+    Delphi/FPC class (`server/classfwd.py`) adds one fact line to `xrefs` (`0x.. is the vmt of Delphi
+    class vc.TBase`) and merges the references to the VMT and the type info (direction=from: every
+    virtual slot); `function` on such an address shows the fact line, the class row, the `vslot`
+    lines, the published/RTTI methods and the references. `vtable` takes a Delphi/FPC class name
+    (also `unit.Class`) or such an address: `[N] 0xaddr function rtti: Unit.Class.Method; origin`
+    with origin `new`, `override, introduced by X` or `inherited from Y[, introduced by X]`; N is
+    the number of the `TClass::vslot N` hint. **[verified]** on a two-class Delphi 13 test program
+    (`vtable TDerived`, `function 0x0041dcfc` on a 3-binary project, `function vc.TBase.Greet`).
 
 ### 7.4 Format
 
@@ -2369,6 +2402,7 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   identical bodies (empty virtual stubs, accessors) that the matcher drops on purpose when one proc matches
   more than `MAX_COPIES` functions. **[verified]** index of FPC 3.2.2 Lazarus and console programs (32 and 64-bit) names 48% to 57% of all functions (`idr:` hints). FPC x86 indirect calls `CALL [reg+disp]` get a stub with the Free Pascal `register` convention (`delphistr.vcall_args`: EAX Self, EDX/ECX when loaded just before the call and not used for the vmt address, pushes right before the loads), named `vmt_<offset>_<regs>_<pushes>` and tagged `airlock:concat vcall <key>`; without it a hidden result pointer is not an argument for the decompiler. The same pass runs for 32-bit Delphi (`delphistr` VERSION 6, collector 11): vmt load into another register skipped, byte/word register arguments (`DL`, `CL`), `PUSH EBP` and prologue pushes ignored, `stdcall`/`safecall` calls with the vmt load in the window get a stack-only stub (`vmt_<offset>_s_<pushes>`), `cdecl` (`ADD ESP,n` after the call) none; the decompiler drops the stub address after a vcall stub name. **[verified]** on 32-bit Delphi programs: calls that lost a register or stack argument in the C, 5 of 17, 6 of 20, 9 of 254 and 10 of 237 before, none after. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
   `fpc_ansistr_concat_multi`) from Ghidra's own symbol loader.
+- Pascal register convention (32-bit Delphi and Free Pascal): arguments in EAX, EDX, ECX (Self first), the rest on the stack pushed left to right, the callee pops (`RET n`). Ghidra's `__register` (borlanddelphi spec) orders the stack parameters by offset, i.e. reversed; Free Pascal programs use the Visual Studio spec and no EAX parameter. `pascalconv.apply_register_prototypes` writes custom storage for each such function (registers, then stack slots from the highest offset down), see HANDOVER "Round 7 fixes (r7c)". **[verified]** `TBase.Num(X,Y,Z,W)` decompiles as `(param_3 * param_4 + param_2) - param_5`. Decompiled virtual calls show the slot and the resolved method (`vcallnames`): `vmt_508_adc_0/*TFormMain vslot 310 -> ...*/`.
 - Strings: `AnsiString` / `UnicodeString` literals are `{u16 codePage; u16 elemSize; (u32 pad on 64-bit);
   SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in
   32-bit, 24 in 64-bit (Delphi has 12 in both). ANSI literals carry code page 0 when the source uses
@@ -2465,3 +2499,10 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
 
 jCodeMunch (dual-use license, no rebranding) is a design inspiration only; no
 code is taken from it.
+
+### Round 7 fixes: names kept, ShortString index rows
+
+- A tool that derives Delphi/IDR data passes the configured `idr_kb_dir`, `delphi_sigdb_dir`, `warp_dir`. A call with no folder keeps the stored IDR names and FPC vslot names (never wipes). **[verified]** vc project copy: `delphi_classes` leaves `idr_info` of all binaries unchanged.
+- `projects` / `project_open` count binaries from the index store when the manifest lists none. `hexdump` and the other file tools fall back to `artifacts/<sha256>` for an analysed binary. `delphi_events` with no form lists all forms.
+- Strings of Delphi/FPC programs include ShortString literals (length byte, printable, 3+ chars) that an instruction references and that lie in no string data (`shortstr.py`, collector 12). **[verified]** FPC 3.2.2: `'purr'` at 0x00428218 found.
+- `delphi.ensure` takes `NOT_GIVEN` as the default of the three folders: a caller that did not pass the configuration keeps the stored IDR and FPC names. `None` passed means the config has no such folder; `idr.stale` then clears an old result (names dropped, unchanged behaviour).
