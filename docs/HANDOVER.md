@@ -1,6 +1,21 @@
 # Handover
 
-Last updated: 2026-11-05. M1.5 issues fixed and verified on a fresh analysis
+Last updated: 2026-11-06. **Release 0.1.0** (tag `v0.1.0`, GitHub release with wheel and sdist).
+CI (`.github/workflows/ci.yml`) runs the unit tests on Python 3.10 and 3.13 for every push.
+
+Next (in this order; new features such as `type_inspect`/`type_search` wait until these are done):
+- .NET N4: `dotnet.parse_file` speed (3-6 s per 3 MB assembly), sequential layout offsets, enum names in the IL listing.
+- Fix pass on a fresh index: Tile Studio still has about 97 direct call targets with no function after the first
+  index (on-demand creation makes them); see `tests/realdata/README.md`.
+- Clean room: Bash in Claude Code is not covered by the deny rules; the Codex TOML format is **[verify]**; spec approval
+  has no MCP elicitation path (CLI `airlock spec-approve` only).
+- Spec quality: one clean-room reconstruction run (dirty specs -> clean reimplementation -> differential tests) on
+  the fixed filter.
+Test policy: one regression test per real fix; run the test files of the changed modules; the full suite only for
+merges, schema or version-key changes, shared core modules and releases (CI runs it on every push). Real-data checks:
+`pytest -q -m realdata --realdata` (3 open-source targets, about 6 min).
+
+Earlier state (2026-11-05): M1.5 issues fixed and verified on a fresh analysis
 of the acceptance target; M2 (resources, RTTI, vtables, MFC message maps and
 the UI join), M3 (annotate), M4 (specs), M5 (`fileformat`), M6 (`delphi`), M7 (`dotnet`) and M8 (`qt_metaobjects`,
 `dataflow`) are done. Delphi RTL/VCL naming has 5 sources (exact sigdb from
