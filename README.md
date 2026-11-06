@@ -65,7 +65,7 @@ exclusion for that folder: real-time scanning slows Ghidra's project writes cons
 ## Development
 
 - Install for development: `pip install -e .[dev]`. Check the install with `airlock doctor --start`.
-- Tests: `pytest -q` (1469 passed, 49 skipped). Tests run in parallel, at most 8 workers.
+- Tests: `pytest -q` (1575 passed, 49 skipped). Tests run in parallel, at most 8 workers.
 - Ghidra tests: `pytest -q -m ghidra --binary=<exe>` or `--xbin=<folder>`. They run one at a time.
 - A new tool must be in `catalog.py` and registered with `@tool` in a module under
   `src/airlock/server/tools/`. Tool output must not contain hints (`tests/test_no_hints.py`).

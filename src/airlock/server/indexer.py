@@ -1259,30 +1259,53 @@ class Indexer:
         limit = max(0, int(self.config.defaults.get("session_wait_s", SESSION_WAIT_S) or 0)
                     if wait_s is None else int(wait_s))
         waited = False
+
+        def busy(job: Job) -> WorkerError:
+            return WorkerError("busy", f"the worker is indexing project '{job.project}' "
+                                       f"({job.program}); about {self._eta_s(job)} s left there"
+                                       f", waited {round(time.monotonic() - start)} s.")
+
+        def other_job() -> Job | None:
+            with self._lock:
+                job = self._running
+            return job if job is not None and job.project != slug and not job.finished.is_set() else None
+
         try:
             while True:
-                with self._switch:
+                left = start + limit - time.monotonic()
+                # A job of another project holds the switch lock while it opens its project (seconds to minutes
+                # with Ghidra): that time counts against the wait limit too. Same project or no job: wait for it.
+                if not self._switch.acquire(timeout=min(max(left, 0.0), 2.0)):
+                    job = other_job()
+                    if job is None:
+                        self._switch.acquire()
+                    elif start + limit - time.monotonic() <= 0:
+                        raise busy(job)
+                    else:
+                        if not waited:
+                            waited = True
+                            with self._lock:
+                                self._waiters[slug] = self._waiters.get(slug, 0) + 1
+                        continue
+                try:
                     # The queue job owns the worker's open project from its import to its last step;
                     # switching it away would make the job import into or read from the wrong project.
-                    with self._lock:
-                        job = self._running
-                    blocked = job is not None and job.project != slug and not job.finished.is_set()
-                    if not blocked:
+                    job = other_job()
+                    if job is None:
                         self._open_here(project, slug)
                         if waited:      # the queue lets this session finish its reads first
                             with self._lock:
                                 self._hold[slug] = time.monotonic() + SESSION_HOLD_S
                         return
-                    assert job is not None
                     left = start + limit - time.monotonic()
                     if left <= 0:
-                        raise WorkerError("busy", f"the worker is indexing project '{job.project}' "
-                                                  f"({job.program}); about {self._eta_s(job)} s left there"
-                                                  f", waited {round(time.monotonic() - start)} s.")
+                        raise busy(job)
                     if not waited:
                         waited = True
                         with self._lock:
                             self._waiters[slug] = self._waiters.get(slug, 0) + 1
+                finally:
+                    self._switch.release()
                 job.finished.wait(min(left, 2.0))
         finally:
             if waited:

@@ -118,6 +118,7 @@ Log files are in `%LOCALAPPDATA%\airlock\logs`. Worker problems are in `worker.l
 | `spec_has_address` | The text has an address. | Name the thing by its role. |
 | `spec_has_bytes` | The text has a long run of hex bytes. | Describe the layout as fields. |
 | `spec_has_ghidra_names` | The text has a Ghidra name such as `FUN_...`. | Use the role in prose. |
+| `needs_approval` | The config key `require_spec_review` is on, so an agent cannot set a specification to `final` or publish it. | Review the specifications, then run `airlock spec-approve <project> --yes`. |
 
 ## Worker and Ghidra
 

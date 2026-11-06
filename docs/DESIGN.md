@@ -2699,7 +2699,7 @@ The worker has one open project. A read that needs the worker (uncached decompil
 the one of the running queue job waits in `Indexer.ensure_open` up to `session_wait_s` (default 120, 0 = no
 wait); the queue does not start a job of another project while such a session waits and for 30 s after it got
 the worker (`_yield_needed`). After the bound: `error busy: the worker is indexing project 'X' (prog); about N s
-left there, waited W s.`; `function` does not retry that error. Internal callers (bulk pass, Qt pass, fixup refresh, function recovery) call `ensure_open(wait_s=0)` and never wait. **[verified]** a session read waited 31 s for the analysis of a new project, then returned the C. Cached C and index data never need the worker.
+left there, waited W s.`; `function` does not retry that error. Internal callers (bulk pass, Qt pass, fixup refresh, function recovery) call `ensure_open(wait_s=0)` and never wait. The switch lock that a job holds while it opens its project counts against the same limit (`ensure_open` takes it with a timeout); a job of the same project, or none, is waited for. **[verified]** a session read waited 31 s for the analysis of a new project, then returned the C. Cached C and index data never need the worker.
 `index_status` says `background pass waits until a session opens <project>` when the bulk pass waits for a
 session bound to that project, and `waiting for analysis` only while the queue is busy.
 `project_create` shows the real states of the other executables: `(1 importing, 2 queued)`.

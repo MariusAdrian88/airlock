@@ -626,8 +626,10 @@ def test_session_read_waits_for_other_project_job(tmp_path):
     wait_for(lambda: states(ctx)["zz/first.dll"] == "importing")
     # the wait is bounded: no wait at all fails at once with the expected wait in one fact line
     ctx.config.defaults["session_wait_s"] = 0
-    with pytest.raises(WorkerError) as ei:
+    t0 = time.monotonic()
+    with pytest.raises(WorkerError) as ei:          # the job holds the switch lock in open_project: no block on it
         ix.ensure_open("other")
+    assert time.monotonic() - t0 < 2.0
     assert ei.value.code == "busy" and ei.value.message.startswith("the worker is indexing project 'proj'")
     assert "s left there" in ei.value.message and "\n" not in ei.value.message
     # a session that can wait gets the worker as soon as the job is done
