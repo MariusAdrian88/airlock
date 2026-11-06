@@ -85,7 +85,7 @@ def test_tools_take_the_selector(tmp_path, over_dll):
     xs = core.xrefs(ctx, "Demo.Proc.Worker::Kill(bool)", direction="to")
     assert "Run" in xs
     amb = core.xrefs(ctx, "Demo.Proc.Worker::Kill", direction="to")
-    assert amb.startswith("error ambiguous:") and "Kill(bool)" in amb
+    assert amb.startswith("2 overloads of Demo.Proc.Worker::Kill merged") and "Kill(bool)" in amb   # N3: merged
 
 
 def test_token_preferred_over_native_thunk(tmp_path, over_dll):

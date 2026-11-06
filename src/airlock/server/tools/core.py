@@ -26,7 +26,7 @@ from airlock.server.cview import (
 )
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import add_note, call as call_tool, tool
-from airlock.server.selectors import fmt_addr, parse_address
+from airlock.server.selectors import describe, fmt_addr, parse_address
 from airlock.server import classfwd, cpp, delphi, dotnet, dotnet_meta, notes, qt, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
@@ -718,6 +718,46 @@ def _class_view(ctx: ServerContext, binary: str, target: str, bud: int, cursor: 
     return fit_lines(out, bud, "code", tool="function", args=args)[0]
 
 
+def _type_members(ctx: ServerContext, binary: str, target: str, bud: int) -> str | None:
+    """The member list of a .NET type that ``target`` names (exactly one type in one binary), else None."""
+    sc = bind_scope(ctx, binary, target)
+    if isinstance(sc, str) or not sc.bare or "(" in sc.bare:
+        return None
+    hits = []
+    for bd in sc.bounds:
+        try:
+            hits += [(bd, n) for n in dotnet.find_type(bd.store, bd.binary.id, sc.bare)]
+        except Exception:  # noqa: BLE001  a binary without .NET tables
+            continue
+    if len(hits) != 1:
+        return None
+    bd, full = hits[0]
+    from airlock.server.tools import dotnet as dn_tools    # late: the tool module imports this one
+    body = dn_tools.dotnet_types(ctx, f"{full}::", 200, bd.binary.name, "method", "", bud)
+    return f"{sc.bare} is the type {full}; its members:\n{body}"
+
+
+def _overload_head(bd: Bound, fns: list[Function], extra: str) -> list[str]:
+    """Fact line plus one ``0xtoken Name(sig)`` line per overload (an ambiguous name that is one method's overloads)."""
+    sigs = describe(fns, bd.psize)
+    return [f"{len(fns)} overloads of {fns[0].qualified_name}{extra}:", *[f"  {x}" for x in sigs]]
+
+
+def _overloads_of(ctx: ServerContext, binary: str, target: str, err: str) -> tuple[Bound, list[Function]] | None:
+    return tg.overload_set(ctx, binary, target) if err.startswith("error ambiguous") else None
+
+
+def _merge_overloads(ctx: ServerContext, bd: Bound, fns: list[Function], bud: int, call) -> str:
+    """One block per overload (signature as header), each within its share of the budget."""
+    share = max(100, bud // len(fns))
+    out = [f"{len(fns)} overloads of {fns[0].qualified_name} merged"]
+    for f in fns:
+        sig = describe([f], bd.psize)[0]
+        out.append(f"== {sig} ==")
+        out.append(call(fmt_addr(f.entry, bd.psize, f.space), share).rstrip("\n"))
+    return "\n".join(out)
+
+
 @tool("function", "Show a function's decompiled C with call addresses (view=c), its assembly (view=asm), "
                   "both (view=both) or its signature (view=signature), by name or address; lines=a-b "
                   "reads a range of a long function's outline.")
@@ -752,8 +792,24 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             return "error bad_args: lines must look like 40-80."
     ft = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT_FN))
     if isinstance(ft, str):
+        ov = _overloads_of(ctx, binary, target, ft)
+        if ov is not None:
+            obd, ofns = ov
+            if view == "signature":
+                return "\n".join(_overload_head(obd, ofns, ""))
+            head = _overload_head(obd, ofns, "; code of the first")
+            cost = estimate_tokens("\n".join(head))
+            if cost * 2 > bud:
+                return "\n".join([head[0].replace("; code of the first", "; code does not fit the budget"), *head[1:]])
+            first = function(ctx, fmt_addr(ofns[0].entry, obd.psize, ofns[0].space), obd.binary.name, view, lines,
+                             cursor, max(100, bud - cost), detail, outline, retry, outline_depth)
+            return "\n".join(head) + "\n" + first
         if ft.startswith("error external:") and view != "signature":    # an import row: no code
             return _import_refs(ctx, target, binary, bud)
+        if ft.startswith("error not_found") and view != "signature":      # a .NET type name: its members
+            tm = _type_members(ctx, binary, target, bud)
+            if tm is not None:
+                return tm
         if ft.startswith("error not_found"):                              # a Delphi / FPC VMT or type info address
             cv = _class_view(ctx, binary, target, bud, cursor)
             if cv is not None:
@@ -965,6 +1021,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
             return (f"error bad_args: unknown kind '{kind}' "
                     "(kinds: call, jump, code, read, write, data, import, dynamic, table).")
     page = max(1, min(int(limit), 1000))
+    limit_arg = page
     limit = XREFS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)
     if isinstance(tr, str) and "::" in target and tr.startswith("error not_found"):
@@ -975,6 +1032,10 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
             binary, target = fld
             tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)
     if isinstance(tr, str):
+        ov = _overloads_of(ctx, binary, target, tr)
+        if ov is not None:
+            return _merge_overloads(ctx, ov[0], ov[1], bud, lambda a, b: xrefs(
+                ctx, a, ov[0].binary.name, direction, kind, limit_arg, "", b))
         return tr
     swapped = ""
     if isinstance(tr, tg.ImportTarget) and direction == "from":
@@ -1067,7 +1128,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     for rb, x in refs:
         pfx = f"[{rb.binary.name}] " if multi else ""
         if direction == "to":
-            who = (x.src_fn.qualified_name if x.src_fn else "-") + _il_site(x)
+            who = (_who(rb.store, x.src_fn) if x.src_fn else "-") + _il_site(x)
             entries.append((x.kind, f"  {pfx}{rb.addr(x.src_addr)}  {who:<36} {x.kind}"))
         else:
             what = _describe_addr(rb, x.dst_addr, x.dst_fn)
@@ -1088,14 +1149,14 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
                     if key in seen_callers:
                         continue
                     seen_callers.add(key)
-                    who = c.src_fn.qualified_name if c.src_fn else "-"
+                    who = _who(sb.store, c.src_fn) if c.src_fn else "-"
                     entries.append((c.kind, f"  [{sb.binary.name}] {sb.addr(c.src_addr)}  {who:<36} "
                                             f"{c.kind} (via {x.kind})"))
                 continue
         if kinds is not None and x.kind not in kinds:
             continue
         imp = sb.store.import_at(x.src_binary, x.src_addr)
-        who = (x.src_fn.qualified_name if x.src_fn else
+        who = (_who(sb.store, x.src_fn) if x.src_fn else
                sb.store.import_label(imp) if imp else "-")
         entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
     over = len(entries) > limit      # a hard cap: the real count is unknown
@@ -1123,6 +1184,11 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
 def _body_fact(st: Any, fn: Function, pfx: str) -> list[str]:
     """``body: Ns.Type+<Run>d__3::MoveNext (async)``: where the code of an async or iterator stub is."""
     return [f"{pfx}body: {c.qualified_name} ({how.split()[0]})" for c, how in st.body_links(fn, True, 3)]
+
+
+def _who(st: Any, fn: Function) -> str:
+    """A caller's name; the source method for a compiler-generated .NET one (``Outer (async MoveNext)``)."""
+    return dotnet.origin_name(st, fn) or fn.qualified_name
 
 
 def _il_site(x: Xref) -> str:
@@ -1154,6 +1220,10 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     depth = max(1, min(int(depth), MAX_DEPTH))
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT))
     if isinstance(tr, str):
+        ov = _overloads_of(ctx, binary, target, tr)
+        if ov is not None:
+            return _merge_overloads(ctx, ov[0], ov[1], bud, lambda a, b: callgraph(
+                ctx, a, ov[0].binary.name, direction, depth, "", b, pointers))
         return tr
     assert isinstance(tr, (tg.FunctionTarget, tg.ImportTarget))
     imp: tg.ImportTarget | None = None
@@ -1256,7 +1326,9 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
             suffix = " (ptr)"
         if f is None:
             return mark + cb.addr(raw or 0) + suffix
-        return mark + fn_desc(cb, f) + (" [thunk]" if f.is_thunk else "") + suffix
+        org = dotnet.origin_name(cb.store, f) if direction == "callers" and not mark else None
+        desc = f"{org} ({cb.addr(f.entry, f.space)})" if org else fn_desc(cb, f)
+        return mark + desc + (" [thunk]" if f.is_thunk else "") + suffix
 
     def walk(cb: Bound, fn: Function, left: int, indent: int, path: frozenset[int]) -> None:
         walk_kids(children(cb, fn), left, indent, path, fn_desc(cb, fn),

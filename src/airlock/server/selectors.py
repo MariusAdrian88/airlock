@@ -33,6 +33,8 @@ def fmt_addr(value: int, pointer_size: int | None = 4, space: str = "ram") -> st
     if value >= US_BASE:                      # a .NET user string: space ``us``, offset in the #US heap
         return f"us:0x{value - US_BASE:08x}"
     width = (pointer_size or 4) * 2
+    if space == "ram" and DN_METHOD_LO <= value < DN_METHOD_HI:
+        width = 8                              # a metadata token has 8 digits on every architecture
     s = f"0x{value:0{width}x}"
     return s if space == "ram" else f"{space}:{s}"
 
@@ -273,17 +275,35 @@ def parse_selector(target: str) -> tuple[str, list[str] | None]:
 
 
 def managed_named(store: Store, binary_id: int, name: str) -> list[Function]:
-    """Managed methods named ``Type::Name`` or ``Type.Name`` (namespace and type before the last separator)."""
+    """Managed methods named ``Type::Name`` or ``Type.Name``. The type may be the full name or a
+    unique-looking suffix (``AssemblyList.Open`` for ``ICSharpCode.ILSpy.AssemblyList``); a suffix that
+    names several types gives the methods of all of them."""
     out = [f for f in store.functions_by_name(binary_id, name) if is_managed(f)]
     if out:
         return out
-    head, sep, meth = name.rpartition(".")
+    head, sep, meth = name.rpartition("::")
+    if not (sep and head.strip() and meth.strip()):
+        head, sep, meth = name.rpartition(".")
+    head, meth = head.strip(), meth.strip()
     if not (sep and head and meth):
         return []
+    esc = head.replace("^", "^^").replace("%", "^%").replace("_", "^_")
     rows = store.db.execute(
         "SELECT entry, space FROM function WHERE binary_id=? AND space='ram' AND entry>=? AND entry<? "
-        "AND name=? AND namespace=? ORDER BY entry", (binary_id, DN_METHOD_LO, DN_METHOD_HI, meth, head)).fetchall()
+        "AND name=? AND (namespace=? OR namespace LIKE ? ESCAPE '^' OR namespace LIKE ? ESCAPE '^') ORDER BY entry",
+        (binary_id, DN_METHOD_LO, DN_METHOD_HI, meth, head, "%." + esc, "%+" + esc)).fetchall()
     return [f for f in (store.function_at(binary_id, r[0], r[1]) for r in rows) if f is not None]
+
+
+def managed_overloads(store: Store, binary_id: int, target: str) -> list[Function]:
+    """Two or more managed overloads that ``target`` (``Type::Name`` or ``Type.Name``, params allowed) leaves
+    open, all of one ``Type::Name``; empty otherwise."""
+    name, params = parse_selector(target)
+    cands = managed_named(store, binary_id, name)
+    picked = cands if params is None else [f for f in cands if sig_params(f.signature) == params]
+    if len(picked) >= 2 and len({f.qualified_name for f in picked}) == 1:
+        return picked
+    return []
 
 
 def describe(fns: list[Function], psize: int | None, qualified: bool = False) -> list[str]:
@@ -321,7 +341,7 @@ def _ambiguous(target: str, fns: list[Function], psize: int | None) -> Resolved:
 def by_selector(store: Store, binary_id: int, target: str, psize: int | None) -> Resolved | None:
     """``Type::Name(params)`` and ``Type.Name`` for managed methods; None when it is not one."""
     name, params = parse_selector(target)
-    if params is None and "." not in name:
+    if params is None and "." not in name and "::" not in name:
         return None
     cands = managed_named(store, binary_id, name)
     if not cands:

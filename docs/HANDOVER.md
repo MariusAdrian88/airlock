@@ -289,7 +289,7 @@ Design in DESIGN §6 "dotnet" and §11 ".NET". Facts:
   parentheses lists the overloads. An ambiguous managed name lists `0xtoken Name(sig)` per candidate. A C++/CLI
   token and its native IJW body of one name resolve to the token with the fact line `native thunk 0x...`
   **[verified]** on KeePass (`AppConfigSerializer::Load()` -> 0x06001bb4) and ClrPhlib (`UnmanagedPE.LoadPE`).
-  `xrefs`/`callgraph` do not merge overloads.
+  Ambiguous overloads of one `Type::Name` are merged since N3 (see ".NET round 2 fix N3").
 - Cross-assembly xrefs (P9, `core.xrefs`): an `mcall`/`pinvoke` in-edge is listed as the callers of the slot or
   thunk (`[Dependencies.exe] 0x... Type::Method call (via mcall)`) plus one fact line; a slot without callers
   stays as a slot line. `callgraph callers` had the same gap (EXTERNAL row taken for a thunk), fixed.
@@ -909,3 +909,28 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
 - Open: sequential layouts have no offsets; inherited implementations through a base class that implements the interface of
   another assembly are matched by name only; the IL listing does not name enum constants (use `dotnet_types kind=field
   query=<enum>`); `xrefs` takes `Type::Field` (other tools do not).
+
+## .NET round 2 fix N3: overloads, name parts, IL bodies, argument gaps (R4, R5, R6, R9, P6)
+
+- R4 overloads (`targets.overload_set`, `selectors.managed_overloads`): when an `error ambiguous` has only managed overloads of one
+  `Type::Name` in one binary, `function` prints `N overloads of Type::Name; code of the first:`, one `0xtoken Name(sig)` line per
+  overload, then the first overload's code (budget left after the list; the list alone when it takes half the budget or more;
+  `view=signature` lists only). `xrefs` and `callgraph` print `N overloads of Type::Name merged` and one block per overload
+  (`== 0xtoken Name(sig) ==`), each with its share of the budget. Candidates of different types or binaries stay `error ambiguous`.
+- R5: `search` took only whole-name prefixes; `camel_words` parts were already in the FTS text. `_fts_query` now also reads a camel-case
+  query word as its parts (`GeneratePasswordList` = whole word or `generate password list`). No index text change, so no FTS version
+  key and no rebuild. `strings` compares with `&` removed from the stored text when the pattern has no `&` (substring and regex).
+- R6: `dotnet_meta.il_ranges` / `il_token_at` give the IL body ranges (RVA, header + code) of a mixed-mode binary; meta key
+  `dn_ilmap:<binary id>` = `1:<json>` (own version `ILMAP_VERSION`, filled on first use; DOTNET_VERSION unchanged). `targets._il_forward`
+  (in `resolve_target`) sends a Ghidra function over an IL body to the method token with the fact line `IL body of Type::Name
+  (0x06000017) at 0x...`, and replaces a wrong `native thunk` line when the "thunk" is an IL body. Real thunks (miNative methods) keep it.
+  **[verified]** ClrPhlib.dll: 0x180071f38 lies in the body 0x71f2c-0x71f70 of 0x06000017 (`UnmanagedPE.LoadPE`). Not done: `search` still
+  lists the pseudo-function next to the token (no `(IL body)` mark); a full Ghidra run was not repeated.
+- R9: `dotnet_types kind=` takes `implementations|implementation|implements|interface|interfaces` (= impl) and `methods`;
+  `list_binaries project=<name>` works while unbound (read only; without `project` it gives `error unbound` with the project list);
+  `function <type name>` prints `X is the type Full.Name; its members:` plus the method list (one type only); the short selector
+  `Type.Method` / `Type::Method` takes a unique type suffix (`selectors.managed_named`); metadata tokens print as 8 hex digits in
+  every architecture (`selectors.fmt_addr`).
+- P6: callers that are `MoveNext` of `<Outer>d__N` or `<Outer>b__N` print `Ns.Type::Outer (async MoveNext)` / `(iterator MoveNext)` /
+  `(lambda b__N)` / `(local function g__Name)` in `xrefs direction=to` and `callgraph direction=callers` (`dotnet.origin_name`).
+- Tests: `tests/test_n3.py`; `test_tools_take_the_selector` in `test_dotnet_names.py` changed (ambiguous overloads are merged now).

@@ -173,7 +173,14 @@ def _fts_query(text: str) -> str | None:
         return None
     # Restrict to the text column: `kind` is indexed too, and a query such as "fun"
     # or "import" would otherwise match every row of that kind.
-    return "text : (" + " ".join(f'"{t}"*' for t in toks) + ")"
+    parts = []
+    for t in toks:
+        words = [w for w in _CAMEL.sub(" ", t).split() if w]
+        if len(words) > 1:       # GeneratePasswordList: the whole token, or its name parts (indexed by camel_words)
+            parts.append(f'("{t}"* OR (' + " ".join(f'"{w}"*' for w in words) + "))")
+        else:
+            parts.append(f'"{t}"*')
+    return "text : (" + " ".join(parts) + ")"
 
 
 # Worker or JVM failures: not decompiler results. Never cached; a stored row with one of these
@@ -964,15 +971,18 @@ class Store:
                 "SELECT id, address, encoding, value FROM string WHERE binary_id=? "
                 "ORDER BY address", (binary_id,)
             ):
-                if rx.search(r["value"]):
+                if rx.search(r["value"]) or ("&" not in pattern and "&" in r["value"]
+                                             and rx.search(r["value"].replace("&", ""))):
                     hits.append(r)
                     if len(hits) >= limit:
                         break
         else:
+            like = f"%{pattern.translate(_LIKE_ESC)}%"
+            mnemonic = "" if "&" in pattern else " OR replace(value, '&', '') LIKE ? ESCAPE '\\'"   # UI mnemonic
             hits = self.db.execute(
                 "SELECT id, address, encoding, value FROM string WHERE binary_id=? "
-                "AND value LIKE ? ESCAPE '\\' ORDER BY address LIMIT ?",
-                (binary_id, f"%{pattern.translate(_LIKE_ESC)}%", limit),
+                f"AND (value LIKE ? ESCAPE '\\'{mnemonic}) ORDER BY address LIMIT ?",
+                (binary_id, like, *([like] if mnemonic else []), limit),
             ).fetchall()
         out = []
         for r in hits:
