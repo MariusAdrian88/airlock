@@ -229,14 +229,21 @@ Design in DESIGN §6 "dotnet" and §11 ".NET". Facts:
   calls `dotnet.link_managed`, which binds them to project assemblies with xedge kind `mcall`.
   Details in DESIGN §11 ".NET". System.Windows.Forms.dll: 92977 edges, indexed in 8 s.
 - COM GUIDs: flag `guid=<lower>` in `dn_type.flags`, shown as `{GUID}` by `dotnet_types kind=com`.
-- Decompile cache folder: `<sha16>-<ilspycmd version>`.
+- Decompile cache folder: `<sha16>-<ilspycmd version>`; files are keyed by metadata token: `t_<type token>.cs`
+  (whole type) and `m_<method token>.cs` (one method, ilspycmd 11 `-m`), never by name (P17).
 - Mixed-mode Ghidra test: `test_mixed_mode_assembly_through_ghidra` in `tests/test_dotnet.py` (marker
   `ghidra`; run with `-m ghidra --binary=<any file>`; it copies CustomMarshalers.dll from the Framework
   folder to a temp dir).
 - `dotnet_version:<id>` meta key (`DOTNET_VERSION`): `Indexer.resume_project` re-parses stale tables.
-- ilspycmd 8.2.0.7535 installed under `.venv\dotnet-tools` (gitignored). The config key `ilspycmd`
-  points at it; the user's own config is not changed. It runs with `DOTNET_ROLL_FORWARD=LatestMajor`
-  set for the child process only (needs .NET 6, the machine has 7 and 8).
+- ilspycmd 11.2.0.10050 (NativeAOT, nuget `ilspycmd.win-x64`, no .NET runtime) is the supported tool:
+  `airlock doctor --fix` downloads it to the configured `ilspycmd` path (WARN when the file is older than 11).
+  Version 8.2 still works for whole types (`-t`, `DOTNET_ROLL_FORWARD=LatestMajor` is still set for the child, NativeAOT 11 ignores it); 8.2 fails on .NET 9/10 assemblies and cannot cut one method. With version >= 11,
+  `dotnet_decompile member=` (and `function view=c` on a managed method, which passes the method token)
+  runs `ilspycmd -m 0x06xxxxxx`: only that method, also MoveNext and lambdas, all overloads of a name, members
+  of nested types. Helpers for other options: `tools/dotnet.py::ilspy_run(ctx, bd, args)` (bytes, error) and
+  `server/dotnet.py::run_ilspy_args`.
+- Spec filter (clean room) rejects IL lines (`IL_xxxx`, opcode lines, `.method`), C# statements, lambdas,
+  attribute lines, member declarations and `{ get; set; }` as `spec_has_code` (tests in `tests/test_specs.py`).
 - `calli` gets no edge (no static target); `function view=asm` shows its signature. Write tools
   (`rename`, `retype`, `comment`, `struct_define`, rename part of `annotate`) refuse managed methods,
   thunks and external callees with `error managed` before the worker; `annotate` keeps the note and
@@ -245,6 +252,40 @@ Design in DESIGN §6 "dotnet" and §11 ".NET". Facts:
   offset); a MemberRef on a derived type that names an inherited method is not matched across assemblies;
   dnfile needs about 6 s for a 6 MB assembly (the dominant cost).
 - `dotnet_types` has an extra `kind` parameter (`type|method|pinvoke|com`).
+
+- Managed names (P19, `selectors.py`): `Type::Name(params)` / `Type.Name(params)` picks one overload by
+  parameter types (loose: short names, `String` = `string`, `Int32` = `int`, `ref` ignored); `Type.Name` without
+  parentheses lists the overloads. An ambiguous managed name lists `0xtoken Name(sig)` per candidate. A C++/CLI
+  token and its native IJW body of one name resolve to the token with the fact line `native thunk 0x...`
+  **[verified]** on KeePass (`AppConfigSerializer::Load()` -> 0x06001bb4) and ClrPhlib (`UnmanagedPE.LoadPE`).
+  `xrefs`/`callgraph` do not merge overloads.
+- Cross-assembly xrefs (P9, `core.xrefs`): an `mcall`/`pinvoke` in-edge is listed as the callers of the slot or
+  thunk (`[Dependencies.exe] 0x... Type::Method call (via mcall)`) plus one fact line; a slot without callers
+  stays as a slot line. `callgraph callers` had the same gap (EXTERNAL row taken for a thunk), fixed.
+  **[verified]** Mono.Cecil `ReadAssembly(String)`: 4 callers in 2 assemblies. Tests: `tests/test_dotnet_names.py`.
+- `type_inspect` / `type_search` stay in the catalog, not implemented (`error not_implemented`); no change.
+
+- IL sites, strings, generics, state machines (net-fix C, DOTNET_VERSION 6, SCHEMA_VERSION 15 adds `edge.site`):
+  every call site is one edge row with its IL offset in `site` (xrefs prints `Caller+IL_0012`; the
+  caller token stays `src_addr`). `ldftn`/`ldvirtftn` write one `fnptr` edge (no `data` twin);
+  `Store.link_fnptr` leaves `fnptr` edges of the managed token range alone. Each `ldstr` writes a
+  string row (address `US_BASE | #US offset` with `US_BASE = 1 << 48`, a window no mapped image can
+  reach, so native Ghidra string rows never clash; shown and parsed as `us:0x0002ece7`; utf16le, full
+  text, empty strings skipped; `ensure` deletes only `US_BASE .. US_BASE + 2^32`) and a
+  `data` edge from the method with the IL offset, so `strings` / `xrefs` on the address list the
+  methods. The IL listing cuts a literal at 200 characters and appends `…(N chars)`. External
+  generic instances keep their arguments in the label (`System.Nullable<uint>::.ctor(T0)`; MethodSpec
+  arguments only in the IL listing); `link_managed` maps `Name<a, b>` back to `Name`2`. Async and
+  iterator stubs get an edge kind `body` to the state machine `MoveNext` (from the
+  Async/Iterator StateMachine attribute, a `newobj` of the machine, or an `initobj`); `callgraph`
+  marks it `(async body)` / `(iterator body)` (`Store.body_links`); `function view=asm` (and the IL
+  fallback of `view=c`) prints one fact line `; body: <MoveNext name> (async|iterator)`. **[verified]** on a 3.2 MB
+  open-source assembly: 13 280 string sites, 7 172 literals, 73 169 call-site rows, `ensure` 3.3 s.
+- P14 dnfile cost **[verified]**: `dnPE()` is 1.3 s (3.2 MB), 2.0 s (3.1 MB), 1.5 s (6.6 MB); my IL
+  scan with strings adds 0.3-0.5 s; 75 % of `dnPE()` is row object creation for 80 k rows. Skipping
+  `parse` of Param/Constant/MethodSemantics/GenericParam and other unused tables gains only 5-20 %,
+  so it was not done. A real gain needs an own table reader (tuples via `struct`) that replaces every
+  row-object consumer in `_parse_tables`; not started.
 
 ## Delphi (M6)
 
@@ -695,3 +736,78 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
   (md5 of all edge rows with `src_fn`/`dst_fn`, and of all function rows) before and after a full `reextract_code` run.
   Fallback to the full read: `extract_at` fails, finds no function, or `create_functions` changed the calling
   convention of more than one function. No version key changed. Tests: `tests/test_r9d.py`.
+
+## .NET fix E: dotnet_events and managed resources (P4, P11)
+
+- New tool `dotnet_events` (set dotnet; `server/dotnet_ui.py`, tool in `tools/dotnet.py`). No schema change, no
+  DOTNET_VERSION change: rows are read from the stored assembly on demand and kept in memory per file and mtime.
+- WinForms: IL of `InitializeComponent` and of every method of types that derive (through the assembly's own types) from
+  `System.Windows.Forms.*`. Pattern, read backwards from `callvirt add_<Event>`: `newobj <Delegate>::.ctor`, `ldftn <handler>`,
+  target (`ldarg.0`), receiver (`ldarg.0 ldfld <field>`, `ldarg.0` = the form, or `ldloc n` that a later `ldarg.0 ldloc n stfld <field>`
+  stores). Caption = `<receiver> ldstr "text" callvirt set_Text`, or `ApplyResources(<receiver>, "name")` / `GetString("x.Text")` read from
+  the form `.resources`. **[verified]** KeePass 2.60: 830 events in 1.4 s; the 7 name-guessing calls of kp_menu become one call
+  (`component="Generate Password List"`). Lambdas show as `Class::<Method>b__N`.
+- WPF: BAML names from the ManifestResource `*.g.resources` entries; XAML from `ilspycmd --resource` (ilspycmd 11; uses `ilspy_run` helpers
+  of `tools/dotnet.py`, 6 threads, cached per BAML file). An attribute is an event when it is in a list of known WPF events or names a
+  method of the `x:Class` type and ends like an event name. `Command=` is joined to `CommandBinding Executed=` of the same XAML (`{x:Static}`
+  and `ApplicationCommands.` prefixes removed); a command with no binding in the XAML prints `-> no CommandBinding in the XAML` (view-model
+  commands, `RoutedCommand`s bound in code). **[verified]** Dependencies 1.11.1: 64 rows in 0.5 s; `Properties` -> `OpenUserSettingsCommandBinding_Executed`,
+  `OK` -> `OnValidate`.
+- `pe_resources` on a managed assembly adds `managed <name> <size> B embedded|linked ...` lines and the entries of `*.g.resources`;
+  `type=managed|resources|baml` lists entries (strings with a text preview). Own `.resources` reader (no dnfile resource parse: 1.1 s on KeePass, 3 ms now).
+- Open: `xrefs` on a handler does not yet print a `wired:` line; WPF code-behind `Connect` wiring and `ICommand` properties of view
+  models are not read; the ICommand join is by XAML text only.
+
+## .NET fix B: how .NET files enter a project (P1, P8, P15, P18, P20)
+
+- **[verified]** Single-file bundles: `projects.bundle_manifest(path)` reads the file table (header versions 1, 2, 6+;
+  real v6.0 from `dotnet publish -p:PublishSingleFile` and the ScreenToGif 2.43 bundle, 17 entries in 0.06 s).
+  Compressed entries (`csize > 0`) are raw deflate (`zlib.decompress(data, -15)`): **[verify]** on a real
+  self-contained+compressed bundle (the offline SDK has no runtime pack); the unit test uses a synthetic one.
+- Scan: a bundle host becomes group `apphost` (not in A-D, selectable with `add=`); each `assembly` entry is a virtual
+  file `Host.exe!Entry.dll` (managed, sizes from the manifest). Root = the entry named like the host (else the only one
+  with a CLI entry point). Framework entries (System.*, Microsoft.*, WindowsBase, ...) are group `runtime`, not parsed.
+  `project_create` / `program_add` store each entry as an artifact (`artifact_from_scan`, sha256 of the entry bytes);
+  the binary name is the entry file name (`ScreenToGif.dll`), `original_path` keeps `Host.exe!ScreenToGif.dll`,
+  `list_binaries` prints `ScreenToGif.dll (in ScreenToGif.exe)`.
+  Result (ScreenToGif copy): option A = 5 binaries, all `ready` in 16 s, cross links 1095/0 ... `dotnet_types` works.
+- Apphost (no payload, marker with offset 0) + `<stem>.dll` or the dll name patched into the host: root = the managed dll, host
+  group `apphost`. ILSpy folder: root `ILSpy.dll` (before: "root unclear: ILSpy.exe, ILSpy.dll"), scan 4 s.
+  Named root `host.exe` maps to the app dll. Own assemblies = reached through AssemblyRef names from the root (read on demand,
+  only for assemblies that stay core), minus a small list of known NuGet names; roots rank by metadata size when code size is 0.
+- R2R: `BinaryInfo.r2r` (ManagedNativeHeader size > 0 and `RTR` at its RVA) => `managed_only`: IL and metadata path only.
+  Native R2R code is **not** imported into Ghidra: the IL is complete, the native bodies are compiler output of the same IL
+  (r2r_kill spent four calls on stubs), and Ghidra took minutes per assembly. Scan prints `ReadyToRun: N assemblies, ...`.
+  A mixed-mode (C++/CLI) image (no ILONLY, no RTR) stays on the Ghidra path.
+- NativeAOT: no CLI header + export `DotNetRuntimeDebugHeader` => toolchain `nativeaot` (native path, no metadata); scan line says so.
+- `outline` of a `dotnet` binary prints `entry Type::Main 0x06xxxxxx` from the CLI `EntryPointToken` (`entry none` for a library);
+  the native entry line stays only for mixed-mode images.
+- `normal_module` keeps `.so[.N]` / `.dylib` names. Version keys: none changed (no index schema change).
+- Tests: `tests/test_net_entry.py`.
+- **[verified]** (real files) R2R: `System.Diagnostics.Process.dll` and `Microsoft.Win32.Registry.dll` 8.0.33 detect as `dotnet`, `r2r`,
+  `managed_only`; `project_create` on the dll file (option A) makes both ready in 1.0 s (before 62 s through Ghidra, 2592 functions;
+  now 1182 managed functions). The r2r_kill calls `search Kill`, `dotnet_decompile Kill` answer at once from the IL; `function`/`callgraph`
+  on `Process::Kill` still say `ambiguous` (two overloads, P19, not this item). NativeAOT: `ilspycmd.exe` 11.2 detects as `nativeaot`, scan prints the
+  NativeAOT line (project_create would send it to Ghidra, not run). A framework-named assembly chosen as root keeps its siblings out of group `runtime`.
+- **[verified]** Dependencies scan: root `DependenciesGui.exe`; `DependenciesLib.dll` and `ClrPhlib.dll` are `core` (before `third_party`);
+  `Dependencies.exe` is `separate_exe`.
+
+## .NET fix D: implementations, fields, native bodies (P5, P7, P10)
+
+- New module `src/airlock/server/dotnet_meta.py` (parse, store, queries); tests `tests/test_dotnet_meta.py` (9 tests: overrides and
+  implementations with explicit `MethodImpl` and `newslot`, fields/layout/constants/properties/events, field access scan, the
+  `dotnet_types` kinds, two assemblies, `xrefs`/`callgraph` dispatch, field edges, native link, framework enum values).
+  Hooks: `dotnet._parse_tables` (`Parsed.meta`, `_Resolver.field_owner` for `Type::Field` labels), `dotnet.ensure`
+  (`clear`/`write`), `dotnet.list_lines` (base + interfaces on type lines), `tools/dotnet.py` (kinds `impl field property
+  event`), `core.py` (`_describe_addr` field label, `xrefs` notes, `callgraph` children, `_get_decompiled`/`_get_asm`
+  forward for native methods), `indexer.bind_native_methods`, worker op `name_functions` (`ghidra_ops/funcs.py`).
+- Tables are in `schema.sql`; SCHEMA_VERSION 16, migration `_v16` (test `test_schema_has_meta_tables_and_migration`);
+  DOTNET_VERSION was bumped (to 5 by this item, others went on) so every managed binary is parsed again once.
+- **[verified]** ClrPhlib.dll run on a copy (project of 2 files, Ghidra 81 s): `function PhLoadMappedImage` now prints the
+  native decompile (`ulonglong <Module>::PhLoadMappedImage(longlong param_1, ...)` with the `NtUnmapViewOfSection` call) instead of
+  the ilspycmd extern stub; `callgraph` shows `<Module>::PhLoadMappedImage (0x0000000180001220) (native)`.
+  Test hint: the worker is started with `python -I`, which ignores PYTHONPATH; a script that tests worktree code against Ghidra
+  must start the worker with `-c "import sys; sys.path.insert(0, '<worktree>\\src'); import runpy; runpy.run_module('airlock.worker', run_name='__main__')"`.
+- Open: sequential layouts have no offsets; inherited implementations through a base class that implements the interface of
+  another assembly are matched by name only; the IL listing does not name enum constants (use `dotnet_types kind=field
+  query=<enum>`); `xrefs` takes `Type::Field` (other tools do not).

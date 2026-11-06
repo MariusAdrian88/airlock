@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from airlock.projects import (
-    MANIFEST_VERSION, copy_artifact, hash_file, new_manifest, project_paths, read_manifest,
+    MANIFEST_VERSION, artifact_from_scan, new_manifest, project_paths, read_manifest,
     slugify, write_clean_deny_rules, write_manifest,
 )
 from airlock.server.context import ServerContext
@@ -91,9 +91,7 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
     pp = project_paths(cfg.projects_root, slug, create=True)
     files = []
     for f in sorted(selected, key=lambda x: x.rel_path.lower()):
-        src = scan.root / f.rel_path
-        sha = hash_file(src)
-        copy_artifact(src, pp, sha)
+        sha = artifact_from_scan(scan.root, f.rel_path, pp)
         files.append({"path": f.rel_path, "group": f.group, "kind": f.kind, "size": f.size,
                       "code_size": f.code_size, "est_funcs": f.est_funcs, "sha256": sha,
                       "state": "queued", **({"managed": True} if f.managed else {})})

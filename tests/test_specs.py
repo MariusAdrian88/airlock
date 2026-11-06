@@ -263,3 +263,57 @@ def test_migration_from_v5_adds_spec_tables(tmp_path):
     MIGRATIONS[7](db)  # idempotent
     names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"spec", "spec_provenance", "audit"} <= names
+
+
+# -- .NET: IL and C# lines are code (P16) -----------------------------------------------------
+
+DOTNET_CODE = [
+    'IL_0013 ldstr "Window_CloseAllDocuments"',
+    "IL_0018 call KeePass.Native.NativeMethods::RegisterClipboardFormat(string)",
+    "ldstr \"Software Microsoft\"",
+    "ldarg.0",
+    "call string [mscorlib]System.String::Concat(string, string)",
+    "callvirt instance void KeePass.Forms.MainForm::UpdateUI(bool)",
+    ".method private hidebysig static void Main(string[] args) cil managed",
+    "await x.Y(args);",
+    "await Task.Delay(100);",
+    "ILSpySettings.SettingsFilePathProvider = () => {",
+    "button.Click += (s, e) => Run();",
+    "foreach (var item in items)",
+    "using (var fs = File.OpenRead(path))",
+    "using var stream = new MemoryStream();",
+    "using System.Collections.Generic;",
+    "lock (gate)",
+    "[FieldOffset(8)] public ushort VirtualKeyCode;",
+    "[DllImport(\"user32.dll\")]",
+    "[StructLayout(LayoutKind.Explicit)]",
+    "public static class SingleInstance",
+    "private static string GetInstanceName()",
+    "internal sealed record ForwardResponse(bool Accepted);",
+    "public int Count { get; set; }",
+    "catch (Exception ex) { Log(ex); }",
+    "} catch (IOException)",
+    "throw new InvalidOperationException();",
+    "yield return item;",
+    "var bytes = Encoding.UTF8.GetBytes(name);",
+    "new Thread(Run).Start();",
+    "namespace KeePass.UI;",
+]
+
+
+@pytest.mark.parametrize("line", [ln for ln in DOTNET_CODE])
+def test_filter_rejects_dotnet_code(line):
+    out = specfilter.check("fine line\n" + line)
+    assert out is not None and out.startswith("error spec_has_code: line 2 "), (line, out)
+    assert "\n" not in out
+
+
+def test_filter_accepts_dotnet_prose():
+    for ok in ("The clipboard format is registered once by RegisterClipboardFormat in NativeMethods.",
+               "Using the mutex name, the second instance forwards its arguments over a named pipe.",
+               "Each public key is stored as a 32-byte value; the new entry follows the lock record.",
+               "The call returns when the lambda finishes; await is not involved.",
+               "| offset | size | meaning |\n| 8 | 2 | virtual key code |",
+               "See [KeePass docs](https://keepass.info) for the plugin API.",
+               "[1] first note about the format"):
+        assert specfilter.check(ok) is None, ok

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 
-from airlock.server import peres, uijoin
+from airlock.server import dotnet_ui, peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
@@ -18,6 +18,7 @@ from airlock.server.registry import tool
 from airlock.server.tools.common import Bound, bind_binary, budget_for, preview
 
 PREFERRED_LANGS = (0, 0x0409)
+MANAGED_TYPES = ('managed', 'baml', 'resources')
 
 
 def _page(lines: list[str], bud: int, name: str, args: dict) -> str:
@@ -128,8 +129,8 @@ def _type_filter(text: str) -> tuple[int | None, str] | None:
         return None, t
 
 
-@tool("pe_resources", "List the resources of a PE file (type, id, language, size); type filters by "
-                      "name or number.")
+@tool("pe_resources", "List the resources of a PE file (type, id, language, size) and the managed resources "
+                      "of a .NET assembly; type filters by name or number, or is managed, resources or baml.")
 def pe_resources(ctx: ServerContext, type: str = "", binary: str = "", cursor: str = "",
                  budget: int = 0) -> str:
     args = {"type": type, "binary": binary}
@@ -140,13 +141,24 @@ def pe_resources(ctx: ServerContext, type: str = "", binary: str = "", cursor: s
     if isinstance(sc, str):
         return sc
     bounds, _, multi = sc
-    flt = _type_filter(type)
+    want = type.strip().lower()
+    managed_kind = want if want in MANAGED_TYPES else ""
+    flt = None if managed_kind else _type_filter(type)
     lines: list[str] = []
     for bd in bounds:
         art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
+        managed = None
+        if bd.binary.toolchain == "dotnet" and (managed_kind or flt is None):
+            managed = dotnet_ui.managed_resources(art, managed_kind)
+        if managed_kind and managed is not None:
+            lines += [f"{_tag(bd, multi)}{ln}" for ln in managed]
+            if not managed:
+                lines.append(f"{_tag(bd, multi)}{bd.binary.name}: no managed resources")
+            continue
         pe = peres.open_pe(art)
         if pe is None:
             lines.append(f"{_tag(bd, multi)}not a PE file or no resources")
+            lines += [f"{_tag(bd, multi)}{ln}" for ln in managed or []]
             continue
         try:
             ents = peres.list_entries(pe)
@@ -163,6 +175,8 @@ def pe_resources(ctx: ServerContext, type: str = "", binary: str = "", cursor: s
         ents.sort(key=lambda e: (e.type_id if e.type_id is not None else 1 << 20, e.type_name,
                                  (0, e.res_id) if e.res_id is not None else (1, 0), str(e.res_name), e.lang))
         lines += [f"{_tag(bd, multi)}{e.type_name} {e.key} lang={_lang(e.lang)} size={e.size}" for e in ents]
+        if managed:
+            lines += [f"{_tag(bd, multi)}{ln}" for ln in managed]
     return _page(lines, bud, "pe_resources", args)
 
 

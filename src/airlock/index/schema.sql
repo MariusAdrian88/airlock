@@ -63,7 +63,8 @@ CREATE TABLE edge (
   src_addr      INTEGER NOT NULL,
   dst_fn        INTEGER REFERENCES function(id),
   dst_addr      INTEGER NOT NULL,
-  kind          TEXT NOT NULL
+  kind          TEXT NOT NULL,
+  site          INTEGER              -- .NET: IL offset of the call site in the caller (NULL elsewhere)
 );
 CREATE INDEX edge_dst ON edge(binary_id, dst_addr, kind);
 CREATE INDEX edge_src ON edge(binary_id, src_addr, kind);
@@ -342,6 +343,76 @@ CREATE TABLE dn_pinvoke (
   entry         TEXT,                    -- entry point name; NULL for an ordinal
   ordinal       INTEGER,
   flags         TEXT NOT NULL DEFAULT '',   -- charset, calling convention, lasterror
+  PRIMARY KEY (binary_id, token)
+);
+
+-- .NET type-system facts (schema v16; server/dotnet_meta.py): derived, rebuilt with the other dn_* tables.
+CREATE TABLE dn_rel (
+  binary_id     INTEGER NOT NULL,
+  type_token    INTEGER NOT NULL,
+  kind          TEXT NOT NULL,           -- base | iface
+  target        TEXT NOT NULL,           -- full type name (this or another assembly)
+  target_token  INTEGER                  -- TypeDef token when the target is in this assembly
+);
+CREATE INDEX dn_rel_by_target ON dn_rel(binary_id, target);
+CREATE INDEX dn_rel_by_type ON dn_rel(binary_id, type_token);
+CREATE TABLE dn_override (
+  binary_id     INTEGER NOT NULL,
+  method        INTEGER NOT NULL,
+  kind          TEXT NOT NULL,           -- impl | override
+  base_token    INTEGER,                 -- MethodDef token when the base is in this assembly
+  base_type     TEXT NOT NULL,
+  base_name     TEXT NOT NULL,
+  base_params   TEXT NOT NULL
+);
+CREATE INDEX dn_override_by_method ON dn_override(binary_id, method);
+CREATE INDEX dn_override_by_base ON dn_override(base_name);
+CREATE TABLE dn_field (
+  binary_id     INTEGER NOT NULL,
+  token         INTEGER NOT NULL,        -- 0x04xxxxxx
+  type_token    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  sig           TEXT NOT NULL,
+  flags         TEXT NOT NULL,
+  offset        INTEGER,                 -- FieldLayout
+  const         TEXT,                    -- Constant
+  PRIMARY KEY (binary_id, token)
+);
+CREATE INDEX dn_field_by_type ON dn_field(binary_id, type_token);
+CREATE TABLE dn_layout (
+  binary_id     INTEGER NOT NULL,
+  type_token    INTEGER NOT NULL,
+  layout        TEXT NOT NULL,           -- explicit | sequential | auto
+  pack          INTEGER,
+  size          INTEGER,
+  PRIMARY KEY (binary_id, type_token)
+);
+CREATE TABLE dn_prop (
+  binary_id     INTEGER NOT NULL,
+  token         INTEGER NOT NULL,
+  type_token    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  sig           TEXT NOT NULL,
+  getter        INTEGER,
+  setter        INTEGER,
+  PRIMARY KEY (binary_id, token)
+);
+CREATE TABLE dn_event (
+  binary_id     INTEGER NOT NULL,
+  token         INTEGER NOT NULL,
+  type_token    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  etype         TEXT NOT NULL,
+  adder         INTEGER,
+  remover       INTEGER,
+  PRIMARY KEY (binary_id, token)
+);
+CREATE TABLE dn_native (
+  binary_id     INTEGER NOT NULL,
+  token         INTEGER NOT NULL,
+  rva           INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  tname         TEXT NOT NULL,
   PRIMARY KEY (binary_id, token)
 );
 

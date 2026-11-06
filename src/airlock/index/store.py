@@ -14,7 +14,8 @@ from typing import Any
 
 from airlock.index.migrations import MIGRATIONS
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
+US_BASE = 1 << 48          # .NET #US strings live in their own address window (space ``us``): above any mapped image
 DN_METHOD_LO, DN_METHOD_HI = 0x06000000, 0x07000000   # MethodDef metadata tokens (P/Invoke thunks)
 
 FTS_KINDS = ("function", "string", "import", "note")
@@ -86,6 +87,7 @@ class Xref:
     kind: str
     src_fn: Function | None
     dst_fn: Function | None
+    site: int | None = None      # .NET: IL offset of the call site in the caller
 
 
 @dataclass(frozen=True)
@@ -455,7 +457,8 @@ class Store:
         ptr = (b.pointer_size if b else 4) or 4
         q = self.db.execute
         with self.db:
-            q("DELETE FROM edge WHERE binary_id=? AND kind='fnptr'", (binary_id,))
+            q("DELETE FROM edge WHERE binary_id=? AND kind='fnptr' AND NOT (src_addr>=? AND src_addr<?)",
+              (binary_id, DN_METHOD_LO, DN_METHOD_HI))   # .NET fnptr edges are written by server/dotnet.py
         rows: dict[tuple[int, int], tuple[int, int, int, int]] = {}   # (F, G) -> src_addr, dst_addr
         for r in q(
                 "SELECT e.src_fn, e.src_addr, e.dst_fn, e.dst_addr FROM edge e "
@@ -642,6 +645,20 @@ class Store:
             "WHERE e.dst_fn=? AND e.kind='fnptr' AND f.id<>? ORDER BY f.entry LIMIT ?",
             (fn.id, fn.id, limit)).fetchall()
         return [_function(r) for r in rows]
+
+    def body_links(self, fn: Function, down: bool = True, limit: int = 20) -> list[tuple[Function, str]]:
+        """(function, label) over the ``body`` edges of fn (.NET): down = the state machine ``MoveNext``
+        of an async or iterator stub (label ``async body`` / ``iterator body``), else the stub of a
+        ``MoveNext`` (label ``async stub`` / ``iterator stub``)."""
+        a, c = ("src_fn", "dst_fn") if down else ("dst_fn", "src_fn")
+        rows = self.db.execute(
+            f"SELECT DISTINCT {_FN_SELECT}, (SELECT COUNT(*) FROM function m WHERE m.binary_id=e.binary_id "
+            "AND m.space='ram' AND m.name='SetStateMachine' AND m.namespace=mv.namespace) AS is_async "
+            f"FROM edge e JOIN function f ON f.id=e.{c} JOIN function mv ON mv.id=e.dst_fn "
+            f"WHERE e.{a}=? AND e.kind='body' AND f.id<>? ORDER BY f.entry LIMIT ?",
+            (fn.id, fn.id, limit)).fetchall()
+        return [(_function(r), ("async " if r["is_async"] else "iterator ") + ("body" if down else "stub"))
+                for r in rows]
 
     def insert_strings(self, binary_id: int, rows: Iterable[tuple[int, str, str]]) -> None:
         """Rows: (address, encoding, value)."""
@@ -844,9 +861,9 @@ class Store:
         sel_s = ", ".join(f"s.{c} AS s_{c}" for c in _FUNCTION_COLS)
         sel_d = ", ".join(f"d.{c} AS d_{c}" for c in _FUNCTION_COLS)
         rows = self.db.execute(
-            f"SELECT e.src_addr, e.dst_addr, e.kind, {sel_s}, {sel_d} FROM edge e "
+            f"SELECT e.src_addr, e.dst_addr, e.kind, e.site, {sel_s}, {sel_d} FROM edge e "
             "LEFT JOIN function s ON s.id=e.src_fn LEFT JOIN function d ON d.id=e.dst_fn "
-            f"WHERE {where} ORDER BY e.src_addr, e.dst_addr, e.kind LIMIT ?",
+            f"WHERE {where} ORDER BY e.src_addr, e.site, e.dst_addr, e.kind LIMIT ?",
             [*args, limit],
         ).fetchall()
         return [
@@ -854,6 +871,7 @@ class Store:
                 r["src_addr"], r["dst_addr"], r["kind"],
                 _function(r, "s_") if r["s_id"] is not None else None,
                 _function(r, "d_") if r["d_id"] is not None else None,
+                r["site"],
             )
             for r in rows
         ]

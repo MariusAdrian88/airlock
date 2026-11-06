@@ -330,7 +330,7 @@ FRAMEWORKS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("Delphi", "dl_class", "classes", ("delphi_classes", "delphi_forms", "delphi_events")),
     ("Qt", "qt_class", "classes", ("qt_metaobjects",)),
     ("MFC", "msgmap_entry", "message map entries", ("mfc_message_maps", "dialogs", "menus")),
-    (".NET", "dn_type", "types", ("dotnet_types", "dotnet_decompile")),
+    (".NET", "dn_type", "types", ("dotnet_types", "dotnet_decompile", "dotnet_events")),
     ("C++ RTTI", "rtti_class", "classes", ("rtti_classes", "vtable")),
     ("Win32 resources", "res_dialog", "dialogs", ("dialogs", "menus", "string_tables")),
 )

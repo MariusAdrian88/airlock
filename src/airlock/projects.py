@@ -8,8 +8,10 @@ import mmap
 import os
 import re
 import shutil
+import struct
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -334,25 +336,208 @@ class BinaryInfo:
     pointer_size: int | None
     image_base: int | None
     entry_point: int | None  # RVA
-    toolchain: str  # msvc | delphi | fpc | qt | dotnet | unknown
-    managed_only: bool = False  # CLI header with the IL-only flag: no native code, Ghidra not needed
+    toolchain: str  # msvc | delphi | fpc | qt | dotnet | nativeaot | unknown
+    managed_only: bool = False  # IL-only or ReadyToRun image: the IL is complete, Ghidra not needed
     toolchain_ver: str | None = None  # fpc: compiler version from the RTL's version string
+    r2r: bool = False  # ReadyToRun image (CLI header with a ManagedNativeHeader "RTR")
+    cli_entry: int = 0  # CLI header EntryPointToken (0x06xxxxxx method; 0 = none, a library)
 
 
 COR_ILONLY = 0x1
 
 
-def cor_flags(pe: pefile.PE) -> int | None:
-    """Flags of the CLI header (``IMAGE_COR20_HEADER``), None without one."""
+NATIVEAOT_EXPORT = b"DotNetRuntimeDebugHeader"
+
+
+def _cli_header(pe: pefile.PE) -> bytes | None:
+    """The bytes of the CLI header (``IMAGE_COR20_HEADER``, 72), None without one."""
     try:
         com = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
         dds = pe.OPTIONAL_HEADER.DATA_DIRECTORY
         if len(dds) <= com or not (dds[com].VirtualAddress and dds[com].Size):
             return None
-        data = pe.get_data(dds[com].VirtualAddress, 20)
-        return int.from_bytes(data[16:20], "little") if len(data) >= 20 else None
-    except Exception:  # noqa: BLE001  damaged header: treated as not managed-only by the caller
+        data = pe.get_data(dds[com].VirtualAddress, 72)
+        return data if len(data) >= 24 else None
+    except Exception:  # noqa: BLE001  damaged header: treated as not managed by the caller
         return None
+
+
+def cor_flags(pe: pefile.PE) -> int | None:
+    """Flags of the CLI header, None without one."""
+    h = _cli_header(pe)
+    return int.from_bytes(h[16:20], "little") if h else None
+
+
+def cli_entry_token(pe: pefile.PE) -> int:
+    """``EntryPointToken`` of the CLI header: the managed Main (0x06xxxxxx), 0 when none or native."""
+    h = _cli_header(pe)
+    if not h or int.from_bytes(h[16:20], "little") & 0x10:       # COMIMAGE_FLAGS_NATIVE_ENTRYPOINT
+        return 0
+    tok = int.from_bytes(h[20:24], "little")
+    return tok if tok >> 24 == 0x06 else 0
+
+
+def is_r2r(pe: pefile.PE) -> bool:
+    """ReadyToRun image: the CLI header has a ManagedNativeHeader that starts with ``RTR``."""
+    h = _cli_header(pe)
+    if not h or len(h) < 72:
+        return False
+    rva, size = struct.unpack_from("<II", h, 64)
+    if not (rva and size):
+        return False
+    try:
+        return pe.get_data(rva, 4) == b"RTR\x00"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_nativeaot(pe: pefile.PE) -> bool:
+    """NativeAOT image: the runtime debug header is exported (needs the export directory parsed)."""
+    exp = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+    return exp is not None and any(s.name == NATIVEAOT_EXPORT for s in exp.symbols)
+
+
+# --- single-file bundles and apphosts -----------------------------------------------------
+
+BUNDLE_SIG = bytes([
+    0x8b, 0x12, 0x02, 0xb9, 0x6a, 0x61, 0x20, 0x38, 0x72, 0x7b, 0x93, 0x02, 0x14, 0xd7, 0xa0, 0x32,
+    0x13, 0xf5, 0xb9, 0xe6, 0xef, 0xae, 0x33, 0x18, 0xee, 0x3b, 0x2d, 0xce, 0x24, 0xb3, 0x6a, 0xae])
+BUNDLE_KINDS = {0: "unknown", 1: "assembly", 2: "nativebinary", 3: "depsjson", 4: "runtimeconfig",
+                5: "symbols"}
+
+
+@dataclass(frozen=True)
+class BundleEntry:
+    path: str          # path inside the bundle, "/" separators
+    kind: str          # assembly (managed) | nativebinary | depsjson | runtimeconfig | symbols | unknown
+    offset: int
+    size: int          # size after decompression
+    csize: int = 0     # stored size when the entry is deflate-compressed (bundle v6+), else 0
+
+
+def bundle_marker(path: Path) -> int | None:
+    """None: no apphost marker in the file. 0: an apphost without payload. Else the offset of the
+    bundle header (a single-file bundle)."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            i = mm.find(BUNDLE_SIG)
+            if i < 8:
+                return None
+            off = struct.unpack_from("<q", mm, i - 8)[0]
+            return off if 0 < off < len(mm) - 12 else 0
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def _s7(d, o: int) -> tuple[str, int]:
+    n = sh = 0
+    while True:
+        b = d[o]
+        o += 1
+        n |= (b & 0x7F) << sh
+        sh += 7
+        if b < 0x80:
+            return bytes(d[o:o + n]).decode("utf-8", "replace"), o + n
+
+
+def bundle_manifest(path: Path) -> list[BundleEntry] | None:
+    """The file table of a .NET single-file bundle (header versions 1, 2 and 6+); None when the
+    file is no bundle (also for a plain apphost)."""
+    off = bundle_marker(path)
+    if not off:
+        return None
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            major, _minor, count = struct.unpack_from("<IIi", mm, off)
+            if not (1 <= major <= 64) or not (0 <= count <= 100000):
+                return None
+            _bid, o = _s7(mm, off + 12)
+            if major >= 2:
+                o += 8 * 4 + 8     # deps.json and runtimeconfig.json (offset, size), flags
+            out = []
+            for _ in range(count):
+                eoff, size = struct.unpack_from("<qq", mm, o)
+                o += 16
+                csize = 0
+                if major >= 6:
+                    csize = struct.unpack_from("<q", mm, o)[0]
+                    o += 8
+                kind = mm[o]
+                o += 1
+                name, o = _s7(mm, o)
+                out.append(BundleEntry(name.replace("\\", "/"), BUNDLE_KINDS.get(kind, "unknown"),
+                                       eoff, size, max(csize, 0)))
+            return out
+    except (OSError, ValueError, struct.error, IndexError):
+        return None
+
+
+def read_bundle_entry(path: Path, e: BundleEntry) -> bytes:
+    """Bytes of a bundle entry; compressed entries are raw deflate (``DeflateStream``)."""
+    with open(path, "rb") as f:
+        f.seek(e.offset)
+        if e.csize:
+            return zlib.decompress(f.read(e.csize), -15)
+        return f.read(e.size)
+
+
+BUNDLE_SEP = "!"     # "<host>!<entry path>": a file inside a single-file bundle
+
+
+def split_bundle_path(rel: str) -> tuple[str, str] | None:
+    """``("host.exe", "entry.dll")`` for ``host.exe!entry.dll``, else None."""
+    host, sep, entry = rel.partition(BUNDLE_SEP)
+    return (host, entry) if sep and host and entry else None
+
+
+def bundle_entry_name(rel: str) -> str:
+    """The file name a bundle entry gets as a binary (``X.dll`` for ``host.exe!sub/X.dll``)."""
+    sp = split_bundle_path(rel)
+    return Path((sp[1] if sp else rel).replace("\\", "/")).name
+
+
+_APPHOST_DLL_RE = re.compile(rb"([A-Za-z0-9_.\- ]{1,200}\.dll)\x00{8}")
+
+
+def apphost_targets(path: Path) -> list[str]:
+    """Managed dll names an apphost (no bundle) can start: ``<host stem>.dll`` first, then the names
+    patched into the host. The caller checks which one exists beside the host."""
+    stem = path.stem + ".dll"
+    names: list[str] = []
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 20)
+    except OSError:
+        return [stem]
+    for m in _APPHOST_DLL_RE.finditer(head):
+        n = m.group(1).decode("ascii", "replace").strip()
+        if n.lower() not in ("hostfxr.dll", "hostpolicy.dll") and n != stem and n not in names:
+            names.append(n)
+    return [stem, *names]
+
+
+def artifact_from_scan(root: Path, rel: str, project: "ProjectPaths") -> str:
+    """Store the file ``rel`` of a scanned program folder as an artifact; returns its sha256. A
+    bundle entry (``host.exe!X.dll``) is cut out of the host and hashed by its own bytes."""
+    sp = split_bundle_path(rel)
+    if sp is None or (root / rel).is_file():
+        src = root / rel
+        sha = hash_file(src)
+        copy_artifact(src, project, sha)
+        return sha
+    host = root / sp[0]
+    entry = next((e for e in bundle_manifest(host) or [] if e.path == sp[1]), None)
+    if entry is None:
+        raise FileNotFoundError(rel)
+    data = read_bundle_entry(host, entry)
+    sha = hashlib.sha256(data).hexdigest()
+    project.artifacts.mkdir(parents=True, exist_ok=True)
+    dest = project.artifacts / sha
+    if not dest.exists():
+        tmp = dest.with_name(dest.name + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+    return sha
 
 
 FPC_VERSION_RE = re.compile(rb"FPC (\d+\.\d+\.\d+)[\w.\-]* \[\d{4}/\d\d/\d\d\] for \w+")
@@ -370,11 +555,15 @@ def fpc_version(path: Path) -> str | None:
 
 
 def classify_toolchain(
-    import_names: list[str], resource_types: set[str], has_cli: bool, has_rich: bool, fpc: bool = False
+    import_names: list[str], resource_types: set[str], has_cli: bool, has_rich: bool, fpc: bool = False,
+    nativeaot: bool = False,
 ) -> str:
-    """Heuristics in order: dotnet, fpc (version string), delphi (TPF0), qt, msvc, unknown."""
+    """Heuristics in order: dotnet, nativeaot (export), fpc (version string), delphi (TPF0), qt,
+    msvc, unknown."""
     if has_cli:
         return "dotnet"
+    if nativeaot:
+        return "nativeaot"
     if fpc:
         return "fpc"
     if "TPF0" in resource_types:
@@ -422,7 +611,8 @@ def detect(path: Path) -> BinaryInfo:
     try:
         D = pefile.DIRECTORY_ENTRY
         pe.parse_data_directories(
-            directories=[D["IMAGE_DIRECTORY_ENTRY_IMPORT"], D["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+            directories=[D["IMAGE_DIRECTORY_ENTRY_IMPORT"], D["IMAGE_DIRECTORY_ENTRY_RESOURCE"],
+                         D["IMAGE_DIRECTORY_ENTRY_EXPORT"]]
         )
         is_plus = pe.OPTIONAL_HEADER.Magic == 0x20B
         machine = pe.FILE_HEADER.Machine
@@ -437,16 +627,20 @@ def detect(path: Path) -> BinaryInfo:
         has_cli = len(dds) > com and bool(dds[com].VirtualAddress and dds[com].Size)
         rtypes = {"TPF0"} if _has_tpf0(pe) else set()
         has_rich = pe.parse_rich_header() is not None
-        fpcv = None if has_cli or has_rich else fpc_version(path)     # GNU ld writes no Rich header
+        aot = not has_cli and is_nativeaot(pe)
+        fpcv = None if has_cli or has_rich or aot else fpc_version(path)   # GNU ld writes no Rich header
+        r2r = has_cli and is_r2r(pe)
         return BinaryInfo(
             "pe32+" if is_plus else "pe32",
             arch,
             ptr,
             pe.OPTIONAL_HEADER.ImageBase,
             pe.OPTIONAL_HEADER.AddressOfEntryPoint,
-            classify_toolchain(imports, rtypes, has_cli, has_rich, fpcv is not None),
-            has_cli and bool((cor_flags(pe) or 0) & COR_ILONLY),
+            classify_toolchain(imports, rtypes, has_cli, has_rich, fpcv is not None, aot),
+            has_cli and (r2r or bool((cor_flags(pe) or 0) & COR_ILONLY)),
             fpcv,
+            r2r,
+            cli_entry_token(pe) if has_cli else 0,
         )
     finally:
         pe.close()

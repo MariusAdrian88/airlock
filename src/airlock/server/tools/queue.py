@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from airlock.projects import copy_artifact, hash_file, read_manifest, write_manifest
+from airlock.projects import artifact_from_scan, read_manifest, write_manifest
 from airlock.server.context import ServerContext
 from airlock.server.indexer import MANAGED_S, IndexerError
 from airlock.server.registry import tool
@@ -83,9 +83,7 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
 
     entries = []
     for f in sorted(new, key=lambda x: x.rel_path.lower()):
-        path = scan.root / f.rel_path
-        sha = hash_file(path)
-        copy_artifact(path, pp, sha)
+        sha = artifact_from_scan(scan.root, f.rel_path, pp)
         entries.append({"path": f.rel_path, "group": f.group, "kind": f.kind, "size": f.size,
                         "code_size": f.code_size, "est_funcs": f.est_funcs, "sha256": sha,
                         "state": "queued", **({"managed": True} if f.managed else {})})

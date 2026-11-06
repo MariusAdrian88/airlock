@@ -26,6 +26,28 @@ _C_DECL = re.compile(r"^(?:(?:unsigned|signed|const|static|struct|class|enum|typ
 _C_PREPROC = re.compile(r"^#\s*(?:include|define|ifdef|ifndef|endif|pragma|if|else)\b")
 _PASCAL = re.compile(r"^(?:begin|end\s*[;.]?|repeat|var|procedure\b.*|function\b.*|try|finally|except"
                      r"|[A-Za-z_][\w.\[\]^]*\s*:=.*;?)\s*$", re.I)
+# .NET: IL listings and C# shapes (ilspycmd output, dotnet_decompile text)
+_IL_LABEL = re.compile(r"\bIL_[0-9A-Fa-f]{4}\b")
+_IL_OP = re.compile(r"^(?:ldarg|ldarga|ldloc|ldloca|stloc|starg|ldstr|ldfld|ldflda|stfld|ldsfld|ldsflda|stsfld|"
+                    r"ldc\.[a-z]\d?|ldnull|newobj|newarr|callvirt|castclass|isinst|brtrue|brfalse|beq|bne\.un|"
+                    r"blt|bgt|ble|bge|br|leave|endfinally|ldelem|stelem|ldind|stind|conv\.[a-z]\d?|box|unbox)"
+                    r"(?:\.\w+)*\s+\S|^call\s+(?:instance\s+)?[\w.\[\]<>`]+\s+[\w.\[\]<>`]+::"
+                    r"|^(?:ldarg|ldloc|stloc|ldc|conv|ldelem|stelem)(?:\.\w+)+$|^ldnull$")
+_IL_DIRECTIVE = re.compile(r"^\.(?:method|class|field|locals|maxstack|custom|assembly|module|entrypoint|try|catch)\b")
+_CS_STMT = re.compile(
+    r"^(?:(?:foreach|using|lock|fixed|checked|unchecked)\s*\(.*\)\s*\{?|catch\s*(?:\(.*\))?\s*(?:\{.*)?"
+    r"|using\s+(?:var|static)\s+.*;|using\s+[\w.]+\s*;"
+    r"|(?:await|yield\s+return)\s+.*;?|yield\s+break\s*;|throw\s+new\b.*|throw\s*;"
+    r"|(?:var|new)\s+[\w.<>\[\]]+.*[;{]"
+    r"|namespace\s+[\w.]+\s*[;{]?|try\s*\{?|finally\s*\{?|\}\s*(?:catch|finally)\b.*)\s*$")
+_CS_LAMBDA = re.compile(r"\)\s*=>|=>\s*[{(]|=>\s*[\w.]+\(")
+_CS_ATTR = re.compile(r"^\[[A-Za-z_][\w.]*(?:\(.*?\))?\](?:\s*$|\s*\[|\s+(?:public|private|internal|protected|static|extern|"
+                      r"\w+(?:<[^>]*>)?\s+\w+\s*[;({=]))")
+_CS_MEMBER = re.compile(
+    r"^(?:\[.*\]\s*)?(?:public|private|internal|protected)\s+(?:(?:static|abstract|virtual|override|sealed|"
+    r"readonly|extern|unsafe|async|partial|new|const)\s+)*(?:[\w.<>\[\],?]+\s+[\w.<>]+\s*[;({=]"
+    r"|(?:class|struct|interface|enum|record|delegate)\s+\w+)")
+_CS_PROPERTY = re.compile(r"\{\s*get;\s*(?:(?:private\s+|protected\s+)?(?:set|init);\s*)?\}")
 _FENCE = re.compile(r"^\s*(?:```|~~~)")
 _HEX_LIT = re.compile(r"(?<![\w$])(?:0[xX]|\$)([0-9A-Fa-f]{1,16})\b|\b([0-9A-Fa-f]{5,16})h\b|"
                       r"(?<![\w.])([0-9A-Fa-f]{6,16})(?![\w.])")
@@ -80,8 +102,12 @@ def check(text: str, ranges: list[tuple[int, int]] | None = None) -> str | None:
                         "allowed: the role in prose, no decompiler names")
         for pat, what in ((_C_PREPROC, "is a preprocessor line"), (_C_BLOCK, "is a code block line"),
                           (_C_ASSIGN, "is an assignment statement"), (_C_CALL, "is a call or return statement"),
-                          (_C_DECL, "is a declaration"), (_PASCAL, "is a Pascal statement")):
-            if pat.match(s):
+                          (_C_DECL, "is a declaration"), (_PASCAL, "is a Pascal statement"),
+                          (_IL_LABEL, "is an IL line"), (_IL_OP, "is an IL line"),
+                          (_IL_DIRECTIVE, "is an IL directive"), (_CS_STMT, "is a C# statement"),
+                          (_CS_LAMBDA, "contains a C# lambda"), (_CS_ATTR, "is a C# attribute line"),
+                          (_CS_MEMBER, "is a C# declaration"), (_CS_PROPERTY, "is a C# property")):
+            if (pat.search(s) if pat in (_IL_LABEL, _CS_LAMBDA, _CS_PROPERTY) else pat.match(s)):
                 return _err("spec_has_code", n, line, what,
                             "allowed: prose and field/offset/size/meaning tables")
         if _is_byte_dump(s) or _LONG_HEX.search(s):
