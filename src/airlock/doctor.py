@@ -202,7 +202,9 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
 
     # Delphi signature databases
     from airlock.server import idr as _idr
-    sigs = _idr.sig_files(cfg.delphi_sigdb_dir, 4) + _idr.sig_files(cfg.delphi_sigdb_dir, 8)
+    from airlock.server import fpcsigs as _fpcsigs
+    sigs = (_idr.sig_files(cfg.delphi_sigdb_dir, 4) + _idr.sig_files(cfg.delphi_sigdb_dir, 8)
+            + _fpcsigs.sig_files(cfg.delphi_sigdb_dir, 4) + _fpcsigs.sig_files(cfg.delphi_sigdb_dir, 8))
     if sigs:
         add(Check("OK", "delphi sigdb", f"{cfg.delphi_sigdb_dir}: " + ", ".join(f.path.name for f in sigs)))
     else:

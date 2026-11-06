@@ -17,6 +17,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .session import Entry, guarded
 
 DEFAULT_LIMIT = 2000
@@ -69,8 +70,11 @@ class Cursor:
 
 def _functions(p: Any) -> Iterator[list[Any]]:
     fm = p.getFunctionManager()
+    skip = stubs.stub_range(p)      # the airlock stubs are no program functions
     for f in itertools.chain(fm.getFunctions(True), fm.getExternalFunctions()):
         entry = f.getEntryPoint()
+        if skip is not None and not f.isExternal() and stubs.in_range(skip, S.addr_int(entry)):
+            continue
         src = str(f.getSymbol().getSource().name())
         ns = f.getParentNamespace()
         yield [
@@ -191,6 +195,7 @@ def _edges(p: Any) -> Iterator[list[Any]]:
     rm = p.getReferenceManager()
     fm = p.getFunctionManager()
     memory = p.getMemory()
+    skip = stubs.stub_range(p)      # the airlock stubs are no program content: no edge to or from them
 
     def fn_entry(addr: Any) -> int | None:
         f = fm.getFunctionContaining(addr)
@@ -200,6 +205,8 @@ def _edges(p: Any) -> Iterator[list[Any]]:
     while it.hasNext():
         src = it.next()
         src_off = S.addr_int(src)
+        if stubs.in_range(skip, src_off):
+            continue
         src_fn = fn_entry(src)
         for r in rm.getReferencesFrom(src):
             if not (r.isMemoryReference() or r.isExternalReference()):
@@ -208,6 +215,8 @@ def _edges(p: Any) -> Iterator[list[Any]]:
             if not kinds:
                 continue
             dst = r.getToAddress()
+            if skip is not None and r.isMemoryReference() and stubs.in_range(skip, S.addr_int(dst)):
+                continue    # a call override to a stub: the call to the real routine is its own edge
             dst_fn = None if r.isExternalReference() else fn_entry(dst)
             for k in kinds:
                 yield [src_off, src_fn, S.space_of(dst), S.addr_int(dst), dst_fn, k]

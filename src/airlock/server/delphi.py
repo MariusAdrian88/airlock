@@ -33,6 +33,7 @@ DFM (``RCDATA`` starting with ``TPF0``): see ``parse_dfm``.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_right
 import re
 import struct
 from dataclasses import dataclass, field
@@ -42,12 +43,13 @@ from typing import Any
 import pefile
 
 from airlock.index.store import Binary, Store
+from airlock.projects import FPC_VERSION_RE
 from airlock.server import peres
 from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 3
+DELPHI_VERSION = 5          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
@@ -174,12 +176,12 @@ def _read_class(img: Image, vmt: int, d_slots: int) -> DlClass | None:
     return DlClass(vmt=vmt, name=name, size=sz, typeinfo=ti)
 
 
-def _unit_name(img: Image, ti: int) -> str:
+def _unit_name(img: Image, ti: int, kind: int = 7) -> str:
     if not ti:
         return ""
     ps = img.psize
     k = img.read(ti, 1)
-    if not k or k[0] != 7:
+    if not k or k[0] != kind:
         return ""
     nm = _sstr_raw(img, ti + 1)
     if nm is None:
@@ -348,7 +350,8 @@ def _properties(img: Image, c: DlClass) -> list[DlMethod]:
     return out
 
 
-def _fields(img: Image, tab: int, by_vmt: dict[int, DlClass]) -> list[DlField]:
+def _fields(img: Image, tab: int, by_vmt: dict[int, DlClass], first: int = 0) -> list[DlField]:
+    """Published fields; ``first`` is the type index of the first class table entry (FPC counts from 1, 0 = none)."""
     ps = img.psize
     n = _u16(img, tab)
     if n is None or n > MAX_PUBLISHED or n == 0:
@@ -367,8 +370,8 @@ def _fields(img: Image, tab: int, by_vmt: dict[int, DlClass]) -> list[DlField]:
                 ok = False
                 break
             tname = ""
-            if ctab and ti < ncls:
-                cell = img.ptr(ctab + 2 + ti * ps)
+            if ctab and first <= ti < ncls + first:
+                cell = img.ptr(ctab + 2 + (ti - first) * ps)
                 tgt = img.ptr(cell) if cell else None
                 k = by_vmt.get(tgt or 0) or by_vmt.get(cell or 0)
                 tname = k.name if k else ""
@@ -390,7 +393,22 @@ def _virtuals(img: Image, vmt: int, limit: int) -> list[DlMethod]:
     return out
 
 
-def parse_classes(img: Image) -> list[DlClass]:
+def has_fpc_marker(img: Image) -> bool:
+    """True when the image holds the version string that the Free Pascal RTL links into every program."""
+    return any(FPC_VERSION_RE.search(s.data) for s in img.sections)
+
+
+def parse_classes(img: Image, vslots: dict[str, dict[int, str]] | None = None,
+                  guid_names: dict[str, str] | None = None) -> list[DlClass]:
+    """All classes of a Pascal program, sorted by address: the Free Pascal parser when the image carries the
+    FPC version string, else the Delphi parser; the other one is tried when the first finds nothing.
+    ``vslots`` / ``guid_names``: names of Free Pascal virtual slots and interfaces (``parse_fpc_classes``)."""
+    if has_fpc_marker(img):
+        return parse_fpc_classes(img, vslots, guid_names) or _parse_delphi_classes(img)
+    return _parse_delphi_classes(img) or parse_fpc_classes(img, vslots, guid_names)
+
+
+def _parse_delphi_classes(img: Image) -> list[DlClass]:
     """All classes with a Delphi VMT, sorted by address; parents, units, published methods and fields
     filled in."""
     ps = img.psize
@@ -438,6 +456,363 @@ def parse_classes(img: Image) -> list[DlClass]:
         if up:
             c.methods = [m for m in c.methods if m.kind == "virtual" or (m.name, m.addr) not in up]
     return [found[v][0] for v in order]
+
+
+# ── Free Pascal (FPC) classes ──────────────────────────────────────────────
+
+FPC_TKCLASS = 15           # type kind of a class in FPC's TTypeKind (Delphi uses 7)
+FPC_METHOD_START = 12      # pointer slots before the first virtual method (vmtMethodStart)
+_FPC_MAX_INSTANCE = 0x1000000
+
+
+def _fpc_scan(img: Image) -> list[int]:
+    """Class references (= VMT start) of FPC classes: aligned words ``n`` followed by ``-n`` (``vmtInstanceSize``
+    and ``vmtInstanceSize2``). Unlike a Delphi VMT the class reference points at the start of the table."""
+    ps = img.psize
+    mask = (1 << (8 * ps)) - 1
+    code = "I" if ps == 4 else "Q"
+    out: list[int] = []
+    for s in img.sections:
+        n = len(s.data) // ps * ps
+        if n < 2 * ps:
+            continue
+        mv = memoryview(s.data)[:n].cast(code)
+        va = s.va
+        for i in range(len(mv) - 1):
+            a = mv[i]
+            if ps <= a <= _FPC_MAX_INSTANCE and mv[i + 1] == (-a) & mask:
+                out.append(va + i * ps)
+    return out
+
+
+def _fpc_table_ok(img: Image, p: int | None) -> bool:
+    return p is not None and (p == 0 or img.in_image(p))
+
+
+def _fpc_read_class(img: Image, vmt: int) -> DlClass | None:
+    """The class at ``vmt``: ``vmtInstanceSize, vmtInstanceSize2, vmtParent, vmtClassName, vmtDynamicTable,
+    vmtMethodTable, vmtFieldTable, vmtTypeInfo, vmtInitTable, vmtAutoTable, vmtIntfTable, vmtMsgStrTable``
+    (pointers; sizes are pointer wide), then the virtual methods."""
+    ps = img.psize
+    w = [img.ptr(vmt + k * ps) for k in range(FPC_METHOD_START)]
+    if any(x is None for x in w) or not all(_fpc_table_ok(img, x) for x in w[2:]):
+        return None
+    name = _sstr(img, w[3]) if w[3] else None
+    if name is None:
+        return None
+    ti = w[7]
+    if ti:
+        k = img.read(ti, 1)
+        nm = _sstr_raw(img, ti + 1)
+        if not k or k[0] != FPC_TKCLASS or nm is None or img.ptr(ti + 2 + nm[1]) != vmt:
+            return None                      # type info of a class names its own class reference
+    return DlClass(vmt=vmt, name=name, size=w[0], typeinfo=ti)
+
+
+def _fpc_published(img: Image, tab: int) -> list[DlMethod]:
+    """Method name table: ``u32 count`` then packed ``{ptr name (ShortString); ptr code}`` entries."""
+    ps = img.psize
+    raw = img.read(tab, 4)
+    n = struct.unpack("<I", raw)[0] if raw else 0
+    if n == 0 or n > MAX_PUBLISHED:
+        return []
+    out: list[DlMethod] = []
+    p = tab + 4
+    for i in range(n):
+        name_p, code = img.ptr(p), img.ptr(p + ps)
+        name = _sstr(img, name_p) if name_p else None
+        if name is None or not code or not img.is_code(code):
+            break
+        out.append(DlMethod("published", i, name, code))
+        p += 2 * ps
+    return out
+
+
+def _fpc_prop_info(img: Image, at: int) -> tuple[str, int, int, int, int] | None:
+    """(name, GetProc, SetProc, PropProcs, record size) of the packed ``TPropInfo`` at ``at``: ``PropType,
+    GetProc, SetProc, StoredProc`` (pointers), ``Index`` (i32), ``Default`` (i32), ``NameIndex`` (i16),
+    ``PropProcs`` (u8), ShortString name."""
+    ps = img.psize
+    raw = img.read(at, 4 * ps + 11)
+    if raw is None:
+        return None
+    nm = _sstr(img, at + 4 * ps + 11)
+    if nm is None:
+        return None
+    return (nm, int.from_bytes(raw[ps:2 * ps], "little"), int.from_bytes(raw[2 * ps:3 * ps], "little"),
+            raw[4 * ps + 10], 4 * ps + 12 + len(nm))
+
+
+def _fpc_properties(img: Image, c: DlClass) -> list[DlMethod]:
+    """Accessor methods of the published properties of the class (type info ``tkClass``: ``ClassType,
+    ParentInfo`` pointers, ``i16 PropCount``, ShortString unit, ``u16 count``, then packed ``TPropInfo``
+    records). ``PropProcs`` holds two bits per accessor: 0 field, 1 static method (``GetProc`` is the code
+    address), 2 virtual method (``GetProc`` is the byte offset in the VMT), 3 constant."""
+    ps = img.psize
+    ti = c.typeinfo
+    k = img.read(ti, 1) if ti else None
+    if not k or k[0] != FPC_TKCLASS:
+        return []
+    nm = _sstr_raw(img, ti + 1)
+    if nm is None:
+        return []
+    p = ti + 2 + nm[1] + 2 * ps
+    un = _sstr_raw(img, p + 2)
+    if un is None:
+        return []
+    q = p + 3 + un[1]
+    n = _u16(img, q)
+    if not n or n > MAX_PROPS:
+        return []
+    q += 2
+    out: list[DlMethod] = []
+    seen: set[tuple[str, int]] = set()
+    for _ in range(n):
+        got = _fpc_prop_info(img, q)
+        if got is None:
+            break
+        name, get, set_, procs, size = got
+        q += size
+        for kind, w, mode in (("prop-get", get, procs & 3), ("prop-set", set_, (procs >> 2) & 3)):
+            t: tuple[int, int] | None = None
+            if mode == 1 and w and img.is_code(w):
+                t = (w, -1)
+            elif mode == 2 and w % ps == 0 and FPC_METHOD_START * ps <= w < MAX_VIRTUAL * ps:
+                a = img.ptr(c.vmt + w)
+                t = (a, w // ps - FPC_METHOD_START) if a and img.is_code(a) else None
+            if t is not None and (kind, t[0]) not in seen:
+                seen.add((kind, t[0]))
+                out.append(DlMethod(kind, t[1], name, t[0]))
+    return out
+
+
+def _fpc_virtuals(img: Image, vmt: int, limit: int) -> list[DlMethod]:
+    ps = img.psize
+    out: list[DlMethod] = []
+    for i in range(min(limit, MAX_VIRTUAL)):
+        t = img.ptr(vmt + (FPC_METHOD_START + i) * ps)
+        if t is None or not img.is_code(t):
+            break
+        out.append(DlMethod("virtual", i, "", t))
+    return out
+
+
+# Virtual slots of ``TObject`` (``objpash.inc``, ``TVmt``: ``vDestroy`` ... ``vToString``), FPC 3.x.
+FPC_TOBJECT_VSLOTS = ("Destroy", "NewInstance", "FreeInstance", "SafeCallException", "DefaultHandler",
+                      "AfterConstruction", "BeforeDestruction", "DefaultHandlerStr", "Dispatch", "DispatchStr",
+                      "Equals", "GetHashCode", "ToString")
+# ``TTypeKind`` of FPC 3.x for the managed field types of the init table
+FPC_KIND_NAMES = {8: "LongString", 9: "AnsiString", 10: "WideString", 11: "Variant", 12: "array", 13: "record",
+                  14: "interface", 15: "class", 16: "object", 21: "DynArray", 22: "interface", 24: "UnicodeString"}
+FPC_COM_SLOTS = ("QueryInterface", "_AddRef", "_Release")
+KNOWN_GUIDS = {"{00000000-0000-0000-C000-000000000046}": "IUnknown",
+               "{00020400-0000-0000-C000-000000000046}": "IDispatch"}
+MAX_INTF = 256
+
+
+def _fpc_u32(img: Image, va: int) -> int | None:
+    raw = img.read(va, 4)
+    return struct.unpack("<I", raw)[0] if raw else None
+
+
+def _fpc_messages(img: Image, tab: int) -> list[DlMethod]:
+    """Integer message handlers (``vmtDynamicTable``): ``u32 count`` (pointer wide), then ``{u32 message id; ptr
+    code}`` entries aligned to the pointer size. The name is the Windows / LCL message name when known."""
+    from airlock.server.cpp import message_name
+    ps = img.psize
+    n = _fpc_u32(img, tab)
+    if not n or n > MAX_PUBLISHED:
+        return []
+    out: list[DlMethod] = []
+    for i in range(n):
+        at = tab + ps + i * 2 * ps
+        mid, code = _fpc_u32(img, at), img.ptr(at + ps)
+        if mid is None or not code or not img.is_code(code):
+            break
+        out.append(DlMethod("message", mid, message_name(mid), code))
+    return out
+
+
+def _fpc_str_messages(img: Image, tab: int) -> list[DlMethod]:
+    """String message handlers (``vmtMsgStrTable``): ``u32 count`` (pointer wide), then ``{ptr ShortString name;
+    ptr code}``."""
+    ps = img.psize
+    n = _fpc_u32(img, tab)
+    if not n or n > MAX_PUBLISHED:
+        return []
+    out: list[DlMethod] = []
+    for i in range(n):
+        at = tab + ps + i * 2 * ps
+        np_, code = img.ptr(at), img.ptr(at + ps)
+        name = _sstr(img, np_) if np_ else None
+        if name is None or not code or not img.is_code(code):
+            break
+        out.append(DlMethod("message-str", i, name, code))
+    return out
+
+
+def _fpc_guid_text(img: Image, ref: int | None) -> str:
+    raw = img.read(ref, 16) if ref else None
+    if raw is None:
+        return ""
+    d1, d2, d3 = struct.unpack("<IHH", raw[:8])
+    return "{%08X-%04X-%04X-%02X%02X-%s}" % (d1, d2, d3, raw[8], raw[9], raw[10:].hex().upper())
+
+
+def _fpc_intf_entries(img: Image, tab: int) -> list[tuple[int, int, int, int, int]]:
+    """Entries of an interface table: ``sizeuint count``, then ``{ptr ^GUID; ptr vtable; sizeuint IOffset; ptr
+    ^ShortString GUID text; u32 IType}`` (20 bytes in 32-bit, 40 in 64-bit). Returns [(ref, vtable, offset,
+    text ref, type)], [] when the table does not look like one."""
+    ps = img.psize
+    n = img.ptr(tab) if ps == 4 else _fpc_u32(img, tab)
+    if not n or n > MAX_INTF:
+        return []
+    out = []
+    for i in range(n):
+        at = tab + ps + i * 5 * ps
+        ref, vt, off, sref = img.ptr(at), img.ptr(at + ps), img.ptr(at + 2 * ps), img.ptr(at + 3 * ps)
+        typ = _fpc_u32(img, at + 4 * ps)
+        if vt is None or off is None or typ is None or typ > 8 or not img.in_image(vt):
+            return []
+        out.append((ref or 0, vt, off, sref or 0, typ))
+    return out
+
+
+def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], vtables: set[int],
+                    guid_names: dict[str, str]) -> tuple[list[DlMethod], list[DlField]]:
+    """Interfaces a class implements. Methods (kind ``interface``) are the code pointers of each interface
+    vtable, named ``Interface.Method`` (``QueryInterface`` / ``_AddRef`` / ``_Release`` for the first three
+    slots of a COM interface) or ``Interface.#n``; the field is the interface pointer at ``IOffset`` in the
+    object. The interface is named from ``guid_names`` / ``KNOWN_GUIDS`` or is its GUID text."""
+    ps = img.psize
+    methods: list[DlMethod] = []
+    fields: list[DlField] = []
+    bounds = sorted(vtables)
+    for ref, vt, off, sref, typ in entries:
+        sp = img.ptr(sref) if sref else None
+        text = (_sstr_raw(img, sp) or ("",))[0] if sp else ""
+        guid = text if text.startswith("{") else _fpc_guid_text(img, img.ptr(ref) if ref else None)
+        label = KNOWN_GUIDS.get(guid.upper(), "") or guid_names.get(guid.upper(), "") or guid or f"intf_{vt:x}"
+        j = bisect_right(bounds, vt)
+        stop = bounds[j] if j < len(bounds) else vt + MAX_VIRTUAL * ps
+        k = 0
+        while vt + k * ps < stop and k < MAX_VIRTUAL:
+            t = img.ptr(vt + k * ps)
+            if t is None or not img.is_code(t):
+                break
+            methods.append(DlMethod("interface", k, f"{label}.{FPC_COM_SLOTS[k] if ref and k < 3 else '#' + str(k)}", t))
+            k += 1
+        if typ == 0:
+            fields.append(DlField(label, off, "interface"))
+    return methods, fields
+
+
+def _fpc_init_fields(img: Image, c: DlClass, tab: int) -> list[DlField]:
+    """Managed fields (strings, interfaces, dynamic arrays, variants) from the init table: ``kind, ShortString
+    name``, then packed ``terminator ptr, i32 size, ptr, ptr, i32 count`` and ``{ptr ^typeinfo; sizeint offset}``
+    entries (FPC 3.2 layout). The fields carry no name; the type is the kind of the field's type info."""
+    ps = img.psize
+    nm = _sstr_raw(img, tab + 1)
+    if nm is None:
+        return []
+    p = tab + 2 + nm[1] + ps + 4 + 2 * ps
+    n = _fpc_u32(img, p)
+    if not n or n > MAX_PUBLISHED:
+        return []
+    out: list[DlField] = []
+    for i in range(n):
+        at = p + 4 + i * 2 * ps
+        cell, off = img.ptr(at), img.ptr(at + ps)
+        ti = img.ptr(cell) if cell else None
+        kind = img.read(ti, 1) if ti else None
+        if off is None or off >= max(c.size, 1) or not kind:
+            return []
+        out.append(DlField("", off, FPC_KIND_NAMES.get(kind[0], f"kind{kind[0]}")))
+    return out
+
+
+def _fpc_name_virtuals(by_vmt: dict[int, DlClass], vslots: dict[str, dict[int, str]] | None) -> None:
+    """Names of the virtual methods a class introduces or overrides: ``TObject`` slots from ``FPC_TOBJECT_VSLOTS``,
+    other classes from ``vslots`` ({introducing class name: {slot: method name}}, built from the symbols of
+    reference programs, see ``fpcsigs``). An inherited slot (same code as the parent's) keeps no name."""
+    for c in by_vmt.values():
+        parent = by_vmt.get(c.parent_vmt)
+        pcode = {m.slot: m.addr for m in parent.methods if m.kind == "virtual"} if parent else {}
+        for m in c.methods:
+            if m.kind != "virtual" or pcode.get(m.slot) == m.addr:
+                continue
+            cur, seen = c, set()
+            while cur.vmt not in seen:                      # the class that introduced the slot
+                seen.add(cur.vmt)
+                up = by_vmt.get(cur.parent_vmt)
+                if up is None or up.nvirtual <= m.slot:
+                    break
+                cur = up
+            name = (vslots or {}).get(cur.name, {}).get(m.slot, "")
+            if not name and cur.name == "TObject" and m.slot < len(FPC_TOBJECT_VSLOTS):
+                name = FPC_TOBJECT_VSLOTS[m.slot]
+            m.name = name
+
+
+def parse_fpc_classes(img: Image, vslots: dict[str, dict[int, str]] | None = None,
+                      guid_names: dict[str, str] | None = None) -> list[DlClass]:
+    """All classes of a Free Pascal program, sorted by address. ``DlMethod.slot`` of a virtual method counts
+    from the first virtual slot (0 = ``Destroy``). Also read: integer / string message handlers (kinds
+    ``message``, ``message-str``), interface tables (kind ``interface`` methods, ``interface`` fields) and the
+    managed fields of the init table (fields without a name). ``vslots`` / ``guid_names``: names from the
+    signature build (``fpcsigs.load_names``). Not read: the automation table."""
+    ps = img.psize
+    intf: dict[int, list[tuple[int, int, int, int, int]]] = {}
+    by_vmt: dict[int, DlClass] = {}
+    for vmt in _fpc_scan(img):
+        c = _fpc_read_class(img, vmt)
+        if c is not None:
+            by_vmt[vmt] = c
+    order = sorted(by_vmt)
+    for i, vmt in enumerate(order):
+        c = by_vmt[vmt]
+        cell = img.ptr(vmt + 2 * ps) or 0
+        if cell:
+            tgt = img.ptr(cell)
+            pv = tgt if tgt in by_vmt else (cell if cell in by_vmt else 0)
+            if pv and pv != vmt:
+                c.parent_vmt = pv
+                c.parent = by_vmt[pv].name
+        c.unit = _unit_name(img, c.typeinfo, FPC_TKCLASS)
+        mt = img.ptr(vmt + 5 * ps) or 0
+        if mt:
+            c.methods.extend(_fpc_published(img, mt))
+        ft = img.ptr(vmt + 6 * ps) or 0
+        if ft:
+            c.fields = _fields(img, ft, by_vmt, first=1)
+        named = {m.addr for m in c.methods}
+        c.methods.extend(m for m in _fpc_properties(img, c) if m.addr not in named)
+        nxt = order[i + 1] if i + 1 < len(order) else vmt + (FPC_METHOD_START + MAX_VIRTUAL) * ps
+        c.methods.extend(_fpc_virtuals(img, vmt, max(0, (nxt - vmt) // ps - FPC_METHOD_START)))
+        dt = img.ptr(vmt + 4 * ps) or 0
+        if dt:
+            c.methods.extend(_fpc_messages(img, dt))
+        st = img.ptr(vmt + 11 * ps) or 0
+        if st:
+            c.methods.extend(_fpc_str_messages(img, st))
+        it = img.ptr(vmt + 8 * ps) or 0
+        if it:
+            have = {f.offset for f in c.fields}
+            c.fields.extend(f for f in _fpc_init_fields(img, c, it) if f.offset not in have)
+        tab = img.ptr(vmt + 10 * ps) or 0
+        if tab:
+            intf[vmt] = _fpc_intf_entries(img, tab)
+    vtables = {e[1] for ents in intf.values() for e in ents}
+    for vmt, ents in intf.items():
+        ms, fs = _fpc_interfaces(img, ents, vtables, guid_names or {})
+        by_vmt[vmt].methods.extend(ms)
+        by_vmt[vmt].fields.extend(fs)
+    _fpc_name_virtuals(by_vmt, vslots)
+    for c in by_vmt.values():             # a property whose accessor an ancestor already declares belongs to it
+        up_p = {(m.kind, m.addr) for a in ancestors(c, by_vmt)[1:] for m in a.methods if m.kind in PROP_KINDS}
+        if up_p:
+            c.methods = [m for m in c.methods if m.kind not in PROP_KINDS or (m.kind, m.addr) not in up_p]
+    return [by_vmt[v] for v in order]
 
 
 def accessor_names(classes: list[DlClass]) -> dict[int, str]:
@@ -784,12 +1159,14 @@ def clear_binary(store: Store, binary_id: int) -> None:
         store.db.execute(f"DELETE FROM {t} WHERE binary_id=?", (binary_id,))
 
 
-def parse_file(path: Path) -> tuple[list[DlClass], list[Form]] | None:
-    """Classes and forms of a PE file; None when it is not a PE."""
+def parse_file(path: Path, vslots: dict[str, dict[int, str]] | None = None,
+               guid_names: dict[str, str] | None = None) -> tuple[list[DlClass], list[Form]] | None:
+    """Classes and forms of a PE file; None when it is not a PE. ``vslots`` / ``guid_names``: Free Pascal names
+    (``parse_classes``)."""
     img = Image.from_pe(path)
     if img is None:
         return None
-    classes = parse_classes(img)
+    classes = parse_classes(img, vslots, guid_names)
     forms: list[Form] = []
     pe = peres.open_pe(path)
     if pe is not None:
@@ -841,9 +1218,11 @@ def store_rows(store: Store, binary_id: int, classes: list[DlClass], forms: list
         store.set_meta(meta_key(binary_id), str(DELPHI_VERSION))
 
 
-def derive_binary(store: Store, binary_id: int, artifact: Path) -> tuple[int, int, int]:
-    """Parse ``artifact`` and replace the Delphi rows of the binary. Returns (classes, forms, events)."""
-    got = parse_file(artifact)
+def derive_binary(store: Store, binary_id: int, artifact: Path,
+                  names: tuple[dict[str, dict[int, str]], dict[str, str]] | None = None) -> tuple[int, int, int]:
+    """Parse ``artifact`` and replace the Delphi rows of the binary. ``names``: (virtual slot names, interface
+    names) of a Free Pascal build (``fpcsigs.load_names``). Returns (classes, forms, events)."""
+    got = parse_file(artifact, *(names or (None, None)))
     if got is None:
         store_rows(store, binary_id, [], [])
         return 0, 0, 0
@@ -853,7 +1232,12 @@ def derive_binary(store: Store, binary_id: int, artifact: Path) -> tuple[int, in
 
 
 def is_delphi(b: Binary) -> bool:
-    return b.toolchain == "delphi"
+    """A Delphi or Free Pascal binary (the ``delphi_*`` tools read both)."""
+    return b.toolchain in ("delphi", "fpc")
+
+
+def is_fpc(b: Binary) -> bool:
+    return b.toolchain == "fpc"
 
 
 def stale(store: Store, binary_id: int) -> bool:
@@ -869,9 +1253,16 @@ def ensure(store: Store, binary: Binary, artifact: Path, idr_dir: Path | None = 
     if not is_delphi(binary) or not artifact.is_file():
         return False
     done = False
-    if stale(store, binary.id):
+    names = tag = None
+    if is_fpc(binary):
+        from airlock.server import fpcsigs
+        names, tag = fpcsigs.load_names(sig_dir, binary.toolchain_ver or "")
+    if stale(store, binary.id) or (is_fpc(binary) and store.get_meta(f"delphi_names:{binary.id}") != tag):
         try:
-            derive_binary(store, binary.id, artifact)
+            derive_binary(store, binary.id, artifact, names)
+            if is_fpc(binary):
+                with store.db:
+                    store.set_meta(f"delphi_names:{binary.id}", tag)
             done = True
         except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
             log.warning("Delphi analysis of %s failed: %s", binary.name, e)
@@ -890,6 +1281,15 @@ def ensure_project(store: Store, artifacts: Path, idr_dir: Path | None = None, s
 
 
 # ── name hints ─────────────────────────────────────────────────────────────
+
+def _fpc_table_hint(cls: str, kind: str, slot: int, name: str) -> str:
+    """Hint for a Free Pascal message handler or interface method (``dl_method`` kinds of ``parse_fpc_classes``)."""
+    if kind == "message":
+        return f"message handler {name} (0x{slot:x}) of {cls}"
+    if kind == "message-str":
+        return f"message handler '{name}' of {cls}"
+    return f"{name} (interface slot {slot}) of {cls}"
+
 
 def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
     """Hints for a function entry: ``Class.Method`` (published), ``handler OnClick of Button1 (TButton
@@ -918,16 +1318,24 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
     for r in props:
         out.append(f"prop: {r[0] + '.' if r[0] else ''}{r[1]}.{accessor_name(r[2], r[3])} "
                    f"({'getter' if r[2] == 'prop-get' else 'setter'} of {r[3]}, name by convention)")
+    for r in q("SELECT c.name, m.kind, m.slot, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id "
+               "AND c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind IN ('message', 'message-str', "
+               "'interface') ORDER BY c.vmt, m.kind, m.slot LIMIT 4", (binary_id, entry)):
+        out.append(_fpc_table_hint(r[0], r[1], r[2], r[3]))
     by_slot: dict[int, list[str]] = {}
-    for r in q("SELECT c.name, m.slot FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
+    slot_name: dict[int, str] = {}
+    for r in q("SELECT c.name, m.slot, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
                "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind='virtual' ORDER BY m.slot, c.vmt",
                (binary_id, entry)):
         names = by_slot.setdefault(r[1], [])
         if r[0] not in names:
             names.append(r[0])
+        if r[2]:
+            slot_name.setdefault(r[1], r[2])
     for slot, names in list(by_slot.items())[:3]:
         extra = f" (+{len(names) - 1} classes)" if len(names) > 1 else ""
-        out.append(f"{names[0]}::vslot {slot}{extra}")
+        label = f" ({slot_name[slot]})" if slot in slot_name else ""
+        out.append(f"{names[0]}::vslot {slot}{label}{extra}")
     from airlock.server import idr
     out.extend(idr.hint_for(store, binary_id, entry))
     return out
@@ -1009,7 +1417,12 @@ RUNTIME_UNITS = frozenset(
     "controls forms graphics stdctrls extctrls dialogs menus buttons comctrls actnlist imglist "
     "clipbrd printers grids dbgrids db dbctrls dbtables adodb datasnap midas sqlexpr "
     "vcl fmx data xml soap web rest system.generics idglobal idcomponent idtcpclient idtcpserver "
-    "idhttp idsockethandle idstack idcustomtcpserver idiohandler idexception".split())
+    "idhttp idsockethandle idstack idcustomtcpserver idiohandler idexception "
+    # Free Pascal RTL and Lazarus LCL
+    "objpas strings sysconst widestrings fgl ctypes dynlibs lcl lclproc lcltype lclintf lclstrconsts lclclasses "
+    "lmessages lresources lcltranslator interfaces interfacebase graphtype fpimage intfgraphics lazutf8 "
+    "lazfileutils lazutils lazloggerbase lazlogger lazmethodlist customtimer extdlgs spin checklst colorbox "
+    "arrow calendar maskedit editbtn".split())
 _UNIT_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
 
 

@@ -17,6 +17,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .decompile import _resolve_function, check_open
 from .session import guarded
 
@@ -83,8 +84,11 @@ def disassemble_function(program: Any, func: Any, max_instructions: int) -> dict
     targets: dict[int, str] = {}
     symtab = program.getSymbolTable()
     refs_of: list[Any] = []
+    skip = stubs.stub_range(program)
     for ins in insns:
         refs = ins.getReferencesFrom()
+        if skip is not None:    # the call overrides to airlock stubs are no program references
+            refs = [r for r in refs if not (r.isMemoryReference() and stubs.in_range(skip, S.addr_int(r.getToAddress())))]
         refs_of.append(refs)
         for r in refs:
             rt = r.getReferenceType()

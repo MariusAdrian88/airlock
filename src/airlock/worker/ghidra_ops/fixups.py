@@ -16,6 +16,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .stubs import STUB_TAG
+
+
+def _is_stub(f: Any) -> bool:
+    """An airlock stub function (delphistr), not program content."""
+    return str(f.getComment() or "").startswith(STUB_TAG)
+
+
 # name, call-fixup name (x86win.cspec), exact entry bytes of the helper
 HELPERS: tuple[tuple[str, str, bytes], ...] = (
     ("__EH_prolog", "EH_prolog", bytes.fromhex(
@@ -53,7 +61,7 @@ def apply_call_fixups(program: Any) -> int:
     mem = program.getMemory()
     changed = 0
     for f in program.getFunctionManager().getFunctions(True):
-        if f.isExternal() or f.isThunk() or int(f.getBody().getNumAddresses()) > MAX_HELPER_SIZE:
+        if f.isExternal() or _is_stub(f) or f.isThunk() or int(f.getBody().getNumAddresses()) > MAX_HELPER_SIZE:
             continue
         size = int(f.getBody().getNumAddresses())
         buf = jpype.JArray(jpype.JByte)(size)
@@ -279,7 +287,7 @@ def apply_conventions(program: Any, monitor: Any = None,
     for f in fm.getFunctions(True):
         if monitor is not None and monitor.isCancelled():
             break
-        if f.isExternal() or f.isThunk():
+        if f.isExternal() or f.isThunk() or _is_stub(f):
             continue
         current = str(f.getCallingConventionName() or "")
         relabel = relabel_fastcall and current == FASTCALL
@@ -314,7 +322,7 @@ def unknown_share(program: Any) -> float:
     """Share of the non-thunk, non-external functions whose calling convention is unset."""
     total = unset = 0
     for f in program.getFunctionManager().getFunctions(True):
-        if f.isExternal() or f.isThunk():
+        if f.isExternal() or f.isThunk() or _is_stub(f):
             continue
         total += 1
         if str(f.getCallingConventionName() or "") in UNSET_CONVENTIONS:

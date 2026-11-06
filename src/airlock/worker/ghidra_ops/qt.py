@@ -24,6 +24,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .decompile import _decomp, _resolve_function, check_open, open_decompiler
 from .project import dispose_decomp
 from .session import guarded
@@ -90,7 +91,7 @@ def _internal_call(tok: Any, fm: Any) -> int | None:
         t = f.getThunkedFunction(True)
         if t is not None and t.isExternal():
             return None
-    return S.addr_int(tgt.getAddress())
+    return stubs.real_callee(f.getProgram(), S.addr_int(tgt.getAddress()))
 
 
 def _function_named(program: Any, text: str) -> int | None:
@@ -100,11 +101,11 @@ def _function_named(program: Any, text: str) -> int | None:
     if m:
         a = program.getAddressFactory().getDefaultAddressSpace().getAddress(int(m.group(1), 16))
         f = fm.getFunctionAt(a)
-        return S.addr_int(f.getEntryPoint()) if f is not None else None
+        return stubs.real_callee(program, S.addr_int(f.getEntryPoint())) if f is not None else None
     for sym in program.getSymbolTable().getGlobalSymbols(text):
         f = fm.getFunctionAt(sym.getAddress())
         if f is not None:
-            return S.addr_int(f.getEntryPoint())
+            return stubs.real_callee(program, S.addr_int(f.getEntryPoint()))
     return None
 
 

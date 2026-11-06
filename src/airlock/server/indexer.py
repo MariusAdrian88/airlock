@@ -642,7 +642,7 @@ class Indexer:
         bid = store.upsert_binary(
             sha, name, original_path=original_path, format="dotnet" if managed else info.format,
             arch=info.arch, pointer_size=info.pointer_size, image_base=info.image_base,
-            toolchain=info.toolchain, imported_at=_now(),
+            toolchain=info.toolchain, toolchain_ver=info.toolchain_ver, imported_at=_now(),
         )
         if managed:
             program = (store.get_meta(f"program:{bid}") if existing is not None else None) \

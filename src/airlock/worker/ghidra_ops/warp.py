@@ -19,6 +19,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .annotate import _address
 from .decompile import check_open
 from .session import guarded
@@ -31,7 +32,7 @@ F_CONST, F_CALL, F_JMP, F_JCC, F_RET, F_NOP, F_OUT = 1, 2, 4, 8, 16, 32, 64
 def _regions(program: Any) -> list[tuple[int, int]]:
     out = []
     for b in program.getMemory().getBlocks():
-        if not b.isInitialized() or b.isOverlay() or str(b.getName()).lower() == "headers":
+        if not b.isInitialized() or b.isOverlay() or str(b.getName()).lower() in ("headers", stubs.STUB_BLOCK):
             continue
         out.append((int(b.getStart().getOffset()), int(b.getEnd().getOffset()) + 1))
     return out

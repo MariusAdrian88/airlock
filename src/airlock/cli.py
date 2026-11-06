@@ -72,6 +72,40 @@ def _cmd_delphi_oracle(args: argparse.Namespace, sigdir: Path, warp_dir: Path | 
     return 0
 
 
+def _cmd_fpc_sigs(args: argparse.Namespace, out: Path) -> int:
+    """`delphi-sigs fpc-build <fpc install or fpc.exe>... [--lazarus DIR]` builds the Free Pascal RTL / LCL
+    signature databases; `delphi-sigs fpc-oracle <binary with symbols>` measures one."""
+    from airlock.server import delphioracle, delphisigs, fpcsigs
+    try:
+        if args.action == "fpc-oracle":
+            if len(args.install) != 1:
+                print("airlock: fpc-oracle needs <binary built with -g>", file=sys.stderr)
+                return 2
+            own = {u.strip() for u in (args.own_units or "").split(",") if u.strip()}
+            print(delphioracle.format_result(fpcsigs.measure(args.install[0], out, own)))
+            return 0
+        if not args.install:
+            print("airlock: give the FPC install folder (or fpc.exe)", file=sys.stderr)
+            return 2
+        exes: list[Path] = []
+        for item in args.install:
+            exes += fpcsigs.find_compilers(item)
+        if args.bits != "both":
+            exes = [e for e in exes if fpcsigs.probe_compiler(e).bits == int(args.bits)]
+        if not exes:
+            print("airlock: no fpc.exe found", file=sys.stderr)
+            return 2
+        res = fpcsigs.build(exes, out, args.work or (out / "work"), None, args.lazarus, args.source or None,
+                            print if args.verbose else None)
+    except (fpcsigs.FpcError, delphisigs.SigError, OSError, ValueError) as e:
+        print(f"airlock: {e}", file=sys.stderr)
+        return 2
+    for r in res:
+        print(f"{r.path}: FPC {r.version}, {r.psize * 8}-bit, {r.programs} programs, {r.names} names, "
+              f"{r.routines} distinct routines, {r.path.stat().st_size // 1024} KB, {r.seconds:.0f} s")
+    return 0
+
+
 def _cmd_warp_build(args: argparse.Namespace, cfg) -> int:
     """`delphi-sigs warp-build <kit>... [--bits 64]`: one own WARP library per bitness from the map builds of
     the given Delphi installs or kits (all compiler versions together; the GUIDs tolerate small layout changes)."""
@@ -120,12 +154,15 @@ def _cmd_delphi_sigs(args: argparse.Namespace) -> int:
         print(f"airlock: {e}", file=sys.stderr)
         return 2
     out = args.out or cfg.delphi_sigdb_dir
+    if args.action in ("fpc-build", "fpc-oracle"):
+        return _cmd_fpc_sigs(args, out)
     if args.action == "list":
-        from airlock.server import idr
-        files = idr.sig_files(out, 4) + idr.sig_files(out, 8)
+        from airlock.server import fpcsigs, idr
+        files = idr.sig_files(out, 4) + idr.sig_files(out, 8) + fpcsigs.sig_files(out, 4) + fpcsigs.sig_files(out, 8)
         for f in files:
             h = delphisigs.read_sigdb_header(f.path)
-            print(f"{f.path.name}: compiler {h.get('compiler')}, {h.get('bits')}-bit, {h.get('count')} names, "
+            print(f"{f.path.name}: {'FPC ' + str(h.get('fpc')) if h.get('fpc') else 'compiler ' + str(h.get('compiler'))}, "
+                  f"{h.get('bits')}-bit, {h.get('count')} names, "
                   f"{f.size // 1024} KB, built {h.get('built', '?')} from "
                   f"{h.get('install') or str(h.get('binaries', '?')) + ' binaries'}")
         if not files:
@@ -248,11 +285,16 @@ def main(argv: list[str] | None = None) -> int:
     d.set_defaults(fn=_cmd_doctor)
 
     g = sub.add_parser("delphi-sigs", help="build or list Delphi RTL / VCL signature databases")
-    g.add_argument("action", choices=["build", "rtti-build", "list", "kit", "oracle", "warp-build"])
+    g.add_argument("action", choices=["build", "rtti-build", "list", "kit", "oracle", "warp-build", "fpc-build", "fpc-oracle"])
     g.add_argument("install", nargs="*", type=Path,
                    help="build: Delphi install folder (the one with bin and Redist); kit: install folder and "
                         "destination; oracle: binary and its map file; warp-build: installs or kits; rtti-build: folders with "
-                        "Delphi programs, one product per folder")
+                        "Delphi programs, one product per folder; fpc-build: FPC install folders or fpc.exe files; "
+                        "fpc-oracle: a program built with -g")
+    g.add_argument("--lazarus", type=Path, default=None, help="fpc-build: Lazarus folder (adds the LCL)")
+    g.add_argument("--source", type=Path, action="append",
+                   help="fpc-build: Pascal source folder whose identifiers restore the case of the names (repeatable)")
+    g.add_argument("--own-units", default=None, help="fpc-oracle: comma separated units that are the program's own code")
     g.add_argument("--own", type=Path, default=None,
                    help="oracle: folder of the program's own .dcu files (their units are not library code)")
     g.add_argument("--hide-exact", action="store_true",

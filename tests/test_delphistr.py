@@ -128,6 +128,13 @@ def test_concat_sites():
         'concat ? + L"exiftool -@ \\"" + ? + "\\r\\n"'
 
 
+def test_piece_storage():
+    # x86: the first pushed piece sits highest, the last one right above the return address
+    assert [D.piece_storage(4, i, 3) for i in range(3)] == [("stack", 12), ("stack", 8), ("stack", 4)]
+    # x64: R8, R9, then stack slots behind return address and shadow space
+    assert [D.piece_storage(8, i, 5) for i in range(5)] ==         [("reg", "R8"), ("reg", "R9"), ("stack", 0x28), ("stack", 0x30), ("stack", 0x38)]
+
+
 def test_shortstring():
     buf = b"\x00" + bytes([8]) + b"Segoe UI" + b"\x00"
     assert D.shortstring_at(buf, 1) == "Segoe UI"
@@ -138,3 +145,31 @@ def test_shortstring():
     assert len(name) == 32
     assert D.shortstring_at(bytes([17, 32]) + name + b"\0" * 8, 0) is None
     assert D.shortstring_at(bytes([4]) + b"err\x07", 0) is None
+
+
+def fpcrec64(text: str, elem: int = 1, cp: int = 0, ref: int = -1) -> bytes:
+    """A Free Pascal x64 string literal: codePage, elemSize, u32 padding, i64 refCount, i64 length, chars, 0."""
+    raw = text.encode("utf-16-le" if elem == 2 else "latin-1")
+    return struct.pack("<HHIqq", cp, elem, 0, ref, len(text)) + raw + b"\0" * elem
+
+
+def test_fpc_x64_literals():
+    lead = b"\x90" * 5
+    buf = lead + fpcrec64("Animal: ") + fpcrec64("Wide text", elem=2, cp=1200) + b"\xc3"
+    got = list(D.scan_strrec64(buf, 0x2000))
+    first = 0x2000 + len(lead) + 24
+    assert [(a, k, t) for a, k, _n, t in got] == [
+        (first, "a", "Animal: "),
+        (first + 9 + 24, "u", "Wide text")]
+    assert got[1][2] == 10 * 2
+    assert not list(D.scan_strrec(buf))                               # the 12-byte header does not match
+    assert not list(D.scan_strrec64(fpcrec64("abc", ref=1)))          # a heap string
+    assert not list(D.scan_strrec64(fpcrec64("abc", elem=2, cp=1252)))
+    assert not list(D.scan_strrec64(fpcrec64("abc")[:-1] + b"x"))   # no terminator
+    assert not list(D.scan_strrec64(fpcrec64("abc")[:26]))            # cut off by the block end
+    assert not list(D.scan_strrec64(strrec("abc", x64=True)))         # the Delphi layout is not FPC's
+
+
+def test_fpc_x86_literals_use_the_delphi_header():
+    buf = strrec("Animal: ", elem=1, cp=0) + strrec("Unicode", elem=2, cp=1200)
+    assert [t for _a, _k, _n, t in D.scan_strrec(buf)] == ["Animal: ", "Unicode"]

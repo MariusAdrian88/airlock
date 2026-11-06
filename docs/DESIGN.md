@@ -505,7 +505,7 @@ CREATE TABLE binary (
   arch          TEXT,          -- x86 | x86_64 | ...
   pointer_size  INTEGER,
   image_base    INTEGER,
-  toolchain     TEXT,          -- msvc | delphi | qt | dotnet | unknown (detected)
+  toolchain     TEXT,          -- msvc | delphi | fpc | qt | dotnet | unknown (detected)
   toolchain_ver TEXT,
   analysis_profile TEXT,
   imported_at   TEXT,
@@ -778,7 +778,7 @@ not a project folder, goes through `project_create`:
 
 1. Hash the file, copy to `artifacts\<sha256>`, register in `binary`.
 2. Detect format and toolchain with `pefile` (no JVM): PE32/PE32+, CLI header
-   (→ .NET), Delphi markers (`TPF0` DFM resources, `Borland`/`Embarcadero`
+   (→ .NET), Free Pascal version string (`FPC 3.2.2 [...] for ...`, → `fpc`), Delphi markers (`TPF0` DFM resources, `Borland`/`Embarcadero`
    strings, Delphi RTTI patterns), Qt imports (`Qt5Core.dll`/`Qt6Core.dll`),
    MSVC Rich header / runtime imports.
 3. .NET-only assembly (CLI header with the IL-only flag): index with `dnfile` on the server and
@@ -2254,6 +2254,82 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
     text in the C 6 -> 2 (x86), 6 -> 2 (x64), 2 -> 2 (old); the rest are pointer variables loaded through
     another pointer, not literals passed. Time of the step 2.6 -> 6-9 s (x86), 6 -> 13-22 s (x64), 0.1 ->
     1-3 s (old, 1 MB).
+
+### Free Pascal (FPC / Lazarus)
+
+Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`, `delphi_events`; the
+`delphi` set). Layout facts, **[verified]** on FPC 3.2.2 programs built for i386-win32 and x86_64-win64
+(console program with classes, and a Lazarus LCL form; stripped and not stripped):
+
+- Detection (`projects.fpc_version`, `classify_toolchain(..., fpc=True)`): the RTL links the version string
+  `FPC 3.2.2 [2021/05/15] for i386 - Win32` into every program; it gives toolchain `fpc` and
+  `toolchain_ver` `3.2.2`. It wins over the `TPF0` form resource (Lazarus forms are binary `TPF0` RCDATA, so
+  the form parser is shared). A binary with a Rich header or a CLI header is not scanned. `is_delphi` is true
+  for `delphi` and `fpc`; IDR / signature / WARP names are never applied to `fpc` (they are Delphi code).
+- VMT (`delphi.parse_fpc_classes`): the class reference points at the start of the table (no negative
+  slots). Pointer-wide words: `vmtInstanceSize`, `vmtInstanceSize2` (= minus the size, the scan pattern),
+  `vmtParent` (the parent VMT, or a cell that holds it: both occur in one program), `vmtClassName`
+  (pointer to a ShortString), `vmtDynamicTable`, `vmtMethodTable`, `vmtFieldTable`, `vmtTypeInfo`,
+  `vmtInitTable`, `vmtAutoTable`, `vmtIntfTable`, `vmtMsgStrTable`, then the virtual methods (slot 0 is
+  `Destroy`; `TObject` has 13). Type info must name its own VMT.
+- Method table: `u32 count`, then packed `{ptr ^ShortString name; ptr code}` (no size field, no extended
+  RTTI). Field table: as Delphi, but the type index counts from 1 (0 = none) and the class table holds class
+  references directly. Type info: kind `15` (`tkClass`), name, `ClassType`, `ParentInfo` (pointer to
+  pointer), `i16` property count, unit name, `u16` count, then packed `TPropInfo` of `4*ps + 11` bytes +
+  name: `PropType, GetProc, SetProc, StoredProc, i32 Index, i32 Default, i16 NameIndex, u8 PropProcs`.
+  `PropProcs` bits 0-1 get, 2-3 set: 0 field, 1 static method (code address), 2 virtual method (byte offset
+  in the VMT), 3 constant. No extended property list.
+- Other tables (`delphi.parse_fpc_classes`, **[verified]** on FPC 3.2.2 i386-win32 and x86_64-win64): the
+  dynamic table (`vmtDynamicTable`) holds the integer `message` handlers, never `dynamic` methods (FPC
+  treats `dynamic` as `virtual`): pointer-wide `u32 count`, then `{u32 id; ptr code}` entries of two
+  pointer-wide words. The string message table (`vmtMsgStrTable`): count, then `{^ShortString name; ptr code}`.
+  Rows `message` (name = `WM_xxx` through `cpp.message_name`, slot = id) and `message-str` (name = the
+  string). The interface table (`vmtIntfTable`): `sizeuint count`, then entries `{^^GUID; vtable;
+  IOffset; ^ShortString GUID text; u32 IType}` of 5 words (the last is padded: 20 bytes in 32-bit, 40 in
+  64-bit). Rows `interface` (the code pointers of each interface vtable up to the next vtable or the first
+  non-code word, named `Interface.Method`: `QueryInterface`/`_AddRef`/`_Release` for the first three slots
+  of a COM interface, else `#n`; an interface is named from `fpcsigs` GUID names, `IUnknown`/`IDispatch`, or
+  is its GUID text) and one field per interface (name = interface, offset = `IOffset`, type `interface`).
+  The init table (`vmtInitTable`, FPC 3.2): `kind, ShortString name`, then packed `ptr terminator, i32
+  size, ptr, ptr, i32 count` and `{^^typeinfo; sizeint offset}` entries: managed fields (fields without a
+  name, type = kind of the type info: `AnsiString`, `UnicodeString`, `interface`, `DynArray`, ...) that
+  the published field table lacks. Not read: the automation table, Lazarus forms linked as `.lrs` data.
+- Virtual slot names: `delphi.FPC_TOBJECT_VSLOTS` (the 13 slots of `TVmt`: `Destroy` ... `ToString`, from
+  `objpash.inc`); other classes (TPersistent, TComponent, TControl ... of the RTL and the LCL) from
+  `fpc-<version>-names.json` next to the signature databases (`fpcsigs.vslot_names`: the method name of the
+  symbol of the code in each slot of the reference programs, voted over a class and its descendants). Only
+  a slot a class introduces or overrides carries the name (an inherited slot has the parent's code and no
+  name); `hints_for` prints `TClass::vslot N (Name)`. Message, interface and virtual-name rows need
+  `DELPHI_VERSION` 5.
+- RTL / LCL signatures (`fpcsigs`, `airlock delphi-sigs fpc-build <fpc install or fpc.exe>... [--lazarus
+  <Lazarus folder>] [--source <folder>]`, `fpc-oracle <program built with -g> [--own-units a,b]`): the build
+  compiles three reference programs per compiler (an `rtlmega` that `uses` every RTL / FCL unit, an `lclmega`
+  that uses the LCL and LazUtils units, and `systouch`, calls that pull the per-routine linked System
+  routines in) with `-g`. **[verified]** FPC links a whole unit when the program uses it (the shipped unit
+  objects are not smart-linked), and the executable keeps its COFF symbol table, whose names are the
+  truth: `UNIT$_$CLASS_$__$$_METHOD$params$$result`, `UNIT_$$_PROC$params$$result`, `fpc_*` helpers
+  (`fpcsigs.demangle`; the case is restored from the most frequent spelling in the Pascal sources when
+  `--source` or the install's `source` folder exists; parameter lists are not kept). The routine code is
+  dumped and masked like the Delphi package routines (`delphisigs.scan_named`: `rel32` operands outside the
+  routine, RIP-relative operands, and absolute 32-bit addresses inside the image because FPC executables have
+  no `.reloc`; bounds: next symbol, `.pdata` in 64-bit). Output `fpc-<version>-<32|64>.sigdb` (+ names file) in
+  `delphi_sigdb_dir`. `idr.files_for`: a binary with toolchain `fpc` uses only the database of its
+  `toolchain_ver` and bitness (tier: by code, then call context; `IDR_VERSION` 10); a Delphi binary never sees an FPC
+  database. Only the exact bytes match: the units must be compiled like the shipped ones (a Lazarus that
+  rebuilt the LCL with other flags, `-O` levels of the RTL, a different FPC patch level give other code).
+  Oracle (`fpcsigs.measure`, the Delphi oracle's counting; truth = symbols of a `-g` build of the same
+  program, whose `.text`/`.data` are byte-identical to the stripped build, **[verified]**): FPC 3.2.2 on a
+  Lazarus form program that was not used for the build, library routines only, >=24 bytes in brackets:
+  32-bit 83.4% right (89.6%), 0.2% wrong, 16.4% none; 64-bit 83.4% right (86.9%), 0.4% wrong, 16.3% none; a
+  console program (32-bit) 86.5% right (94.6%), 0.1% wrong, 13.4% none (all three after the call-context pass;
+  by code alone 80.4% / 79.4% / 79.4%). The `none` routines are mostly tiny or
+  identical bodies (empty virtual stubs, accessors) that the matcher drops on purpose when one proc matches
+  more than `MAX_COPIES` functions. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
+  `fpc_ansistr_concat_multi`) from Ghidra's own symbol loader.
+- Strings: `AnsiString` / `UnicodeString` literals are `{u16 codePage; u16 elemSize; (u32 pad on 64-bit);
+  SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in
+  32-bit, 24 in 64-bit (Delphi has 12 in both). ANSI literals carry code page 0 when the source uses
+  `{$H+}` without a codepage directive, 1200 for `UnicodeString`.
 
 ### .NET
 

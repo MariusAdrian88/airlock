@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1148 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1210 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -269,6 +269,15 @@ Design in DESIGN §6 "delphi" and §11 "Delphi" (layout facts marked **[verified
   `ui-dialog` feature seeds (`FEATURES_VERSION` 6), `runtime: Delphi` clusters (`graph.CallGraph.lib_hint`
   from units of runtime classes, plus `@`-prefixed names in `clusters.runtime_family`).
 - Tests: `tests/test_delphi.py` (synthetic 32/64-bit PEs, all DFM value types, tools, hints, seeds).
+- Free Pascal (DESIGN §11 "Free Pascal"): toolchain `fpc` (version string in the RTL, `projects.fpc_version`),
+  `delphi.parse_fpc_classes` (other VMT, method table, type info and `TPropInfo` layout), forms are the same
+  `TPF0` parser, `DELPHI_VERSION` 4. **[verified]** with FPC 3.2.2 / Lazarus 4.8 programs (i386-win32 and
+  x86_64-win64, stripped and with `-g`) through the real worker: classes, fields with types, published methods,
+  form tree, events to handlers and string literals with references. Tests: `tests/test_fpc.py`. FPC RTL / LCL signature databases
+  (`fpcsigs`, `delphi-sigs fpc-build` / `fpc-oracle`, DESIGN §11), message / interface / init tables and
+  virtual slot names (`DELPHI_VERSION` 5, `IDR_VERSION` 10) are done. Open: other FPC versions (2.x, trunk) are not checked. Strings: Ghidra's own handling already finds the
+  literals and their references (ANSI and UTF-16), also in 64-bit; the 64-bit FPC string header has 8-byte
+  `refCount` / `length` (24 bytes before the data) and `delphistr._STRREC` (4-byte refcount) does not match it.
 - IDR names (`server/idr.py`, `tests/test_idr.py`, DESIGN §11 "Delphi"): optional, config key `idr_kb_dir`
   (a folder with the IDR `kb*.bin` / `syskb*.bin`; 32-bit files in it or in `x86\`, 64-bit files in `x64\`).
   Files come from github.com/crypto2011/IDR (32-bit: `kb2` to `kb2014`, `syskb2` to `syskb2014`, XE4 is the
@@ -510,8 +519,11 @@ Failure patterns (round 4):
   only where code references them. Stores to locals and fields needed nothing once the data is typed.
   **[verified]** on the x64 and x86 programs above and on an open-source Delphi 7-2007 program: on 20
   sampled functions per program no literal is left as a hex constant (1 before on each); a project at
-  collector 4 reruns only this pass on open (end-to-end on a copy of the x64 project). Open: on x86 the
-  pieces stay out of the call itself (comment only); Free Pascal programs were not checked.
+  collector 4 reruns only this pass on open (end-to-end on a copy of the x64 project). Collector 6: each call of a concat routine
+  (x86 and x64) is pointed, by a primary CALL_OVERRIDE_UNCONDITIONAL reference, at a 1-byte stub function in the block
+  `airlock_stubs` with custom storage for exactly its n pieces, so the C lists every piece in order
+  (x86 pushes left to right, so a plain signature came out reversed; x64 varargs lost the stack pieces). The PRE
+  comment remains only where no stub could be made. **[verified]** live (Ghidra 12.1.4, x86 and x64 Delphi programs, opened through the MCP tools): outline / function_map / search / xrefs / callgraph / function show no stub and no `airlock_stubs` block; a caller's callgraph edge goes to the real concat routine; the C lists every piece; renaming the routine renames its stubs (the C then reads `NewName_3/*0x...*/(...)`); a project at collector 7 reruns only the string pass on open. Collector 8: the caps are 255 pieces and 1024 stubs (no sample came near the old 64 / 256); Free Pascal x64 literals (24-byte header `u16 codePage; u16 elemSize; u32 pad; i64 refCount; i64 length`, `scan_strrec64`) are typed and their callee parameters retyped (Free Pascal 32-bit uses the Delphi 12-byte header and needed nothing). FPC concat routines (`fpc_*_concat`: fixed registers; `_multi`: an open array built in a stack array) and the Delphi fixed-register forms (`UStrCat3`, `LStrCat3`) need no stub: the decompiler already lists their pieces (as arguments, or as the stores into the array). `create_functions` refuses an address in the stub block like `set_comment`.
 - Binary named by project name: Haiku passed `binary=ohm` (4 errors in t7/t8); the error lists the one binary, but
   with a single binary the tool could just use it.
 - Other errors are wrong tool choices: `delphi_classes` on a Qt project, `dotnet_types kind=methods`,

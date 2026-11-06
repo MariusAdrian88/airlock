@@ -31,6 +31,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .decompile import check_open, open_decompiler
 from .project import dispose_decomp
 from .session import Entry, guarded
@@ -187,6 +188,7 @@ def _rename_function(program: Any, func: Any, new_name: str) -> None:
     func.setName(base, SourceType.USER_DEFINED)
     if ns is not None:
         func.setParentNamespace(ns)
+    stubs.rename_for(program, func)     # airlock stubs named after this routine follow it
 
 
 def _parse_type(program: Any, text: str) -> Any:
@@ -360,7 +362,7 @@ def set_comment(args: dict[str, Any]) -> dict[str, Any]:
 
     def body(e: Entry, program: Any) -> dict[str, Any]:
         addr = _address(program, args.get("space"), args.get("address"))
-        if program.getMemory().getBlock(addr) is None:
+        if program.getMemory().getBlock(addr) is None or stubs.in_stubs(program, addr):
             raise WorkerError("bad_args", f"{addr} is not in the program's memory")
         if kind == "plate":
             _user, block = split_plate(_plate_text(program, addr))
@@ -495,6 +497,8 @@ def patch_bytes(args: dict[str, Any]) -> dict[str, Any]:
         a = addr
         while a is not None and a.compareTo(end) <= 0:
             blk = mem.getBlock(a)
+            if blk is not None and str(blk.getName()) == stubs.STUB_BLOCK:
+                raise WorkerError("bad_args", f"{a} is not in the program image")
             if blk is None or not blk.isInitialized():
                 raise WorkerError("uninitialized", f"{a} is not in initialised memory"
                                   + (f" (block {blk.getName()})" if blk is not None else ""))

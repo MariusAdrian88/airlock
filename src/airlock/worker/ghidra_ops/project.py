@@ -14,11 +14,12 @@ from airlock.worker.protocol import WorkerError
 
 from . import fixups
 from . import session as S
+from . import stubs
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 5  # 4: Delphi string literals (delphistr); 5: delphistr v2. Bump when extract/decompile row semantics or post-analysis fixups change
+COLLECTOR_VERSION = 8  # 8: Free Pascal x64 string literals (24-byte header), stub caps raised; 7: airlock stubs left out of extract/disassemble/decompile rows; 4: Delphi string literals (delphistr); 5: delphistr v2; 6: concat calls get stub signatures. Bump when extract/decompile row semantics or post-analysis fixups change
 PROFILE_COLLECTOR = 4  # the collector part of analysis_profile; raise with COLLECTOR_VERSION unless only delphistr changed
-STRINGS_ONLY_FROM = {4}  # stored collector versions that need only the Delphi string pass rerun
+STRINGS_ONLY_FROM = {4, 5, 6, 7}  # stored collector versions that need only the Delphi string pass rerun
 PROGRESS_INTERVAL_S = 1.0
 
 
@@ -234,7 +235,7 @@ def _analysis_thread(e: Entry, timeout_min: Any, parameter_id: bool = True) -> N
         while not done.wait(PROGRESS_INTERVAL_S):
             try:
                 tasks = [str(x) for x in mgr.getTimedTasks()]
-                nfun = int(e.program.getFunctionManager().getFunctionCount())
+                nfun = stubs.program_function_count(e.program)
             except Exception:
                 continue
             msg = f"{len(tasks)} analyzers done" + (f", last: {tasks[-1]}" if tasks else "")
@@ -266,7 +267,7 @@ def _analysis_thread(e: Entry, timeout_min: Any, parameter_id: bool = True) -> N
                 GhidraProgramUtilities.markProgramAnalyzed(program)
                 e.analysis_profile = analysis_profile(program)
                 SESSION.gp.save(program)
-            nfun = int(program.getFunctionManager().getFunctionCount())
+            nfun = stubs.program_function_count(program)
         final = {"cancelled": cancelled, "functions": nfun}
     except BaseException as ex:  # report, never die silently
         if hasattr(ex, "getClass"):

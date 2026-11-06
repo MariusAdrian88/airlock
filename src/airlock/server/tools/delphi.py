@@ -125,6 +125,9 @@ def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIM
             lines.append(line)
     if not lines:
         if have == 0:
+            if all(delphi.is_fpc(bd.binary) for bd in bounds):
+                return ("no Free Pascal classes: no VMT found (packed, or an FPC version with another table "
+                        "layout than 3.x).")
             return "no Delphi classes: no VMT found (a Delphi version older than 2009 with another layout, or packed)."
         return f"no Delphi class matches '{query}' ({have} classes)."
     return fit_lines(lines, bud, "code", tool="delphi_classes", args=args, max_lines=limit)[0]
@@ -180,6 +183,9 @@ def delphi_forms(ctx: ServerContext, form: str = "", binary: str = "", cursor: s
                     line += f" {r['flags']}"
                 lines.append(line)
         if not lines:
+            if all(delphi.is_fpc(bd.binary) for bd in bounds):
+                return ("no forms: the binary has no TPF0 form resources (Lazarus forms linked as .lrs "
+                        "data are not read).")
             return "no DFM forms: the binary has no TPF0 form resources."
         return fit_lines(lines, bud, "code", tool="delphi_forms", args=args)[0]
     hits = [(bd, f) for bd in bounds for f in _find_forms(bd, form)]

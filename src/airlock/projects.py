@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import mmap
 import os
 import re
 import shutil
@@ -309,8 +310,9 @@ class BinaryInfo:
     pointer_size: int | None
     image_base: int | None
     entry_point: int | None  # RVA
-    toolchain: str  # msvc | delphi | qt | dotnet | unknown
+    toolchain: str  # msvc | delphi | fpc | qt | dotnet | unknown
     managed_only: bool = False  # CLI header with the IL-only flag: no native code, Ghidra not needed
+    toolchain_ver: str | None = None  # fpc: compiler version from the RTL's version string
 
 
 COR_ILONLY = 0x1
@@ -329,12 +331,28 @@ def cor_flags(pe: pefile.PE) -> int | None:
         return None
 
 
+FPC_VERSION_RE = re.compile(rb"FPC (\d+\.\d+\.\d+)[\w.\-]* \[\d{4}/\d\d/\d\d\] for \w+")
+
+
+def fpc_version(path: Path) -> str | None:
+    """Compiler version of a Free Pascal program (``3.2.2``), read from the version string that the
+    RTL links into every program (``FPC 3.2.2 [2021/05/15] for i386 - Win32``); None when absent."""
+    try:
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            m = FPC_VERSION_RE.search(mm)
+            return m.group(1).decode("ascii") if m else None
+    except (OSError, ValueError):
+        return None
+
+
 def classify_toolchain(
-    import_names: list[str], resource_types: set[str], has_cli: bool, has_rich: bool
+    import_names: list[str], resource_types: set[str], has_cli: bool, has_rich: bool, fpc: bool = False
 ) -> str:
-    """Heuristics in order: dotnet, delphi (TPF0), qt, msvc, unknown."""
+    """Heuristics in order: dotnet, fpc (version string), delphi (TPF0), qt, msvc, unknown."""
     if has_cli:
         return "dotnet"
+    if fpc:
+        return "fpc"
     if "TPF0" in resource_types:
         return "delphi"
     if any(_QT_IMPORT_RE.match(n) for n in import_names):
@@ -394,14 +412,17 @@ def detect(path: Path) -> BinaryInfo:
         dds = pe.OPTIONAL_HEADER.DATA_DIRECTORY
         has_cli = len(dds) > com and bool(dds[com].VirtualAddress and dds[com].Size)
         rtypes = {"TPF0"} if _has_tpf0(pe) else set()
+        has_rich = pe.parse_rich_header() is not None
+        fpcv = None if has_cli or has_rich else fpc_version(path)     # GNU ld writes no Rich header
         return BinaryInfo(
             "pe32+" if is_plus else "pe32",
             arch,
             ptr,
             pe.OPTIONAL_HEADER.ImageBase,
             pe.OPTIONAL_HEADER.AddressOfEntryPoint,
-            classify_toolchain(imports, rtypes, has_cli, pe.parse_rich_header() is not None),
+            classify_toolchain(imports, rtypes, has_cli, has_rich, fpcv is not None),
             has_cli and bool((cor_flags(pe) or 0) & COR_ILONLY),
+            fpcv,
         )
     finally:
         pe.close()

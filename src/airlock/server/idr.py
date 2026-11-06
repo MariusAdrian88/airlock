@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 9               # bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 10              # 10: Free Pascal databases; bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -474,6 +474,15 @@ def candidates(store: Store, binary_id: int) -> list[tuple[int, int | None]]:
     return [(r[0], r[1] or None) for r in rows if _UNNAMED.match(r[2])]
 
 
+def files_for(binary: Binary, kb_dir: Path | None, sig_dir: Path | None, warp_dir: Path | None) -> list[KbFile]:
+    """The databases that apply to the binary: for a Free Pascal program only the ``fpc-<version>-<bits>``
+    database of its compiler version (IDR, Delphi and WARP names are Delphi code), else the Delphi ones."""
+    if binary.toolchain == "fpc":
+        from airlock.server import fpcsigs
+        return [f for f in fpcsigs.sig_files(sig_dir, binary.pointer_size or 4) if f.year == binary.toolchain_ver]
+    return kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
+
+
 def expected(files: list[KbFile], ncand: int) -> str:
     return f"{IDR_VERSION}:{kb_signature(files)}:{ncand}"
 
@@ -482,7 +491,7 @@ def stale(store: Store, binary: Binary, kb_dir: Path | None, sig_dir: Path | Non
           warp_dir: Path | None = None) -> bool:
     """True when the hits were computed by another IDR_VERSION, from other knowledge base files or for
     another number of unnamed functions (the function list changed)."""
-    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
+    files = files_for(binary, kb_dir, sig_dir, warp_dir)
     cur = store.get_meta(_key(VERSION_META, binary.id))
     if not files:                      # nothing configured: only a former result has to be cleared
         return cur is not None and not cur.startswith(f"{IDR_VERSION}:none:")
@@ -570,6 +579,18 @@ def _pick(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]],
     return "+".join(labels), hits, notes
 
 
+def _pick_fpc(files: list[KbFile], img: Image, funcs: list[tuple[int, int | None]]
+              ) -> tuple[str, dict[int, list[str]], list[str]]:
+    """Names for the functions of a Free Pascal program from the database of its compiler version (by code,
+    then by call context)."""
+    f = files[0]
+    try:
+        got, ctx = match_with_context(load_kb(f), img, funcs)
+    except KbError as e:
+        return "", {}, [f"{f.label}: {e}"]
+    return f.label, {**ctx, **got}, [f"{f.label} {len(got)}/{len(funcs)}" + (f" +{len(ctx)} by calls" if ctx else "")]
+
+
 def _generic_instances(store: Store, binary_id: int) -> dict[str, set[str]]:
     """Generic classes of the program from its RTTI (``{Unit.TBase: {type arguments}}``)."""
     from airlock.server import warp
@@ -618,7 +639,7 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
            sig_dir: Path | None = None, warp_dir: Path | None = None) -> tuple[str, int, int]:
     """Match the unnamed functions of a Delphi binary against the knowledge bases and store the result.
     Returns (knowledge base label or '', matched functions, candidates)."""
-    files = kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
+    files = files_for(binary, kb_dir, sig_dir, warp_dir)
     funcs = candidates(store, binary.id)
     sig = expected(files, len(funcs))
     label, hits, info = "", {}, "no knowledge base configured" if kb_dir is None else "no knowledge base files found"
@@ -627,7 +648,10 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
         if img is None:
             info = "not a PE file"
         else:
-            label, hits, notes = _pick(files, img, funcs, _generic_instances(store, binary.id))
+            if binary.toolchain == "fpc":
+                label, hits, notes = _pick_fpc(files, img, funcs)
+            else:
+                label, hits, notes = _pick(files, img, funcs, _generic_instances(store, binary.id))
             info = (f"{label}: {len(hits)} of {len(funcs)} unnamed functions named; tried " + ", ".join(notes)
                     if label else "; ".join(notes))
     elif files:
@@ -652,7 +676,7 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
 def ensure(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
            sig_dir: Path | None = None, warp_dir: Path | None = None) -> bool:
     """Derive the hits of a Delphi binary when missing or stale. Never raises; True when rewritten."""
-    if binary.toolchain != "delphi" or not artifact.is_file():
+    if binary.toolchain not in ("delphi", "fpc") or not artifact.is_file():
         return False
     try:
         if not stale(store, binary, kb_dir, sig_dir, warp_dir):

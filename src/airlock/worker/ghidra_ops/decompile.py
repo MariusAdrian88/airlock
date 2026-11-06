@@ -19,6 +19,7 @@ from airlock.worker.pool import Engine
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .project import dispose_decomp
 from .session import Entry, guarded
 
@@ -151,6 +152,17 @@ def _resolve_function(program: Any, entry: Any) -> Any:
     return f
 
 
+def _unstub_calls(program: Any, rows: list[list[Any]]) -> None:
+    """A call to an airlock stub is recorded as a call of the routine the stub stands for (the C text
+    keeps the stub's name)."""
+    rng = stubs.stub_range(program)
+    if rng is None:
+        return
+    for r in rows:
+        if r[0] == "call" and r[4] is not None and stubs.in_range(rng, r[4]):
+            r[4] = stubs.real_callee(program, r[4])
+
+
 def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
                        with_version: bool = True) -> dict[str, Any]:
     """Decompile one function with `di`. The caller holds e.lock (read or write) and `di`.
@@ -175,6 +187,7 @@ def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
             out["status"] = "ok"
             out["c_text"] = c_text
             out["ast"] = _ast_rows(res.getCCodeMarkup(), res.getHighFunction(), c_text)
+            _unstub_calls(e.program, out["ast"])
         callee_entries = sorted({r[4] for r in out["ast"] if r[0] == "call" and r[4] is not None})
     if with_version:
         from ghidra.framework import Application  # type: ignore

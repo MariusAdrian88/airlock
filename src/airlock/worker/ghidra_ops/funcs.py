@@ -24,7 +24,7 @@ from typing import Any
 from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
-from . import fixups
+from . import fixups, stubs
 from .annotate import _address, _write
 from .session import guarded
 
@@ -41,6 +41,12 @@ def _int_list(value: Any) -> list[int]:
         return sorted({int(v, 0) if isinstance(v, str) else int(v) for v in value})
     except (TypeError, ValueError) as ex:
         raise WorkerError("bad_args", f"addresses must be integers ({ex})") from ex
+
+
+def _refuse_stub(program: Any, addr: Any) -> None:
+    """The airlock stub block is no program memory (same answer as ``set_comment``)."""
+    if stubs.in_stubs(program, addr):
+        raise WorkerError("bad_args", f"{addr} is not in the program's memory")
 
 
 def _one(program: Any, addr: Any, monitor: Any) -> str:
@@ -93,6 +99,7 @@ def create_functions(args: dict[str, Any]) -> dict[str, Any]:
         sample: dict[str, list[int]] = {}
         for a in addresses:
             addr = _address(program, space, a)
+            _refuse_stub(program, addr)
             try:
                 r = _one(program, addr, monitor)
             except Exception as ex:  # noqa: BLE001  one address must not stop the others

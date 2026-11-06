@@ -460,11 +460,12 @@ def callee_names(seen: dict[int, list[str]]) -> dict[int, str]:
 
 
 def scan_named(md, img: _Pe, seen: dict[int, list[str]], starts: set[int] | None = None,
-               with_calls: bool = False) -> list[tuple]:
+               with_calls: bool = False, abs_range: tuple[int, int] | None = None) -> list[tuple]:
     """[(name, dump, mask)] for the routines ``seen`` ({rva: names}) of an image. ``starts``: more addresses
     that end a 32-bit routine (the next symbol); the section ends and the ``.pdata`` routines always do.
     ``with_calls``: records are ``(name, dump, mask, calls)``, ``calls`` = ((operand offset, opcode, callee
-    name), ...) for the direct calls and jumps to routines of ``seen``."""
+    name), ...) for the direct calls and jumps to routines of ``seen``. ``abs_range``: (low, high) addresses of the image whose absolute
+    32-bit operands are masked too (a program without relocations)."""
     xsecs = [(va, va + max(vs, rs)) for va, vs, _r, rs, x in img.sections if x]
     funcs = img.funcs
     bounds = sorted((starts or set()) | set(seen) | {e for _s, e in xsecs} | (set(funcs) if funcs else set()))
@@ -474,7 +475,7 @@ def scan_named(md, img: _Pe, seen: dict[int, list[str]], starts: set[int] | None
         i = bisect.bisect_right(bounds, rva)
         limit = (bounds[i] if i < len(bounds) else rva + MAX_SWEEP) - rva
         exact = funcs[rva] - rva if funcs and rva in funcs else None
-        got = _scan_routine(md, img, rva, limit, exact, callees=callees)
+        got = _scan_routine(md, img, rva, limit, exact, abs_range, callees)
         if got is None:
             continue
         for nm in sorted(set(names)):

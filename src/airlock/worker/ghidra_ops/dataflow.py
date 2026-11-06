@@ -20,6 +20,7 @@ from airlock.worker.main import op
 from airlock.worker.protocol import WorkerError
 
 from . import session as S
+from . import stubs
 from .decompile import _decomp, _resolve_function, check_open
 from .session import guarded
 
@@ -296,7 +297,7 @@ def constants(args: dict[str, Any]) -> dict[str, Any]:
         hits = 0
         seen_ins: set[int] = set()
         for block in mem.getBlocks():
-            if not block.isExecute() or not block.isInitialized():
+            if not block.isExecute() or not block.isInitialized() or str(block.getName()) == stubs.STUB_BLOCK:
                 continue
             end = block.getEnd()
             for pat in pats:
