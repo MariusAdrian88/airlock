@@ -21,6 +21,7 @@ completed by the refresh steps there (no re-analysis).
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import logging
 import threading
@@ -37,8 +38,8 @@ from airlock.server import estimate as est
 from airlock.server import cpp, delphi, dotnet, dotnet_meta, fnfix, linking, peres, qt
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
-    ProjectPaths, bundle_entry_name, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
-    read_sections, slugify, write_manifest,
+    BUNDLE_SEP, ProjectPaths, bundle_entry_name, bundle_manifest, copy_artifact, detect, hash_file, list_projects,
+    project_paths, read_bundle_entry, read_manifest, read_sections, slugify, write_manifest,
 )
 from airlock.worker.protocol import WorkerError
 
@@ -450,6 +451,19 @@ class Indexer:
         todo = [f for f in man.get("files") or []
                 if f.get("kind", "pe") == "pe" and f.get("state", "queued") not in ("ready", "error")]
         n += len(self.enqueue(slug, todo))
+        try:
+            n += self._add_bundle_entries(slug, paths, man, plog)
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot add the bundle entries of %s: %s", slug, e)
+        for b in store.list_binaries():   # error from the parse race of an older version: parse again
+            status, err = self.get_status(store, b.id)
+            if (status == "error" and b.toolchain == "dotnet" and self.job_for(slug, b.id) is None
+                    and "cannot read .NET metadata" in (err or "") and "IntegrityError" in (err or "")
+                    and (paths.artifacts / b.sha256).is_file()):
+                with store.db:
+                    store.set_meta(f"dotnet_version:{b.id}", "")
+                self.set_status(store, b.id, "queued")
+                self._mf_update(slug, b.sha256, state="queued")
         for b in store.list_binaries():  # opened with open_binary, no manifest entry
             status, _ = self.get_status(store, b.id)
             if status in FINAL or self.job_for(slug, b.id) is not None:
@@ -511,6 +525,49 @@ class Indexer:
         except Exception as e:
             plog.warning("cannot resume the decompile pass of %s: %s", slug, e)
         return n
+
+    def _add_bundle_entries(self, slug: str, paths: ProjectPaths, man: dict[str, Any], plog: Any) -> int:
+        """A project made before bundles were unpacked holds the single-file host only: queue the
+        own (non-framework) assembly entries of each such host once, as ``program_add`` does."""
+        from airlock.server.scan import is_framework_name
+        files = man.get("files") or []
+        have = {str(f.get("path")) for f in files}
+        added: list[dict[str, Any]] = []
+        for f in files:
+            host, sha = str(f.get("path") or ""), f.get("sha256")
+            if f.get("kind", "pe") != "pe" or BUNDLE_SEP in host or not sha or f.get("managed"):
+                continue
+            art = paths.artifacts / sha
+            if not art.is_file() or any(h.startswith(host + BUNDLE_SEP) for h in have):
+                continue
+            entries = bundle_manifest(art)
+            if not entries:
+                continue
+            for e in entries:
+                rel = f"{host}{BUNDLE_SEP}{e.path}"
+                if e.kind != "assembly" or is_framework_name(e.path) or rel in have:
+                    continue
+                data = read_bundle_entry(art, e)
+                if data[:2] != b"MZ":
+                    continue
+                esha = hashlib.sha256(data).hexdigest()
+                dest = paths.artifacts / esha
+                if not dest.exists():
+                    tmp = dest.with_name(dest.name + ".part")
+                    tmp.write_bytes(data)
+                    tmp.replace(dest)
+                added.append({"path": rel, "group": "core", "kind": "pe", "size": e.size, "code_size": 0,
+                              "est_funcs": 0, "sha256": esha, "state": "queued", "managed": True})
+            if added:
+                plog.info("%s is a single-file bundle: %d entries queued", host, len(added))
+        if not added:
+            return 0
+        with self._mf_lock:
+            cur = read_manifest(paths.manifest)
+            cur.setdefault("files", []).extend(added)
+            cur.setdefault("added", []).append({"option": None, "files": [a["path"] for a in added]})
+            write_manifest(paths.manifest, cur)
+        return len(self.enqueue(slug, added))
 
     def refresh_fixups(self, project: str, store: Store) -> int:
         """Ready binaries whose stored collector version (meta ``collector:<id>``) is not the

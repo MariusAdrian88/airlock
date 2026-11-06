@@ -38,7 +38,7 @@ from airlock.index.store import DN_METHOD_HI, DN_METHOD_LO, US_BASE, Binary, Fun
 
 log = logging.getLogger(__name__)
 
-DOTNET_VERSION = 6            # meta key ``dotnet_version:<binary id>``; older rows are parsed again
+DOTNET_VERSION = 7            # meta key ``dotnet_version:<binary id>``; older rows are parsed again
 TYPE_TOKEN = 0x02000000
 METHOD_TOKEN = 0x06000000
 REF_LO, REF_HI = 0x0A000000, 0x0B000000      # MemberRef tokens: import slots of external callees
@@ -883,11 +883,30 @@ def ensure(store: Store, b: Binary, artifact: Path, force: bool = False) -> bool
         return False
     if not force and not stale(store, b.id):
         return False
+    with _ensure_lock(store, b.id):
+        if not force and not stale(store, b.id):   # another thread parsed it while this one waited
+            return False
+        return _ensure_locked(store, b, artifact)
+
+
+_ENSURE_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+_ENSURE_GUARD = threading.Lock()
+
+
+def _ensure_lock(store: Store, bid: int) -> threading.Lock:
+    """One lock per binary of one database: the parse and its writes of two callers never interleave."""
+    row = store.db.execute("PRAGMA database_list").fetchone()
+    key = (str(row[2]) if row else "", bid)
+    with _ENSURE_GUARD:
+        return _ENSURE_LOCKS.setdefault(key, threading.Lock())
+
+
+def _ensure_locked(store: Store, b: Binary, artifact: Path) -> bool:
     from airlock.server import dotnet_meta
     parsed = parse_file(artifact)
     db = store.db
     sig_of = {m.token: m.sig for m in parsed.methods} if parsed else {}
-    with db:
+    with db:   # one transaction: delete, insert, FTS and version key; a failure leaves the old rows
         for t in ("dn_type", "dn_method", "dn_pinvoke"):
             db.execute(f"DELETE FROM {t} WHERE binary_id=?", (b.id,))
         dotnet_meta.clear(db, b.id)
@@ -910,12 +929,11 @@ def ensure(store: Store, b: Binary, artifact: Path, force: bool = False) -> bool
             db.executemany("INSERT INTO dn_pinvoke VALUES (?,?,?,?,?,?)",
                            [(b.id, p.token, p.module, p.entry, p.ordinal, p.flags)
                             for p in parsed.pinvokes])
-    if parsed is not None:
-        _write_functions(store, b, parsed, sig_of)
-        if parsed.meta is not None:
-            dotnet_meta.write(store, b.id, parsed.meta)
-    store.rebuild_fts(b.id)
-    store.set_meta(_meta_key(b.id), str(DOTNET_VERSION))
+            _write_functions(store, b, parsed, sig_of)
+            if parsed.meta is not None:
+                dotnet_meta.write(store, b.id, parsed.meta)
+        store.rebuild_fts(b.id)
+        store.set_meta(_meta_key(b.id), str(DOTNET_VERSION))
     return True
 
 
@@ -961,7 +979,7 @@ def _write_edges(store: Store, b: Binary, parsed: Parsed, ids: dict[int, int]) -
             for a, c, k, at in parsed.sites if a in ids]
     srows = [(b.id, ids[a], a, None, US_BASE | uo, "data", at)
              for a, uo, at in parsed.str_sites if a in ids]
-    with store.db:
+    with store.tx():
         store.db.executemany(
             "INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind, site) "
             "VALUES (?,?,?,?,?,?,?)", rows + srows)
@@ -972,9 +990,12 @@ def _write_edges(store: Store, b: Binary, parsed: Parsed, ids: dict[int, int]) -
 
 def ensure_project(store: Store, artifacts: Path, ready: list[int]) -> int:
     """``ensure`` for every managed binary of the project; relinks the ones parsed now against the
-    other ``ready`` binaries. Returns how many were parsed."""
+    other ``ready`` binaries. A binary that is not ``ready`` is skipped: its own job (still running)
+    writes the tables. Returns how many were parsed."""
     n = 0
     for b in store.list_binaries():
+        if store.get_meta(f"status:{b.id}") != "ready":
+            continue
         try:
             if ensure(store, b, artifacts / b.sha256):
                 n += 1

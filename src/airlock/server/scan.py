@@ -491,7 +491,7 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
     out = []
     for f in pool:
         score, why = 0, []
-        if _tokens(Path(f.rel_path).stem) & ref:
+        if _name_match(Path(f.rel_path).stem, ref):
             score += 3
             why.append("name")
         v = normalise_vendor(f.company)
@@ -511,6 +511,13 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
         out.append((f.rel_path, score, ", ".join(why) or "none", f.code_size or f.meta_size))
     out.sort(key=lambda t: (-t[1], -t[3]))
     return [(r, sc, w) for r, sc, w, _ in out]
+
+
+def _name_match(stem: str, ref: set[str]) -> bool:
+    """The file stem shares a token with the folder/product names; a stem that starts with a long
+    token counts too (``DependenciesGui`` for the product ``Dependencies``)."""
+    toks = _tokens(stem)
+    return bool(toks & ref) or any(t.startswith(r) for t in toks for r in ref if len(r) >= 6)
 
 
 def _build_options(files: list[ScannedFile], s_per_code_mb: float,
@@ -580,6 +587,11 @@ def scan_program(path: Path, root_exe: str | None = None,
         return cache[f.rel_path]
 
     files = assign_groups(files, root_rel, refs_of)
+    pes_g = [f for f in files if f.kind == "pe" and f.group != "unreadable"]
+    folder_of_framework = (root_rel is None and bool(pes_g)
+                           and all(f.group == "runtime" and f.dotnet for f in pes_g))
+    if folder_of_framework:     # only framework-named assemblies (R2R folder): they are the program
+        files = [dataclasses.replace(f, group="core") if f in pes_g else f for f in files]
 
     present = {Path(f.rel_path).name.lower() for f in files}
     system = sorted({i for f in files if f.kind == "pe" for i in f.imports
@@ -594,7 +606,7 @@ def scan_program(path: Path, root_exe: str | None = None,
     data_summary = tuple(sorted(((e, c, b) for e, (c, b) in ext.items()),
                                 key=lambda t: (-t[1], -t[2], t[0])))
 
-    options = _build_options(files, s_per_code_mb, overhead_s) if root_rel else ()
+    options = _build_options(files, s_per_code_mb, overhead_s) if root_rel or folder_of_framework else ()
     keys = [o.key for o in options]
     recommended = "B" if "B" in keys else ("A" if "A" in keys else (keys[0] if keys else ""))
     return ScanResult(base, root_rel, reason, tuple(files), tuple(system), data_summary,
