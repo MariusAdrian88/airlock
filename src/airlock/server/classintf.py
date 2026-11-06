@@ -72,30 +72,108 @@ def _class_rows(bd: Any, vmt: int) -> tuple[list[tuple[int, IntfTable, int]], di
     return tabs, names, targets
 
 
+def parent_chain(bd: Any, vmt: int) -> list[int]:
+    """VMT addresses of the ancestors of a class, nearest first."""
+    out: list[int] = []
+    seen = {vmt}
+    row = (_q(bd, "SELECT parent_vmt FROM dl_class WHERE binary_id=? AND vmt=?", vmt) or [(0,)])[0]
+    nxt = row[0] or 0
+    while nxt and nxt not in seen and len(out) < 64:
+        seen.add(nxt)
+        out.append(nxt)
+        row = (_q(bd, "SELECT parent_vmt FROM dl_class WHERE binary_id=? AND vmt=?", nxt) or [(0,)])[0]
+        nxt = row[0] or 0
+    return out
+
+
+def virtual_slot(bd: Any, vmt: int, addr: int) -> int | None:
+    """The virtual slot of the class whose code is ``addr``, when it is one slot only. A Delphi interface thunk
+    that dispatches through the VMT jumps through this slot: the call reaches the code of the object's class, not
+    this one. None for Free Pascal (its thunks jump to the method) and for an address that is not a virtual slot."""
+    if bd.binary.toolchain == "fpc":
+        return None
+    rows = _q(bd, "SELECT DISTINCT slot FROM dl_method WHERE binary_id=? AND vmt=? AND kind='virtual' AND addr=?",
+              vmt, addr)
+    return rows[0][0] if len(rows) == 1 else None
+
+
+def virtual_impls(bd: Any, vmt: int, slot: int, limit: int = 6,
+                  owners: dict[int, list[tuple[str, str]]] | None = None) -> list[str]:
+    """Names of the code that virtual slot ``slot`` runs for the class ``vmt`` and for the classes derived from it
+    that override it: the class's own first, then the other code addresses, in VMT order (`TBase.Greet`,
+    `TDerived.Greet`). A name is the Ghidra function, else a published / RTTI method name of the address, else `Class.Method` of the slot, else the `FUN_` name. At most
+    ``limit`` names, then `+N more`."""
+    owners = _owners(bd) if owners is None else owners
+    kids: dict[int, list[int]] = {}
+    for v, pv in _q(bd, "SELECT vmt, parent_vmt FROM dl_class WHERE binary_id=? ORDER BY vmt"):
+        kids.setdefault(pv or 0, []).append(v)
+    order, todo = [], [vmt]
+    while todo and len(order) < 512:
+        v = todo.pop(0)
+        if v not in order:
+            order.append(v)
+            todo += kids.get(v, [])
+    names: list[str] = []
+    seen: set[int] = set()
+    for v in order:
+        r = _q(bd, "SELECT m.addr, m.name, c.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
+                   "c.vmt=m.vmt WHERE m.binary_id=? AND m.vmt=? AND m.kind='virtual' AND m.slot=?", v, slot)
+        if not r or r[0][0] in seen:
+            continue
+        addr, mname, cname = r[0]
+        seen.add(addr)
+        fn = bd.store.function_at(bd.binary.id, addr)
+        own = owners.get(addr)
+        if fn is not None and not fn.name.startswith(_PLAIN):
+            names.append(fn.qualified_name)
+        elif own:
+            names.append(f"{own[0][0]}.{own[0][1]}")
+        elif mname:
+            names.append(f"{cname}.{mname}")
+        else:
+            names.append(fn.name if fn is not None else bd.addr(addr))
+    return names[:limit] + ([f"+{len(names) - limit} more"] if len(names) > limit else [])
+
+
 def iface_lines(bd: Any, vmt: int, mark: tuple[str, int] | None = None) -> list[str]:
     """`interface Name {GUID} imt 0x.. offset N` and per slot `  [k] 0xthunk Method -> 0xtarget Impl` of a class.
-    ``mark``: (interface name, slot) that ends with ` <-`."""
-    tabs, names, targets = _class_rows(bd, vmt)
-    if not tabs:
-        return []
+    A slot whose thunk dispatches through the VMT reads `  [k] 0xthunk Method -> vslot N (virtual: A.M; B.M)`.
+    The interfaces of the ancestors follow with ` inherited from X` on the header line (the class's own table of
+    the same interface wins); of those only the slots that dispatch through the VMT are listed, resolved against this class. ``mark``: (interface name, slot) that ends with ` <-`."""
     owners = _owners(bd)
     out: list[str] = []
-    for idx, t, imt in tabs:
-        head = f"interface {t.name}" + (f" {t.guid}" if t.guid else "") + f" imt {bd.addr(imt)} offset {t.offset}"
-        out.append(head + f" slots {t.slots}")
-        for k in range(t.slots):
-            got = names.get(idx * INTF_STRIDE + k)
-            if got is None:
+    done: set[str] = set()
+    for owner in [vmt, *parent_chain(bd, vmt)]:
+        tabs, names, targets = _class_rows(bd, owner)
+        inherited = owner != vmt
+        who = ""
+        if inherited:
+            who = (_q(bd, "SELECT name FROM dl_class WHERE binary_id=? AND vmt=?", owner) or [("",)])[0][0]
+        for idx, t, imt in tabs:
+            if t.name in done:
                 continue
-            method = got[0].split(".", 1)[1] if "." in got[0] else got[0]
-            line = f"  [{k}] {bd.addr(got[1])} {method}"
-            tg = targets.get(idx * INTF_STRIDE + k)
-            if tg is not None:
-                line += f" -> {bd.addr(tg)}"
-                impl = _impl(bd, owners, tg, method)
-                if impl:
-                    line += f" {impl}"
-            out.append(line + (" <-" if mark == (t.name, k) else ""))
+            done.add(t.name)
+            head = f"interface {t.name}" + (f" {t.guid}" if t.guid else "") + f" imt {bd.addr(imt)} offset {t.offset}"
+            out.append(head + f" slots {t.slots}" + (f" inherited from {who}" if inherited else ""))
+            for k in range(t.slots):
+                got = names.get(idx * INTF_STRIDE + k)
+                if got is None:
+                    continue
+                method = got[0].split(".", 1)[1] if "." in got[0] else got[0]
+                line = f"  [{k}] {bd.addr(got[1])} {method}"
+                tg = targets.get(idx * INTF_STRIDE + k)
+                vs = virtual_slot(bd, owner, tg) if tg is not None else None
+                impls = virtual_impls(bd, vmt, vs, owners=owners) if vs is not None else []
+                if inherited and not impls:
+                    continue                # the ancestor's listing shows it; only dispatching slots can differ
+                if impls:
+                    line += f" -> vslot {vs} (virtual: {'; '.join(impls)})"
+                elif tg is not None:
+                    line += f" -> {bd.addr(tg)}"
+                    impl = _impl(bd, owners, tg, method)
+                    if impl:
+                        line += f" {impl}"
+                out.append(line + (" <-" if not inherited and mark == (t.name, k) else ""))
     return out
 
 
@@ -143,7 +221,12 @@ def index(bd: Any) -> tuple[dict[str, dict[int, tuple[str, list[str]]]], dict[in
                 tg = targets.get(idx * INTF_STRIDE + k)
                 impl = _impl(bd, owners, tg, method) if tg is not None else ""
                 cur = slots.setdefault(k, (method, []))
-                if impl and impl not in cur[1]:
+                vs = virtual_slot(bd, vmt, tg) if tg is not None and k >= 3 else None
+                if vs is not None:      # the thunk dispatches through the VMT: all the code the slot can run
+                    names_ = virtual_impls(bd, vmt, vs)
+                    if names_ and names_[0] not in cur[1]:
+                        cur[1].extend([f"vslot {vs}: {names_[0]}", *names_[1:]])
+                elif impl and impl not in cur[1]:
                     cur[1].append(impl)
                 elif not impl and cls and k >= 3 and not method.startswith("#") and f"{cls}.{method}" not in cur[1]:
                     cur[1].append(f"{cls}.{method}")

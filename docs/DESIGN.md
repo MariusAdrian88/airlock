@@ -870,6 +870,10 @@ match. Invalid rows are recomputed on next request, not eagerly.
 
 ### Large functions (decompile time limits)
 
+Worker failures (no_program, JVMNotRunning, worker_exited, worker timeout) are never stored in
+`decomp`; stored ones are cache misses and deleted. The background pass runs only for the project a
+session is bound to and queues a binary again when results were lost. **[verified]** (unit tests)
+
 The background pass uses `bulk_decompile_timeout_s` (short). A function that
 timed out there, or has no row, is decompiled on its first request with an
 adaptive limit: `decompile_timeout_s` plus 6 s per KB of code beyond 8 KB,
@@ -981,7 +985,7 @@ Details settled in M3:
 | Tool | Parameters | Returns |
 |---|---|---|
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
-| `vtable` | `target` (class name or address; C++ RTTI, Delphi, FPC; also an interface table or IMT address and the header words before a Delphi VMT) | slots: index, address, function name, origin; Delphi / FPC classes end with their interfaces (`interface IGreeter {GUID} imt .. slots N`, one line per slot) and the dynamic methods (`dynamic [-1] 0x.. name`) |
+| `vtable` | `target` (class name or address; C++ RTTI, Delphi, FPC; also an interface table or IMT address and the header words before a Delphi VMT) | slots: index, address, function name, origin; Delphi / FPC classes end with their interfaces (`interface IGreeter {GUID} imt .. slots N`, one line per slot; a slot that dispatches through the VMT reads `-> vslot N (virtual: A.M; B.M)`; ancestors' interfaces follow with `inherited from X`; in a table of 64+ slots, runs of 4+ inherited slots are one `[a-b] inherited from X, N slots` line) and the dynamic methods (`dynamic [-1] 0x.. name`) |
 | `mfc_message_maps` | `target?` (class) | no class: the classes that have a message map (with the class's dialog) and the dispatch / interface / event sink maps; a class: message, control id, handler function per entry (`as OnCommand_57600_Open` when the function has no name of its own), `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one), then its automation maps: `method Name(long, LPCSTR) -> void dispid 2 -> 0x... fn`, `property Name BSTR dispid 5 get 0x... set 0x...`, `stock BackColor dispid -501 long`, `interface IDispatch offset 0x10`, `event dispid 7 ctrl 1000 -> 0x...` |
 | `qt_metaobjects` | `class_?`, `limit=50`, `connections=false`, `binary?` | no class: one line per Qt class (parent, signal/slot/property counts, methods mapped); a class: signals, slots, invokable methods and constructors with index, parameter types and names, flags and the function behind each; properties (notify signal), enums, `Q_CLASSINFO`, connections that name its signals or slots. `connections=true`: all string connects and `connectImpl` call sites. Done in M8 |
 
@@ -1580,7 +1584,7 @@ restart.
     8, 40-byte entries with 8-byte IOffset and ImplGetter. **[verified]** vc22.exe (32-bit), a larger 32-bit Delphi test program,
     HeidiSQL (64-bit: 236 entries, 3219 slots). An IMT entry is `ADD EAX|RCX|[ESP+4],-n; JMP method` or the
     same followed by a call through the object's VMT (the method is virtual). The interface slot number is
-    not a class slot: C comments use `/*IGreeter.Greet -> TBase.Greet*/` or `/*intf slot N*/`, never `vslot`.
+    not a class slot: C comments use `/*IGreeter.Greet -> TBase.Greet*/` or `/*intf slot N*/`, never `vslot`. A thunk through the VMT reads `/*IGreeter.Greet -> vslot 0: TBase.Greet | TDerived.Greet*/`. The helpers (`@IntfAddRef`, `@FinalizeArray`) are found by call target address, because the stored C still has `FUN_` names. **[verified]** vc22 copy. 64-bit Pascal calls `(**(code **)(*recv + off))(...)` get the same `vslot` comment (FPC off/8 - 12, Delphi off/8). **[verified]** gui64 (FPC): offset 0xa10 = slot 310.
     FPC: the linker may point unused virtual methods of a class (TObject among them) at one shared empty stub
     (`FPC_EMPTYMETHOD`), so a child that carries the real empty RTL method looks like an override; a shared
     stub gets no method name from any class. **[verified]** FPC 3.2.2 i386 (t1_32): 87 of 90 classes hold the
@@ -2540,3 +2544,5 @@ code is taken from it.
 - Strings of Delphi/FPC programs include ShortString literals (length byte, printable, 3+ chars) that an instruction references and that lie in no string data (`shortstr.py`, collector 12). **[verified]** FPC 3.2.2: `'purr'` at 0x00428218 found.
 - `delphi.ensure` takes `NOT_GIVEN` as the default of the three folders: a caller that did not pass the configuration keeps the stored IDR and FPC names. `None` passed means the config has no such folder; `idr.stale` then clears an old result (names dropped, unchanged behaviour).
 - Round 8 target rules (§7.3 additions): a bare Qt/Delphi method name that is unique in the scope resolves to `Class::name` with a fact line (several: `error ambiguous`); `main`/`WinMain`/`wWinMain`/`PASCALMAIN`/`program` of a Delphi or FPC binary without a function of that name is the program body (Delphi: the entry point function; FPC: field 5 of the `TEntryInformation` record that the entry point passes to `FPC_EXE_ENTRY`). **[verified]** FPC 3.2.2 x86 and x64. A function-only tool given an address in an executable block with no function creates it (`create_functions`, dirty role, `allow_writes` on) and says so. `xrefs kind=code` = call + jump kinds. `strings` with no pattern lists all strings. `delphi_events` with `form` and `component` filters inside the form. File tools use the analysed copy when only the file name matches one binary.
+
+- Round 9 (D): `strings` retries in the other mode when nothing matches (literal with a regex character incl. `\` -> regex; regex -> literal text) and says so in the header. `search main|WinMain|wWinMain|PASCALMAIN|program` adds the program-body line for Delphi/FPC. Function creation on demand (§7.3) reads back only the new function: worker op `extract_at` returns its row, the edges from its body and the body ranges; the store replaces and relinks only those edges. **[verified]** 41 s -> 8.6 s on a binary of 31k functions, identical index tables to a full re-read.

@@ -408,7 +408,7 @@ def code_address(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, i
 def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | None:
     """An address in an executable block of one binary where Ghidra has no function (a Qt vtable slot, a handler
     no static table names): create the function with the worker op ``create_functions`` (the same op as the
-    bulk pass), re-read the binary's functions and return it with a fact line. None when the session may not
+    bulk pass), read back just that function and its edges and return it with a fact line. None when the session may not
     write (clean role, ``allow_writes`` off), the address is no code, or Ghidra refuses."""
     from airlock.server import roles
 
@@ -425,7 +425,13 @@ def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionT
         r = ctx.worker.request("create_functions", {"program": program, "addresses": [value]}, timeout=600)
         if not r.get("created"):
             return None
-        ix.reextract_code(bd.store, bd.binary, program)
+        conv = r.get("conventions") or {}
+        try:
+            if sum(int(n) for n in conv.values()) > 1:   # the pass touched other functions: read them all
+                raise ValueError("conventions changed")
+            ix.extract_new_functions(bd.store, bd.binary, program, [value])
+        except Exception:  # noqa: BLE001  the whole binary is read instead
+            ix.reextract_code(bd.store, bd.binary, program)
     except Exception:  # noqa: BLE001  the not_found line stands
         return None
     fn = bd.store.function_at(bd.binary.id, value)

@@ -138,7 +138,7 @@ def test_vtable_lists_interfaces(proj):
     assert out[head] == f"interface IGreeter {GUID} imt 0x{imt:08x} offset 12 slots 6"
     greet = pe.code["TBase.Greet"]
     assert re.fullmatch(rf"  \[3\] 0x[0-9a-f]{{8}} Greet -> 0x{greet:08x} TBase\.Greet", out[head + 4])
-    assert out[head + 5].split("-> ")[1].endswith("0x%08x" % pe.code["TBase.v2_Make"])     # virtual: no name known
+    assert re.fullmatch(r"  \[4\] 0x[0-9a-f]{8} #4 -> vslot 2 \(virtual: [^;)]+\)", out[head + 5])    # one class: one impl
     assert out[head + 1].startswith("  [0] ") and " QueryInterface -> " in out[head + 1]
 
 
@@ -244,7 +244,7 @@ def _index_of(tmp_path):
     text = "void f(int *p)\n{\n  System.@IntfAddRef((int *)p);\n  vmt_c_adc_0(p,1);\n}\n"
     out = annotate(text, cls)
     assert "/*intf slot 3: IGreeter.Greet | IRunner.Run*/" in out                     # two candidates: no false certainty
-    return classintf.index(SimpleNamespace(store=st, psize=4, binary=SimpleNamespace(id=bid, toolchain="delphi")))
+    return classintf.index(SimpleNamespace(store=st, psize=4, addr=lambda a, *_: f"0x{a:08x}", binary=SimpleNamespace(id=bid, toolchain="delphi")))
 
 
 def test_image_reads_without_interface_table(tmp_path):
@@ -253,3 +253,128 @@ def test_image_reads_without_interface_table(tmp_path):
     pe.write(tmp_path / "a.exe")
     img = Image.from_pe(tmp_path / "a.exe")
     assert not [m for c in delphi.parse_classes(img) for m in c.methods if m.kind in delphi.INTF_KINDS]
+
+
+def test_helpers_found_by_address_when_the_text_has_ghidra_names(proj):
+    """The stored C names the runtime helpers FUN_xxxxxxxx; the library names come only from the display relabel."""
+    text = C_INTF.replace("System.@IntfAddRef/*0x0040b490*/(", "FUN_0040b490(")
+
+    class Named(DbClasses):
+        def helper_names(self):
+            return {0x40b490: "System.@IntfAddRef", 0x408c20: "System.@FinalizeArray"}
+
+    ctx, st, bid, pe, tab, imt = proj
+    out = annotate(text, Named(st, st.get_binary_by_id(bid), 0x401000))
+    assert "vmt_c_adc_0/*IGreeter.Greet -> TBase.Greet*/(local_8,param_2,&local_10);" in out
+    assert "vslot" not in out.split("vmt_28_ad_0")[0].split("vmt_c_adc_0")[1]
+    assert "intf slot" not in annotate(text, _cls(proj))              # a helper nobody names stays unknown
+    fin = ("void FUN_00401000(void)\n{\n  vmt_c_adc_0(local_8,1,&local_10);\n"
+           "  FUN_00408c20((int *)&local_c,&DAT_00401234,2);\n}\n")
+    assert intflabel.named_helpers(fin, Named(st, st.get_binary_by_id(bid), 0)).count("System.@FinalizeArray(") == 1
+
+
+def test_interface_call_through_a_virtual_thunk_names_the_overrides(tmp_path):
+    pe = Pe(4)
+    pe.klass("TObject", None, "System", 8, virtuals=("Dtor",))
+    pe.klass("TBase", "TObject", "vc", 16, published=("Greet",), virtuals=("Dtor", "Init", "Make"))
+    pe.klass("TDerived", "TBase", "vc", 16, virtuals=("Dtor", "Init", "Make"))
+    c = [pe.stub(f"c{i}") for i in range(3)]
+    add_interface(pe, "TBase", GUID, "IGreeter", [thunk(pe, "jmp", x) for x in c] + [thunk(pe, "virt", 8)], 8)
+    pe.write(tmp_path / "a.exe")
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    ix.current = "proj"
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    (art / ("ef" * 32)).write_bytes((tmp_path / "a.exe").read_bytes())
+    bid = st.upsert_binary("ef" * 32, "vc.exe", format="pe32", arch="x86", pointer_size=4, image_base=0x400000,
+                           toolchain="delphi", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert delphi.ensure(st, st.get_binary_by_id(bid), art / ("ef" * 32))
+    from types import SimpleNamespace
+    from airlock.server import classintf
+    bd = SimpleNamespace(store=st, psize=4, addr=lambda a, *_: f"0x{a:08x}", binary=SimpleNamespace(id=bid, toolchain="delphi"))
+    index, _types = classintf.index(bd)
+    method, impls = index["IGreeter"][3]
+    assert impls[0] == f"vslot 2: 0x{pe.code['TBase.v2_Make']:08x}" and impls[1] == f"0x{pe.code['TDerived.v2_Make']:08x}"
+
+
+# ── round 9 (P3, P6): virtual dispatch in the interface listing, inherited interfaces, slot runs ──
+
+def _derived(tmp_path, with_override: bool):
+    pe = Pe(4)
+    pe.klass("TObject", None, "System", 8, virtuals=("Dtor",))
+    pe.klass("TBase", "TObject", "vc", 16, published=("Greet",), virtuals=("Dtor", "Init", "Make"))
+    com = [pe.stub(f"TBase.com{i}") for i in range(3)]
+    slots = [thunk(pe, "jmp", c) for c in com]
+    slots.append(thunk(pe, "virt", 2 * 4))                                    # Make: through virtual slot 2
+    slots.append(thunk(pe, "jmp", pe.code["TBase.Greet"]))                    # Greet: a plain method
+    add_interface(pe, "TBase", GUID, "IGreeter", slots, 12)
+    pe.klass("TDerived", "TBase", "vc", 16, virtuals=("Dtor", "Init", "Make"))
+    pe.write(tmp_path)
+    return pe
+
+
+def test_interface_listing_shows_virtual_dispatch(tmp_path):
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    ix.current = "proj"
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    sha = "ab" * 32
+    _derived(art / sha, True)
+    bid = st.upsert_binary(sha, "vc.exe", format="pe32", arch="x86", pointer_size=4, image_base=0x400000,
+                           toolchain="delphi", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert delphi.ensure(st, st.get_binary_by_id(bid), art / sha)
+    base = cpp_tools.vtable(ctx, "TBase").splitlines()
+    make = next(ln for ln in base if ln.startswith("  [3] "))
+    assert "-> vslot 2 (virtual: " in make and make.count(";") == 1          # TBase's and TDerived's code
+    greet = next(ln for ln in base if ln.startswith("  [4] "))
+    assert "vslot" not in greet                                               # a plain jmp stays an address
+    kid = cpp_tools.vtable(ctx, "TDerived").splitlines()
+    head = next(ln for ln in kid if ln.startswith("interface IGreeter"))
+    assert head.endswith("inherited from TBase")
+    kmake = next(ln for ln in kid if ln.startswith("  [3] "))
+    assert "vslot 2 (virtual: " in kmake and ";" not in kmake              # the child: its own code only
+    assert not any(ln.startswith("  [4] ") for ln in kid)                          # static slots: the parent's listing
+    # the helper
+    from airlock.server import classintf
+    bd = core_bound(ctx)
+    base_vmt = bd.store.db.execute("SELECT vmt FROM dl_class WHERE name='TBase'").fetchone()[0]
+    assert classintf.virtual_slot(bd, base_vmt, pe_code(ctx, bd, base_vmt, 2)) == 2
+    assert len(classintf.virtual_impls(bd, base_vmt, 2)) == 2                 # TBase's and TDerived's code
+
+
+def core_bound(ctx):
+    from airlock.server.tools.common import bind_many
+    return bind_many(ctx, "")[0][0]
+
+
+def pe_code(ctx, bd, vmt, slot):
+    return bd.store.db.execute("SELECT addr FROM dl_method WHERE vmt=? AND kind='virtual' AND slot=?",
+                               (vmt, slot)).fetchone()[0]
+
+
+def test_inherited_slot_runs_are_one_line(tmp_path, monkeypatch):
+    from airlock.server import classfwd
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    ix.current = "proj"
+    art = ix.paths("proj", create=True).artifacts
+    art.mkdir(parents=True, exist_ok=True)
+    sha = "ab" * 32
+    _derived(art / sha, True)
+    bid = st.upsert_binary(sha, "vc.exe", format="pe32", arch="x86", pointer_size=4, image_base=0x400000,
+                           toolchain="delphi", analysis_profile="p")
+    ix.set_status(st, bid, "ready")
+    assert delphi.ensure(st, st.get_binary_by_id(bid), art / sha)
+    monkeypatch.setattr(classfwd, "_origin", lambda chain, slot, addr: "inherited from TBase, introduced by TObject")
+    monkeypatch.setattr(classfwd, "_names_of", lambda bd, addr: "")
+    monkeypatch.setattr(classfwd, "RUN_MIN", 2)
+    monkeypatch.setattr(classfwd, "COLLAPSE_FROM", 1)
+    out = cpp_tools.vtable(ctx, "TDerived").splitlines()
+    assert out[1] == "[0-2] inherited from TBase, 3 slots"

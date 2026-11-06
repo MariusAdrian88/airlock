@@ -13,7 +13,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from airlock.index.store import CODE_EDGES, CrossRef, Function, StringHit, Xref
+from airlock.index.store import (CODE_EDGES, CrossRef, Function, StringHit, Xref,
+                                is_transient_decomp_error)
 from airlock.projects import read_manifest, read_sections
 from airlock.server.bulk import BG_TIMEOUT
 from airlock.server.budget import (
@@ -196,6 +197,8 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     for bd in bounds:
         seq = _search_binary(bd, query, kind, fetch, groups, seq,
                              f"[{bd.binary.name}] " if multi else "")
+    if kind in ("any", "function"):
+        _program_body_hit(ctx, binary, query, groups, multi)
     for g in groups.values():
         g.sort(key=lambda x: x[0])
     if kind == "any":
@@ -213,6 +216,26 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     if skipped:
         head += f" ({skipped} binaries not ready, skipped)"
     return _page([head, *merged], "search", args, bud, limit + 1, limit)
+
+
+def _program_body_hit(ctx: ServerContext, binary: str, query: str,
+                       groups: dict[str, list[tuple[tuple[int, ...], str]]], multi: bool) -> None:
+    """`main` / `WinMain` / `PASCALMAIN` / `program` in a Delphi or FPC program: no function has that name,
+    the program body is found by the entry point (the same rule as the `function` target). Adds
+    `function <body> addr (program body: main)` as the top function hit."""
+    if query.strip().lower() not in tg._PROGRAM_NAMES:
+        return
+    try:
+        t = tg.resolve_target(ctx, binary, query.strip(), (tg.FUNCTION,))
+    except Exception:  # noqa: BLE001  the search stands without it
+        return
+    if not isinstance(t, tg.FunctionTarget) or "program body" not in (t.note or ""):
+        return
+    bd, fn = t.bound, t.fn
+    pfx = f"[{bd.binary.name}] " if multi else ""
+    groups.setdefault("function", []).append(
+        ((0, 0, 0), f"{pfx}function {fn.qualified_name} {bd.addr(fn.entry, fn.space)} "
+                    f"(program body: {query.strip()})"))
 
 
 def _qt_method_hits(bd: Bound, query: str, fetch: int,
@@ -475,12 +498,9 @@ def _block_listing(ctx: ServerContext, bd: Bound, fn: Function, why: str) -> tup
     return head + "\n" + "\n".join(lines), None
 
 
-_INFRA_ERRORS = ("JVMNotRunning", "ClosedException", "File is closed")
-
-
 def _infra_error(text: str | None) -> bool:
     """A worker or JVM failure, not a decompiler result: never cached, always retried."""
-    return any(x in (text or "") for x in _INFRA_ERRORS)
+    return is_transient_decomp_error(text)
 
 
 def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
@@ -535,7 +555,7 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
                     break
             transient = d.get("status") == "error" and _infra_error(d.get("error"))
         except WorkerError as e:
-            if round_ == 2 or e.code not in ("worker_exited", "busy") and not _infra_error(e.message):
+            if round_ == 2 or e.code not in ("worker_exited", "busy", "no_program") and not _infra_error(e.message):
                 return None, worker_error(e)
             transient = True
         if not transient:
@@ -1239,6 +1259,10 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     if pattern and not merged and not regex and _REGEX_CHARS.search(pattern) and _compiles(pattern):
         regex, used = True, "(regex used: no literal match)"    # `a|b`, `^foo`: meant as a regex
         merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
+    elif pattern and not merged and regex and not used:
+        lit, lit_capped = _string_lines(bounds, pattern, False, with_refs, limit)   # a path with backslashes
+        if lit:
+            regex, used, merged, capped = False, "(literal used: no regex match)", lit, lit_capped
     if not merged:
         return (f"no strings match '{pattern}'" if pattern else "no strings") + (f" {used}" if used else "")
     head = (f"strings matching '{pattern}': " if pattern else "strings: ") + f"{len(merged)}{'+' if capped else ''}"
@@ -1253,7 +1277,7 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
 
 
 STRINGS_FETCH = 500
-_REGEX_CHARS = re.compile(r"[|\^$*+?\[\](){}]")
+_REGEX_CHARS = re.compile(r"[|\^$*+?\[\](){}\\]")
 
 
 def _compiles(pattern: str) -> bool:

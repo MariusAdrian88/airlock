@@ -28,7 +28,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from airlock.projects import read_manifest
+from airlock.index.store import is_transient_decomp_error
+from airlock.projects import read_manifest, slugify
 from airlock.worker.protocol import WorkerError
 
 log = logging.getLogger("airlock")
@@ -38,6 +39,7 @@ TERMINAL = ("done", "cancelled", "error", "interrupted")
 IDLE_POLL_S = 1.0
 EVENT_WAIT_S = 2.0
 BG_TIMEOUT = "bg_timeout"  # error prefix of a timeout row written by the background pass
+MAX_REQUEUE = 3  # a pass that lost results to a worker failure or a project switch is queued again
 STALL_S = 180.0  # no event for this long while the worker lives: the pass is stuck
 
 
@@ -81,6 +83,7 @@ class BulkScheduler:
         self._thread: threading.Thread | None = None
         self._progress: dict[tuple[str, int], BulkProgress] = {}
         self._cancelled: set[tuple[str, int]] = set()
+        self._requeued: dict[tuple[str, int], int] = {}
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         indexer.worker.on_event(self._on_event)
 
@@ -128,6 +131,7 @@ class BulkScheduler:
             man = {}
         groups = {f.get("sha256"): f.get("group") for f in man.get("files") or []}
         n = 0
+        st.purge_transient_decomp()      # rows of older versions: worker failures stored as results
         for b in st.list_binaries():
             if ix.get_status(st, b.id)[0] != "ready":
                 continue
@@ -188,8 +192,13 @@ class BulkScheduler:
                     self._current = None
                     self._thread = None
                     return
-                item = self._pending.pop(0)
-                self._current = item
+                item = next((i for i in self._pending if self._may_run(i)), None)
+                if item is not None:
+                    self._pending.remove(item)
+                    self._current = item
+            if item is None:    # only projects other than the bound one wait: do not switch the worker
+                time.sleep(IDLE_POLL_S)
+                continue
             key = (item.project, item.binary_id)
             try:
                 self._run(item)
@@ -200,6 +209,22 @@ class BulkScheduler:
                 log.warning("bulk decompile of binary %s failed: %s: %s",
                             item.binary_id, type(e).__name__, e)
                 self._progress[key] = BulkProgress("error", message=f"{type(e).__name__}: {e}")
+
+    def _may_run(self, item: _Item) -> bool:
+        """A session bound to a project owns the worker's open project: the pass runs only for that
+        project (opening another one closes the programs the session works on)."""
+        cur = getattr(self.ix, "current", None)
+        return not cur or slugify(cur) == item.project
+
+    def _requeue(self, key: tuple[str, int]) -> None:
+        n = self._requeued.get(key, 0)
+        if n >= MAX_REQUEUE or key in self._cancelled:
+            return
+        self._requeued[key] = n + 1
+        with self._lock:    # the running pass is this key: schedule() would refuse it
+            if not any((i.project, i.binary_id) == key for i in self._pending):
+                self._pending.append(_Item(key[0], key[1]))
+                self._progress[key] = BulkProgress("waiting")
 
     def _wait_queue_idle(self, key: tuple[str, int]) -> bool:
         while not self.ix.queue_idle():
@@ -225,6 +250,7 @@ class BulkScheduler:
             return
         self._progress[key] = BulkProgress("planning")
         profile = b.analysis_profile or "unknown"
+        st.purge_transient_decomp()
         rows = self.plan(st, b.id, profile)
         if not rows:
             self._progress[key] = BulkProgress("done")
@@ -253,31 +279,40 @@ class BulkScheduler:
                                            processors=int(res.get("processors") or 0))
         if key in self._cancelled:
             self.cancel(*key)
-        self._consume(item, st, profile, by_entry, job, total)
+        lost, state = self._consume(item, st, profile, by_entry, job, total)
+        # results lost to a worker failure, or the pass cut by a project switch: plan the rest again
+        if (lost or state == "cancelled") and key not in self._cancelled:
+            self._requeue(key)
+        elif state == "done":
+            self._requeued.pop(key, None)
 
     def _consume(self, item: _Item, st: Any, profile: str, by_entry: dict[int, tuple[int, int]],
-                 job: Any, total: int) -> None:
+                 job: Any, total: int) -> tuple[int, str]:
+        """Write the events of one pass. Returns (results dropped as worker failures, end state)."""
         key = (item.project, item.binary_id)
         last = time.monotonic()
+        lost = 0
         while True:
             try:
                 msg = self._events.get(timeout=EVENT_WAIT_S)
             except queue.Empty:
                 if not self.ix.worker.running():
                     self._finish(key, "interrupted", "worker stopped during the pass")
-                    return
+                    return lost, "interrupted"
                 if time.monotonic() - last > STALL_S:
                     try:
                         self.ix.worker.request("cancel_bulk", {"program": item.program}, timeout=30)
                     except WorkerError:
                         pass
                     self._finish(key, "error", f"no progress for {STALL_S:.0f}s")
-                    return
+                    return lost, "error"
                 continue
             if msg.get("program") != item.program or msg.get("job") != job:
                 continue
             last = time.monotonic()
             if msg["event"] == "decompile_results":
+                lost += sum(1 for r in msg.get("results") or []
+                            if r.get("status") != "ok" and is_transient_decomp_error(r.get("error")))
                 self.write_results(st, profile, by_entry, msg)
                 continue
             state = str(msg.get("state") or "running")
@@ -288,7 +323,7 @@ class BulkScheduler:
                 failed=int(msg.get("failed") or 0), message=str(msg.get("message") or ""))
             self._progress[key] = p
             if state in TERMINAL:
-                return
+                return lost, state
 
     def _finish(self, key: tuple[str, int], state: str, message: str) -> None:
         old = self._progress.get(key) or BulkProgress(state)

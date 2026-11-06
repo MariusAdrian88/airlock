@@ -265,7 +265,7 @@ def decompile_function(e: Entry, di: Any, func: Any, timeout: int, monitor: Any,
 
 def check_open(e: Entry) -> None:
     if e.closed:
-        raise WorkerError("no_program", f"'{e.name}' was closed. Call open_project again.")
+        raise WorkerError("no_program", f"'{e.name}' was closed by a project switch.")
 
 
 @op("decompile")

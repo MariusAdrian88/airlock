@@ -30,6 +30,19 @@ _DAT = re.compile(r"&\s*\w*?_?([0-9a-fA-F]{6,16})\b")
 _LOCAL = re.compile(r"^local_([0-9a-fA-F]+)$")
 
 
+_FUN = re.compile(r"(?<![A-Za-z0-9_])(?:thunk_)?FUN_([0-9a-fA-F]{6,16})(?=\()")
+
+
+def named_helpers(c_text: str, cls: Any) -> str:
+    """``c_text`` with ``FUN_xxxxxxxx(`` calls of the interface / finalize helpers shown under their library name:
+    the stored C has the Ghidra names, the library names come later (libnames) and are not there yet."""
+    f = getattr(cls, "helper_names", None)
+    names = f() if f else {}
+    if not names or "FUN_" not in c_text:
+        return c_text
+    return _FUN.sub(lambda m: names.get(int(m.group(1), 16), m.group(0)), c_text)
+
+
 def _args(text: str, open_at: int) -> list[str]:
     d, start, out = 0, open_at + 1, []
     for i in range(open_at, len(text)):
@@ -114,7 +127,7 @@ def _index(cls: Any) -> tuple[dict[str, dict[int, tuple[str, list[str]]]], dict[
     store = getattr(cls, "store", None)
     if store is None:
         return None
-    bd = SimpleNamespace(store=store, psize=cls.psize,
+    bd = SimpleNamespace(store=store, psize=cls.psize, addr=lambda a, *_: f"0x{a:0{cls.psize * 2}x}",
                          binary=SimpleNamespace(id=cls.bid, toolchain="fpc" if cls.fpc else "delphi"))
     try:
         idx = classintf.index(bd)
@@ -143,7 +156,7 @@ def intf_label(c_text: str, recv_expr: str, slot: int, cls: Any) -> str:
     index, types = got
     cache = getattr(cls, "_intf_vars", None)
     if cache is None or cache[0] is not c_text:
-        cache = (c_text, interface_vars(c_text, types, cls.psize))
+        cache = (c_text, interface_vars(named_helpers(c_text, cls), types, cls.psize))
         try:
             cls._intf_vars = cache
         except AttributeError:

@@ -251,6 +251,23 @@ def _vcall_label(slot: int, vmts: list[int], cls: Classes) -> str:
     return f"vslot {slot}: {' | '.join(parts)}" if parts else f"vslot {slot}"
 
 
+_PLAIN_CALL = re.compile(r"\(\*\*\(code \*\*\)(?=[(*])")      # (**(code **)(*recv + 0xOFF))(args): 64-bit, no stub
+_PLAIN_BODY = re.compile(r"^\*\s*(.+?)\s*(?:\+\s*(0x[0-9a-fA-F]+|\d+))?$", re.S)
+
+
+def _plain_calls(c_text: str):
+    """(position after the callee expression, receiver expression, vmt offset) of the calls that read their target
+    straight out of the VMT: ``(**(code **)(*recv + 0xa10))(recv,..)`` and ``(**(code **)*recv)(recv)``."""
+    for m in _PLAIN_CALL.finditer(c_text):
+        outer = close_of(c_text, m.start())
+        inner = c_text[m.end():outer].strip()
+        if inner.startswith("(") and close_of(inner, 0) == len(inner) - 1:
+            inner = inner[1:-1].strip()
+        b = _PLAIN_BODY.match(inner)
+        if b and c_text[outer + 1:outer + 2] == "(":
+            yield outer + 1, b.group(1), int(b.group(2), 0) if b.group(2) else 0
+
+
 _DYNA = re.compile(r"(?<![A-Za-z0-9_])(?:(?:thunk_)?FUN_([0-9a-fA-F]{6,16})|[\w.]*@(?:Call|Find)Dyna(Inst|Class)"
                    r"/\*0x([0-9a-fA-F]+)\*/)(?=\()")
 _DYNA_NAME = re.compile(r"@(?:Call|Find)Dyna(?:Inst|Class)$")
@@ -261,8 +278,8 @@ def annotate(c_text: str, cls: Classes) -> str:
     """``c_text`` with a comment after every virtual-call stub name, dynamic-call name and VMT address."""
     ins: list[tuple[int, str]] = []
     rs: Resolver | None = None
+    from airlock.server.intflabel import intf_label       # interface calls: IMT slot, not a class slot
     for m in _STUB.finditer(c_text):
-        from airlock.server.intflabel import intf_label       # interface calls: IMT slot, not a class slot
         il = intf_label(c_text, first_arg(c_text, m.end()), int(m.group(1), 16) // cls.psize, cls)
         if il:
             ins.append((m.end(), f"/*{il}*/"))
@@ -274,6 +291,17 @@ def annotate(c_text: str, cls: Classes) -> str:
             rs = Resolver(c_text, cls)
         vmts = rs.classes(first_arg(c_text, m.end()), m.start()) or []
         ins.append((m.end(), f"/*{_vcall_label(slot, vmts, cls)}*/"))
+    for pos, recv, disp in _plain_calls(c_text):
+        il = intf_label(c_text, recv, disp // cls.psize, cls) if disp % cls.psize == 0 else ""
+        if il:
+            ins.append((pos, f"/*{il}*/"))
+            continue
+        slot = slot_of(disp, cls.psize, cls.fpc)
+        if slot is None:
+            continue
+        if rs is None:
+            rs = Resolver(c_text, cls)
+        ins.append((pos, f"/*{_vcall_label(slot, rs.classes(recv, pos) or [], cls)}*/"))
     dyn = getattr(cls, "dynamic_index", None)
     nth: dict[int, int] = {}
     for m in _DYNA.finditer(c_text) if dyn else ():
@@ -474,6 +502,19 @@ class DbClasses:
                 names.setdefault(r[0], r[1])
             self._cache["d"] = {a: n.endswith("Class") for a, n in names.items() if _DYNA_NAME.search(n)}
         return self._cache["d"]
+
+    def helper_names(self) -> dict[int, str]:
+        """{entry: name} of the interface reference-count and finalize helpers of the runtime, by call target
+        address: the library name (IDR / sigdb) or the Ghidra name. The stored C still says ``FUN_xxxxxxxx``."""
+        if "h" not in self._cache:
+            from airlock.server import libnames
+            keep = re.compile(r"Intf|Finalize|fpc_intf", re.I)
+            names = {a: n for a, n in libnames.labels(self.store, self.bid).items() if keep.search(n)}
+            for r in self._q("SELECT entry, name FROM function WHERE binary_id=? AND (name LIKE '%Intf%' OR "
+                             "name LIKE '%Finalize%') AND substr(name, 1, 4) <> 'FUN_'"):
+                names.setdefault(r[0], r[1])
+            self._cache["h"] = names
+        return self._cache["h"]
 
     def dyna_class_call(self, target: int) -> bool:
         return self._dispatchers().get(target, False)

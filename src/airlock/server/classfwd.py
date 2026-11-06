@@ -193,6 +193,10 @@ def _names_of(bd: Bound, addr: int) -> str:
     return f"rtti: {r[0] + '.' if r[0] else ''}{r[1]}.{r[2]}" if r else ""
 
 
+RUN_MIN = 4        # inherited slots in a row (one ancestor) that `vtable` prints as one line
+COLLAPSE_FROM = 64  # only tables with this many slots collapse runs; small ones show every slot
+
+
 def slot_lines(h: ClassHit) -> list[str]:
     """`[N] 0xaddr function [slot name] [rtti: Unit.Class.Method] origin` per virtual slot; the slot an
     interior address pointed at ends with ` <-`."""
@@ -200,7 +204,7 @@ def slot_lines(h: ClassHit) -> list[str]:
     if h.how in classintf.HOWS:         # an interface structure: the interface listing shows it
         return []
     chain = _chain(h)
-    out: list[str] = []
+    rows: list[tuple[int, str, str, str]] = []      # (slot, line, run key `inherited` or "", ancestor)
     for slot, (name, addr) in sorted(chain[0][1].items()):
         fn = bd.store.function_at(bd.binary.id, addr)
         parts = [f"[{slot}] {bd.addr(addr)}"]
@@ -216,7 +220,22 @@ def slot_lines(h: ClassHit) -> list[str]:
             parts.append(rt)
         org = _origin(chain, slot, addr)
         line = " ".join(parts) + (f"; {org}" if org else "")
-        out.append(line + (" <-" if h.slot == slot else ""))
+        key = "inherited" if org.startswith("inherited from") and not rt and h.slot != slot else ""
+        owner = org.split(",")[0][len("inherited from "):] if key else ""
+        rows.append((slot, line + (" <-" if h.slot == slot else ""), key, owner))
+    out: list[str] = []
+    i = 0
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[i][2] and rows[j + 1][2] == rows[i][2] and rows[j + 1][0] == rows[j][0] + 1:
+            j += 1
+        if len(rows) >= COLLAPSE_FROM and j - i + 1 >= RUN_MIN:     # a run of one ancestor: one line
+            who = list(dict.fromkeys(r[3] for r in rows[i:j + 1]))
+            out.append(f"[{rows[i][0]}-{rows[j][0]}] inherited from {', '.join(who[:4])}"
+                       f"{f' (+{len(who) - 4} more)' if len(who) > 4 else ''}, {j - i + 1} slots")
+        else:
+            out += [r[1] for r in rows[i:j + 1]]
+        i = j + 1
     return out
 
 

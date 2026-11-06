@@ -633,6 +633,20 @@ class Indexer:
         store.link_edges(b.id)
         store.rebuild_fts(b.id)
 
+    def extract_new_functions(self, store: Store, b: Binary, program: str, addresses: list[int]) -> None:
+        """Read back only the functions just created at ``addresses`` and the edges from their bodies (worker op
+        ``extract_at``), relink those edges, rebuild the derived links and the search index. Same index
+        state as ``reextract_code`` for such a change, in seconds instead of minutes on a large binary.
+        Raises when the worker found no function there (the caller then reads the whole binary)."""
+        r = self.worker.request("extract_at", {"program": program, "addresses": addresses}, timeout=300)
+        rows = map_function_rows(r["function_columns"], r["functions"])
+        if not rows:
+            raise ValueError("no new function to read")
+        store.insert_functions(b.id, rows)
+        store.replace_edges_in(b.id, [(lo, hi) for lo, hi in r["ranges"]],
+                               map_edge_rows(r["edge_columns"], r["edges"]))
+        store.rebuild_fts(b.id)
+
     def _enqueue_one(self, paths: ProjectPaths, store: Store, sha: str, name: str,
                      rel_path: str | None, group: str, code_size: int | None,
                      original_path: str | None, est_funcs: int = 0) -> Job | None:

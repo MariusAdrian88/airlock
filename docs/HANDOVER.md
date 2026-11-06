@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1326 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1346 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -632,3 +632,66 @@ Files (tasks, launcher, transcripts, source copies) are in the session scratchpa
   2.5 times faster (large DLL: under 0.5 s on a quiet machine).
   Open: 24-bit PCM, tables whose fields are not adjacent, delimited text
   without line ends.
+
+## Round 9 fix A: worker failures in the decompile cache (P1)
+
+Cause [verified in code]: `index_status` called `resume_project` for every project; the bulk pass of
+project B opened B in the worker, `_close_project` set `Entry.closed` on the programs of A, and the
+queued functions of A came back as `error` results ("no_program ... was closed") that
+`save_decomp_batch` stored; `function` served the stored row. `JVMNotRunning` rows had the same path.
+Fixes:
+- `index_status` is read-only (`_resolve_project`, no `resume_project`, no worker call).
+- `Store.upsert_decomp` and `save_decomp_batch` skip rows whose error is a worker failure
+  (`TRANSIENT_DECOMP_ERRORS` in `index/store.py`: no_program, JVMNotRunning, ClosedException, File is closed,
+  worker_exited, WorkerError: timeout/busy, worker stopped). Decompiler results (timeout status, bg_timeout) stay.
+- Old rows: `get_decomp` treats such a row as a miss and deletes it; `bulk.resume` and the bulk plan call
+  `purge_transient_decomp`. No cache version bump.
+- The bulk pass counts dropped results and a pass cut by a project switch (`cancelled`, not by the user) and
+  queues the binary again (max 3 times, `MAX_REQUEUE`).
+- The bulk thread runs only items of the project the session is bound to (`Indexer.current`); others wait,
+  so the worker is not switched under a session.
+- `function`: `no_program` from the worker is a transient failure (reopen via `ensure_open`, retry once).
+- `check_open` message has no instruction text now.
+Tests: tests/test_bulk_server.py (round 9 block at the end). No Ghidra run (all paths are server side).
+
+## Round 9 fix B: interface and x64 virtual call labels (P2, P3 C-label part, P5)
+
+- P2: the stored C names the runtime helpers `FUN_xxxxxxxx`; the library names come from the display relabel after
+  `vcallnames.annotate`, so `intflabel._HELPER` / `_FINAL` never matched. `DbClasses.helper_names()` gives
+  {entry: name} (IDR / sigdb hits plus Ghidra names with `Intf` / `Finalize`); `intflabel.named_helpers` renames the
+  `FUN_` calls in the analysis copy of the text. `intflabel._index` now passes an `addr` formatter to `classintf`.
+- P3 (C label): `classintf.index` uses `virtual_slot` / `virtual_impls` (shared with the `vtable` listing, group C):
+  a thunk that dispatches through VMT slot N lists `vslot N: TBase.Greet | TDerived.Greet`.
+- P5: `vcallnames._plain_calls` finds `(**(code **)(*recv + off))(...)` and `(**(code **)*recv)(...)` (64-bit, no stub)
+  and labels them like stub calls (FPC slot = off/8 - 12, Delphi slot = off/8; interface receivers use the IMT label).
+- Cache keys: none changed (display only).
+Tests: tests/test_vcallnames.py `test_plain_x64_virtual_calls_get_a_slot_comment`; tests/test_r8_intf.py
+`test_helpers_found_by_address_when_the_text_has_ghidra_names`,
+`test_interface_call_through_a_virtual_thunk_names_the_overrides`.
+Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e360 now reads
+`vmt_c_adc_0/*IGreeter.Greet -> vslot 0: TBase.Greet | TDerived.Greet*/(...)`, `vmt_10_adc_0/*IGreeter.Make -> vslot 1: TBase.Make*/`,
+`vmt_20_s_3/*IGreeter.Std -> TBase.Std*/` (before: `/*vslot N*/`). gui64 `BtnGoClick`: `(**(code **)(*local_18 + 0xa10))/*TFormMain vslot 310 -> FUN_10002f480*/(local_18,...)`.
+
+## Round 9 fixes: vtable listing and delphi_events (P3 listing, P6, P7)
+- P3: an IMT slot whose thunk dispatches through the VMT (Delphi, target = a virtual slot of the class) reads `[3] 0x0041dbf9 Greet -> vslot 0 (virtual: TBase.Greet; TDerived.Greet)`; `vtable TDerived` lists the inherited interfaces (`interface IGreeter {..} .. inherited from TBase`) with only the dispatching slots, resolved against the child (`Greet -> vslot 0 (virtual: TDerived.Greet)`). Helpers in `server/classintf.py`: `virtual_slot(bd, vmt, thunk_target)` and `virtual_impls(bd, vmt, slot)` (names of the class's code and of the overriding descendants), `parent_chain`. FPC thunks jump to the method and keep the address form. The vslot test is "target address is exactly one virtual slot of the owner" (no new index row, no version key changed).
+- P6: `vtable` (and `function` on a class address) print a run of 4 or more inherited slots, in a table of 64 or more slots (small tables keep every slot, so empty/abstract facts stay visible), as `[0-309] inherited from TCustomForm, TObject, .. (+N more), 310 slots`; own (new / override) slots, slots with an RTTI name and the marked slot stay. **[verified]** copy of the r9fpc project: `vtable TFormMain` 30,189 chars (2 binaries, 311 slots each) -> 1,416 chars. The tool still uses `function_budget`.
+- P7: `delphi_events component=X` without `form`: exact component/action name, else prefix, else part of the name, over all forms (also with `form`); a non-exact match adds `component 'Flush': no exact name; partial match, 6 events`. `MainForm.actFlush` form prefix accepts the class name without its T. **[verified]** HeidiSQL copy: `component=actFlush` and `component=Flush` list the 6 `actFlush*` actions (was `not_found`).
+- Tests: `test_r8_intf.py::test_interface_listing_shows_virtual_dispatch`, `test_inherited_slot_runs_are_one_line`, `test_r8g.py::test_delphi_events_component_without_form`.
+
+## Round 9 fix D: strings retry, search program body, incremental function creation (P4, P8, P9)
+
+- P4: `strings`: a literal pattern that finds nothing and contains a regex character (now also `\`) is retried as a regex
+  (`(regex used: no literal match)`); a `regex=true` pattern that finds nothing is retried as literal text
+  (`(literal used: no regex match)`, only when the literal finds something). `server/tools/core.py`.
+- P9: `search` with `main`, `WinMain`, `wWinMain`, `PASCALMAIN` or `program` adds the line
+  `function <body> <addr> (program body: <query>)` for Delphi/FPC programs without a function of that name (same rule as
+  the `function` target). Not added when a real function has that name.
+- P8: **[verified]** on a copy of the ExifToolGUI project (31k functions): the call creating one function took 41 s, all of
+  it `reextract_code` (38.5 s: edges extract about 20 s, `link_edges` 8.7 s, functions extract, `rebuild_fts` 0.5 s).
+  `targets._create_on_demand` now calls worker op `extract_at` (function rows of the new function, edge rows from its
+  body, body ranges) through `Indexer.extract_new_functions`; `Store.replace_edges_in` replaces the edges that start in the
+  body and relinks only edges that start or end there (then `link_fnptr`, `link_string_tables`, `rebuild_fts`). Same
+  call after the change: 8.6 s (create, extract, decompile). The edge and function tables were identical
+  (md5 of all edge rows with `src_fn`/`dst_fn`, and of all function rows) before and after a full `reextract_code` run.
+  Fallback to the full read: `extract_at` fails, finds no function, or `create_functions` changed the calling
+  convention of more than one function. No version key changed. Tests: `tests/test_r9d.py`.

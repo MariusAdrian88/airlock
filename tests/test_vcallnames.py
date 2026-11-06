@@ -197,3 +197,31 @@ def test_db_classes_dynamic_labels_global_and_callers():
     db.execute("UPDATE ast_node SET start_off=? WHERE function_id=12", (off,))
     assert V.DbClasses(store, b, 4198400).caller_classes(0) == [5242880]
     assert V.DbClasses(store, b, 4198400).caller_classes(2) is None      # no such argument
+
+
+class Fake64(Fake):
+    psize = 8
+
+    def method(self, vmt, slot):
+        return self.vmt[vmt], ("TButton.Click" if (vmt, slot) == (0x510000, 310) else "")
+
+
+def test_plain_x64_virtual_calls_get_a_slot_comment():
+    c = ("void FUN_x(longlong *param_1)\n{\n  longlong *local_18;\n\n  local_18 = param_1;\n"
+         "  (**(code **)(*local_18 + 0xa10))(local_18,&local_20,local_28);\n"
+         "  (**(code **)(*(longlong *)DAT_14059e150 + 0xa10))(DAT_14059e150,1);\n"
+         "  (**(code **)(**(longlong **)(param_1 + 0x4a0) + 0xa10))();\n"
+         "  (**(code **)*local_18)(local_18);\n  (**(code **)(*local_18 + 0x18))(local_18);\n}\n")
+    f = Fake64()
+    f.field_class = lambda vmt, off: 0x510000 if off == 0x4a0 else None
+    out = V.annotate(c, f)
+    assert "(**(code **)(*local_18 + 0xa10))/*TFormMain vslot 310*/(local_18,&local_20" in out      # FPC: 0xa10/8 - 12
+    assert "0xa10))/*vslot 310*/(DAT_14059e150,1)" in out                                          # unknown receiver
+    assert "0xa10))/*TButton vslot 310 -> TButton.Click*/()" in out                                # field receiver
+    assert "(**(code **)*local_18)(local_18)" in out                                               # header offset: none
+    assert "0x18))(local_18)" in out                                                               # slot < 0 for FPC
+    f.fpc = False                                                                                  # Delphi: off / 8
+    out = V.annotate(c, f)
+    assert "(**(code **)*local_18)/*TFormMain vslot 0*/(local_18)" in out
+    assert "0x18))/*TFormMain vslot 3*/(local_18)" in out
+    assert "0xa10))/*TFormMain vslot 322*/(local_18" in out

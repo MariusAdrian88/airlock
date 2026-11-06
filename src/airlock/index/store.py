@@ -174,6 +174,17 @@ def _fts_query(text: str) -> str | None:
     return "text : (" + " ".join(f'"{t}"*' for t in toks) + ")"
 
 
+# Worker or JVM failures: not decompiler results. Never cached; a stored row with one of these
+# in `error` (older indexes) counts as a cache miss and is deleted.
+TRANSIENT_DECOMP_ERRORS = ("JVMNotRunning", "ClosedException", "File is closed", "no_program",
+                           "worker_exited", "WorkerError: timeout", "WorkerError: busy",
+                           "worker stopped")
+
+
+def is_transient_decomp_error(text: str | None) -> bool:
+    return any(x in (text or "") for x in TRANSIENT_DECOMP_ERRORS)
+
+
 class Store:
     """One index.sqlite. Not thread-safe; use one Store per thread."""
 
@@ -366,6 +377,21 @@ class Store:
         (ram space; size NULL/0 counts as 1 byte)."""
         # Done in Python with a sorted entry table: a correlated SQL lookup is
         # O(functions) per address that lies in no function (data, strings).
+        find = self._fn_finder(binary_id)
+        rows = self.db.execute(
+            "SELECT rowid, src_addr, dst_addr FROM edge WHERE binary_id=?", (binary_id,)
+        ).fetchall()
+        with self.db:
+            self.db.executemany(
+                "UPDATE edge SET src_fn=?, dst_fn=? WHERE rowid=?",
+                [(find(r["src_addr"]), find(r["dst_addr"]), r["rowid"]) for r in rows],
+            )
+        self.normalise_import_edges(binary_id)
+        self.link_fnptr(binary_id)
+        self.link_string_tables(binary_id)
+
+    def _fn_finder(self, binary_id: int):
+        """``find(addr)``: id of the ram function containing ``addr`` (size NULL/0 counts as 1 byte), or None."""
         fns = self.db.execute(
             "SELECT id, entry, MAX(COALESCE(size,0),1) AS sz FROM function "
             "WHERE binary_id=? AND space='ram' ORDER BY entry", (binary_id,)
@@ -379,14 +405,30 @@ class Store:
                     return fns[k]["id"]
             return None
 
-        rows = self.db.execute(
-            "SELECT rowid, src_addr, dst_addr FROM edge WHERE binary_id=?", (binary_id,)
-        ).fetchall()
+        return find
+
+    def replace_edges_in(self, binary_id: int, ranges: list[tuple[int, int]],
+                         rows: Iterable[tuple[int, int, str]]) -> None:
+        """New functions at ``ranges`` (inclusive address ranges of their bodies): replace the edges that start
+        there with ``rows`` and link every edge that starts or ends there, then redo the derived links
+        (the same result as ``link_edges`` after a full re-read, without touching the other edges)."""
+        with self.db:
+            for lo, hi in ranges:
+                self.db.execute("DELETE FROM edge WHERE binary_id=? AND src_addr BETWEEN ? AND ?",
+                                (binary_id, lo, hi))
+        self.insert_edges(binary_id, rows)
+        find = self._fn_finder(binary_id)
+        touched: dict[int, tuple[int, int]] = {}
+        for lo, hi in ranges:
+            for r in self.db.execute(
+                    "SELECT rowid, src_addr, dst_addr FROM edge WHERE binary_id=? AND src_addr BETWEEN ? AND ? "
+                    "UNION SELECT rowid, src_addr, dst_addr FROM edge WHERE binary_id=? "
+                    "AND dst_addr BETWEEN ? AND ?", (binary_id, lo, hi, binary_id, lo, hi)):
+                touched[r["rowid"]] = (r["src_addr"], r["dst_addr"])
         with self.db:
             self.db.executemany(
                 "UPDATE edge SET src_fn=?, dst_fn=? WHERE rowid=?",
-                [(find(r["src_addr"]), find(r["dst_addr"]), r["rowid"]) for r in rows],
-            )
+                [(find(s), find(d), rid) for rid, (s, d) in touched.items()])
         self.normalise_import_edges(binary_id)
         self.link_fnptr(binary_id)
         self.link_string_tables(binary_id)
@@ -649,6 +691,8 @@ class Store:
         self, function_id: int, fn_version: int, analysis_profile: str, status: str,
         c_text: str | None = None, error: str | None = None, produced_at: str | None = None,
     ) -> None:
+        if status != "ok" and is_transient_decomp_error(error):
+            return   # never cache a worker failure
         with self.db:
             self.db.execute(
                 "INSERT INTO decomp(function_id, fn_version, analysis_profile, c_text, status, "
@@ -1077,8 +1121,23 @@ class Store:
         ).fetchone()
         if not r:
             return None
+        if r["status"] != "ok" and is_transient_decomp_error(r["error"]):
+            with self.db:   # a stored worker failure: a miss, and gone
+                self.db.execute("DELETE FROM decomp WHERE function_id=?", (fn.id,))
+            return None
         return Decomp(r["function_id"], r["fn_version"], r["analysis_profile"], r["c_text"],
                       r["status"], r["error"], r["produced_at"])
+
+    def purge_transient_decomp(self) -> int:
+        """Delete stored rows whose error is a worker or JVM failure (see TRANSIENT_DECOMP_ERRORS),
+        so the background pass plans those functions again. Returns the rows deleted."""
+        ids = [r[0] for r in self.db.execute(
+            "SELECT function_id, error FROM decomp WHERE status<>'ok' AND error IS NOT NULL")
+            if is_transient_decomp_error(r[1])]
+        if ids:
+            with self.db:
+                self.db.executemany("DELETE FROM decomp WHERE function_id=?", [(i,) for i in ids])
+        return len(ids)
 
     def decomp_candidates(self, binary_id: int, analysis_profile: str) -> list[sqlite3.Row]:
         """Functions the background pass should decompile: not thunk, not external, in ram,
@@ -1116,6 +1175,8 @@ class Store:
         n = 0
         with self.db:
             for it in items:
+                if it.get("status") != "ok" and is_transient_decomp_error(it.get("error")):
+                    continue   # never cache a worker failure
                 row = self.db.execute("SELECT version FROM function WHERE id=?",
                                       (it["function_id"],)).fetchone()
                 if row is None or row[0] != it["fn_version"]:

@@ -221,6 +221,18 @@ def delphi_forms(ctx: ServerContext, form: str = "", binary: str = "", cursor: s
 
 # ── delphi_events ──────────────────────────────────────────────────────────
 
+def _match(rows: list, want: str) -> tuple[list, str]:
+    """Rows whose component (or action) name is ``want``; else those that start with it; else those that contain it.
+    Returns (rows, "exact" | "prefix" | "partial")."""
+    name = lambda r: (r["cname"] or "form").lower()      # noqa: E731
+    for how, test in (("exact", lambda n: n == want), ("prefix", lambda n: n.startswith(want)),
+                      ("partial", lambda n: want in n)):
+        sel = [r for r in rows if test(name(r))]
+        if sel:
+            return sel, how
+    return [], ""
+
+
 def _event_line(bd: Bound, r, show_form: bool) -> str:
     who = r["cname"] or "form"
     left = f"{who}.{r['prop']}"
@@ -286,14 +298,17 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
     else:
         want = ident.split(".")[-1].lower()
         fwant = ident.split(".")[0].lower() if "." in ident else ""
-        total = 0
+        rows = []
         for bd in bounds:
-            for r in bd.store.db.execute(base + "AND lower(c.name)=? ORDER BY e.form, e.seq, e.prop",
-                                         (bd.binary.id, want)):
-                if fwant and fwant not in (r["fclass"].lower(),):
+            for r in bd.store.db.execute(base + "ORDER BY e.form, e.seq, e.prop", (bd.binary.id,)):
+                if fwant and r["fclass"].lower() not in (fwant, "t" + fwant):
                     continue
-                total += 1
-                lines.append(f"{_prefix(bd, several)}" + _event_line(bd, r, True))
-        if not lines:
+                rows.append((bd, r))
+        sel, how = _match([r for _, r in rows], want)
+        if not sel:
             return f"error not_found: no component '{ident}' with event handlers."
+        keep = {id(r) for r in sel}
+        if how != "exact":
+            lines.append(f"component '{ident.split('.')[-1]}': no exact name; {how} match, {len(sel)} events")
+        lines += [f"{_prefix(bd, several)}" + _event_line(bd, r, True) for bd, r in rows if id(r) in keep]
     return fit_lines(lines, bud, "code", tool="delphi_events", args=args)[0]

@@ -36,6 +36,20 @@ def test_delphi_events_component_inside_form(proj):  # noqa: F811
     assert both[0] == "TMainForm events 8"
 
 
+def test_delphi_events_component_without_form(proj):  # noqa: F811
+    """Round 9 (P7): no form: exact name, else prefix, else part of the name, over all forms."""
+    ctx, st, bid, pe = proj
+    exact = dtools.delphi_events(ctx, component="Button1").splitlines()
+    assert len(exact) == 1 and exact[0].startswith("TMainForm Button1.OnClick")
+    pre = dtools.delphi_events(ctx, component="Check").splitlines()
+    assert pre[0] == "component 'Check': no exact name; prefix match, 2 events" and len(pre) == 3
+    part = dtools.delphi_events(ctx, component="utton1").splitlines()
+    assert part[0] == "component 'utton1': no exact name; partial match, 1 events" and "Button1.OnClick" in part[1]
+    dotted = dtools.delphi_events(ctx, component="MainForm.Button1")      # form class without its T
+    assert dotted.startswith("TMainForm Button1.OnClick")
+    assert dtools.delphi_events(ctx, component="Nope").startswith("error not_found:")
+
+
 # -- N10: xrefs kind=code, strings without pattern, bare method -------------------------------------
 
 def _world(tmp_path):

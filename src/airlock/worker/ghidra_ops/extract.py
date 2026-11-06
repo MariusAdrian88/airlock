@@ -68,6 +68,22 @@ class Cursor:
 
 # ── functions ──────────────────────────────────────────────────────────────
 
+def _function_row(f: Any) -> list[Any]:
+    entry = f.getEntryPoint()
+    src = str(f.getSymbol().getSource().name())
+    ns = f.getParentNamespace()
+    return [
+        S.space_of(entry), S.addr_int(entry), str(f.getName()),
+        NAME_STATE.get(src, "auto"), src,
+        None if ns.isGlobal() else str(ns.getName(True)),
+        str(f.getPrototypeString(False, False)),
+        str(f.getCallingConventionName()),
+        int(f.getBody().getNumAddresses()),
+        1 if f.isThunk() else 0,
+        1 if f.isExternal() else 0,
+    ]
+
+
 def _functions(p: Any) -> Iterator[list[Any]]:
     fm = p.getFunctionManager()
     skip = stubs.stub_range(p)      # the airlock stubs are no program functions
@@ -75,18 +91,7 @@ def _functions(p: Any) -> Iterator[list[Any]]:
         entry = f.getEntryPoint()
         if skip is not None and not f.isExternal() and stubs.in_range(skip, S.addr_int(entry)):
             continue
-        src = str(f.getSymbol().getSource().name())
-        ns = f.getParentNamespace()
-        yield [
-            S.space_of(entry), S.addr_int(entry), str(f.getName()),
-            NAME_STATE.get(src, "auto"), src,
-            None if ns.isGlobal() else str(ns.getName(True)),
-            str(f.getPrototypeString(False, False)),
-            str(f.getCallingConventionName()),
-            int(f.getBody().getNumAddresses()),
-            1 if f.isThunk() else 0,
-            1 if f.isExternal() else 0,
-        ]
+        yield _function_row(f)
 
 
 # ── imports ────────────────────────────────────────────────────────────────
@@ -194,7 +199,8 @@ def _edge_kinds(rt: Any) -> list[str]:
     return []
 
 
-def _edges(p: Any) -> Iterator[list[Any]]:
+def _edges(p: Any, sources: Any = None) -> Iterator[list[Any]]:
+    """Edge rows of the references from ``sources`` (an AddressSetView; the whole memory when None)."""
     rm = p.getReferenceManager()
     fm = p.getFunctionManager()
     memory = p.getMemory()
@@ -204,7 +210,7 @@ def _edges(p: Any) -> Iterator[list[Any]]:
         f = fm.getFunctionContaining(addr)
         return S.addr_int(f.getEntryPoint()) if f is not None else None
 
-    it = rm.getReferenceSourceIterator(memory, True)
+    it = rm.getReferenceSourceIterator(memory if sources is None else sources, True)
     while it.hasNext():
         src = it.next()
         src_off = S.addr_int(src)
@@ -279,3 +285,40 @@ def extract(args: dict[str, Any]) -> dict[str, Any]:
             "image_base": S.addr_int(p.getImageBase()),
             "pointer_size": int(p.getDefaultPointerSize()),
         }
+
+
+@op("extract_at")
+@guarded
+def extract_at(args: dict[str, Any]) -> dict[str, Any]:
+    """extract_at(program, addresses): the function rows (columns as ``extract`` functions) of the functions
+    that start at the integer ``addresses``, the edge rows (columns as ``extract`` edges) of the references
+    from their bodies, and the body ranges [[min, max], ...] (ints). Used after ``create_functions`` so the
+    server need not read the whole program again."""
+    from ghidra.program.model.address import AddressSet  # type: ignore
+
+    from .annotate import _address
+
+    e = S.ready_entry(args.get("program"))
+    try:
+        wanted = sorted({int(a) for a in args.get("addresses") or []})
+    except (TypeError, ValueError) as ex:
+        raise WorkerError("bad_args", f"addresses must be integers ({ex})") from ex
+    if not wanted:
+        raise WorkerError("bad_args", "addresses must be a non-empty list of integers")
+    with S.POOL.foreground(), e.lock.read():
+        p = e.program
+        fm = p.getFunctionManager()
+        body = AddressSet()
+        frows: list[list[Any]] = []
+        ranges: list[list[int]] = []
+        for a in wanted:
+            f = fm.getFunctionAt(_address(p, None, a))
+            if f is None:
+                continue
+            frows.append(_function_row(f))
+            body.add(f.getBody())
+            for r in f.getBody().getAddressRanges():
+                ranges.append([S.addr_int(r.getMinAddress()), S.addr_int(r.getMaxAddress())])
+        erows = list(_edges(p, body)) if frows else []
+        return {"function_columns": FUNCTION_COLUMNS, "functions": frows, "edge_columns": EDGE_COLUMNS,
+                "edges": erows, "ranges": ranges}

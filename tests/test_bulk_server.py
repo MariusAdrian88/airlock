@@ -527,3 +527,114 @@ def test_block_listing_rows():
         "0x00401000 [3 insns] calls KERNEL32.DLL::Sleep -> JNZ LAB_00401020",
         '0x00401008 [2 insns] refs "hello" -> RET',
         "0x00401020 [1 insns]"]
+
+
+# ── round 9: worker failures are never cached; index_status is read-only; no project switch ──
+
+CLOSED = "WorkerError: no_program: 'app_exe' was closed by a project switch."
+
+
+def test_index_status_does_not_resume_or_switch_projects(pass_ctx):
+    ctx = pass_ctx
+    fill(ctx)
+    ix = ctx.indexer
+    ix._resumed.discard("proj")
+    ctx.worker.calls.clear()
+    out = admin.index_status(ctx)
+    assert "proj" in out or "app" in out
+    assert "proj" not in ix._resumed and not ix.bulk.active()
+    assert ctx.worker.calls == []
+    admin.index_status(ctx, project="proj")
+    assert "proj" not in ix._resumed and ctx.worker.calls == []
+
+
+def test_store_never_saves_a_worker_failure(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    st = ctx.indexer.store("proj")
+    a = st.function_at(bid, 0x401000)
+    for err in (CLOSED, "JVMNotRunning: gone", "WorkerError: worker_exited: x",
+                "WorkerError: timeout: 'decompile' did not answer"):
+        st.upsert_decomp(a.id, a.version, "prof1", "error", error=err)
+        st.save_decomp_batch("prof1", [{"function_id": a.id, "fn_version": a.version,
+                                        "status": "error", "error": err}], "now")
+        assert st.get_decomp(a, "prof1") is None
+    st.upsert_decomp(a.id, a.version, "prof1", "error", error="Low-level Error: x")
+    assert st.get_decomp(a, "prof1").status == "error"      # a decompiler result stays
+
+
+def test_stored_transient_rows_are_misses_and_deleted(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    st = ctx.indexer.store("proj")
+    a, b = st.function_at(bid, 0x401000), st.function_at(bid, 0x401100)
+    with st.db:     # rows an older version stored
+        for f in (a, b):
+            st.db.execute("INSERT INTO decomp(function_id, fn_version, analysis_profile, status, error) "
+                          "VALUES (?,?,?,?,?)", (f.id, f.version, "prof1", "error", CLOSED))
+    assert st.get_decomp(a, "prof1") is None
+    assert st.db.execute("SELECT COUNT(*) FROM decomp WHERE function_id=?", (a.id,)).fetchone()[0] == 0
+    assert st.purge_transient_decomp() == 1
+    # `function` does a live decompile for it
+    out = core.function(ctx, "0x401100")
+    assert ctx.worker.count("decompile") == 1 and "closed" not in out
+
+
+def test_resume_plans_functions_with_stored_transient_rows(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    st = ctx.indexer.store("proj")
+    with st.db:
+        for e in (0x401000, 0x401100, 0x401200):
+            f = st.function_at(bid, e)
+            st.db.execute("INSERT INTO decomp(function_id, fn_version, analysis_profile, status, error) "
+                          "VALUES (?,?,?,?,?)", (f.id, f.version, "prof1", "error", CLOSED))
+    assert ctx.indexer.bulk.resume("proj") == 1
+    assert ctx.indexer.bulk.wait_idle()
+    assert st.decomp_current_count(bid, "prof1") == 3
+    assert all(st.get_decomp(st.function_at(bid, e), "prof1").status == "ok"
+               for e in (0x401000, 0x401100, 0x401200))
+
+
+def test_pass_drops_worker_failures_and_queues_the_rest_again(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    w = ctx.worker
+    orig = w._pass
+    runs = []
+
+    def flaky(args):
+        runs.append(1)
+        if len(runs) == 1:      # first pass: the project is closed under it
+            w.event({"event": "decompile_results", "program": args["program"], "job": 7,
+                     "ast_columns": AST_COLS,
+                     "results": [{"entry": e, "status": "error", "error": CLOSED} for e in args["order"]]})
+            w._progress(args["program"], "done", len(args["order"]), len(args["order"]))
+            return
+        orig(args)
+    w._pass = flaky
+    ctx.indexer.bulk.schedule("proj", bid)
+    assert ctx.indexer.bulk.wait_idle()
+    st = ctx.indexer.store("proj")
+    assert len(runs) == 2 and st.decomp_current_count(bid, "prof1") == 3
+    assert st.db.execute("SELECT COUNT(*) FROM decomp WHERE status<>'ok'").fetchone()[0] == 0
+
+
+def test_pass_waits_while_a_session_is_bound_to_another_project(pass_ctx):
+    ctx = pass_ctx
+    bid = fill(ctx)
+    ix = ctx.indexer
+    ix.current = "other"
+    ix.bulk.schedule("proj", bid)
+    time.sleep(0.3)
+    assert ctx.worker.orders == [] and ix.bulk.active()      # no ensure_open, no switch
+    assert ctx.worker.count("open_project") == 0
+    ix.current = "proj"
+    assert ix.bulk.wait_idle()
+    assert len(ctx.worker.orders) == 1
+
+
+def test_check_open_error_has_no_instruction():
+    from airlock.worker.ghidra_ops import decompile
+    src = open(decompile.__file__, encoding="utf-8").read()
+    assert "Call open_project again" not in src

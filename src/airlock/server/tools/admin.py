@@ -89,13 +89,12 @@ def index_status(ctx: ServerContext, project: str = "") -> str:
            f"ghidra {'started' if w.ghidra is not None and w.running() else 'not started'}",
            f"logs worker {ctx.config.data_dir / 'logs' / logs.WORKER_LOG}; server {ctx.config.data_dir / 'logs' / logs.SERVER_LOG}"]
     try:
-        names = [ix.resolve_project(project)] if project else ix.projects()
+        names = [ix._resolve_project(project)] if project else ix.projects()   # read-only: no resume
     except IndexerError as e:
         return e.message
     if not names:
         out.append("no projects")
     for p in names:
-        ix.resume_project(p)
         st = ix.store(p)
         out += _project_lines(ix, p, st)
     return chr(10).join(out)
