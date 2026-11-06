@@ -127,24 +127,27 @@ def _cut(lines: Sequence[str], budget: int, kind: str) -> int:
     return n
 
 
-def _split(lines: Sequence[str], budget: int, kind: str) -> tuple[list[str], int]:
-    if sum(_cost(ln, kind) for ln in lines) <= budget:
+def _split(lines: Sequence[str], budget: int, kind: str,
+           max_lines: int = 0) -> tuple[list[str], int]:
+    if sum(_cost(ln, kind) for ln in lines) <= budget and not 0 < max_lines < len(lines):
         return list(lines), 0
     n = _cut(lines, budget, kind)
+    if max_lines > 0:
+        n = min(n, max_lines)
     return list(lines[:n]), len(lines) - n
 
 
 def fit_lines(lines: Iterable[str], budget: int, kind: str = "prose", *,
               tool: str = "", args: dict[str, Any] | None = None,
-              store: CursorStore | None = None) -> tuple[str, int]:
-    """Cut `lines` at a line boundary to fit `budget` tokens.
+              store: CursorStore | None = None, max_lines: int = 0) -> tuple[str, int]:
+    """Cut `lines` at a line boundary to fit `budget` tokens (and `max_lines` if > 0).
 
     Returns (text, remaining_line_count). When lines remain, the text ends with
     `… N more lines. cursor=<id>` and the rest is stored under that cursor.
     At least one line is always emitted so a resumed cursor always progresses.
     """
     seq = list(lines)
-    head, rem = _split(seq, budget, kind)
+    head, rem = _split(seq, budget, kind, max_lines)
     if not rem:
         return "\n".join(head), 0
     cid = (STORE if store is None else store).create_lines(tool, args, seq[len(head):])
@@ -171,7 +174,7 @@ def fit_text(text: str, budget: int, kind: str = "code", *, offset: int = 0,
 
 def resume_lines(cursor_id: str, budget: int, kind: str = "prose", *, tool: str,
                  args: dict[str, Any] | None = None,
-                 store: CursorStore | None = None) -> tuple[str, int]:
+                 store: CursorStore | None = None, max_lines: int = 0) -> tuple[str, int]:
     """Continue a list-style cursor (validates it, consumes it, may issue a new one).
 
     Raises CursorError; return e.message to the agent.
@@ -179,4 +182,5 @@ def resume_lines(cursor_id: str, budget: int, kind: str = "prose", *, tool: str,
     st = STORE if store is None else store
     cur = st.get(cursor_id, tool, args)
     st.drop(cursor_id)
-    return fit_lines(cur.lines or [], budget, kind, tool=tool, args=args, store=st)
+    return fit_lines(cur.lines or [], budget, kind, tool=tool, args=args, store=st,
+                     max_lines=max_lines)

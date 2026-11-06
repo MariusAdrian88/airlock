@@ -39,15 +39,15 @@ CALLGRAPH_FANOUT = 15
 CALLGRAPH_MAX_LINES = 500
 
 
-def _cursor_page(cursor: str, tool_name: str, budget: int) -> str:
+def _cursor_page(cursor: str, tool_name: str, budget: int, max_lines: int = 0) -> str:
     try:
-        return resume_lines(cursor, budget, "code", tool=tool_name)[0]
+        return resume_lines(cursor, budget, "code", tool=tool_name, max_lines=max_lines)[0]
     except CursorError as e:
         return e.message
 
 
-def _page(lines: list[str], tool_name: str, args: dict, budget: int) -> str:
-    return fit_lines(lines, budget, "code", tool=tool_name, args=args)[0]
+def _page(lines: list[str], tool_name: str, args: dict, budget: int, max_lines: int = 0) -> str:
+    return fit_lines(lines, budget, "code", tool=tool_name, args=args, max_lines=max_lines)[0]
 
 
 # ── open_binary / list_binaries ────────────────────────────────────────────────
@@ -1067,11 +1067,15 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
 def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool = False,
             with_refs: bool = True, limit: int = 30, cursor: str = "", budget: int = 0) -> str:
     bud = budget_for(ctx, budget)
+    used = ""
+    page = max(1, min(int(limit), 500))
     if cursor:
-        return _cursor_page(cursor, "strings", bud)
+        res = _cursor_page(cursor, "strings", bud, page)
+        if not (pattern and res.startswith("error bad_cursor")):
+            return res
+        used = f"(cursor {cursor} unknown, searched anew)"   # a pattern is given: do the search
     if not pattern:
         return "error bad_args: pattern is empty."
-    used = ""
     if regex:
         try:
             re.compile(pattern)
@@ -1081,7 +1085,7 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     if isinstance(many, str):
         return many
     bounds, skipped = many
-    limit = max(1, min(int(limit), 500))
+    limit = STRINGS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
     merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
     if not merged and not regex and _REGEX_CHARS.search(pattern) and _compiles(pattern):
         regex, used = True, "(regex used: no literal match)"    # `a|b`, `^foo`: meant as a regex
@@ -1096,9 +1100,10 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     out = [head, *merged]
     args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
             "limit": limit}
-    return _page(out, "strings", args, bud)
+    return _page(out, "strings", args, bud, page + 1)    # +1: the header line
 
 
+STRINGS_FETCH = 500
 _REGEX_CHARS = re.compile(r"[|\^$*+?\[\](){}]")
 
 

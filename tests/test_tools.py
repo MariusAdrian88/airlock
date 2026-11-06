@@ -875,3 +875,20 @@ def test_delphi_method_names_resolve_and_search():
     _qt_method_hits(bd, "button2", 50, groups, 0, "")
     assert [x for _, x in groups["function"]] == [
         "function TFRemoveMeta.Button2Click 0x0082d2a8 (Delphi published)"]
+
+
+def test_strings_capped_result_has_cursor_and_bad_cursor_falls_back(ctx, monkeypatch):
+    # Eval t14: "40+" without a cursor made the agent invent cursor '40' -> bad_cursor.
+    lines = [f"0x{0x1000 + i:08x} \"s{i}\"" for i in range(100)]
+    monkeypatch.setattr(core, "_string_lines", lambda *a, **k: (list(lines), False))
+    out = core.strings(ctx, "FILE", limit=40, budget=100000)
+    rows = out.splitlines()
+    assert rows[0].startswith("strings matching 'FILE': 100") and rows[-1].startswith("… 60 more lines. cursor=")
+    assert len(rows) == 1 + 40 + 1
+    cid = rows[-1].rsplit("cursor=", 1)[1]
+    nxt = core.strings(ctx, cursor=cid, limit=40, budget=100000).splitlines()
+    assert nxt[0] == lines[40] and nxt[39] == lines[79] and "more lines" in nxt[-1]
+    # an unknown cursor together with a pattern: search anew, say so, do not fail
+    again = core.strings(ctx, "FILE", cursor="40", limit=40, budget=100000)
+    assert not again.startswith("error") and "(cursor 40 unknown, searched anew)" in again
+    assert core.strings(ctx, cursor="40").startswith("error bad_cursor")

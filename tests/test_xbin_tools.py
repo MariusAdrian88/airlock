@@ -100,7 +100,8 @@ def test_strings_across_binaries(xctx):
     assert out[0] == "strings matching 'open': 3"
     assert [ln.split("]")[0] for ln in out[1:]] == ["[main.exe", "[engine.dll", "[util.dll"]
     assert out[1] == '[main.exe] 0x00403000 "Open file failed"  <- (no refs)'
-    assert core.strings(xctx, "open", limit=2).splitlines()[0] == "strings matching 'open': 2+"
+    paged = core.strings(xctx, "open", limit=2).splitlines()   # page of 2, rest behind a cursor
+    assert paged[0] == "strings matching 'open': 3" and "1 more lines. cursor=" in paged[-1]
     assert core.strings(xctx, "open", binary="util.dll") == (
         'strings matching \'open\': 1\n0x20003000 "Open util channel"  <- (no refs)')
 
