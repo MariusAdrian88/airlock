@@ -259,7 +259,21 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
             return f"error ambiguous: '{ident}' matches {len(names)} forms: {shown}."
         bd, f = hits[0]
         rows = bd.store.db.execute(base + "AND e.form=? ORDER BY e.seq, e.prop", (bd.binary.id, f["res_name"])).fetchall()
-        lines.append(f"{_prefix(bd, several)}{f['class']} events {len(rows)}")
+        total = len(rows)
+        cwant = component.strip().split(".")[-1].lower()
+        if cwant:       # a component (or action) inside the form: exact name, else prefix
+            sel = [r for r in rows if (r["cname"] or "form").lower() == cwant] or \
+                  [r for r in rows if (r["cname"] or "form").lower().startswith(cwant)]
+            if not sel:
+                names = [x["name"] for x in bd.store.db.execute(
+                    "SELECT name FROM dl_component WHERE binary_id=? AND form=? AND seq>0 ORDER BY seq",
+                    (bd.binary.id, f["res_name"])) if x["name"]]
+                shown = ", ".join(names[:40]) + (f" (+{len(names) - 40} more)" if len(names) > 40 else "")
+                return (f"error not_found: no component '{component.strip()}' with event handlers in "
+                        f"{f['class']} (components: {shown}).")
+            rows = sel
+        head = f"{_prefix(bd, several)}{f['class']} events {len(rows)}"
+        lines.append(head + (f" of {total} (component '{component.strip()}')" if cwant else ""))
         lines += ["  " + _event_line(bd, r, False) for r in rows]
         if not rows:
             lines.append("  no event handlers")

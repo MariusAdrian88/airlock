@@ -262,3 +262,131 @@ def test_build_needs_a_compiler(tmp_path):
     (tmp_path / "bin" / "i386-win32").mkdir(parents=True)
     (tmp_path / "bin" / "i386-win32" / "fpc.exe").write_bytes(b"x")
     assert fpcsigs.find_compilers(tmp_path) == [tmp_path / "bin" / "i386-win32" / "fpc.exe"]
+
+
+# ── keep-all link (routines the reference program never calls) ────────────────
+
+def make_obj(path: Path, syms: list[tuple[str, int, int]], long_name: str | None = None) -> None:
+    """Minimal COFF object: section 1 is code, section 2 is data. ``syms``: (name, section, storage class)."""
+    strtab = b""
+    names = list(syms) + ([(long_name, 1, 2)] if long_name else [])
+    ents = b""
+    for nm, sec, sc in names:
+        raw = nm.encode()
+        if len(raw) <= 8:
+            field = raw.ljust(8, b"\0")
+        else:
+            field = b"\0\0\0\0" + struct.pack("<I", 4 + len(strtab))
+            strtab += raw + b"\0"
+        ents += field + struct.pack("<IhHBB", 0, sec, 0, sc, 0)
+    sect = lambda ch: b".x".ljust(8, b"\0") + struct.pack("<IIIIIIHHI", 0, 0, 0, 0, 0, 0, 0, 0, ch)
+    hdr = 20 + 80
+    path.write_bytes(struct.pack("<HHIIIHH", 0x14C, 2, 0, hdr, len(names), 0, 0)
+                     + sect(0x60000020) + sect(0xC0000040) + ents + struct.pack("<I", 4 + len(strtab)) + strtab)
+
+
+def test_object_symbols_lists_global_code_symbols(tmp_path):
+    o = tmp_path / "dialogs.o"
+    make_obj(o, [("SHOWMSG", 1, 2), ("DATAVAR", 2, 2), ("LOCALFN", 1, 3), ("UNDEF", 0, 2)],
+             long_name="DIALOGS_$$_SHOWMESSAGE$ANSISTRING")
+    assert fpcsigs.object_symbols(o) == ["SHOWMSG", "DIALOGS_$$_SHOWMESSAGE$ANSISTRING"]
+
+
+def test_keep_symbols_reads_only_the_listed_units(tmp_path):
+    make_obj(tmp_path / "Dialogs.o", [("A1", 1, 2), ("A2", 1, 2)])
+    make_obj(tmp_path / "other.o", [("B1", 1, 2)])
+    assert fpcsigs.keep_symbols(["dialogs", "nounit"], [tmp_path]) == ["A1", "A2"]
+
+
+def _fake_compiler(tmp_path: Path, fail_with_keep: bool) -> fpcsigs.Compiler:
+    """A Python script that stands in for fpc: records its command line, writes the exe."""
+    log = tmp_path / "calls.txt"
+    script = tmp_path / "fakefpc.py"
+    script.write_text(
+        "import sys, pathlib\n"
+        f"a = sys.argv[1:]\nopen(r'{log}', 'a').write(' '.join(a) + '\\n')\n"
+        f"if {fail_with_keep!r} and 'airlock_keep' in open(a[-1]).read():\n    print('Error: undefined reference'); sys.exit(1)\n"
+        "fe = [x[3:] for x in a if x.startswith('-FE')][0]\n"
+        "pathlib.Path(fe, pathlib.Path(a[-1]).stem + '.exe').write_bytes(b'MZ')\n")
+    bat = tmp_path / "fakefpc.bat"
+    bat.write_text(f'@"{__import__("sys").executable}" "{script}" %*\n')
+    return fpcsigs.Compiler(bat, "3.2.2", "i386", "win32")
+
+
+def test_write_keep_object_has_one_relocation_per_symbol(tmp_path):
+    for bits, machine, rtype in ((32, 0x14C, 6), (64, 0x8664, 1)):
+        o = tmp_path / f"k{bits}.o"
+        fpcsigs.write_keep_object(o, "airlock_keep", ["SYMBOL_ONE", "B"], bits)
+        d = o.read_bytes()
+        mach, nsec, _t, symptr, nsym = struct.unpack_from("<HHIII", d, 0)
+        assert (mach, nsec, nsym) == (machine, 1, 3)
+        size, rawptr, relptr, _l, nrel = struct.unpack_from("<IIIIH", d, 20 + 16)
+        assert (size, nrel) == (2 * bits // 8, 2)
+        rel = [struct.unpack_from("<IIH", d, relptr + 10 * i) for i in range(2)]
+        assert rel == [(0, 1, rtype), (bits // 8, 2, rtype)]
+        assert d[symptr:symptr + 8] == b"airlock_" or d[symptr:symptr + 4] == bytes(4)    # long name: string table
+
+
+def test_write_keep_objects_split_in_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(fpcsigs, "_KEEP_CHUNK", 2)
+    names = fpcsigs.write_keep_objects(tmp_path, "lclmega", ["A", "B", "C"], 32)
+    assert names == ["airlock_keep_lclmega_0", "airlock_keep_lclmega_1"]
+    assert all((tmp_path / f"{n}.o").is_file() for n in names)
+
+
+def test_compile_makes_the_program_refer_to_every_routine(tmp_path):
+    comp = _fake_compiler(tmp_path, False)
+    objs = tmp_path / "o"
+    objs.mkdir()
+    make_obj(objs / "dialogs.o", [("DIALOGS_SHOWMESSAGE", 1, 2)])
+    exe = fpcsigs._compile(comp, ["Dialogs"], tmp_path / "w", "lclmega", [], lambda _m: None, [objs])
+    assert exe.is_file()
+    pas = (tmp_path / "w" / "lclmega.pas").read_text()
+    assert "{$L airlock_keep_lclmega_0.o}" in pas and "external name 'airlock_keep_lclmega_0'" in pas
+    assert "if @airlock_keep_lclmega_0 = nil" in pas
+    assert (tmp_path / "w" / "airlock_keep_lclmega_0.o").is_file()
+
+
+def test_compile_falls_back_to_the_normal_link(tmp_path):
+    comp = _fake_compiler(tmp_path, True)
+    objs = tmp_path / "o"
+    objs.mkdir()
+    make_obj(objs / "dialogs.o", [("DIALOGS_SHOWMESSAGE", 1, 2)])
+    said: list[str] = []
+    exe = fpcsigs._compile(comp, ["Dialogs"], tmp_path / "w", "lclmega", [], said.append, [objs])
+    assert exe.is_file() and any("keep-all link failed" in m for m in said)
+    assert "airlock_keep" not in (tmp_path / "w" / "lclmega.pas").read_text()
+
+
+# ── look-alike names (Create / Destroy of many classes have the same bytes) ───
+
+def _kb_with(names: list[str]) -> idr.Kb:
+    kb = idr.Kb("fpc-3.2.2-32")
+    kb.procs = [idr.Proc(n, 0, 0, 8, 8) for n in names]
+    return kb
+
+
+def test_class_of_name():
+    assert idr._class_of("Graphics.TFont.Destroy") == "tfont"
+    assert idr._class_of("Dialogs.ShowMessage") == ""
+
+
+def test_class_table_picks_the_owner_class(monkeypatch):
+    names = ["Graphics.TFont.Destroy", "Graphics.TPen.Destroy", "Graphics.TBrush.Destroy"]
+    kb = _kb_with(names)
+    out = {0x1000: list(names)}
+    kept = {0x1000: [0, 1, 2]}
+    monkeypatch.setattr(idr, "_fpc_owners", lambda _img: {0x1000: {"tpen"}})
+    idr._fpc_disambiguate(kb, None, out, kept)
+    assert out == {0x1000: ["Graphics.TPen.Destroy"]} and kept == {0x1000: [1]}
+
+
+def test_unambiguous_matches_order_the_rest_and_big_sets_are_dropped(monkeypatch):
+    monkeypatch.setattr(idr, "_fpc_owners", lambda _img: {})
+    kb = _kb_with([])
+    many = [f"U{i}.TC{i}.Destroy" for i in range(6)]
+    out = {1: ["Graphics.TPen.Destroy", "Graphics.TBrush.Destroy"], 2: ["Graphics.TBrush.Close"],
+           3: ["Graphics.TBrush.Open"], 4: many}
+    idr._fpc_disambiguate(kb, None, out, {k: [] for k in out})
+    assert out[1] == ["Graphics.TBrush.Destroy", "Graphics.TPen.Destroy"]    # TBrush has two sure matches
+    assert 4 not in out

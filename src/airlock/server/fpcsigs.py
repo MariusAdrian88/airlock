@@ -2,8 +2,9 @@
 
 A Free Pascal program links the RTL (and the LCL of a Lazarus program) as the machine code of the units that
 shipped with the compiler: the same bytes in every program of that compiler version and target. The build
-compiles reference programs that ``use`` the units of a local FPC install (and of a Lazarus install) with ``-g``,
-so the linker keeps the whole units and the executable keeps its COFF symbol table. The symbols are the true
+compiles reference programs that ``use`` the units of a local FPC install (and of a Lazarus install) with ``-g``
+and refer to every routine of those units (``write_keep_objects``: the linker drops routines nobody calls), and
+the executable keeps its COFF symbol table. The symbols are the true
 names; the code of each routine is dumped and masked exactly like the Delphi package routines
 (``delphisigs.scan_named``): relocations and ``rel32`` operands outside the routine, RIP-relative operands
 (64-bit) and absolute 32-bit addresses inside the image (FPC executables have no ``.reloc`` section).
@@ -80,6 +81,34 @@ def read_coff(path: Path) -> list[tuple[str, int, int]]:
         val, sn, _typ, _sc, na = struct.unpack_from("<IhHBB", d, o + 8)
         if 1 <= sn <= len(secs) and secs[sn - 1][1]:
             out.append((name, secs[sn - 1][0] + val, 0))
+        i += 1 + na
+    return out
+
+
+def object_symbols(path: Path) -> list[str]:
+    """Names of the global symbols that lie in code sections of a COFF object file (a unit's ``.o``)."""
+    d = path.read_bytes()
+    if len(d) < 20:
+        return []
+    _mach, nsec, _t, ptr, n = struct.unpack_from("<HHIII", d, 0)
+    if not ptr or not n:
+        return []
+    code = [bool(struct.unpack_from("<I", d, 20 + 40 * i + 36)[0] & 0x20) for i in range(nsec)]
+    strtab = ptr + 18 * n
+    out: list[str] = []
+    i = 0
+    while i < n:
+        o = ptr + 18 * i
+        raw = d[o:o + 8]
+        if raw[:4] == b"\0\0\0\0":
+            off = struct.unpack_from("<I", raw, 4)[0]
+            e = d.index(b"\0", strtab + off)
+            name = d[strtab + off:e].decode("latin-1")
+        else:
+            name = raw.rstrip(b"\0").decode("latin-1")
+        _val, sn, _typ, sc, na = struct.unpack_from("<IhHBB", d, o + 8)
+        if sc == 2 and 1 <= sn <= nsec and code[sn - 1] and name and not any(c.isspace() or c in "\"'\\" for c in name):
+            out.append(name)
         i += 1 + na
     return out
 
@@ -360,6 +389,15 @@ def _unit_lists(comp: Compiler, root: Path, lazarus: Path | None) -> tuple[list[
     return sorted(set(rtl), key=str.lower), lcl, folders
 
 
+def _rtl_object_dirs(comp: Compiler, root: Path) -> list[Path]:
+    target = f"{comp.cpu}-{comp.os}"
+    for cand in (root / "units" / target, root.parent / "units" / target, root.parent.parent / "units" / target,
+                 root.parent.parent.parent / "units" / target):
+        if cand.is_dir():
+            return [cand / f for f in _RTL_FOLDERS if (cand / f).is_dir()]
+    return []
+
+
 def _compile_text(comp: Compiler, text: str, work: Path, name: str) -> Path:
     """Compile the program ``text`` with ``-g``. Returns the executable."""
     work.mkdir(parents=True, exist_ok=True)
@@ -373,21 +411,104 @@ def _compile_text(comp: Compiler, text: str, work: Path, name: str) -> Path:
     return exe
 
 
+def keep_symbols(units: list[str], obj_dirs: list[Path]) -> list[str]:
+    """Every global code symbol of the unit objects (``<unit>.o`` in ``obj_dirs``) of ``units``. The shipped
+    LCL (and a part of the RTL) is linked per routine: a routine that the reference program does not call is
+    dropped by the linker, so ``Dialogs.ShowMessage`` would be missing from the database.
+    ``write_keep_objects`` makes the program refer to all of these symbols, which keeps them."""
+    index: dict[str, Path] = {}
+    for d in obj_dirs:
+        try:
+            for p in d.glob("*.o"):
+                index.setdefault(p.stem.lower(), p)
+        except OSError:
+            continue
+    seen: dict[str, None] = {}
+    for u in units:
+        p = index.get(u.lower())
+        if p is None:
+            continue
+        try:
+            seen.update(dict.fromkeys(object_symbols(p)))
+        except (OSError, ValueError, struct.error):
+            continue
+    return list(seen)
+
+
+_KEEP_CHUNK = 30000
+
+
+def write_keep_object(path: Path, var: str, symbols: list[str], bits: int) -> None:
+    """Write a COFF object that defines the data symbol ``var``: an array of pointers to ``symbols`` (one absolute
+    relocation each). A program that uses ``var`` (``{$L path}``, ``external name``) makes the linker keep
+    every referenced routine (internal linker and ``ld``)."""
+    ps = bits // 8
+    machine, rtype = (0x8664, 1) if bits == 64 else (0x14C, 6)       # ADDR64 / DIR32
+    names = [var] + symbols
+    strtab = bytearray()
+    ents = bytearray()
+    for i, nm in enumerate(names):
+        raw = nm.encode("latin-1")
+        if len(raw) <= 8:
+            field = raw.ljust(8, bytes(1))
+        else:
+            field = bytes(4) + struct.pack("<I", 4 + len(strtab))
+            strtab += raw + bytes(1)
+        if i == 0:
+            ents += field + struct.pack("<IhHBB", 0, 1, 0, 2, 0)
+        else:
+            ents += field + struct.pack("<IhHBB", 0, 0, 0x20, 2, 0)
+    n = len(symbols)
+    raw_ofs = 20 + 40
+    reloc_ofs = raw_ofs + n * ps
+    sym_ofs = reloc_ofs + 10 * n
+    sec = (b".data".ljust(8, bytes(1))
+           + struct.pack("<IIIIIIHHI", 0, 0, n * ps, raw_ofs, reloc_ofs, 0, n, 0, 0xC0300040))
+    relocs = b"".join(struct.pack("<IIH", i * ps, 1 + i, rtype) for i in range(n))
+    path.write_bytes(struct.pack("<HHIIIHH", machine, 1, 0, sym_ofs, len(names), 0, 0) + sec
+                     + bytes(n * ps) + relocs + bytes(ents) + struct.pack("<I", 4 + len(strtab)) + bytes(strtab))
+
+
+def write_keep_objects(work: Path, name: str, symbols: list[str], bits: int) -> list[str]:
+    """Keep objects for ``symbols`` (chunks of ``_KEEP_CHUNK``: a section has at most 65535 relocations).
+    Returns the names of their data symbols."""
+    out: list[str] = []
+    for i in range(0, max(len(symbols), 1), _KEEP_CHUNK):
+        var = f"airlock_keep_{name}_{len(out)}"
+        write_keep_object(work / f"{var}.o", var, symbols[i:i + _KEEP_CHUNK], bits)
+        out.append(var)
+    return out
+
+
 def _compile(comp: Compiler, units: list[str], work: Path, name: str, folders: list[str],
-             say: Callable[[str], None]) -> Path:
+             say: Callable[[str], None], obj_dirs: list[Path] | None = None) -> Path:
     """Compile a program that uses ``units`` with ``-g``; a unit the compiler cannot find is dropped and the
-    compile retried. Returns the executable."""
+    compile retried. With ``obj_dirs`` the program refers to every routine of the units (see
+    ``keep_symbols``); when that link fails the program is linked the normal way. Returns the executable."""
     work.mkdir(parents=True, exist_ok=True)
     units = list(units)
     src = work / f"{name}.pas"
     exe = work / f"{name}.exe"
-    for _attempt in range(len(units) + 2):
-        src.write_text("program %s;\n{$mode objfpc}{$H+}\nuses\n  %s;\nbegin\nend.\n" % (name, ",\n  ".join(units)),
-                       encoding="ascii")
-        cmd = [str(comp.exe), "-g", "-vewn", f"-FE{work}", f"-FU{work}"] + [f"-Fu{f}" for f in folders] + [str(src)]
+    link_keep = bool(obj_dirs)
+    for _attempt in range(len(units) + 4):
+        decl = use = ""
+        if link_keep:
+            keys = write_keep_objects(work, name, keep_symbols(units, obj_dirs or []), comp.bits)
+            decl = "".join("{$L %s.o}\nvar %s: pointer; external name '%s';\n" % (k, k, k) for k in keys)
+            use = "".join("  if @%s = nil then Halt(1);\n" % k for k in keys)
+        src.write_text("program %s;\n{$mode objfpc}{$H+}\nuses\n  %s;\n%sbegin\n%send.\n"
+                       % (name, ",\n  ".join(units), decl, use), encoding="ascii")
+        cmd = ([str(comp.exe), "-g", "-vewn", f"-FE{work}", f"-FU{work}", f"-Fo{work}"]
+               + [f"-Fu{f}" for f in folders] + [str(src)])
+        exe.unlink(missing_ok=True)
         rc, text = _run(cmd, work)
         if rc == 0 and exe.is_file():
             return exe
+        if link_keep and not re.search(r"Can't find unit", text):
+            say(f"{name}: the keep-all link failed, linking the normal way ("
+                + " | ".join(ln for ln in text.splitlines() if "Error" in ln or "Fatal" in ln or "undefined" in ln)[:300] + ")")
+            link_keep = False
+            continue
         gone = {g.lower() for m in _MISSING.finditer(text) for g in m.groups()}      # the unit and its importer
         gone |= {m.group(1).lower() for m in re.finditer(r"Fatal: Can't find unit (\S+)", text)}
         keep = [u for u in units if u.lower() not in gone]
@@ -427,7 +548,8 @@ def build(compilers: list[Path], out_dir: Path, work: Path, fpc_root: Path | Non
         if not rtl:
             raise FpcError(f"no RTL units for {comp.cpu}-{comp.os} found near {exe}")
         wdir = work / f"fpc-{comp.version}-{comp.bits}"
-        progs: list[Path] = [_compile(comp, rtl, wdir, "rtlmega", [], say)]
+        rtl_objs = _rtl_object_dirs(comp, root)
+        progs: list[Path] = [_compile(comp, rtl, wdir, "rtlmega", [], say, rtl_objs)]
         say(f"{comp.version} {comp.bits}-bit: rtlmega ({len(rtl)} units)")
         try:
             progs.append(_compile_text(comp, _TOUCH, wdir, "systouch"))
@@ -435,7 +557,7 @@ def build(compilers: list[Path], out_dir: Path, work: Path, fpc_root: Path | Non
             say(f"{comp.version} {comp.bits}-bit: no System program ({e})")
         if lcl:
             try:
-                progs.append(_compile(comp, lcl, wdir, "lclmega", folders, say))
+                progs.append(_compile(comp, lcl, wdir, "lclmega", folders, say, [Path(f) for f in folders]))
                 say(f"{comp.version} {comp.bits}-bit: lclmega ({len(lcl)} units)")
             except FpcError as e:
                 say(f"{comp.version} {comp.bits}-bit: no LCL program ({e})")

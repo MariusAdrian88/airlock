@@ -205,5 +205,5 @@ def test_missing_ole_stream_lists_the_streams(env):  # noqa: F811
 def test_errors_end_with_data_not_orders(bad, world):  # noqa: F811
     c = world[0]
     for out in (core.xrefs(c, ""), core.function(c, "host.exe!Nope"), core.callgraph(c, "x", direction="up"),
-                core.strings(c, ""), core.search(c, "")):
+                core.search(c, "")):
         assert out.startswith("error ") and bad not in out and "\n" not in out

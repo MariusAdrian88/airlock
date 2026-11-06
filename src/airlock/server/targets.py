@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 from airlock.index.store import CODE_EDGES, Function, StringHit, Xref
@@ -363,10 +363,65 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
             fr = _focused(ctx, binary, target, kinds, aggregate)
             if fr is not None:
                 return fr
+        if r.startswith("error not_found: no function at or containing") and FUNCTION in kinds:
+            made = _create_on_demand(ctx, binary, target)
+            if made is not None:
+                _set_focus(ctx, made.bound)
+                return made
         return r
     if isinstance(r, FunctionTarget):
         _set_focus(ctx, r.bound)
     return r
+
+
+def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | None:
+    """An address in an executable block of one binary where Ghidra has no function (a Qt vtable slot, a handler
+    no static table names): create the function with the worker op ``create_functions`` (the same op as the
+    bulk pass), re-read the binary's functions and return it with a fact line. None when the session may not
+    write (clean role, ``allow_writes`` off), the address is no code, or Ghidra refuses."""
+    from airlock.server import roles
+    from airlock.server.cpp import Image
+
+    if ctx.session.role == roles.CLEAN or not ctx.config.allow_writes:
+        return None
+    sc = bind_scope(ctx, binary, target)
+    if isinstance(sc, str):
+        return None
+    pa = parse_address(sc.bare)
+    if pa is not None:
+        space, value = pa
+    elif default_name_address(sc.bare) is not None:
+        space, value = "ram", default_name_address(sc.bare)
+    elif _HEX.match(sc.bare):
+        space, value = "ram", int(sc.bare, 16)
+    else:
+        return None
+    if space != "ram" or value is None:
+        return None
+    ix = ctx.indexer
+    code: list[Bound] = []
+    for bd in sc.bounds:
+        art = ix.paths(bd.project).artifacts / bd.binary.sha256
+        img = Image.from_pe(art) if art.is_file() else None
+        if img is not None and img.is_code(value):
+            code.append(bd)
+    if len(code) != 1:
+        return None
+    bd = code[0]
+    program = ix.program_of(bd.store, bd.binary)
+    try:
+        ix.ensure_open(bd.project)
+        r = ctx.worker.request("create_functions", {"program": program, "addresses": [value]}, timeout=600)
+        if not r.get("created"):
+            return None
+        ix.reextract_code(bd.store, bd.binary, program)
+    except Exception:  # noqa: BLE001  the not_found line stands
+        return None
+    fn = bd.store.function_at(bd.binary.id, value)
+    if fn is None:
+        return None
+    return FunctionTarget(bd, fn, f"no Ghidra function at {bd.addr(value)}; created one from the code there",
+                          None if sc.explicit else f"binary {bd.binary.name}")
 
 
 def _set_focus(ctx: ServerContext, bd: Bound) -> None:
@@ -432,6 +487,14 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
     da = default_name_address(t)
     if da is not None:     # a name the decompiler prints for data or a label: the address is in it
         return _by_address(sc, f"0x{da:x}", ks)
+    if FUNCTION in ks or IMPORT_FN in ks or ADDRESS in ks:
+        mr = _bare_method(sc, t, ks)
+        if mr is not None:
+            return mr
+    if (FUNCTION in ks or IMPORT_FN in ks) and t.lower() in _PROGRAM_NAMES:
+        pr = _program_body(ctx, sc, t)
+        if pr is not None:
+            return pr
     if FEATURE in ks:
         try:
             feat = sc.store.get_feature(t.lower())
@@ -572,6 +635,98 @@ def _qt_method_addr(sc: Scope, text: str) -> int | None:
         if len(found) == 1:
             return found.pop()
     return None
+
+
+_IDENT = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _bare_method(sc: Scope, name: str, ks: frozenset[str]) -> Target | str | None:
+    """A bare method name (``fileOpen``) that is one Qt method or one published Delphi method of the scope
+    resolves to it, with a fact line; several give ``error ambiguous`` with ``Class::name 0xaddr``."""
+    if not _IDENT.match(name):
+        return None
+    found: dict[tuple[int, int], tuple[Bound, str]] = {}
+    for bd in sc.bounds:
+        for sql, sep in (
+                ("SELECT m.addr, c.name AS cn, m.name AS mn FROM qt_method m JOIN qt_class c ON "
+                 "c.binary_id=m.binary_id AND c.meta_addr=m.meta_addr WHERE m.binary_id=? AND m.name=? "
+                 "AND m.addr IS NOT NULL", "::"),
+                ("SELECT m.addr, c.name AS cn, m.name AS mn FROM dl_method m JOIN dl_class c ON "
+                 "c.binary_id=m.binary_id AND c.vmt=m.vmt WHERE m.binary_id=? AND lower(m.name)=lower(?) "
+                 "AND m.addr IS NOT NULL AND m.addr>0", ".")):
+            try:
+                rows = bd.store.db.execute(sql, (bd.binary.id, name)).fetchall()
+            except Exception:  # noqa: BLE001  no framework tables
+                continue
+            for r in rows:
+                found.setdefault((bd.binary.id, int(r["addr"])), (bd, f"{r['cn']}{sep}{r['mn']}"))
+    if not found:
+        return None
+    if len(found) > 1:
+        listed = [f"{'' if sc.explicit else bd.binary.name + '!'}{label} {bd.addr(a)}"
+                  for (_b, a), (bd, label) in sorted(found.items(), key=lambda kv: (kv[0][0], kv[0][1]))]
+        return ambiguous(name, listed, len(listed))
+    (_bid, addr), (bd, label) = next(iter(found.items()))
+    r = _by_address(sc, f"0x{addr:x}", ks)
+    if isinstance(r, FunctionTarget) and not r.note:
+        r = replace(r, note=f"resolved '{name}' to {label}")
+    return r
+
+
+_PROGRAM_NAMES = frozenset({"main", "winmain", "wwinmain", "pascalmain", "program"})
+_PASCALMAIN_FIELD = 5       # TEntryInformation.PascalMain, in pointers (verified, FPC 3.2.2 x86 and x64)
+
+
+def _program_body(ctx: ServerContext, sc: Scope, name: str) -> Target | str | None:
+    """``main`` / ``WinMain`` / ``PASCALMAIN`` / ``program`` of a Delphi or FPC program (no function of that
+    name exists): the program body. Delphi inlines it into the PE entry point function; FPC's entry point
+    passes ``@EntryInformation`` (the last ``mov eax, imm32`` / ``lea rcx, [rip+d]`` before the call) to
+    ``FPC_EXE_ENTRY``, and field 5 of that record is PASCALMAIN."""
+    from airlock.projects import detect
+    from airlock.server.cpp import Image
+
+    found: list[tuple[Bound, Function, str]] = []
+    for bd in sc.bounds:
+        b = bd.binary
+        if b.toolchain not in ("delphi", "fpc") or b.image_base is None:
+            continue
+        artifact = ctx.indexer.paths(bd.project).artifacts / b.sha256
+        if not artifact.is_file():
+            continue
+        try:
+            rva = detect(artifact).entry_point
+            img = Image.from_pe(artifact) if b.toolchain == "fpc" else None
+        except Exception:  # noqa: BLE001  not a readable PE
+            continue
+        if rva is None or (b.toolchain == "fpc" and img is None):
+            continue
+        ep = b.image_base + rva
+        fn = bd.store.function_containing(b.id, ep)
+        if fn is None:
+            continue
+        if b.toolchain == "fpc":
+            code = img.read(ep, 0x60) or b""
+            ps = img.psize
+            if ps == 4:
+                m = list(re.finditer(rb"\xb8(....)\xe8", code, re.S))
+                rec = int.from_bytes(m[-1].group(1), "little") if m else None
+            else:
+                m = list(re.finditer(rb"\x48\x8d\x0d(....)", code, re.S))
+                rec = (ep + m[-1].end() + int.from_bytes(m[-1].group(1), "little", signed=True)) if m else None
+            pm = img.ptr(rec + _PASCALMAIN_FIELD * ps) if rec is not None else None
+            main = bd.store.function_at(b.id, pm) if pm else None
+            if main is None:
+                continue
+            found.append((bd, main, "PASCALMAIN"))
+        else:
+            found.append((bd, fn, "entry"))
+    if len(found) > 1:
+        return ambiguous(name, _cands([(bd, f) for bd, f, _w in found]), len(found))
+    if not found:
+        return None
+    bd, fn, what = found[0]
+    return FunctionTarget(bd, fn, f"resolved '{name}' to the program body {fn.qualified_name} ({what})",
+                          None if sc.explicit else f"binary {bd.binary.name}")
 
 
 def _mfc_handler_addrs(bd: Bound, cls: str, meth: str) -> set[int]:

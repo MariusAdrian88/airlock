@@ -40,7 +40,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-IDR_VERSION = 11              # 11: short Delphi sigdb matches need a long match of their unit; 10: Free Pascal databases; bump when matching or storage changes: projects recompute on open
+IDR_VERSION = 13              # 13: Free Pascal look-alike names are chosen by class table and evidence; 12: Free Pascal databases keep every LCL / RTL routine (ShowMessage); 11: short Delphi sigdb matches need a long match of their unit; 10: Free Pascal databases; bump when matching or storage changes: projects recompute on open
 VERSION_META = "idr_version"         # ``idr_version:<binary id>`` = ``IDR_VERSION:kb signature:candidates``
 HITS_META = "idr_hits"               # ``idr_hits:<binary id>`` = lines ``<hex address>\t<names>``
 INFO_META = "idr_info"               # ``idr_info:<binary id>`` = one line for humans
@@ -352,6 +352,10 @@ def load_kb(f: KbFile) -> Kb:
     return kb
 
 
+FPC_AMBIGUOUS = 5
+FPC_MIN_CLASS = 2
+
+
 # -- matching ---------------------------------------------------------------------------------
 
 def _name_rank(name: str) -> tuple[bool, bool, int, str]:
@@ -423,7 +427,74 @@ def _match(kb: Kb, img: Image, funcs: list[tuple[int, int | None]]
             kept[entry] = ok
     if kb.unit_support:
         _drop_unsupported(kb, out, kept)
+    if kb.label.lower().startswith("fpc") and out:
+        _fpc_disambiguate(kb, img, out, kept)
     return out, kept
+
+
+def _class_of(name: str) -> str:
+    """The class part of ``Unit.Class.Method`` in lower case (empty for ``Unit.Proc``)."""
+    parts = name.split(".")
+    return parts[-2].lower() if len(parts) >= 3 else ""
+
+
+def _fpc_owners(img: Image) -> dict[int, set[str]]:
+    """{routine address: classes that introduce it} from the class tables of a Free Pascal program: a virtual
+    method belongs to the class whose parent has another routine in that slot; a published method to its class."""
+    from airlock.server import delphi
+    try:
+        classes = delphi.parse_fpc_classes(img)
+    except Exception:  # noqa: BLE001  damaged tables: no owners
+        return {}
+    by_vmt = {c.vmt: c for c in classes}
+    out: dict[int, set[str]] = {}
+    for c in classes:
+        up = by_vmt.get(c.parent_vmt)
+        inherited = {(m.slot, m.addr) for m in up.methods if m.kind == "virtual"} if up else set()
+        for m in c.methods:
+            if not m.addr or m.kind not in ("virtual", "published"):
+                continue
+            if m.kind == "virtual" and (m.slot, m.addr) in inherited:
+                continue
+            out.setdefault(m.addr, set()).add(c.name.lower())
+    return out
+
+
+def _fpc_disambiguate(kb: Kb, img: Image, out: dict[int, list[str]], kept: dict[int, list[int]]) -> None:
+    """Order and thin the names of a Free Pascal function that several reference routines match (the
+    ``Create`` / ``Destroy`` of many classes have the same bytes). (1) A routine that a class table lists
+    belongs to that class: only the names of that class stay (and the function loses its match when the
+    class is none of the candidates: the program's own method that looks like library code). (2) The other
+    names are ordered by evidence: the class, then the unit, that the unambiguous matches of the binary
+    name most often. (3) A set of more than ``FPC_AMBIGUOUS`` names whose first class has fewer than
+    ``FPC_MIN_CLASS`` unambiguous matches is dropped."""
+    owners = _fpc_owners(img)
+    for e in list(out):
+        own = owners.get(e)
+        if own and len(out[e]) > 1:
+            keep = [n for n in out[e] if _class_of(n) in own]
+            if keep:
+                out[e] = keep
+                names = set(keep)
+                kept[e] = [i for i in kept[e] if kb.procs[i].name in names]
+    units: dict[str, int] = {}
+    classes: dict[str, int] = {}
+    for names in out.values():
+        if len(names) == 1:
+            units[unit_of(names[0])] = units.get(unit_of(names[0]), 0) + 1
+            c = names[0].rsplit(".", 1)[0].lower()
+            classes[c] = classes.get(c, 0) + 1
+
+    def key(n: str):
+        return (-classes.get(n.rsplit(".", 1)[0].lower(), 0), -units.get(unit_of(n), 0)) + _name_rank(n)
+
+    for e in list(out):
+        names = sorted(out[e], key=key)
+        if len(names) > FPC_AMBIGUOUS and classes.get(names[0].rsplit(".", 1)[0].lower(), 0) < FPC_MIN_CLASS:
+            del out[e]
+            kept.pop(e, None)
+            continue
+        out[e] = names
 
 
 def unit_of(name: str) -> str:

@@ -41,7 +41,8 @@ def candidates(store: Store, binary_id: int) -> list[int]:
     sql = ("SELECT DISTINCT {col} FROM {tab} WHERE binary_id=?1 AND {col} IS NOT NULL AND {col} NOT IN "
            "(SELECT entry FROM function WHERE binary_id=?1 AND space='ram')")
     out: set[int] = set()
-    for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target"), ("dl_method", "addr"),
+    code_methods = "(SELECT binary_id, addr FROM dl_method WHERE kind NOT IN ('interface-tab', 'interface-table', 'header'))"
+    for tab, col in (("msgmap_entry", "handler"), ("vtable_slot", "target"), (code_methods, "addr"),
                      ("dl_event", "addr"), ("mfc_map_entry", "pfn"), ("mfc_map_entry", "pfn_set")):
         out.update(r[0] for r in store.db.execute(sql.format(tab=tab, col=col), (binary_id,)))
     return sorted(out)

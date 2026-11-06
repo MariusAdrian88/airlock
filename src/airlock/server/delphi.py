@@ -38,7 +38,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pefile
 
@@ -49,7 +49,7 @@ from airlock.server.cpp import Image
 
 log = logging.getLogger("airlock")
 
-DELPHI_VERSION = 6          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names; 6: FPC interface method names
+DELPHI_VERSION = 8          # 4: Free Pascal classes; 5: FPC message / interface / init tables, virtual names; 6: FPC interface method names; 7: Delphi dynamic method table (kind 'dynamic'); 8: interface tables (kinds 'interface-tab/-table/-target'), header and empty-stub rows
 DELPHI_META = "delphi_version"     # meta key prefix; the full key is ``delphi_version:<binary id>``
 
 MAX_VIRTUAL = 1024                 # virtual method slots read per class
@@ -393,6 +393,22 @@ def _virtuals(img: Image, vmt: int, limit: int) -> list[DlMethod]:
     return out
 
 
+def _dynamic(img: Image, tab: int) -> list[DlMethod]:
+    """Dynamic method table (``vmtDynamicTable``): word count, ``count`` signed word indexes (-1, -2, ...), then
+    ``count`` code pointers. ``slot`` holds the index, ``name`` stays empty."""
+    n = _u16(img, tab)
+    if not n or n > 4096:
+        return []
+    out: list[DlMethod] = []
+    for i in range(n):
+        idx = _u16(img, tab + 2 + 2 * i)
+        t = img.ptr(tab + 2 + 2 * n + i * img.psize)
+        if idx is None or t is None or not img.is_code(t):
+            return []
+        out.append(DlMethod("dynamic", idx - 0x10000 if idx & 0x8000 else idx, "", t))
+    return out
+
+
 def has_fpc_marker(img: Image) -> bool:
     """True when the image holds the version string that the Free Pascal RTL links into every program."""
     return any(FPC_VERSION_RE.search(s.data) for s in img.sections)
@@ -432,6 +448,7 @@ def _parse_delphi_classes(img: Image) -> list[DlClass]:
                 c.parent_vmt = pv
                 c.parent = by_vmt[pv].name
         c.unit = _unit_name(img, c.typeinfo)
+        c.methods.append(DlMethod("header", d, "", lo))     # the words before the VMT (``find`` in classintf)
         mt = img.ptr(lo + 6 * ps) or 0
         if mt:
             c.methods.extend(_published(img, c, mt))
@@ -444,6 +461,9 @@ def _parse_delphi_classes(img: Image) -> list[DlClass]:
         c.methods.extend(m for m in _properties(img, c) if m.addr not in named)
         nxt = order[i + 1] - found[order[i + 1]][1] * ps if i + 1 < len(order) else vmt + MAX_VIRTUAL * ps
         c.methods.extend(_virtuals(img, vmt, max(0, (nxt - vmt) // ps)))
+        dyn = img.ptr(lo + 7 * ps) or 0
+        if dyn:
+            c.methods.extend(_dynamic(img, dyn))
     for c in by_vmt.values():             # a property whose accessor an ancestor already declares (a redeclared
         anc = ancestors(c, by_vmt)[1:]    # ``published`` property) belongs to the ancestor
         up_p = {(m.kind, m.addr) for a in anc for m in a.methods if m.kind in PROP_KINDS}
@@ -455,7 +475,32 @@ def _parse_delphi_classes(img: Image) -> list[DlClass]:
         up = {(m.name, m.addr) for a in ancestors(c, by_vmt)[1:] for m in a.methods if m.kind != "virtual"}
         if up:
             c.methods = [m for m in c.methods if m.kind == "virtual" or (m.name, m.addr) not in up]
+    _delphi_all_interfaces(img, found, by_vmt)
+    _mark_empty(img, [found[v][0] for v in order])
     return [found[v][0] for v in order]
+
+
+def _delphi_all_interfaces(img: Image, found: dict[int, tuple[DlClass, int]], by_vmt: dict[int, DlClass]) -> None:
+    """Interface tables of all Delphi classes (``vmtIntfTable``, the slot after the self pointer), added to the
+    methods and fields of the classes."""
+    ps = img.psize
+    tabs: dict[int, tuple[int, list[tuple[int, int, int, int]]]] = {}
+    for vmt, (_c, d) in found.items():
+        tab = img.ptr(vmt - d * ps + ps) or 0
+        ents = _delphi_intf_entries(img, tab) if tab else []
+        if ents:
+            tabs[vmt] = (tab, ents)
+    bounds = sorted({e[1] for _t, ents in tabs.values() for e in ents if e[1]})
+    for vmt, (tab, ents) in tabs.items():
+        c = by_vmt[vmt]
+        known: dict[int, str] = {}
+        for a in reversed(ancestors(c, by_vmt)):         # the nearest class wins
+            for m in a.methods:
+                if m.name and (m.kind in ("published", "virtual") or m.kind.startswith("rtti")):
+                    known[m.addr] = m.name
+        ms, fs = _delphi_interfaces(img, c, tab, ents, bounds, known, {})
+        c.methods.extend(ms)
+        c.fields.extend(f for f in fs if (f.name, f.offset) not in {(x.name, x.offset) for x in c.fields})
 
 
 # ── Free Pascal (FPC) classes ──────────────────────────────────────────────
@@ -682,7 +727,7 @@ FPC_TKINTERFACE = 14       # type kind of a COM interface (``tkInterface``)
 MAX_INTF_CHAIN = 16
 
 
-def _fpc_intf_typeinfo(img: Image, guid: bytes) -> int | None:
+def _fpc_intf_typeinfo(img: Image, guid: bytes, kind: int = FPC_TKINTERFACE, code: bool = False) -> int | None:
     """Type info (``tkInterface``) of the interface with this GUID: ``kind, ShortString name, ^parent, u8 flags,
     GUID``. The class tables point to no type info, so the GUID is searched in the data and the bytes before
     it are checked."""
@@ -690,7 +735,7 @@ def _fpc_intf_typeinfo(img: Image, guid: bytes) -> int | None:
     if len(guid) != 16 or guid == bytes(16):
         return None
     for s in img.sections:
-        if s.executable:
+        if s.executable and not code:           # Delphi keeps type info in the code section
             continue
         i = s.data.find(guid)
         while i >= 0:
@@ -698,7 +743,7 @@ def _fpc_intf_typeinfo(img: Image, guid: bytes) -> int | None:
             for ln in range(1, 65):
                 ti = at - 1 - ps - ln - 2
                 hdr = img.read(ti, 2)
-                if hdr and hdr[0] == FPC_TKINTERFACE and hdr[1] == ln and _sstr(img, ti + 1) is not None:
+                if hdr and hdr[0] == kind and hdr[1] == ln and _sstr(img, ti + 1) is not None:
                     return ti
             i = s.data.find(guid, i + 1)
     return None
@@ -804,6 +849,7 @@ def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], v
     ps = img.psize
     methods: list[DlMethod] = []
     fields: list[DlField] = []
+    tabs: list[int] = []
     bounds = sorted(vtables)
     for ref, vt, off, sref, typ in entries:
         sp = img.ptr(sref) if sref else None
@@ -823,17 +869,176 @@ def _fpc_interfaces(img: Image, entries: list[tuple[int, int, int, int, int]], v
             rtti = list(FPC_COM_SLOTS) + rtti
         if len(rtti) != len(slots):
             rtti = []
+        names: list[str] = []
+        targets: list[int | None] = []
         for k, t in enumerate(slots):
+            tgt = _fpc_thunk_target(img, t)
+            targets.append(tgt)
             if ref and k < 3:
                 nm = FPC_COM_SLOTS[k]
             else:
-                tgt = _fpc_thunk_target(img, t)
                 nm = rtti[k] if rtti else ""
                 nm = nm or (known or {}).get(tgt if tgt is not None else -1, "") or f"#{k}"
-            methods.append(DlMethod("interface", k, f"{label}.{nm}", t))
+            names.append(nm)
+        methods.extend(_intf_rows(len(tabs), label, guid, vt, off, slots, targets, names))
+        tabs.append(vt)
         if typ == 0:
             fields.append(DlField(label, off, "interface"))
     return methods, fields
+
+
+# ── interface tables (rows of the ``interface*`` kinds) ────────────────────
+#
+# Rows of one class, written by ``_intf_rows`` for Delphi and Free Pascal:
+#   interface-tab     slot = entry count, addr = the interface table (``vmtIntfTable``)
+#   interface-table   slot = index i of the interface, name = ``Name {GUID} offset N slots M``, addr = its method table (IMT)
+#   interface         slot = k, name = ``Name.Method`` (``Name.#k`` when unknown), addr = the IMT entry (thunk) of slot k
+#   interface-target  slot = i * INTF_STRIDE + k, addr = the code the thunk reaches (name empty)
+INTF_STRIDE = 4096
+INTF_KINDS = ("interface-tab", "interface-table", "interface", "interface-target")
+DATA_KINDS = ("interface-tab", "interface-table", "header")     # kinds whose ``addr`` is data, not code
+DELPHI_TKINTERFACE = 15    # tkInterface in Delphi's TTypeKind (Free Pascal: 14)
+_INTF_TABLE = re.compile(r"^(\S+) (\{[0-9A-Fa-f-]*\}|\S*) offset (-?\d+) slots (\d+)(?: type 0x([0-9a-f]+))?$")
+
+
+class IntfTable(NamedTuple):
+    name: str
+    guid: str
+    offset: int
+    slots: int
+    typeinfo: int           # the ``tkInterface`` type info, 0 when not found
+
+
+def _intf_rows(idx: int, label: str, guid: str, imt: int, off: int, slots: list[int],
+               targets: list[int | None], names: list[str], typeinfo: int = 0) -> list[DlMethod]:
+    """Rows of one interface (see the block comment above)."""
+    tail = f" type 0x{typeinfo:x}" if typeinfo else ""
+    out = [DlMethod("interface-table", idx, f"{label} {guid or '-'} offset {off} slots {len(slots)}{tail}", imt)]
+    for k, t in enumerate(slots):
+        out.append(DlMethod("interface", k, f"{label}.{names[k]}", t))
+        if targets[k] is not None:
+            out.append(DlMethod("interface-target", idx * INTF_STRIDE + k, "", targets[k]))
+    return out
+
+
+def parse_intf_table(name: str) -> IntfTable | None:
+    """The parts of the ``name`` of an ``interface-table`` row."""
+    m = _INTF_TABLE.match(name)
+    return IntfTable(m.group(1), "" if m.group(2) == "-" else m.group(2), int(m.group(3)), int(m.group(4)),
+                     int(m.group(5), 16) if m.group(5) else 0) if m else None
+
+
+# ``add`` / ``sub`` of the Self pointer in front of an interface thunk: (opcode bytes, length)
+_DELPHI_ADJ = ((bytes([0x83, 0x44, 0x24, 0x04]), 5), (bytes([0x81, 0x44, 0x24, 0x04]), 8),    # add [esp+4], n
+               (bytes([0x83, 0x6C, 0x24, 0x04]), 5), (bytes([0x81, 0x6C, 0x24, 0x04]), 8),    # sub [esp+4], n
+               (bytes([0x48, 0x83, 0xC1]), 4), (bytes([0x48, 0x81, 0xC1]), 7),                # add rcx, n
+               (bytes([0x48, 0x83, 0xE9]), 4), (bytes([0x48, 0x81, 0xE9]), 7),                # sub rcx, n
+               (bytes([0x83, 0xC0]), 3), (bytes([0x05]), 5),                                  # add eax, n
+               (bytes([0x83, 0xE8]), 3), (bytes([0x2D]), 5))                                  # sub eax, n
+# the body of a thunk that calls a virtual method: load the VMT, jump through the slot at ``disp``
+_DELPHI_VIRT32 = ((bytes([0x50, 0x8B, 0x00, 0x8B, 0x00]), 0, bytes([0x87, 0x04, 0x24, 0xC3])),   # push eax; mov eax,[eax]; mov eax,[eax]; xchg [esp],eax; ret
+                  (bytes([0x50, 0x8B, 0x00, 0x8B, 0x40]), 1, bytes([0x87, 0x04, 0x24, 0xC3])),
+                  (bytes([0x50, 0x8B, 0x00, 0x8B, 0x80]), 4, bytes([0x87, 0x04, 0x24, 0xC3])),
+                  (bytes([0x8B, 0x44, 0x24, 0x04, 0x8B, 0x00, 0xFF, 0x20]), 0, b""),            # mov eax,[esp+4]; mov eax,[eax]; jmp [eax+disp]
+                  (bytes([0x8B, 0x44, 0x24, 0x04, 0x8B, 0x00, 0xFF, 0x60]), 1, b""),
+                  (bytes([0x8B, 0x44, 0x24, 0x04, 0x8B, 0x00, 0xFF, 0xA0]), 4, b""))
+_DELPHI_VIRT64 = ((bytes([0x48, 0x8B, 0x01, 0xFF, 0x20]), 0), (bytes([0x48, 0x8B, 0x01, 0xFF, 0x60]), 1),
+                  (bytes([0x48, 0x8B, 0x01, 0xFF, 0xA0]), 4))
+
+
+def _delphi_thunk(img: Image, addr: int) -> tuple[str, int] | None:
+    """What a Delphi interface method table entry does: ``("jmp", target)`` (``ADD EAX,-n; JMP target``, or the
+    method itself when no adjustment is needed) or ``("virt", byte offset in the VMT)`` (``ADD EAX,-n`` then a call
+    through the VMT of the object, for an interface method that a virtual method implements). None when the code
+    is not one of these."""
+    b = img.read(addr, 24)
+    if not b:
+        return None
+    mask = (1 << (8 * img.psize)) - 1
+    i = 0
+    for pat, size in _DELPHI_ADJ:
+        if b.startswith(pat):
+            i = size
+            break
+    rest = b[i:]
+    if rest[:1] == b"\xe9" and len(rest) >= 5:
+        return "jmp", (addr + i + 5 + struct.unpack("<i", rest[1:5])[0]) & mask
+    if rest[:1] == b"\xeb" and len(rest) >= 2:
+        return "jmp", (addr + i + 2 + struct.unpack("<b", rest[1:2])[0]) & mask
+    if img.psize == 4:
+        for pat, n, end in _DELPHI_VIRT32:
+            if rest.startswith(pat) and rest[len(pat) + n:].startswith(end):
+                return "virt", int.from_bytes(rest[len(pat):len(pat) + n], "little", signed=True) if n else 0
+    else:
+        for pat, n in _DELPHI_VIRT64:
+            if rest.startswith(pat):
+                return "virt", int.from_bytes(rest[len(pat):len(pat) + n], "little", signed=True) if n else 0
+    return ("jmp", addr) if i == 0 else None
+
+
+def _delphi_intf_entries(img: Image, tab: int) -> list[tuple[int, int, int, int]]:
+    """Entries of a Delphi interface table (``vmtIntfTable``): ``i32 count``, then ``{TGUID; ptr IMT; IOffset;
+    ImplGetter}``, packed in 32-bit programs (28 bytes, entries at +4; both fields i32) and aligned in 64-bit ones
+    (40 bytes, entries at +8; both fields 8 bytes). Returns [(address of the GUID, IMT, IOffset, getter)], []
+    when the table does not look like one."""
+    ps = img.psize
+    n = _fpc_u32(img, tab)
+    if not n or n > MAX_INTF:
+        return []
+    first, stride, fmt = (tab + 4, 28, "<ii") if ps == 4 else (tab + 8, 40, "<qq")
+    out = []
+    for i in range(n):
+        at = first + i * stride
+        vt, raw = img.ptr(at + 16), img.read(at + 16 + ps, 2 * ps)
+        if vt is None or raw is None or (vt and not img.in_image(vt)):
+            return []
+        off, getter = struct.unpack(fmt, raw)
+        out.append((at, vt, off, getter))
+    return out
+
+
+def _delphi_interfaces(img: Image, c: DlClass, tab: int, entries: list[tuple[int, int, int, int]],
+                       bounds: list[int], known: dict[int, str], guid_names: dict[str, str]
+                       ) -> tuple[list[DlMethod], list[DlField]]:
+    """The interfaces of a Delphi class (see the block comment): one ``interface-tab`` row, then per interface the
+    rows of ``_intf_rows``. The interface is named from ``KNOWN_GUIDS``, else from its type info (``tkInterface``,
+    found by the GUID), else it is its GUID. Slots 0-2 are ``QueryInterface`` / ``_AddRef`` / ``_Release``; the others
+    take the name of the class method the thunk reaches (``known``: {code address: name}), else ``#k``. A thunk
+    through the VMT reaches the class's own virtual method of that slot."""
+    ps = img.psize
+    virt = {m.slot: m.addr for m in c.methods if m.kind == "virtual"}
+    rows = [DlMethod("interface-tab", len(entries), "", tab)]
+    fields: list[DlField] = []
+    for idx, (at, vt, off, getter) in enumerate(entries):
+        guid = _fpc_guid_text(img, at)
+        if not guid.strip("{}-0"):
+            guid = ""                      # the all-zero GUID of an anonymous method interface
+        label = KNOWN_GUIDS.get(guid.upper(), "") or guid_names.get(guid.upper(), "")
+        ti = _fpc_intf_typeinfo(img, img.read(at, 16) or b"", DELPHI_TKINTERFACE, True) if guid else None
+        if not label and ti:
+            label = _sstr(img, ti + 1) or ""
+        label = label or guid or f"intf_{vt:x}"
+        j = bisect_right(bounds, vt)
+        stop = bounds[j] if j < len(bounds) else vt + MAX_VIRTUAL * ps
+        slots: list[int] = []
+        while vt and vt + len(slots) * ps < stop and len(slots) < MAX_VIRTUAL:
+            t = img.ptr(vt + len(slots) * ps)
+            if t is None or not img.is_code(t):
+                break
+            slots.append(t)
+        targets: list[int | None] = []
+        names: list[str] = []
+        for k, t in enumerate(slots):
+            th = _delphi_thunk(img, t)
+            tgt = None
+            if th is not None:
+                tgt = th[1] if th[0] == "jmp" else (virt.get(th[1] // ps) if th[1] % ps == 0 else None)
+            targets.append(tgt)
+            names.append(FPC_COM_SLOTS[k] if k < 3 else known.get(tgt if tgt is not None else -1, "") or f"#{k}")
+        rows.extend(_intf_rows(idx, label, guid, vt, off, slots, targets, names, ti or 0))
+        if off > 0 and not getter:
+            fields.append(DlField(label, off, "interface"))
+    return rows, fields
 
 
 def _fpc_init_fields(img: Image, c: DlClass, tab: int) -> list[DlField]:
@@ -860,15 +1065,49 @@ def _fpc_init_fields(img: Image, c: DlClass, tab: int) -> list[DlField]:
     return out
 
 
-def _fpc_name_virtuals(by_vmt: dict[int, DlClass], vslots: dict[str, dict[int, str]] | None) -> None:
+def _empty_code(img: Image, addr: int) -> bool:
+    """True when the code at ``addr`` is a bare ``RET`` / ``RET n``: an empty method (``FPC_EMPTYMETHOD`` or an empty
+    ``DefaultHandler`` of the RTL). Such slots are equal for the comparison with the parent's slot."""
+    b = img.read(addr, 3)
+    return bool(b) and (b[0] == 0xC3 or (b[0] == 0xC2 and len(b) == 3))
+
+
+SHARED_STUB_USES = 3       # a bare-RET address that this many virtual slots hold is a shared stub, not a method
+
+
+def _mark_empty(img: Image, classes: list[DlClass]) -> tuple[frozenset[int], frozenset[int]]:
+    """Rows of kind ``empty-stub`` (slot, address) for the virtual slots whose code is a bare ``RET``, and of kind
+    ``empty-shared`` for those whose address is held by ``SHARED_STUB_USES`` slots or more (``FPC_EMPTYMETHOD``, which
+    the linker puts into the VMT of a class for the methods that nothing calls). Returns (bare, shared) addresses."""
+    uses: dict[int, int] = {}
+    for c in classes:
+        for m in c.methods:
+            if m.kind == "virtual":
+                uses[m.addr] = uses.get(m.addr, 0) + 1
+    bare = {a for a in uses if _empty_code(img, a)}
+    shared = frozenset(a for a in bare if uses[a] >= SHARED_STUB_USES)
+    for c in classes:
+        for m in [m for m in c.methods if m.kind == "virtual" and m.addr in bare]:
+            c.methods.append(DlMethod("empty-stub", m.slot, "", m.addr))
+            if m.addr in shared:
+                c.methods.append(DlMethod("empty-shared", m.slot, "", m.addr))
+    return frozenset(bare), shared
+
+
+def _fpc_name_virtuals(by_vmt: dict[int, DlClass], vslots: dict[str, dict[int, str]] | None,
+                       empty: tuple[frozenset[int], frozenset[int]] = (frozenset(), frozenset())) -> None:
     """Names of the virtual methods a class introduces or overrides: ``TObject`` slots from ``FPC_TOBJECT_VSLOTS``,
     other classes from ``vslots`` ({introducing class name: {slot: method name}}, built from the symbols of
-    reference programs, see ``fpcsigs``). An inherited slot (same code as the parent's) keeps no name."""
+    reference programs, see ``fpcsigs``). An inherited slot (same code as the parent's, or a bare ``RET`` against the
+    shared empty stub of a parent that the linker emptied: ``empty`` from ``_mark_empty``) keeps no name."""
+    bare, shared = empty
     for c in by_vmt.values():
         parent = by_vmt.get(c.parent_vmt)
         pcode = {m.slot: m.addr for m in parent.methods if m.kind == "virtual"} if parent else {}
         for m in c.methods:
-            if m.kind != "virtual" or pcode.get(m.slot) == m.addr:
+            pa = pcode.get(m.slot)
+            if m.kind != "virtual" or pa == m.addr or (
+                    m.addr in bare and pa in bare and (m.addr in shared or pa in shared)):
                 continue
             cur, seen = c, set()
             while cur.vmt not in seen:                      # the class that introduced the slot
@@ -932,11 +1171,14 @@ def parse_fpc_classes(img: Image, vslots: dict[str, dict[int, str]] | None = Non
         if tab:
             intf[vmt] = _fpc_intf_entries(img, tab)
     vtables = {e[1] for ents in intf.values() for e in ents}
-    _fpc_name_virtuals(by_vmt, vslots)
+    empty = _mark_empty(img, [by_vmt[v] for v in order])
+    _fpc_name_virtuals(by_vmt, vslots, empty)
     for vmt, ents in intf.items():
         known = {m.addr: m.name for a in reversed(ancestors(by_vmt[vmt], by_vmt)) for m in a.methods
                  if m.name and m.kind in ("published", "virtual", "message-str")}
         ms, fs = _fpc_interfaces(img, ents, vtables, guid_names or {}, known)
+        if ms:
+            by_vmt[vmt].methods.append(DlMethod("interface-tab", len(ents), "", img.ptr(vmt + 10 * ps) or 0))
         by_vmt[vmt].methods.extend(ms)
         by_vmt[vmt].fields.extend(fs)
     for c in by_vmt.values():             # a property whose accessor an ancestor already declares belongs to it
@@ -1463,19 +1705,24 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
                "'interface') ORDER BY c.vmt, m.kind, m.slot LIMIT 4", (binary_id, entry)):
         out.append(_fpc_table_hint(r[0], r[1], r[2], r[3]))
     by_slot: dict[int, list[str]] = {}
-    slot_name: dict[int, str] = {}
+    slot_names: dict[int, list[str]] = {}
     for r in q("SELECT c.name, m.slot, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
                "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind='virtual' ORDER BY m.slot, c.vmt",
                (binary_id, entry)):
         names = by_slot.setdefault(r[1], [])
         if r[0] not in names:
             names.append(r[0])
-        if r[2]:
-            slot_name.setdefault(r[1], r[2])
+        slot_names.setdefault(r[1], []).append(r[2])
+    shared = len(by_slot) > 1          # one code address in several different slots: a shared stub, not a method
     for slot, names in list(by_slot.items())[:3]:
         extra = f" (+{len(names) - 1} classes)" if len(names) > 1 else ""
-        label = f" ({slot_name[slot]})" if slot in slot_name else ""
+        label = ""                      # a name counts only when every class that uses the code gives it
+        if not shared and len(set(slot_names[slot])) == 1 and slot_names[slot][0]:
+            label = f" ({slot_names[slot][0]})"
         out.append(f"{names[0]}::vslot {slot}{label}{extra}")
+    if shared:
+        out.append(f"shared stub of virtual slots {', '.join(str(k) for k in list(by_slot)[:6])}: an abstract or "
+                   f"empty method; the slots have no common method name")
     from airlock.server import idr
     out.extend(idr.hint_for(store, binary_id, entry))
     return out

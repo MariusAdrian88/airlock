@@ -425,12 +425,14 @@ def annotate_calls(c_text: str, nodes, psize: int) -> str:
     return c_text
 
 
-def _vcall_names(c_text: str, bd: Bound, fn: Function) -> str:
-    """Slot (and method) comment after each virtual-call stub name (vcallnames)."""
-    if "vmt_" not in c_text:
+def _vcall_names(c_text: str, bd: Bound, fn: Function, ctx: ServerContext | None = None) -> str:
+    """Slot (and method) comment after each virtual-call stub name, dynamic index after each dynamic-method
+    dispatcher call, class name after each VMT address (vcallnames)."""
+    if bd.binary.toolchain not in ("delphi", "fpc"):
         return c_text
     from airlock.server import vcallnames
-    return vcallnames.annotate(c_text, vcallnames.DbClasses(bd.store, bd.binary, fn.entry))
+    art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256 if ctx is not None else None
+    return vcallnames.annotate(c_text, vcallnames.DbClasses(bd.store, bd.binary, fn.entry, artifact=art))
 
 
 def _now() -> str:
@@ -624,7 +626,7 @@ def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None,
         if err:
             return err
         assert c_text is not None
-        c = reduce_c(_vcall_names(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn).rstrip(chr(10)), detail)
+        c = reduce_c(_vcall_names(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn, ctx).rstrip(chr(10)), detail)
         body = ["// C"] + c.split(chr(10)) + [f"// asm ({len(asm)} lines)"]
     first = 1
     full_asm = asm
@@ -665,7 +667,7 @@ def _class_view(ctx: ServerContext, binary: str, target: str, bud: int, cursor: 
     for h in hits[:3]:
         bd, st = h.bd, h.bd.store
         out += [f"// {classfwd.fact(h, value, several)}", classfwd.class_line(h, several),
-                *classfwd.slot_lines(h), *classfwd.method_lines(h)]
+                *classfwd.slot_lines(h), *classfwd.dynamic_lines(h), *classfwd.method_lines(h)]
         seen: set[tuple[int, int, str]] = set()
         refs = []
         for a in dict.fromkeys(x for x in (h.vmt, h.typeinfo) if x):
@@ -770,7 +772,7 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if err:
         return err
     assert c_text is not None
-    full = _vcall_names(annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn).rstrip("\n")
+    full = _vcall_names(annotate_calls(c_text, st.get_ast_nodes(fn.id, "call"), bd.psize), bd, fn, ctx).rstrip("\n")
     full = reduce_c(full, detail)   # after annotation: it needs raw char offsets
     if outline and not cursor and not span and estimate_tokens(full, "code") > bud:
         all_lines = full.split("\n")
@@ -827,7 +829,7 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
 
 _KIND_MAP = {"call": ("call", "call_ind", "call_imp"), "jump": ("jump",), "read": ("read",),
              "write": ("write",), "data": ("data",), "import": ("import",), "dynamic": ("dynamic",), "fnptr": ("fnptr",),
-             "table": ("table",)}
+             "table": ("table",), "code": ("call", "call_ind", "call_imp", "jump")}
 
 
 def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
@@ -867,7 +869,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         kinds = _KIND_MAP.get(fixed)
         if kinds is None:
             return (f"error bad_args: unknown kind '{kind}' "
-                    "(kinds: call, jump, read, write, data, import, dynamic, table).")
+                    "(kinds: call, jump, code, read, write, data, import, dynamic, table).")
     page = max(1, min(int(limit), 1000))
     limit = XREFS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
@@ -1176,9 +1178,9 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
         if not (pattern and res.startswith("error bad_cursor")):
             return res
         used = f"(cursor {cursor} unknown, searched anew)"   # a pattern is given: do the search
-    if not pattern:
-        return "error bad_args: pattern is empty."
-    if regex:
+    if not pattern:         # no pattern: every defined string, in pages
+        regex = False
+    elif regex:
         try:
             re.compile(pattern)
         except re.error as e:           # an invalid regex is searched as literal text
@@ -1187,14 +1189,14 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     if isinstance(many, str):
         return many
     bounds, skipped = many
-    limit = STRINGS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
+    limit = STRINGS_FETCH if pattern else 4 * STRINGS_FETCH   # fetch deep; `page` lines are shown, the rest sits behind a cursor
     merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
-    if not merged and not regex and _REGEX_CHARS.search(pattern) and _compiles(pattern):
+    if pattern and not merged and not regex and _REGEX_CHARS.search(pattern) and _compiles(pattern):
         regex, used = True, "(regex used: no literal match)"    # `a|b`, `^foo`: meant as a regex
         merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
     if not merged:
-        return f"no strings match '{pattern}'" + (f" {used}" if used else "")
-    head = f"strings matching '{pattern}': {len(merged)}{'+' if capped else ''}"
+        return (f"no strings match '{pattern}'" if pattern else "no strings") + (f" {used}" if used else "")
+    head = (f"strings matching '{pattern}': " if pattern else "strings: ") + f"{len(merged)}{'+' if capped else ''}"
     if used:
         head += f" {used}"
     if skipped:

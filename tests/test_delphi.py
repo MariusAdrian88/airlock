@@ -152,7 +152,8 @@ class Pe:
     def klass(self, name: str, parent: str | None, unit: str, size: int = 16,
               published: tuple[str, ...] = (), virtuals: tuple[str, ...] = (),
               fields: tuple[tuple[str, int, str], ...] = (),
-              rtti: tuple[tuple[str, int, int], ...] = (), props: tuple = (), ext_props: tuple = ()) -> int:
+              rtti: tuple[tuple[str, int, int], ...] = (), props: tuple = (), ext_props: tuple = (),
+              dyn: tuple[tuple[int, str], ...] = ()) -> int:
         """A class: VMT with ``virtuals`` code slots, a published method table (``rtti``: extended entries
         ``(name, flags, virtual index)`` after it) and a field table. ``props``: published properties
         ``(name, getter, setter)`` and ``ext_props``: properties of the extended list only; an accessor is
@@ -226,6 +227,11 @@ class Pe:
             self.put(ctab, struct.pack("<H", len(fields)) + b"".join(self.p(c) for c, _t in cells))
             words[5] = tab
             self._cells = getattr(self, "_cells", []) + cells
+        if dyn:                              # dynamic method table: count, signed indexes, code pointers
+            dt = self.alloc(2 + 2 * len(dyn) + ps * len(dyn), 2)
+            self.put(dt, struct.pack("<H", len(dyn)) + b"".join(struct.pack("<h", i) for i, _n in dyn)
+                     + b"".join(self.p(self.stub(f"{name}.dyn_{n}")) for _i, n in dyn))
+            words[7] = dt
         if parent:
             pcell = self.alloc(ps)
             self._parents = getattr(self, "_parents", []) + [(pcell, parent)]
@@ -689,3 +695,18 @@ def test_delphi_tools_keep_idr_names(proj, tmp_path):
     finally:
         delphi.ensure = real
     assert seen[-1] == (kb, sig, warp)                           # the tool passes the configured folders
+
+
+@pytest.mark.parametrize("psize", [4, 8])
+def test_dynamic_method_table(tmp_path, psize):
+    pe = Pe(psize)
+    pe.klass("TObject", None, "System")
+    pe.klass("TBase", "TObject", "App", dyn=((-1, "Dyn"), (-3, "Other")))
+    pe.klass("TKid", "TBase", "App", dyn=((-1, "Dyn"),))
+    pe.write(tmp_path / "dyn.exe")
+    classes, _forms = delphi.parse_file(tmp_path / "dyn.exe")
+    by = {c.name: c for c in classes}
+    got = {n: [(m.slot, m.addr) for m in c.methods if m.kind == "dynamic"] for n, c in by.items()}
+    assert got["TBase"] == [(-1, pe.code["TBase.dyn_Dyn"]), (-3, pe.code["TBase.dyn_Other"])]
+    assert got["TKid"] == [(-1, pe.code["TKid.dyn_Dyn"])] and got["TObject"] == []
+    assert by["TBase"].nvirtual == 0

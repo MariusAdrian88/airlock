@@ -1571,6 +1571,21 @@ restart.
     the number of the `TClass::vslot N` hint. **[verified]** on a two-class Delphi 13 test program
     (`vtable TDerived`, `function 0x0041dcfc` on a 3-binary project, `function vc.TBase.Greet`).
 
+11. **Interfaces and shared stubs of Pascal classes.** `dl_method` also holds the interface tables of
+    Delphi and FPC classes: `interface-tab`, `interface-table` (IMT address, interface name, GUID, IOffset,
+    slot count, type info), `interface` (slot, `Name.Method`, IMT entry = thunk), `interface-target` (the
+    class method behind the thunk), plus `header` (words before a Delphi VMT) and `empty-stub` /
+    `empty-shared` (bare `RET` slots). Delphi `vmtIntfTable` (slot 1 from the self pointer):
+    32-bit `i32 count`, then 28-byte entries `{TGUID, IMT, i32 IOffset, i32 ImplGetter}`; 64-bit count padded to
+    8, 40-byte entries with 8-byte IOffset and ImplGetter. **[verified]** vc22.exe (32-bit), a larger 32-bit Delphi test program,
+    HeidiSQL (64-bit: 236 entries, 3219 slots). An IMT entry is `ADD EAX|RCX|[ESP+4],-n; JMP method` or the
+    same followed by a call through the object's VMT (the method is virtual). The interface slot number is
+    not a class slot: C comments use `/*IGreeter.Greet -> TBase.Greet*/` or `/*intf slot N*/`, never `vslot`.
+    FPC: the linker may point unused virtual methods of a class (TObject among them) at one shared empty stub
+    (`FPC_EMPTYMETHOD`), so a child that carries the real empty RTL method looks like an override; a shared
+    stub gets no method name from any class. **[verified]** FPC 3.2.2 i386 (t1_32): 87 of 90 classes hold the
+    stub in slots 4-7. **[verify]** the same linker behaviour with `-O3`/whole-program options.
+
 ### 7.4 Format
 
 Plain text with a fixed, compact line layout, not JSON. JSON costs more
@@ -2381,8 +2396,25 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   <Lazarus folder>] [--source <folder>]`, `fpc-oracle <program built with -g> [--own-units a,b]`): the build
   compiles three reference programs per compiler (an `rtlmega` that `uses` every RTL / FCL unit, an `lclmega`
   that uses the LCL and LazUtils units, and `systouch`, calls that pull the per-routine linked System
-  routines in) with `-g`. **[verified]** FPC links a whole unit when the program uses it (the shipped unit
-  objects are not smart-linked), and the executable keeps its COFF symbol table, whose names are the
+  routines in) with `-g`. **[verified]** The linker drops every routine of the shipped LCL and of parts of the RTL
+  that the program does not call (smart linking: the unit objects have a section per routine), so a reference
+  program that only `uses` `Dialogs` had 48 of its symbols and no `ShowMessage`, `InputBox`, `QuestionDlg`,
+  `TApplication.Run` (FPC 3.2.2: 9913 names in the 32-bit database, 10774 in the 64-bit one; Free Pascal round 8,
+  problem N5). `fpcsigs.keep_symbols` reads the global code symbols of the `<unit>.o` files of the used units and
+  `write_keep_objects` writes a COFF object per 30000 symbols that defines a data array with one absolute
+  relocation (`DIR32` / `ADDR64`) per symbol; the reference program `{$L}`-links it and tests the address of the
+  array, so the internal linker keeps every routine. No change to the shipped units or to the command line of the
+  linker (`ld` 2.28 of the 64-bit Lazarus crashes on this link, `-u` / `--undefined` through `-k` is unusable). If
+  the link with the keep objects fails the unit is linked the normal way and the build says so. Numbers (FPC 3.2.2,
+  `fpc-build` with `--lazarus` and the RTL / LCL / LazUtils sources): 32-bit database 9913 -> 25977 names, 64-bit
+  10774 -> 28279; the files grow from 0.8 to 1.9 MB and from 0.9 to 2.1 MB. Oracle on programs that were not used for
+  the build (after the call-context pass, all library routines): Lazarus form program 32-bit right 83.3% -> 83.1%,
+  wrong 0.2% -> 0.7%, none 16.4% -> 16.2%; 64-bit right 83.3% -> 82.8%, wrong 0.4% -> 1.1%; console program 32-bit
+  right 86.5% -> 86.9%, wrong 0.1% -> 0.5%; console program 64-bit right 87.1% -> 86.3%, wrong 0.4% -> 1.1%. The
+  oracle programs hardly use the new routines; the extra names add look-alike candidates (the `Destroy` / `Create`
+  of many classes have the same bytes), which is the whole increase of `wrong`. The routines the LCL programs call
+  and had no name now match: in the Lazarus form program `Dialogs.ShowMessage` (0x50a680), `LCLIntf.NotifyUser`,
+  `LCLIntf.PromptUser` and `Forms.TApplication.Run` (all `none` before). Look-alike names (`idr._fpc_disambiguate`, FPC databases only, `IDR_VERSION` 13): (1) a routine that a class table lists (`delphi.parse_fpc_classes`: virtual method whose parent has another routine in the slot, or published method) keeps only the names of that class, and loses its match when the class is none of the candidates; (2) the other names are ordered by the class, then the unit, that the unambiguous matches of the binary name most often; (3) more than 5 names whose first class has fewer than 2 unambiguous matches are dropped. **[verified]** same four programs, all library routines, right / wrong: Lazarus form 32-bit 83.3 / 0.2 -> 83.6 / 0.17, 64-bit 83.3 / 0.4 -> 83.7 / 0.19, console 32-bit 86.5 / 0.1 -> 87.3 / 0.11, console 64-bit 87.1 / 0.4 -> 87.0 / 0.36 (without this step: wrong 0.7 / 1.1 / 0.5 / 1.1). The Delphi unit rule did not help FPC (right -0.3 to -0.7). The executable keeps its COFF symbol table, whose names are the
   truth: `UNIT$_$CLASS_$__$$_METHOD$params$$result`, `UNIT_$$_PROC$params$$result`, `fpc_*` helpers
   (`fpcsigs.demangle`; the case is restored from the most frequent spelling in the Pascal sources when
   `--source` or the install's `source` folder exists; parameter lists are not kept). The routine code is
@@ -2403,6 +2435,7 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   more than `MAX_COPIES` functions. **[verified]** index of FPC 3.2.2 Lazarus and console programs (32 and 64-bit) names 48% to 57% of all functions (`idr:` hints). FPC x86 indirect calls `CALL [reg+disp]` get a stub with the Free Pascal `register` convention (`delphistr.vcall_args`: EAX Self, EDX/ECX when loaded just before the call and not used for the vmt address, pushes right before the loads), named `vmt_<offset>_<regs>_<pushes>` and tagged `airlock:concat vcall <key>`; without it a hidden result pointer is not an argument for the decompiler. The same pass runs for 32-bit Delphi (`delphistr` VERSION 6, collector 11): vmt load into another register skipped, byte/word register arguments (`DL`, `CL`), `PUSH EBP` and prologue pushes ignored, `stdcall`/`safecall` calls with the vmt load in the window get a stack-only stub (`vmt_<offset>_s_<pushes>`), `cdecl` (`ADD ESP,n` after the call) none; the decompiler drops the stub address after a vcall stub name. **[verified]** on 32-bit Delphi programs: calls that lost a register or stack argument in the C, 5 of 17, 6 of 20, 9 of 254 and 10 of 237 before, none after. A program built with `-g` also gets names (`P$T1$_$TDOG_$__$$_SPEAK$$ANSISTRING`,
   `fpc_ansistr_concat_multi`) from Ghidra's own symbol loader.
 - Pascal register convention (32-bit Delphi and Free Pascal): arguments in EAX, EDX, ECX (Self first), the rest on the stack pushed left to right, the callee pops (`RET n`). Ghidra's `__register` (borlanddelphi spec) orders the stack parameters by offset, i.e. reversed; Free Pascal programs use the Visual Studio spec and no EAX parameter. `pascalconv.apply_register_prototypes` writes custom storage for each such function (registers, then stack slots from the highest offset down), see HANDOVER "Round 7 fixes (r7c)". **[verified]** `TBase.Num(X,Y,Z,W)` decompiles as `(param_3 * param_4 + param_2) - param_5`. Decompiled virtual calls show the slot and the resolved method (`vcallnames`): `vmt_508_adc_0/*TFormMain vslot 310 -> ...*/`.
+- Dynamic methods and receivers (`vcallnames`, round 8): a call of the dynamic dispatchers (`@CallDynaInst`, `@CallDynaClass`, `@FindDynaInst`, `@FindDynaClass`) is followed by `/*dynamic <index> -> Class.Method*/`; the signed 16-bit index is the immediate that the code loads into SI/ESI/RSI before the call, and the method comes from the dynamic method table (`vmtDynamicTable`, `dl_method` kind `dynamic`, slot = index; the class chain is walked). **[verified]** `O.Dyn('x')` on a Delphi test program: `/*dynamic -1 -> TBase.Dyn*/`; the 64-bit load register is **[verify]**. The class of a receiver comes from the nearest earlier store (constructor call with a VMT argument), from all stores into a global in other functions, or from the classes that all callers pass to a parameter; VMT addresses in the C are followed by the class name (`&DAT_0042807c/*TDog*/`).
 - Strings: `AnsiString` / `UnicodeString` literals are `{u16 codePage; u16 elemSize; (u32 pad on 64-bit);
   SizeInt refCount = -1; SizeInt length}` followed by the data and a NUL: 12 bytes before the data in
   32-bit, 24 in 64-bit (Delphi has 12 in both). ANSI literals carry code page 0 when the source uses
@@ -2506,3 +2539,4 @@ code is taken from it.
 - `projects` / `project_open` count binaries from the index store when the manifest lists none. `hexdump` and the other file tools fall back to `artifacts/<sha256>` for an analysed binary. `delphi_events` with no form lists all forms.
 - Strings of Delphi/FPC programs include ShortString literals (length byte, printable, 3+ chars) that an instruction references and that lie in no string data (`shortstr.py`, collector 12). **[verified]** FPC 3.2.2: `'purr'` at 0x00428218 found.
 - `delphi.ensure` takes `NOT_GIVEN` as the default of the three folders: a caller that did not pass the configuration keeps the stored IDR and FPC names. `None` passed means the config has no such folder; `idr.stale` then clears an old result (names dropped, unchanged behaviour).
+- Round 8 target rules (§7.3 additions): a bare Qt/Delphi method name that is unique in the scope resolves to `Class::name` with a fact line (several: `error ambiguous`); `main`/`WinMain`/`wWinMain`/`PASCALMAIN`/`program` of a Delphi or FPC binary without a function of that name is the program body (Delphi: the entry point function; FPC: field 5 of the `TEntryInformation` record that the entry point passes to `FPC_EXE_ENTRY`). **[verified]** FPC 3.2.2 x86 and x64. A function-only tool given an address in an executable block with no function creates it (`create_functions`, dirty role, `allow_writes` on) and says so. `xrefs kind=code` = call + jump kinds. `strings` with no pattern lists all strings. `delphi_events` with `form` and `component` filters inside the form. File tools use the analysed copy when only the file name matches one binary.

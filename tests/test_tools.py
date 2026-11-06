@@ -327,7 +327,7 @@ def test_strings(ctx):
     assert alt.startswith("strings matching 'zzz|other': ") and "(regex used: no literal match)" in alt
     assert '"other"' in alt
     assert core.strings(ctx, "zzz|yyy", regex=True) == "no strings match 'zzz|yyy'"
-    assert core.strings(ctx, "").startswith("error bad_args:")
+    assert core.strings(ctx, "").startswith("strings: ")      # no pattern: every string, paged
 
 
 def test_search(ctx):

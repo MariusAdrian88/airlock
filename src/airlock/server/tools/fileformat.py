@@ -29,8 +29,9 @@ def _roots(ctx: ServerContext) -> list[Path] | str:
     return roots
 
 
-def resolve_path(ctx: ServerContext, path: str) -> Path | str:
-    """A readable file inside the project roots, or a one-line error."""
+def resolve_path(ctx: ServerContext, path: str, notes: list[str] | None = None) -> Path | str:
+    """A readable file inside the project roots, or a one-line error. A path that does not exist but whose
+    file name is that of exactly one analysed binary gives the stored copy of it, and a fact line in ``notes``."""
     roots = _roots(ctx)
     if isinstance(roots, str):
         return roots
@@ -53,6 +54,12 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
     art = _artifact_copy(ctx, text)
     if art is not None:
         return art
+    if p.name and p.name != text:
+        art = _artifact_copy(ctx, p.name, only=True)
+        if art is not None:
+            if notes is not None:
+                notes.append(f"path not found; used the analysed copy of {p.name}")
+            return art
     if not inside:
         names = ", ".join(str(r) for r in roots)
         return (f"error outside_project: '{path}' is not inside the program folder or dirty\\work "
@@ -62,21 +69,27 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
             + (f". Files with that name: {', '.join(near)}." if near else "."))
 
 
-def _artifact_copy(ctx: ServerContext, text: str) -> Path | None:
+def _artifact_copy(ctx: ServerContext, text: str, only: bool = False) -> Path | None:
     """The stored copy (``artifacts/<sha256>``) of an analysed binary named by ``text`` (file name or
-    original path), so a project without a readable root can still be dumped; None when no binary matches."""
+    original path), so a project without a readable root can still be dumped; None when no binary matches
+    (``only``: also None when several binaries match)."""
     pp = ctx.session.project
     if pp is None:
         return None
     try:
         st = ctx.indexer.store(pp.name)
         low = text.replace("\\", "/").lower()
+        hits: list[Path] = []
         for b in st.list_binaries():
             orig = (b.original_path or "").replace("\\", "/").lower()
             if low in (b.name.lower(), orig) or (orig and orig.endswith("/" + low)):
                 f = pp.artifacts / b.sha256
                 if f.is_file():
-                    return f
+                    if not only:
+                        return f
+                    hits.append(f)
+        if only and len(set(hits)) == 1:
+            return hits[0]
     except Exception:  # noqa: BLE001  the plain error below reports the problem
         return None
     return None
@@ -162,7 +175,8 @@ def hexdump(ctx: ServerContext, path: str = "", offset: int = 0, length: int = 2
     args = {"path": path, "offset": offset, "length": length, "stream": stream}
     if cursor:
         return _page(ctx, [], "hexdump", args, cursor, budget, "code")
-    p = resolve_path(ctx, path)
+    notes: list[str] = []
+    p = resolve_path(ctx, path, notes)
     if isinstance(p, str):
         return p
     if stream:
@@ -178,7 +192,7 @@ def hexdump(ctx: ServerContext, path: str = "", offset: int = 0, length: int = 2
     if offset + len(chunk) < src.size:
         tail = [f"… more bytes. offset=0x{offset + len(chunk):x}"
                 + (f" (max {ff.MAX_DUMP} per call)" if length > ff.MAX_DUMP else "")]
-    return _page(ctx, [head] + ff.hexdump_lines(chunk, offset) + tail, "hexdump", args, cursor,
+    return _page(ctx, notes + [head] + ff.hexdump_lines(chunk, offset) + tail, "hexdump", args, cursor,
                  budget, "code")
 
 
