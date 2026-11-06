@@ -60,7 +60,8 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
     out.append(f"ghidra  {g}")
     out.append(f"jdk     {cfg.jdk_dir or 'auto'}")
     if not cfg.is_clean:
-        out.append(f"logs    worker {cfg.data_dir / "logs" / logs.WORKER_LOG}; server {cfg.data_dir / "logs" / logs.SERVER_LOG}")
+        log_dir = cfg.data_dir / "logs"
+        out.append(f"logs    worker {log_dir / logs.WORKER_LOG}; server {log_dir / logs.SERVER_LOG}")
         if se.project is not None:
             out.append(f"        project {logs.project_log_path(se.project.logs)}")
     out += _wrap_list("tools", usable, more=more)

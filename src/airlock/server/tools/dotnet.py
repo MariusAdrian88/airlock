@@ -117,9 +117,9 @@ def dotnet_decompile(ctx: ServerContext, type: str = "", member: str = "", binar
     exe = ctx.config.ilspycmd
     if exe is None:
         return ('error tool_missing: "ilspycmd" is not set in config.jsonc '
-                '(install: dotnet tool install ilspycmd --tool-path <folder>).')
+                '(run airlock doctor --fix).')
     if not Path(exe).is_file():
-        return f'error tool_missing: ilspycmd not found at {exe} ("ilspycmd" in config.jsonc).'
+        return f'error tool_missing: ilspycmd not found at {exe} ("ilspycmd" in config.jsonc); run airlock doctor --fix.'
     bounds = _scope(ctx, binary)
     if isinstance(bounds, str):
         return bounds
@@ -263,7 +263,7 @@ def ilspy_run(ctx: ServerContext, bd: Bound, args: list[str], timeout: int = 0,
     resource and bundle tools."""
     exe = ctx.config.ilspycmd
     if exe is None or not Path(exe).is_file():
-        return None, 'ilspycmd is not set or not found ("ilspycmd" in config.jsonc)'
+        return None, 'ilspycmd is not set or not found ("ilspycmd" in config.jsonc; run airlock doctor --fix)'
     if dn.ilspy_major(Path(exe)) < 11:
         return None, f"ilspycmd {dn.ilspy_version(Path(exe))} is too old for {args[0]} (needs 11)"
     prep = ilspy_prepare(ctx, bd, Path(exe))
@@ -368,7 +368,7 @@ def _wpf_rows(ctx: ServerContext, bd: Bound, art: Path, form: str) -> tuple[list
         return [], ""
     exe = ctx.config.ilspycmd
     if exe is None or not Path(exe).is_file():
-        return [], f"wpf: {len(names)} BAML resources not read (ilspycmd is not set or not found)"
+        return [], f"wpf: {len(names)} BAML resources not read (ilspycmd is not set or not found; run airlock doctor --fix)"
     if dn.ilspy_major(Path(exe)) < 11:
         return [], f"wpf: {len(names)} BAML resources not read (ilspycmd {dn.ilspy_version(Path(exe))} is older than 11)"
     prep = ilspy_prepare(ctx, bd, Path(exe))

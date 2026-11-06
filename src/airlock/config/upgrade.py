@@ -188,9 +188,8 @@ def stale_message(text: str) -> str | None:
     if plan.from_version >= plan.to_version:
         return None
     items = plan.new_tools + plan.added
-    shown = ", ".join(items[:8]) + (", ..." if len(items) > 8 else "")
     return (f"version {plan.from_version} < {plan.to_version}; {len(items)} tools/keys "
-            f"missing ({shown}) — run airlock config upgrade")
+            "missing; run airlock config upgrade")
 
 
 def upgrade_file(path: Path, dry_run: bool = False) -> tuple[UpgradePlan, Path | None]:

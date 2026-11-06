@@ -114,9 +114,14 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
         return 1
     add(Check("OK" if cfg.source else "WARN", "config",
               str(cfg.source) if cfg.source else
-              "no config file; run `airlock init --ghidra <path>` to create one"))
+              "no config file; run `airlock init --ghidra <path>`"))
+    if cfg.source is None and fix:
+        add(Check("WARN", "fix", "needs a config file first; run `airlock init --ghidra <path>`"))
+        fix = False
     add(Check("OK", "profile", f"{cfg.profile} (role {cfg.role}), {len(cfg.tools)} tools enabled"))
     for issue in cfg.issues:
+        if issue.message.startswith("ghidra_dir is not set"):
+            continue                # the ghidra check below reports it once
         if issue.level != "info":
             add(Check("FAIL" if issue.level == "error" else "WARN", "config", issue.message))
     if cfg.source is not None:
@@ -138,7 +143,7 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
             pass
         net = drives.is_network_path(data)
         if net:
-            add(Check("WARN", "data dir", f"{data} is on a network drive; SQLite WAL needs a local disk"))
+            add(Check("WARN", "data dir", f"{data} is on a network drive; SQLite WAL needs a local disk; move index_dir to a local disk"))
         else:
             add(Check("OK", "data dir", str(data)))
     except OSError as e:
@@ -152,7 +157,7 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
             pass
         if drives.is_network_path(root):
             add(Check("WARN", "projects root",
-                      f"{root} is on a network drive; Ghidra projects need a local disk"))
+                      f"{root} is on a network drive; Ghidra projects need a local disk; move projects_root to a local disk"))
         else:
             add(Check("OK", "projects root", str(root)))
     except OSError as e:
@@ -165,7 +170,7 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
     # Ghidra
     info = None
     if cfg.ghidra_dir is None:
-        add(Check("FAIL", "ghidra", "ghidra_dir is not set"))
+        add(Check("FAIL", "ghidra", "ghidra_dir is not set; run `airlock init --ghidra <path>`"))
     else:
         try:
             info = ghidra_install.inspect(cfg.ghidra_dir)
@@ -174,7 +179,7 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
                 add(Check("WARN", "ghidra/python",
                           f"Ghidra lists Python {', '.join(info.python_supported)}"))
             if info.pyghidra_wheel is None:
-                add(Check("FAIL", "pyghidra bundle", "no pyghidra wheel in Ghidra/Features/PyGhidra/pypkg/dist"))
+                add(Check("FAIL", "pyghidra bundle", "no pyghidra wheel in Ghidra/Features/PyGhidra/pypkg/dist; use a full Ghidra release"))
             elif not info.bundled_jpype_for(v.major, v.minor):
                 add(Check("WARN", "jpype bundle",
                           f"no bundled JPype wheel for Python {v.major}.{v.minor} on this OS "
@@ -194,10 +199,11 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
         major, text = _java_version(found) if found else (None, "java not on PATH")
         where = f"PATH ({found})" if found else "PATH"
     if major is None:
-        hint = "" if cfg.jdk_dir else " (set jdk_dir in config.jsonc, or PyGhidra falls back to JAVA_HOME)"
+        hint = (f"; set jdk_dir to a JDK {need}+ folder" if cfg.jdk_dir else
+                f"; set jdk_dir to a JDK {need}+ folder (or PyGhidra falls back to JAVA_HOME)")
         add(Check("FAIL" if cfg.jdk_dir else "WARN", "jdk", f"{text}{hint}"))
     elif major < need:
-        add(Check("FAIL", "jdk", f"Java {major} from {where}; Ghidra needs {need}+"))
+        add(Check("FAIL", "jdk", f"Java {major} from {where}; Ghidra needs {need}+; set jdk_dir to a JDK {need}+ folder"))
     else:
         add(Check("OK", "jdk", f"Java {major} from {where}"))
 
@@ -230,6 +236,18 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
                 add(Check("FIXED" if ok else "WARN", "ilspycmd", msg if ok else f"{problem}; install failed: {msg}"))
             else:
                 add(Check("WARN", "ilspycmd", f"{problem}; run `airlock doctor --fix`"))
+    elif fix:
+        dest = cfg.data_dir / "tools" / "ilspycmd.exe"
+        ok, msg = install_ilspycmd(dest)
+        if ok:
+            from airlock.config.report import set_value
+            try:
+                set_value(cfg.source, "ilspycmd", str(dest))
+            except (ValueError, ConfigError, OSError) as e:
+                ok, msg = False, f"installed at {dest} but config.jsonc not updated ({e}); run `airlock config --set ilspycmd {dest}`"
+        add(Check("FIXED" if ok else "WARN", "ilspycmd", msg if ok else f"install failed: {msg}"))
+    else:
+        add(Check("WARN", "ilspycmd", "not set; optional, for .NET; run `airlock doctor --fix`"))
 
     # IDR knowledge bases
     if cfg.idr_kb_dir:
@@ -247,7 +265,8 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
         add(Check("OK", "delphi sigdb", f"{cfg.delphi_sigdb_dir}: " + ", ".join(f.path.name for f in sigs)))
     else:
         add(Check("OK", "delphi sigdb",
-                  f"none in {cfg.delphi_sigdb_dir}; build with `airlock delphi-sigs build <Delphi install folder>`"))
+                  f"none in {cfg.delphi_sigdb_dir}; build them from your own install with `airlock delphi-sigs build <Delphi install folder>` "
+                  "or `airlock delphi-sigs fpc-build <FPC install folder>` (they cannot be downloaded)"))
 
     # WARP libraries (delphinja)
     warps = _idr.warp_files(cfg.warp_dir, 4) + _idr.warp_files(cfg.warp_dir, 8)

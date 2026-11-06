@@ -52,8 +52,6 @@ ALLOW = [
      "same choice, when the scan found a root but others are plausible"),
     ("project_create.py", "option=",
      "the analysis option is a choice; the line lists the options and the recommended one"),
-    ("dotnet.py", "install: dotnet tool install ilspycmd",
-     "only the user can install ilspycmd; one fact line names the fix"),
     ("warp.py", "pip install airlock[sigs]",
      "a missing optional package; only the user can install it"),
     ("projectmap.py", "airlock config --set",
