@@ -177,3 +177,23 @@ def test_suggested_handler_names_resolve(proj):  # noqa: F811
     assert isinstance(r, targets.FunctionTarget) and r.fn.entry == h["upd"]
     r = targets.resolve_target(ctx, "", "CSettingsDlg::OnCommand_100_Open", [targets.FUNCTION])
     assert isinstance(r, str) and r.startswith("error not_found")             # another class
+
+
+def test_search_lists_generated_mfc_handler_names(proj):  # noqa: F811
+    from airlock.server.tools import core
+    ctx, st, bid, h = proj
+    st.db.execute("UPDATE function SET name='FUN_00401000', namespace=NULL WHERE binary_id=? AND entry=?",
+                  (bid, h["open"]))
+    st.db.commit()
+    out = core.search(ctx, "oncommand_100_open", kind="function")
+    assert any(ln.startswith("function CMainFrame::OnCommand_100_Open 0x00401000 (MFC handler)")
+               for ln in out.splitlines()), out
+    assert "function FUN_00401000" not in out
+
+
+def test_cpp_tool_errors_list_data_not_advice(proj):  # noqa: F811
+    ctx, st, bid, h = proj
+    out = cpp_tools.mfc_message_maps(ctx, "NoSuchClass")
+    assert out.startswith("error not_found") and "classes with a map: " in out and "CMainFrame" in out
+    assert "Call " not in out
+    assert "Retry" not in cpp_tools.rtti_classes(ctx, limit=0)

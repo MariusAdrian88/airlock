@@ -58,8 +58,6 @@ ALLOW = [
      "a missing optional package; only the user can install it"),
     ("projectmap.py", "airlock config --set",
      "a disabled tool set; only the user can enable it (fact line with the command)"),
-    # MFC work in progress elsewhere (server/mfc.py, tools/cpp.py): reported, not changed here.
-    ("cpp.py", "", "owned by the MFC work; its hints are listed for that change"),
 ]
 
 

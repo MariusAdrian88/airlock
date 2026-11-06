@@ -240,6 +240,42 @@ def _qt_method_hits(bd: Bound, query: str, fetch: int,
     return seq
 
 
+def _mfc_handler_hits(bd: Bound, query: str, fetch: int,
+                      groups: dict[str, list[tuple[tuple[int, ...], str]]], seq: int, pfx: str) -> int:
+    """Generated MFC handler names (`Class::OnCommand_<id>_<leaf>`, see `uijoin.UiIndex.suggest`) of
+    handlers that are still FUN_ functions: adds `function Class::name addr (MFC handler)` lines."""
+    q = query.strip().lower()
+    if not q or " " in q:
+        return seq
+    try:
+        ui = uijoin.UiIndex(bd.store, bd.binary.id)
+        hs = list(ui.handlers)
+    except Exception:           # noqa: BLE001  no message map tables
+        return seq
+    seen: set[int] = set()
+    n = 0
+    for h in hs:
+        if h.addr in seen or n >= fetch:
+            continue
+        fn = bd.store.function_at(bd.binary.id, h.addr)
+        if not uijoin.is_unnamed(fn):
+            continue
+        name = ui.suggest(h)
+        if q not in f"{h.cls}::{name}".lower():
+            continue
+        seen.add(h.addr)
+        n += 1
+        at = f" {bd.addr(h.addr)} "
+        fns = groups.setdefault("function", [])
+        fun = f"{pfx}function FUN_"
+        if any(at in x + " " and not x.startswith(fun) for _, x in fns):
+            continue
+        fns[:] = [(k, x) for k, x in fns if not (at in x + " " and x.startswith(fun))]
+        seq += 1
+        fns.append(((_match_rank(query, name), 0, seq), f"{pfx}function {h.cls}::{name}{at}(MFC handler)"))
+    return seq
+
+
 def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
                    groups: dict[str, list[tuple[tuple[int, ...], str]]], seq: int,
                    pfx: str) -> int:
@@ -265,6 +301,7 @@ def _search_binary(bd: Bound, query: str, kind: str, fetch: int,
                 groups.setdefault(k, []).append(((*key, seq), pfx + line))
     if kind in ("any", "function"):
         seq = _qt_method_hits(bd, query, fetch, groups, seq, pfx)
+        seq = _mfc_handler_hits(bd, query, fetch, groups, seq, pfx)
     for value, (key, s) in strings.items():
         total = st.string_copies(b.id, value)
         enc = "" if s.encoding == "ascii" else f" {s.encoding}"

@@ -7,6 +7,8 @@ cut to the token budget with a cursor. Names are hints: nothing is renamed in Gh
 
 from __future__ import annotations
 
+import difflib
+
 from airlock.server import cpp, mfc, peres, uijoin
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
@@ -63,7 +65,7 @@ def _prefix(bd: Bound, several: bool) -> str:
 def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT, binary: str = "",
                  cursor: str = "", budget: int = 0) -> str:
     if limit < 1:
-        return "error bad_args: limit must be at least 1. Fix and retry."
+        return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary)
     if isinstance(sc, str):
         return sc
@@ -97,11 +99,18 @@ def rtti_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT
         return f"no RTTI class matches '{query}' ({have} classes)."
     shown = [ln for _, ln in rows[:limit]]
     if total > limit:
-        shown.append(f"… {total - limit} more classes beyond limit={limit}. Raise limit or narrow query.")
+        shown.append(f"… {total - limit} more classes beyond limit={limit}.")
     return fit_lines(shown, bud, "code", tool="rtti_classes", args=args)[0]
 
 
 # ── vtable ─────────────────────────────────────────────────────────────────
+
+def _close_names(bounds: list[Bound], want: str) -> list[str]:
+    names = sorted({r["name"] for bd in bounds for r in bd.store.db.execute(
+        "SELECT name FROM rtti_class WHERE binary_id=? AND vtable_addr IS NOT NULL", (bd.binary.id,))})
+    low = {n.lower(): n for n in names}
+    return [low[m] for m in difflib.get_close_matches(want, list(low), n=5, cutoff=0.5)]
+
 
 def _vtable_lines(bd: Bound, several: bool, vtable: int, name: str, mark: int | None) -> list[str]:
     slots = bd.store.db.execute(
@@ -119,7 +128,7 @@ def _vtable_lines(bd: Bound, several: bool, vtable: int, name: str, mark: int | 
 def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", budget: int = 0) -> str:
     t = target.strip()
     if not t:
-        return "error bad_target: target is empty. Pass a class name (see rtti_classes) or an address like 0x00401000."
+        return "error bad_target: target is empty: a class name or an address is needed."
     sc = _scope(ctx, binary)
     if isinstance(sc, str):
         return sc
@@ -145,8 +154,7 @@ def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", 
             mark = (addr[1] - r["vtable_addr"]) // ps if addr[1] != r["vtable_addr"] else None
             lines += _vtable_lines(bd, several, r["vtable_addr"], nm["name"] if nm else "?", mark)
         if not lines:
-            return (f"error not_found: no vtable at or around {t}. "
-                    "Call rtti_classes for the class vtables.")
+            return f"error not_found: no vtable at or around {t}."
     else:
         want = t.lower()
         hits: list[tuple[Bound, str, int]] = []
@@ -166,14 +174,16 @@ def vtable(ctx: ServerContext, target: str, binary: str = "", cursor: str = "", 
             if len(names) > 1:
                 shown = ", ".join(names[:10])
                 more = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
-                return (f"error ambiguous: '{t}' matches {len(names)} classes: {shown}{more}. "
-                        "Retry with the full class name.")
+                return (f"error ambiguous: '{t}' matches {len(names)} classes: {shown}{more}.")
         if not hits:
-            return f"error not_found: no class '{t}' with a vtable. Call rtti_classes with a query."
+            close = _close_names(bounds, want)
+            return (f"error not_found: no class '{t}' with a vtable."
+                    + (f" close names: {', '.join(close)}." if close else ""))
         for bd, nm, va in hits[:MAX_VTABLES]:
             lines += _vtable_lines(bd, several, va, nm, None)
         if len(hits) > MAX_VTABLES:
-            lines.append(f"… {len(hits) - MAX_VTABLES} more vtables of this class. Pass an address to see one.")
+            rest = ", ".join(bd.addr(va) for bd, _nm, va in hits[MAX_VTABLES:MAX_VTABLES + 20])
+            lines.append(f"… {len(hits) - MAX_VTABLES} more vtables of this class: {rest}")
     return fit_lines(lines, bud, "code", tool="vtable", args=args)[0]
 
 
@@ -276,8 +286,7 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                 lines.append(f"{_prefix(bd, several)}{r['class']} {r['kind']} map {bd.addr(r['map_addr'])} "
                              f"entries {r['n']}")
         if not lines:
-            return ("no MFC message maps found in the binary (a layout this decoder does not know, or no MFC). "
-                    "Follow a command id with menus or dialogs, then constants(value=id) and xrefs.")
+            return "no MFC message maps found in the binary (a layout this decoder does not know, or no MFC)."
         return fit_lines(lines, bud, "code", tool="mfc_message_maps", args=args)[0]
     want = t.lower()
     found = False
@@ -300,7 +309,7 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                 shown = ", ".join(names[:10])
                 more = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
                 return (f"error ambiguous: '{t}' matches {len(names)} classes with message maps: "
-                        f"{shown}{more}. Retry with the full class name.")
+                        f"{shown}{more}.")
             else:                                  # no own map: the nearest base class that has one
                 cls = bd.store.db.execute(
                     "SELECT name FROM rtti_class WHERE binary_id=? AND lower(name)=? LIMIT 1",
@@ -329,7 +338,7 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
             ).fetchall()
             if len({r["class"] for r in extra_maps}) > 1:
                 return (f"error ambiguous: '{t}' matches classes with automation maps: "
-                        f"{', '.join(sorted({r['class'] for r in extra_maps})[:10])}. Retry with the full class name.")
+                        f"{', '.join(sorted({r['class'] for r in extra_maps})[:10])}.")
         for m in maps:
             found = True
             if inherited:
@@ -353,6 +362,9 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                          f"entries {len(rows)}")
             lines += [_dispatch_line(bd, r) for r in rows]
     if not found:
-        return (f"error not_found: no message map for '{t}'. Call mfc_message_maps without a class for "
-                "the classes that have one.")
+        names = sorted({r["class"] for bd in bounds for r in bd.store.db.execute(
+            "SELECT DISTINCT class FROM msgmap_entry WHERE binary_id=?", (bd.binary.id,))})
+        have = (f" classes with a map: {', '.join(names[:30])}"
+                + (f" (+{len(names) - 30} more)" if len(names) > 30 else "") + ".") if names else ""
+        return f"error not_found: no message map for '{t}'.{have}"
     return fit_lines(lines, bud, "code", tool="mfc_message_maps", args=args)[0]
