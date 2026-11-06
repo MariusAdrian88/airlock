@@ -721,6 +721,11 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
             cv = _class_view(ctx, binary, target, bud, cursor)
             if cv is not None:
                 return cv
+            if view != "signature" and ft.startswith("error not_found: no function at or containing"):
+                rv = _raw_view(ctx, binary, target, view, bud, cursor, {
+                    "binary": binary, "target": target, "view": view, "lines": lines, "detail": detail})
+                if rv is not None:
+                    return rv
         return ft
     assert isinstance(ft, tg.FunctionTarget)
     bd, fn, note = ft.bound, ft.fn, ft.any_note
@@ -781,6 +786,46 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head, outline_depth)
         return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
     return _function_page(full, bud, span, lines, offset, note, args, identity)
+
+
+RAW_MAX = 200
+
+
+def _raw_view(ctx: ServerContext, binary: str, target: str, view: str, bud: int, cursor: str,
+              args: dict) -> str | None:
+    """``function`` on a code address where Ghidra has no function and none could be created: the disassembly
+    from that address to the first RET / unconditional jump (at most RAW_MAX instructions), one fact line first.
+    None (the not_found line stands) for a clean session, data, or an address Ghidra cannot disassemble."""
+    from airlock.server import roles
+
+    if ctx.session.role == roles.CLEAN:
+        return None
+    if cursor:
+        try:
+            return resume_lines(cursor, bud, "code", tool="function", args=args)[0]
+        except CursorError:
+            pass
+    ca = tg.code_address(ctx, binary, target)
+    if ca is None:
+        return None
+    bd, value, sc = ca
+    ix = ctx.indexer
+    try:
+        ix.ensure_open(bd.project)
+        r = ctx.worker.request("disassemble", {"program": ix.program_of(bd.store, bd.binary), "entry": value,
+                                               "raw": True, "max_instructions": RAW_MAX}, timeout=300)
+    except (WorkerError, IndexerError):
+        return None
+    if not r.get("rows"):
+        return None
+    total = r.get("total") if r.get("truncated") else None
+    asm = format_asm(r["rows"], bd.psize, total)
+    where = bd.addr(value)
+    fact = (f"// no function at {where}; disassembly from there to the first RET or unconditional JMP"
+            + (f" (cut at {RAW_MAX} instructions)" if total else ""))
+    if not sc.explicit:
+        fact += f"; binary {bd.binary.name}"
+    return fit_lines([fact] + asm, bud, "code", tool="function", args=args)[0]
 
 
 def _import_refs(ctx: ServerContext, target: str, binary: str, bud: int) -> str:

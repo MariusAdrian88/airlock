@@ -374,16 +374,11 @@ def resolve_target(ctx: ServerContext, binary: str, target: str, kinds: Iterable
     return r
 
 
-def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | None:
-    """An address in an executable block of one binary where Ghidra has no function (a Qt vtable slot, a handler
-    no static table names): create the function with the worker op ``create_functions`` (the same op as the
-    bulk pass), re-read the binary's functions and return it with a fact line. None when the session may not
-    write (clean role, ``allow_writes`` off), the address is no code, or Ghidra refuses."""
-    from airlock.server import roles
+def code_address(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, int, Scope] | None:
+    """(binary, address, scope) when ``target`` is an address (or a default name such as ``FUN_...``) in an
+    executable block of exactly one binary of the scope; None otherwise."""
     from airlock.server.cpp import Image
 
-    if ctx.session.role == roles.CLEAN or not ctx.config.allow_writes:
-        return None
     sc = bind_scope(ctx, binary, target)
     if isinstance(sc, str):
         return None
@@ -407,7 +402,23 @@ def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionT
             code.append(bd)
     if len(code) != 1:
         return None
-    bd = code[0]
+    return code[0], value, sc
+
+
+def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionTarget | None:
+    """An address in an executable block of one binary where Ghidra has no function (a Qt vtable slot, a handler
+    no static table names): create the function with the worker op ``create_functions`` (the same op as the
+    bulk pass), re-read the binary's functions and return it with a fact line. None when the session may not
+    write (clean role, ``allow_writes`` off), the address is no code, or Ghidra refuses."""
+    from airlock.server import roles
+
+    if ctx.session.role == roles.CLEAN or not ctx.config.allow_writes:
+        return None
+    ca = code_address(ctx, binary, target)
+    if ca is None:
+        return None
+    bd, value, sc = ca
+    ix = ctx.indexer
     program = ix.program_of(bd.store, bd.binary)
     try:
         ix.ensure_open(bd.project)

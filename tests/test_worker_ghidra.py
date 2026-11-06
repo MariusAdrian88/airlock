@@ -487,3 +487,7 @@ def test_disassemble(world):
     assert len(cut["rows"]) == 5 and cut["truncated"] and cut["total"] == d["total"]
     with pytest.raises(WorkerError):
         c.request("disassemble", {"program": PROGRAM, "entry": 0})
+    raw = c.request("disassemble", {"program": PROGRAM, "entry": f["entry"], "raw": True}, timeout=120)
+    assert raw["rows"][0][0] == f["entry"] and len(raw["rows"]) <= d["total"]
+    assert len(c.request("disassemble", {"program": PROGRAM, "entry": f["entry"], "raw": True,
+                                         "max_instructions": 2})["rows"]) == 2

@@ -916,10 +916,10 @@ omitted when the project has one binary. With several ready binaries,
 | `list_binaries` | `project?` | one line per binary: id, name, format, arch, toolchain, sha256 prefix, status, then `group=` and `code=` (from the manifest, when known), `fns=` and `links=out/in` (cross-binary edges) |
 | `outline` | `binary` | sections, entry points, import DLLs with counts, `exports N`, `imports from project binaries: x.dll 12, …`, function counts by `name_state`, classes count, toolchain. ~300 tokens |
 | `search` | `query`, `kind?` (`function`/`string`/`import`/`const`/`class`/`note`/`any`), `limit=20` | ranked hits, one line each: kind, name, address, short context; ranking and dedup in §7.4 |
-| `function` | `target`, `view=c` (`c`/`asm`/`both`/`signature`), `lines?` | decompiled C (or asm) with address annotations on calls; truncated to budget with a cursor |
-| `xrefs` | `target`, `direction=to` (`to`/`from`), `kind?` (`call`/`read`/`write`/`data`), `limit=50` | one line per reference: from-function, address, kind |
+| `function` | `target`, `view=c` (`c`/`asm`/`both`/`signature`), `lines?` | decompiled C (or asm) with address annotations on calls; truncated to budget with a cursor. A code address with no Ghidra function: the function is created when the session may write (dirty role, `allow_writes`), else the disassembly from that address to the first RET / unconditional JMP (at most 200 instructions) after one `// no function at 0x..` line |
+| `xrefs` | `target`, `direction=to` (`to`/`from`), `kind?` (`call`/`jump`/`code`/`read`/`write`/`data`/`import`/`dynamic`/`fnptr`/`table`; `code` = call + jump kinds), `limit=50` | one line per reference: from-function, address, kind |
 | `callgraph` | `target`, `direction=callees`, `depth=2` | indented tree, names + addresses; cycles marked |
-| `strings` | `pattern`, `regex=false`, `with_refs=true`, `limit=30` | string, address, referencing functions |
+| `strings` | `pattern?`, `regex=false`, `with_refs=true`, `limit=30`, `binary?` | string, address, referencing functions; no pattern: every defined string in pages (`strings: N` head line, cursor) |
 
 ### types
 
@@ -981,7 +981,7 @@ Details settled in M3:
 | Tool | Parameters | Returns |
 |---|---|---|
 | `rtti_classes` | `query?`, `limit=50` | classes from MSVC RTTI: name, vtable, slot count, direct base classes |
-| `vtable` | `target` (class name or address; C++ RTTI, Delphi, FPC) | slots: index, address, function name, origin |
+| `vtable` | `target` (class name or address; C++ RTTI, Delphi, FPC; also an interface table or IMT address and the header words before a Delphi VMT) | slots: index, address, function name, origin; Delphi / FPC classes end with their interfaces (`interface IGreeter {GUID} imt .. slots N`, one line per slot) and the dynamic methods (`dynamic [-1] 0x.. name`) |
 | `mfc_message_maps` | `target?` (class) | no class: the classes that have a message map (with the class's dialog) and the dispatch / interface / event sink maps; a class: message, control id, handler function per entry (`as OnCommand_57600_Open` when the function has no name of its own), `// menu "File > Open..."` or `// dialog 101 button "OK"` for the id (a class without a map of its own shows the nearest base class that has one), then its automation maps: `method Name(long, LPCSTR) -> void dispid 2 -> 0x... fn`, `property Name BSTR dispid 5 get 0x... set 0x...`, `stock BackColor dispid -501 long`, `interface IDispatch offset 0x10`, `event dispid 7 ctrl 1000 -> 0x...` |
 | `qt_metaobjects` | `class_?`, `limit=50`, `connections=false`, `binary?` | no class: one line per Qt class (parent, signal/slot/property counts, methods mapped); a class: signals, slots, invokable methods and constructors with index, parameter types and names, flags and the function behind each; properties (notify signal), enums, `Q_CLASSINFO`, connections that name its signals or slots. `connections=true`: all string connects and `connectImpl` call sites. Done in M8 |
 
@@ -991,7 +991,7 @@ Details settled in M3:
 |---|---|---|
 | `delphi_classes` | `query?`, `limit=50`, `binary?`, `cursor?`, `budget?` | classes from the VMTs: `Name : Parent unit U vmt 0x.. size N published P virtual V fields F`; `query` matches the class or unit name |
 | `delphi_forms` | `form?`, `binary?`, `cursor?`, `budget?` | no form: one line per DFM form (class, name, caption, component and event counts). A form (resource name, class or form name; `binary!form` works): the component tree, indented, `Name: Class "caption" events N` (no addresses) |
-| `delphi_events` | `form?` or `component?`, `binary?`, `cursor?`, `budget?` | `Button1.OnClick -> TMainForm.Button1Click 0x.. TMainForm::Button1Click`; a handler the form class (and its ancestors) do not publish shows `(not in the published methods)` |
+| `delphi_events` | `form?` and/or `component?`, `binary?`, `cursor?`, `budget?`: `form` + `component` = the component (exact name, else prefix, case-insensitive) inside that form, head `TMainForm events 6 of 457 (component 'actFlush')`, no match = `error not_found` with the form's component names; `form` alone = its events; `component` alone = that component in every form; neither = the events of all forms | `Button1.OnClick -> TMainForm.Button1Click 0x.. TMainForm::Button1Click`; a handler the form class (and its ancestors) do not publish shows `(not in the published methods)` |
 
 Dirty-role only. Tables `dl_class`, `dl_method`, `dl_field`, `dl_form`, `dl_component`, `dl_event`
 (schema v12, meta `delphi_version:<id>`), filled on the server from the PE bytes (`server/delphi.py`,
@@ -1368,7 +1368,7 @@ MFC message map entries.
 | Tool | Parameters | Returns |
 |---|---|---|
 | `ole_streams` | `path`, `stream?` | stream tree with sizes; one stream as hexdump page |
-| `hexdump` | `path`, `offset=0`, `length=256` | hex + ASCII |
+| `hexdump` | `path`, `offset=0`, `length=256`, `stream?` | hex + ASCII; a path that does not exist but whose file name is that of one analysed binary reads `artifacts/<sha256>` (first line `path not found; used the analysed copy of NAME`) |
 | `file_diff` | `path_a`, `path_b`, `stream?` | changed byte ranges with context; for OLE, per stream |
 | `record_guess` | `path`, `stream?`, `offset?` | candidate record layouts: length prefixes, repeated strides, string fields |
 

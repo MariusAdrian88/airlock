@@ -303,7 +303,7 @@ Tools that take a target accept these forms:
   32 and 64-bit. Virtual member pointers resolve through the vtable of a known receiver.
 - **Delphi.** `delphi_classes` lists classes from the VMT, published methods, fields
   and extended RTTI. `delphi_forms` shows the component tree of a form. `delphi_events`
-  maps component events to handlers. Ghidra is not renamed: `function` shows the names
+  maps component events to handlers (a form and a component filter inside the form, all forms when none is given). Ghidra is not renamed: `function` shows the names
   as hints.
   - RTL and VCL routine names come from four sources, in this order: the exact-version
     signature database, the RTTI consensus database, WARP libraries and the IDR knowledge base.
@@ -383,7 +383,7 @@ side only ever sees specifications.
 ## Development
 
 - Install for development: `pip install -e .[dev]`. Check the install with `airlock doctor --start`.
-- Tests: `pytest -q` (1323 passed, 47 skipped). Tests run in parallel, at most 8 workers.
+- Tests: `pytest -q` (1326 passed, 47 skipped). Tests run in parallel, at most 8 workers.
 - Ghidra tests: `pytest -q -m ghidra --binary=<exe>` or `--xbin=<folder>`. They run one at a time.
 - A new tool must be in `catalog.py` and registered with `@tool` in a module under
   `src/airlock/server/tools/`. Tool output must not contain hints (`tests/test_no_hints.py`).
