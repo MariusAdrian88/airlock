@@ -440,9 +440,10 @@ def _accesses(md: Any, pe: Any, parsed: Any, out: Meta, fowner: dict[int, str], 
 # -- storing -----------------------------------------------------------------------------------
 
 def write(store: Any, bid: int, meta: Meta) -> None:
-    """Fill the tables of one binary (after ``clear``) and add the field access edges."""
+    """Fill the tables of one binary (after ``clear``) and add the field access edges. Joins an open
+    transaction (the caller commits)."""
     db = store.db
-    with db:
+    with store.tx():
         db.executemany("INSERT INTO dn_rel VALUES (?,?,?,?,?)", [(bid, *r) for r in meta.rels])
         db.executemany("INSERT INTO dn_override VALUES (?,?,?,?,?,?,?)", [(bid, *r) for r in meta.overrides])
         db.executemany("INSERT INTO dn_field VALUES (?,?,?,?,?,?,?,?)", [(bid, *r) for r in meta.fields])

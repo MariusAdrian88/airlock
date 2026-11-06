@@ -2708,3 +2708,17 @@ session bound to that project, and `waiting for analysis` only while the queue i
   **[verify]** compressed entries on a real self-contained bundle (raw deflate).
 - An apphost (marker with offset 0) names the managed dll beside it; that dll is the root.
 - `BinaryInfo.r2r` (RTR header) is managed-only: IL path, no Ghidra import (**[verified]** on System.Diagnostics.Process.dll 8.0.33: 1.0 s, 1182 managed functions, instead of 62 s and 2592 Ghidra functions). Toolchain `nativeaot` = no CLI header and export `DotNetRuntimeDebugHeader` (**[verified]** on ilspycmd 11.2: detect = nativeaot, scan line).
+- A folder where every PE is a framework-named managed assembly (no root, for example ReadyToRun runtime assemblies) is not
+  group `runtime`: all of them become `core`, so option A exists and is recommended.
+- Root ranking: a file stem that starts with a folder or product token of 6+ letters counts as a name match
+  (`DependenciesGui` for the product `Dependencies`); the larger GUI exe then wins over the CLI exe.
+- `resume_project` adds the own (non-framework, `MZ`) assembly entries of a single-file bundle host whose project has the host only
+  (project made before bundles were unpacked), once, as manifest entries `Host.exe!Entry.dll`.
+
+### 5.0b .NET tables: one writer per binary
+
+`dotnet.ensure` takes a lock per (database, binary id), checks the version key again under the lock, parses, and writes
+deletes, inserts, FTS and the version key in one transaction (`Store.tx()` joins an open transaction instead of committing
+it). A failed parse or insert leaves the old rows. `ensure_project` (open of an old project) skips binaries that are not
+`ready`: their own job writes the tables. A managed binary in `error` with `cannot read .NET metadata ... IntegrityError`
+(left by the older race) is queued again on the next open. DOTNET_VERSION 7.

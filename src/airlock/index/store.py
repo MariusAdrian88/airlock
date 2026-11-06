@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import json
 import re
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -244,6 +245,16 @@ class Store:
         r = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return r["value"] if r else None
 
+    @contextlib.contextmanager
+    def tx(self) -> Iterator[None]:
+        """A transaction that joins the caller's open one (the caller commits) instead of
+        committing it half way; outside a transaction it commits on exit."""
+        if self.db.in_transaction:
+            yield
+        else:
+            with self.db:
+                yield
+
     def set_meta(self, key: str, value: str) -> None:
         """Upsert one meta row. Outside a transaction it commits at once (a bare write would
         leave the implicit transaction open and lock every other thread out); inside one the
@@ -334,7 +345,7 @@ class Store:
             )
             for r in rows
         ]
-        with self.db:
+        with self.tx():
             self.db.executemany(
                 "INSERT INTO function(binary_id, space, entry, name, name_state, namespace, "
                 "signature, calling_conv, size, is_thunk, is_external, bytes_hash, masked_hash) "
@@ -366,7 +377,7 @@ class Store:
     def normalise_import_edges(self, binary_id: int) -> int:
         """Turn read/data edges from a function to an import slot of the same binary into
         ``call_imp`` edges (needs src_fn: run after ``link_edges``). Idempotent; returns rows changed."""
-        with self.db:
+        with self.tx():
             cur = self.db.execute(
                 "UPDATE edge SET kind='call_imp' WHERE binary_id=? AND src_fn IS NOT NULL "
                 "AND kind IN ('read','data') AND dst_addr IN "
@@ -672,7 +683,7 @@ class Store:
         self, binary_id: int, rows: Iterable[tuple[str | None, str | None, int | None, int | None]]
     ) -> None:
         """Rows: (dll, name, ordinal, address)."""
-        with self.db:
+        with self.tx():
             self.db.executemany(
                 "INSERT INTO import(binary_id, dll, name, ordinal, address) VALUES (?,?,?,?,?)",
                 [(binary_id, *r) for r in rows],
@@ -725,7 +736,7 @@ class Store:
     def rebuild_fts(self, binary_id: int) -> None:
         """Repopulate fts rows (function names, strings, imports) of a binary.
         ref_id is function.id, string.id or import rowid."""
-        with self.db:
+        with self.tx():
             self.db.execute("DELETE FROM fts WHERE binary_id=? AND kind<>'note'", (binary_id,))
             self.db.execute(
                 "INSERT INTO fts(kind, ref_id, binary_id, text) "

@@ -949,3 +949,24 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
   `ghidra_start_failed` messages. Sigdbs cannot be downloaded: doctor names `airlock delphi-sigs build|fpc-build`.
 - Bug found by the `--fix` test: `config.edit.set_key` on a one-line config (`{"a": 1}`) wrote broken JSON
   (indent was `{`). Fixed in `_indent_of`.
+
+## .NET round 2 fix N1: one writer per managed binary, bundle resume, R2R folders, GUI root (R1, R8, R7, P15)
+
+- R1: `dotnet.ensure` has a lock per (db, binary) and one transaction for delete + insert + FTS + version key; `Store.tx()` (new)
+  makes `insert_functions`, `insert_imports`, `normalise_import_edges`, `rebuild_fts`, `dotnet_meta.write`, `_write_edges` join an open
+  transaction. `dotnet.ensure_project` skips binaries with status other than `ready`. DOTNET_VERSION 7 (parse again once; the
+  delete removes doubled edges). `resume_project` resets a dotnet binary in `error` with `IntegrityError` to `queued`
+  (version key cleared) so the next open rebuilds it. **[verified]** KeePass 2.x folder, project created in two fresh roots, with
+  `index_status` right after `project_create`: all 3 binaries `ready`, 0 duplicate edge groups (SQL), KeePass.exe 106301 edges
+  (before 192750 doubled), 7171 strings (before 14342); same numbers in both roots; re-open leaves them unchanged.
+- R8: `Indexer._add_bundle_entries` (from `resume_project`): a manifest host that `bundle_manifest` reads as a bundle and that has no
+  `Host!Entry` manifest paths gets its non-framework `MZ` assembly entries as artifacts and manifest entries, queued once.
+- R7: `scan_program`: no root and every PE a framework-named managed file -> group `core`, option A, recommended A.
+- P15: **[verified]** the HANDOVER claim holds on the full release folder (root `DependenciesGui.exe`), but not on a folder with a
+  short name (`prog\dep`): the folder token `dep` and the product `Dependencies` matched `Dependencies.exe` only (name +3), so the CLI exe
+  won. Fix: `_name_match` accepts a stem that starts with a token of 6+ letters. Both folders now give root `DependenciesGui.exe`
+  (flagged "root unclear" with the scores 5 and 4; the root is the GUI exe).
+- Tests: `tests/test_net_round2.py` (race with two threads and a fake parse, rollback on a failed insert, not-ready skip, error recovery,
+  bundle resume, framework-only folder, GUI/CLI root).
+- Open: the perf test `test_clusters.py::test_performance_20k_functions_200k_edges` and `test_queue.py::test_session_read_waits_for_other_project_job`
+  failed once under machine load in a full run and passed alone (timing, not caused by this change).
