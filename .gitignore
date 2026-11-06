@@ -17,3 +17,4 @@ tests/fixtures/
 
 # agent worktrees
 .claude/worktrees/
+docs/TOOLS.md.new
