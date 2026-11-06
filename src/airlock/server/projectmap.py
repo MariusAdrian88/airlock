@@ -438,21 +438,85 @@ def scrub_clean(text: str, names: list[str]) -> str:
 
 def scrub_dirty_path(text: str, pp: ProjectPaths) -> str:
     """Remove the dirty folder's path (either slash style) from a free text going into the clean map."""
-    d = str(pp.dirty)
-    for form in {d, d.replace("\\", "/")}:
-        text = re.sub(re.escape(form) + r"[\\/]?", "[path removed]", text, flags=re.I)
+    forms = {str(pp.dirty), str(pp.dirty.resolve()), _short_path(pp.dirty)}
+    for d in sorted({x for x in forms if x}, key=len, reverse=True):
+        for form in {d, d.replace("\\", "/")}:
+            text = re.sub(re.escape(form) + r"[\\/]?", "[path removed]", text, flags=re.I)
+    # relative forms: ..\dirty\x, ./dirty/x, dirty\x
+    text = re.sub(r"(?:\.{1,2}[\\/])+dirty\b[\\/]?|(?<![\w.-])dirty[\\/]", "[path removed]", text, flags=re.I)
     return text
+
+
+def _short_path(p: Path) -> str:
+    """The Windows 8.3 form of an existing path, else ''."""
+    if os.name != "nt" or not p.exists():
+        return ""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 1024)  # type: ignore[attr-defined]
+        return buf.value if 0 < n < 1024 else ""
+    except Exception:  # noqa: BLE001  an extra scrub form; its absence is not an error
+        return ""
+
+
+def migrate_clean_maps(root: Path) -> list[str]:
+    """Server start: for every project under ``root`` whose clean\\PROJECT.md holds a purpose that fails the
+    filter, put "(not set yet)" there. Reads and writes clean files only (no index). Returns the names."""
+    from airlock.projects import find_project, list_projects
+    fixed = []
+    for name in list_projects(root):
+        pp = find_project(root, name)
+        if pp is None:
+            continue
+        try:
+            f = pp.clean / "PROJECT.md"
+            lines = f.read_text("utf-8").splitlines()
+            a = lines.index("## Purpose") + 1
+            b = lines.index("## Specs") if "## Specs" in lines else len(lines)
+            text = " ".join(x.strip() for x in lines[a:b] if x.strip())
+            if text and text != "(not set yet)" and not _purpose_ok(text, []):
+                _write_atomic(f, [*lines[:a], "(not set yet)", *lines[b:]])
+                fixed.append(name)
+        except (OSError, ValueError):
+            continue
+    return fixed
+
+
+def _purpose_ok(text: str, ranges: list[tuple[int, int]]) -> bool:
+    """The purpose reaches the clean side, so it passes the same filter as a spec."""
+    from airlock.server import specfilter
+    return specfilter.check_text(text, ranges) is None
+
+
+def saved_purpose(pp: ProjectPaths) -> str:
+    """The purpose paragraph from clean\\PROJECT.md: a clean session reads clean files only, never the index."""
+    try:
+        lines = (pp.clean / "PROJECT.md").read_text("utf-8").splitlines()
+        a = lines.index("## Purpose") + 1
+        b = lines.index("## Specs") if "## Specs" in lines else len(lines)
+    except (OSError, ValueError):
+        return ""
+    text = " ".join(x.strip() for x in lines[a:b] if x.strip())
+    return "" if text == "(not set yet)" else text
 
 
 def render_clean(pp: ProjectPaths, store: Store | None, man: dict[str, Any] | None = None) -> list[str]:
     names: list[str] = []
     purpose = ""
+    ranges: list[tuple[int, int]] = []
     if store is not None:
+        from airlock.server import specs as sp
         purpose = get_purpose(store)
         names = [b.name for b in store.list_binaries()]
+        ranges = sp.image_ranges(store)
+    else:
+        purpose = saved_purpose(pp)         # a clean session: clean files only
     man = load_manifest(pp) if man is None else man
     names += [PurePosixPath(str(f.get("path", "")).replace("\\", "/")).name
               for f in man.get("files") or [] if isinstance(f, dict)]
+    if purpose and not _purpose_ok(purpose, ranges):
+        purpose = ""                        # old row or edited file: the filter drops it
     out = [f"# {pp.name} (clean map)", "## Purpose",
            scrub_clean(scrub_dirty_path(purpose, pp), names) if purpose else "(not set yet)", "## Specs"]
     specs = published_specs(pp)

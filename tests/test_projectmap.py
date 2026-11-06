@@ -240,6 +240,7 @@ def test_project_open_dirty_stays_within_budget_with_many_features(proj):
 def test_project_open_clean_returns_clean_map(proj):
     ctx, pp, st, _ = proj
     pm.set_purpose(st, "Edits brew logs for app.exe.")
+    pm.write_maps(pp, st)       # the dirty side publishes the clean map; a clean session reads only that file
     out = sess.project_open(ctx, "proj", "clean")
     assert out.splitlines()[0].startswith("session clean for proj:")
     assert "# proj (clean map)" in out and "Edits brew logs for" in out

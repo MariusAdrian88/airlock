@@ -24,6 +24,7 @@ class ServerContext:
     indexer: Indexer = field(init=False)
     session: roles.SessionState = field(default_factory=roles.SessionState)
     profile_role: str | None = None  # role of an explicit --profile, else None
+    unredacted_shown: bool = False   # an unbound tool showed paths or file names: no clean bind afterwards
     author: str = field(default_factory=notes.new_author)   # note author label of this session
     focus: dict[str, int] = field(default_factory=dict)  # project -> binary id viewed last (7.3 rule 9)
 
@@ -98,6 +99,9 @@ class ServerContext:
             if self.profile_role and self.profile_role != role:
                 return (f"error wrong_role: this server was started with --profile "
                         f"{self.profile_role}.")
+            if role == roles.CLEAN and self.unredacted_shown:
+                return ("error role_locked: this session already showed paths or file names of the "
+                        "analysed program, so it cannot become clean; a clean session needs a new session.")
             self.session = roles.SessionState(role, pp)
             if role == roles.DIRTY:
                 self.indexer.current = pp.name

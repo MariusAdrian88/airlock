@@ -200,6 +200,8 @@ def read_published(pp: ProjectPaths, topic: str) -> tuple[dict, str] | None:
             path = (pp.specs / str(e.get("file") or f"{topic}.md")).resolve()
             try:
                 path.relative_to(pp.specs.resolve())
+                if path.stat().st_nlink > 1:      # a hard link may point at a dirty file
+                    return None
                 text = path.read_text("utf-8")
             except (OSError, ValueError):
                 return None
@@ -225,20 +227,47 @@ def render_file(s: dict) -> str:
     return "\n".join(head) + s["body"].rstrip("\n") + "\n"
 
 
-def publish(st: Store, pp: ProjectPaths, role: str, prefix: str) -> tuple[list[dict], int, int]:
+def approve(st: Store, prefix: str = "", dry_run: bool = False) -> list[dict]:
+    """Person's step (CLI only): set the latest 'reviewed' specs under ``prefix`` to 'final'.
+    Returns the specs (with body) that were, or with ``dry_run`` would be, approved."""
+    ranges = image_ranges(st)
+    out = []
+    for c in latest(st, prefix):
+        if c["status"] != "reviewed":
+            continue
+        full = get_spec(st, c["topic"], version=c["version"])
+        assert full is not None
+        if specfilter.check(full["title"], ranges) or specfilter.check(full["body"], ranges):
+            continue
+        out.append(full)
+        if not dry_run:
+            with st.db:
+                st.db.execute("UPDATE spec SET status='final', updated_at=? WHERE id=?", (now(), full["id"]))
+                audit(st, "person", "spec_approve", f"{full['topic']}\n{full['body']}", "approved",
+                      f"{full['topic']} v{full['version']}")
+    return out
+
+
+def publish(st: Store, pp: ProjectPaths, role: str, prefix: str) -> tuple[list[dict], int, int, list[str]]:
     """Write the final latest specs under ``prefix`` to clean\\specs.
 
-    Returns (published, skipped_not_final, withdrawn). Specs under the prefix that are no longer
-    final are withdrawn (file and index entry removed). Provenance, addresses and notes never
-    leave the index."""
+    Returns (published, skipped_not_final, withdrawn, refused_topics). Specs under the prefix that are
+    no longer final are withdrawn (file and index entry removed). The filter runs again here, so a row
+    stored before a filter fix cannot pass: a failing spec is refused and, if published earlier,
+    withdrawn. Provenance, addresses and notes never leave the index."""
     cur = latest(st, prefix)
     final = []
+    refused: list[str] = []
+    ranges = image_ranges(st)
     for c in cur:
         if c["status"] == "final":
             full = get_spec(st, c["topic"], version=c["version"])
             assert full is not None
+            if specfilter.check(full["title"], ranges) or specfilter.check(full["body"], ranges):
+                refused.append(c["topic"])
+                continue
             final.append(full)
-    skipped = len(cur) - len(final)
+    skipped = len(cur) - len(final) - len(refused)
     have = published(pp)
     keep = [e for e in have if not e["topic"].startswith(prefix)]
     old = {e["topic"]: e for e in have if e["topic"].startswith(prefix)}
@@ -262,7 +291,7 @@ def publish(st: Store, pp: ProjectPaths, role: str, prefix: str) -> tuple[list[d
         audit(st, role, "spec_export", prefix, "ok",
               f"published {len(final)} withdrawn {len(gone)} skipped {skipped}")
     _atomic(pp.specs / "audit-summary.md", audit_summary(st))
-    return final, skipped, len(gone)
+    return final, skipped, len(gone), refused
 
 
 def _remove(pp: ProjectPaths, rel: str) -> None:

@@ -53,7 +53,7 @@ def _w(ctx, topic="fmt/header", body=GOOD, sources="app.exe!main", **kw):
     ("uVar3 holds the length", "spec_has_ghidra_names"),
     ("the param_1 value", "spec_has_ghidra_names"),
     ("```c", "spec_has_code"),
-    ("50 4B 03 04 14 00 06 00 08 00 00 00", "spec_has_bytes"),
+    ("50 4B 03 04 14 00 06 00 08 00 00 00 01 02 03 04", "spec_has_bytes"),
     ("magic is 0x0000000140001000 here", "spec_has_address"),
     ("handler lives at 0x00401100", "spec_has_address"),
     ("handler lives at 0x401100", "spec_has_address"),
@@ -132,12 +132,12 @@ def test_filter_accepts_decimal_lists(line):
 
 
 @pytest.mark.parametrize("line", [
-    "50 4B 03 04 14 00 06 00 08 00 00 00",
-    "00, 00, 00, 00, 00, 00, 00, 00, 00",
-    "64, 4A, 48, 73, 90, 12, 45, 33",
-    "0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00",
+    "50 4B 03 04 14 00 06 00 08 00 00 00 01 02 03 04",
+    "00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00",
+    "64, 4A, 48, 73, 90, 12, 45, 33, 64, 4A, 48, 73, 90, 12, 45, 33",
+    "0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00",
     "4d5a90000300000004000000ffff0000",
-    "64 64 48 73 90 12 45 33 21",
+    "64 64 48 73 90 12 45 33 21 17 5 9",
 ])
 def test_filter_still_rejects_byte_dumps(line):
     out = specfilter.check(line)

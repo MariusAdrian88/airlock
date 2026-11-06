@@ -11,7 +11,7 @@ from airlock.server.registry import tool
 
 def redacted(ctx: ServerContext) -> bool:
     """Clean session or clean profile: no paths into dirty, no binary names."""
-    return ctx.session.role == roles.CLEAN or ctx.config.is_clean
+    return ctx.session.role in (roles.CLEAN, roles.UNBOUND) or ctx.config.is_clean
 
 
 def dirty_lines(pp: ProjectPaths) -> list[str]:
@@ -24,8 +24,27 @@ def dirty_lines(pp: ProjectPaths) -> list[str]:
 OPEN_MAP_BUDGET = 1500   # tokens of the map that project_open adds
 
 
+def ensure_deny_rules(ctx: ServerContext, pp: ProjectPaths) -> None:
+    """Old projects: write the deny rules again when one is missing (read back from the files)."""
+    from pathlib import Path
+    from airlock.projects import deny_rules_current, write_clean_deny_rules
+    try:
+        src = (projectmap.load_manifest(pp).get("source") or {}).get("path")
+        dirs = [ctx.config.data_dir, *([Path(src)] if src else [])]
+        files = [ctx.config.source] if ctx.config.source else []
+        if not deny_rules_current(pp, dirs, files):
+            write_clean_deny_rules(pp, deny_dirs=dirs, deny_files=files)
+    except Exception as e:  # noqa: BLE001  an extra; the session must open
+        from airlock import logs
+        logs.project_log(pp.logs).warning("deny rules for %s not refreshed: %s", pp.name, e)
+
+
 def dirty_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
-    """Session line + the first map sections (Purpose, Binaries, Features)."""
+    """Session line + the first map sections (Purpose, Binaries, Features).
+
+    Also, once per open: the clean map is rendered again through the filter (``write_maps``) and the
+    deny rules of an old project are refreshed."""
+    ensure_deny_rules(ctx, pp)
     head = dirty_lines(pp)
     try:
         st = ctx.indexer.store(pp.name)
@@ -39,8 +58,12 @@ def dirty_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
 
 
 def clean_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
-    st = ctx.indexer.store(pp.name) if pp.index_db.exists() else None
-    return clean_line(pp) + "\n" + "\n".join(projectmap.render_clean(pp, st))
+    """Clean files only: the index (dirty data) is never opened in a clean session (DESIGN 9)."""
+    try:
+        body = "\n".join(projectmap.render_clean(pp, None))
+    except Exception:  # noqa: BLE001  the map is an extra; no error text from files goes to the agent
+        body = "(project map unavailable)"
+    return clean_line(pp) + "\n" + body
 
 
 def clean_line(pp: ProjectPaths) -> str:

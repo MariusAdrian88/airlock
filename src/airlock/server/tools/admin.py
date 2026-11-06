@@ -40,6 +40,8 @@ def project_info(ctx: ServerContext, check_ghidra: bool = False) -> str:
         out = [f"airlock {__version__} | role clean | "
                f"project {se.project.name if se.project else '-'}"]
         return "\n".join(out + _wrap_list("tools", usable, more=more))
+    if se.role == roles.UNBOUND:
+        ctx.unredacted_shown = True       # paths below: this session can no longer bind clean
     out = [
         f"airlock {__version__} | profile {cfg.profile} (role {cfg.role}) | "
         f"writes {'on' if cfg.allow_writes else 'off'}",

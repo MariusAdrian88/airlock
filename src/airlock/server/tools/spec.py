@@ -37,6 +37,15 @@ def _page(ctx: ServerContext, lines: list[str], tool_name: str, args: dict, curs
     return fit_lines(lines, bud, "prose", tool=tool_name, args=args)[0]
 
 
+def _needs_review(ctx: ServerContext) -> bool:
+    return bool(ctx.config.defaults.get("require_spec_review"))
+
+
+def _review_error(pp: ProjectPaths) -> str:
+    return (f"error needs_approval: config require_spec_review is on; the user must approve final specs "
+            f"with `airlock spec-approve {pp.name}`.")
+
+
 @tool("spec_write", "Write a specification page (code and addresses are rejected); a rewrite of a "
                     "topic makes a new version.")
 def spec_write(ctx: ServerContext, topic: str, title: str, body: str, sources: str,
@@ -50,6 +59,8 @@ def spec_write(ctx: ServerContext, topic: str, title: str, body: str, sources: s
         return bad
     if status not in sp.STATUSES:
         return sp.err("bad_status", f"status '{status}' is not one of draft, reviewed, final")
+    if status == "final" and _needs_review(ctx):
+        return _review_error(pp)
     if not title or len(title) > sp.MAX_TITLE:
         return sp.err("bad_title", f"the title must be 1 to {sp.MAX_TITLE} characters")
     if not body.strip() or len(body) > sp.MAX_BODY:
@@ -148,8 +159,11 @@ def spec_export(ctx: ServerContext, topic_prefix: str = "", format: str = "md") 
     if _is_clean(ctx):
         n = len([e for e in sp.published(pp) if e["topic"].startswith(prefix)])
         return f"{n} published specs in {pp.specs}."
+    if _needs_review(ctx):
+        return _review_error(pp)
     st = ctx.indexer.store(pp.name)
-    final, skipped, gone = sp.publish(st, pp, ctx.session.role, prefix)
+    final, skipped, gone, refused = sp.publish(st, pp, ctx.session.role, prefix)
     extra = (f", {skipped} not final and left out" if skipped else "") + (
+        f", {len(refused)} failed the filter and left out ({', '.join(refused)})" if refused else "") + (
         f", {gone} withdrawn" if gone else "")
     return f"published {len(final)} specs to {pp.specs}{extra}. Index: specs.json; audit-summary.md."
