@@ -1016,3 +1016,4 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
 - P6: callers that are `MoveNext` of `<Outer>d__N` or `<Outer>b__N` print `Ns.Type::Outer (async MoveNext)` / `(iterator MoveNext)` /
   `(lambda b__N)` / `(local function g__Name)` in `xrefs direction=to` and `callgraph direction=callers` (`dotnet.origin_name`).
 - Tests: `tests/test_n3.py`; `test_tools_take_the_selector` in `test_dotnet_names.py` changed (ambiguous overloads are merged now).
+- IDR stamp fix (eval round 11): the stamp no longer holds the unnamed-function count; `idr.extend` names only new functions, `resume_project` runs the fix pass before the IDR step, `Indexer.name_new_functions` follows on-demand creation. Test: `test_functions_added_later_are_named_without_a_full_derive`. Real open timing not measured.

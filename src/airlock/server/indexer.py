@@ -35,7 +35,7 @@ from airlock import logs
 from airlock.config import Config
 from airlock.index.store import USABLE_STATES, Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, delphi, dotnet, dotnet_meta, fnfix, linking, peres, qt
+from airlock.server import cpp, delphi, dotnet, dotnet_meta, fnfix, idr, linking, peres, qt
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
     BUNDLE_SEP, ProjectPaths, bundle_entry_name, bundle_manifest, copy_artifact, detect, hash_file, list_projects,
@@ -501,14 +501,9 @@ class Indexer:
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the C++ tables of %s: %s", slug, e)
         try:
-            delphi.ensure_project(store, paths.artifacts, self.config.idr_kb_dir, self.config.delphi_sigdb_dir,
-                                  self.config.warp_dir)  # Delphi tables and IDR names missing or stale: no re-analysis
+            delphi.ensure_project(store, paths.artifacts)   # Delphi tables only: the fix pass needs them, not the IDR names
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot refresh the Delphi tables of %s: %s", slug, e)
-        try:
-            qt.ensure_project(store, paths.artifacts)  # Qt metaobject tables missing or stale: no re-analysis
-        except Exception as e:  # noqa: BLE001  an extra
-            plog.warning("cannot refresh the Qt tables of %s: %s", slug, e)
         try:
             if self.refresh_missing_functions(slug, store):   # C++ entry points without a function
                 ready = linking.ready_ids(store)
@@ -516,6 +511,15 @@ class Indexer:
                                        after=(lambda: self._fire_ready(slug, ready[0])) if ready else None)
         except Exception as e:  # noqa: BLE001  an extra
             plog.warning("cannot create the missing functions of %s: %s", slug, e)
+        try:
+            delphi.ensure_project(store, paths.artifacts, self.config.idr_kb_dir, self.config.delphi_sigdb_dir,
+                                  self.config.warp_dir)  # Delphi tables and IDR names missing or stale: named after the fix pass: new functions only
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot refresh the Delphi tables of %s: %s", slug, e)
+        try:
+            qt.ensure_project(store, paths.artifacts)  # Qt metaobject tables missing or stale: no re-analysis
+        except Exception as e:  # noqa: BLE001  an extra
+            plog.warning("cannot refresh the Qt tables of %s: %s", slug, e)
         try:
             qt.resolve_project(self, slug, store)   # Qt method addresses and imported parents (worker)
         except Exception as e:  # noqa: BLE001  an extra
@@ -699,6 +703,12 @@ class Indexer:
             except Exception as e:  # noqa: BLE001  one binary must not stop the others
                 logs.project_log(self.paths(project).logs).warning("missing functions of %s: %s", b.name, e)
         return n
+
+    def name_new_functions(self, project: str, store: Store, b: Binary) -> None:
+        """IDR names for the functions created since the last run (only those; never a full derive)."""
+        if b.toolchain in ("delphi", "fpc"):
+            idr.ensure(store, b, self.paths(project).artifacts / b.sha256, self.config.idr_kb_dir,
+                       self.config.delphi_sigdb_dir, self.config.warp_dir)
 
     def reextract_code(self, store: Store, b: Binary, program: str) -> None:
         """Re-read the functions (upsert: ids and decompiles of unchanged rows stay) and replace

@@ -1041,8 +1041,8 @@ not used. The KB is chosen by the compiler version that the System unit stores a
 for Win32 compiler version N.0`; without an exact file the one with the most matches on a sample wins.
 **Decision: hints, no rename.** The worker has no bulk rename (each `rename_function` saves the whole
 Ghidra project), a rename would make the name `user`, and Ghidra stays the truth for names. The result
-is meta only (no table): `idr_version:<id>` (`IDR_VERSION:kb signature:unnamed functions`, so old
-projects compute on open and again when the KB files or the function list change), `idr_hits:<id>`
+is meta only (no table): `idr_version:<id>` (`IDR_VERSION:kb signature:w<highest function id>`, so old
+projects compute on open and again when the KB files change; functions added later, for example by the fix pass, are named alone by `idr.extend`, never by a full derive; the older stamp with a candidate count is accepted once), `idr_hits:<id>`
 (`address<TAB>names` lines, at most 3 names, plain names first) and `idr_info:<id>`. `function` shows
 `idr: System.@LStrAsg`, and the addresses count as runtime (`graph.lib_hint`, `runtime: Delphi`
 clusters), so they and the functions that only they call leave the unclassified part. Without

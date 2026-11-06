@@ -585,11 +585,11 @@ def _key(prefix: str, binary_id: int) -> str:
     return f"{prefix}:{binary_id}"
 
 
-def candidates(store: Store, binary_id: int) -> list[tuple[int, int | None]]:
-    """(entry, size) of the unnamed functions of a binary."""
+def candidates(store: Store, binary_id: int, after_id: int = 0) -> list[tuple[int, int | None]]:
+    """(entry, size) of the unnamed functions of a binary (only the rows newer than ``after_id``)."""
     rows = store.db.execute(
         "SELECT entry, size, name FROM function WHERE binary_id=? AND space='ram' AND is_external=0 AND "
-        "name_state='auto' ORDER BY entry", (binary_id,)).fetchall()
+        "name_state='auto' AND id>? ORDER BY entry", (binary_id, after_id)).fetchall()
     return [(r[0], r[1] or None) for r in rows if _UNNAMED.match(r[2])]
 
 
@@ -602,23 +602,40 @@ def files_for(binary: Binary, kb_dir: Path | None, sig_dir: Path | None, warp_di
     return kb_files(kb_dir, binary.pointer_size or 4, sig_dir, warp_dir)
 
 
-def expected(files: list[KbFile], ncand: int) -> str:
-    return f"{IDR_VERSION}:{kb_signature(files)}:{ncand}"
+def _top_id(store: Store, binary_id: int) -> int:
+    return store.db.execute("SELECT COALESCE(MAX(id), 0) FROM function WHERE binary_id=?", (binary_id,)).fetchone()[0]
+
+
+def expected(files: list[KbFile]) -> str:
+    """The stamp prefix: IDR_VERSION and the knowledge base files (not the function list)."""
+    return f"{IDR_VERSION}:{kb_signature(files)}"
+
+
+def _watermark(store: Store, binary: Binary, cur: str | None, base: str) -> int | None:
+    """The highest function id that has IDR names (or was tried) according to the stamp; None when the
+    stamp is not of this IDR_VERSION and knowledge base. A stamp of the older format (candidate count)
+    is taken once as current: its watermark is the highest id now."""
+    if cur is None or not cur.startswith(base + ":"):
+        return None
+    tail = cur[len(base) + 1:]
+    if tail.startswith("w") and tail[1:].isdigit():
+        return int(tail[1:])
+    return _top_id(store, binary.id)
 
 
 def stale(store: Store, binary: Binary, kb_dir: Path | None, sig_dir: Path | None = None,
           warp_dir: Path | None = None) -> bool:
-    """True when the hits were computed by another IDR_VERSION, from other knowledge base files or for
-    another number of unnamed functions (the function list changed)."""
+    """True when the hits were computed by another IDR_VERSION or from other knowledge base files.
+    Functions added later do not make them stale: ``extend`` names those."""
     files = files_for(binary, kb_dir, sig_dir, warp_dir)
     cur = store.get_meta(_key(VERSION_META, binary.id))
     if not files:                      # nothing configured: only a former result has to be cleared
         return cur is not None and not cur.startswith(f"{IDR_VERSION}:none:")
     try:
-        n = len(candidates(store, binary.id))
+        _top_id(store, binary.id)
     except Exception:  # noqa: BLE001  no function table yet
         return False
-    return cur != expected(files, n)
+    return _watermark(store, binary, cur, expected(files)) is None
 
 
 _COMPILER = re.compile(rb"(?:Embarcadero|CodeGear) Delphi for Win(?:32|64) compiler version (\d+)\.(\d+)")
@@ -760,7 +777,8 @@ def derive(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
     Returns (knowledge base label or '', matched functions, candidates)."""
     files = files_for(binary, kb_dir, sig_dir, warp_dir)
     funcs = candidates(store, binary.id)
-    sig = expected(files, len(funcs))
+    top = _top_id(store, binary.id)
+    sig = f"{expected(files)}:w{top}"
     label, hits, info = "", {}, "no knowledge base configured" if kb_dir is None else "no knowledge base files found"
     if files and funcs:
         img = Image.from_pe(artifact)
@@ -799,12 +817,55 @@ def ensure(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
         return False
     try:
         if not stale(store, binary, kb_dir, sig_dir, warp_dir):
-            return False
+            return extend(store, binary, artifact, kb_dir, sig_dir, warp_dir)
         derive(store, binary, artifact, kb_dir, sig_dir, warp_dir)
         return True
     except Exception as e:  # noqa: BLE001  an extra; the binary stays usable
         log.warning("IDR names of %s failed: %s", binary.name, e)
         return False
+
+
+def extend(store: Store, binary: Binary, artifact: Path, kb_dir: Path | None,
+           sig_dir: Path | None = None, warp_dir: Path | None = None) -> bool:
+    """Name only the unnamed functions that appeared since the last run (fix pass, on-demand creation)
+    and add them to the stored hits. True when the stamp or the hits changed."""
+    files = files_for(binary, kb_dir, sig_dir, warp_dir)
+    if not files:
+        return False
+    base = expected(files)
+    key = _key(VERSION_META, binary.id)
+    cur = store.get_meta(key)
+    wm = _watermark(store, binary, cur, base)
+    top = _top_id(store, binary.id)
+    if wm is None or (cur or "").endswith(f":w{top}"):
+        return False
+    new = candidates(store, binary.id, wm)
+    lines = store.get_meta(_key(HITS_META, binary.id)) or ""
+    if new:
+        img = Image.from_pe(artifact)
+        if img is not None:
+            if binary.toolchain == "fpc":
+                _l, got, _n = _pick_fpc(files, img, new)
+            else:
+                _l, got, _n = _pick(files, img, new, _generic_instances(store, binary.id))
+            if got:
+                merged = {int(a, 16): t for a, _t, t in (ln.partition("	") for ln in lines.splitlines())
+                          if a and all(c in "0123456789abcdef" for c in a)}
+                for entry, names in got.items():
+                    merged[entry] = " | ".join(names[:MAX_NAMES]) + (
+                        f" (+{len(names) - MAX_NAMES})" if len(names) > MAX_NAMES else "")
+                out, size = [], 0
+                for entry in sorted(merged):
+                    line = f"{entry:x}	{merged[entry]}"
+                    size += len(line) + 1
+                    if size > MAX_HITS_PAYLOAD:
+                        break
+                    out.append(line)
+                lines = "\n".join(out)
+    with store.db:
+        store.set_meta(_key(HITS_META, binary.id), lines)
+        store.set_meta(key, f"{base}:w{top}")
+    return True
 
 
 # -- hits -------------------------------------------------------------------------------------

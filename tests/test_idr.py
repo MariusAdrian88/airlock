@@ -298,6 +298,23 @@ def test_ensure_stores_hits_and_info(proj):
     assert base in delphi.runtime_addrs(st, bid)
 
 
+def test_functions_added_later_are_named_without_a_full_derive(proj, monkeypatch):
+    ctx, st, bid, art, kbdir, base = proj
+    b = st.get_binary_by_id(bid)
+    with st.db:
+        st.db.execute("DELETE FROM function WHERE binary_id=? AND entry=?", (bid, base))   # the fix pass adds it later
+    calls = []
+    real = idr.derive
+    monkeypatch.setattr(idr, "derive", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert idr.ensure(st, b, art, kbdir) and idr.hits(st, bid) == {}
+    st.insert_functions(bid, [{"entry": base, "name": f"FUN_{base:08x}", "name_state": "auto", "size": 20}])
+    assert not idr.stale(st, b, kbdir) and idr.ensure(st, b, art, kbdir)
+    assert idr.hits(st, bid) == {base: "System.@RtlThing"} and len(calls) == 1
+    assert not idr.ensure(st, b, art, kbdir) and len(calls) == 1
+    st.set_meta(f"idr_version:{bid}", st.get_meta(f"idr_version:{bid}").rsplit(":", 1)[0] + ":3")   # older stamp
+    assert not idr.stale(st, b, kbdir) and idr.ensure(st, b, art, kbdir) and len(calls) == 1
+
+
 def test_stale_follows_files_functions_and_configuration(proj, tmp_path):
     ctx, st, bid, art, kbdir, base = proj
     b = st.get_binary_by_id(bid)
@@ -306,7 +323,7 @@ def test_stale_follows_files_functions_and_configuration(proj, tmp_path):
     build_kb(kbdir / "kb2012.bin", ["System"], [(0, "@Other", raw, masks(len(raw)))])       # another file appears
     assert idr.stale(st, b, kbdir) and idr.ensure(st, b, art, kbdir) and not idr.stale(st, b, kbdir)
     st.insert_functions(bid, [{"entry": base + 192, "name": "FUN_00401ff0", "name_state": "auto", "size": 4}])
-    assert idr.stale(st, b, kbdir)                                              # one more unnamed function
+    assert not idr.stale(st, b, kbdir)                                          # one more unnamed function: named on its own
     assert idr.ensure(st, b, art, kbdir)
     assert idr.stale(st, b, None)                                               # configuration removed: result cleared
     assert idr.ensure(st, b, art, None) and idr.hits(st, bid) == {}

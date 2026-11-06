@@ -538,6 +538,7 @@ def _create_on_demand(ctx: ServerContext, binary: str, target: str) -> FunctionT
             ix.extract_new_functions(bd.store, bd.binary, program, [entry])
         except Exception:  # noqa: BLE001  the whole binary is read instead
             ix.reextract_code(bd.store, bd.binary, program)
+        ix.name_new_functions(bd.project, bd.store, bd.binary)
     except Exception:  # noqa: BLE001  the not_found line stands
         return None
     fn = bd.store.function_at(bd.binary.id, entry)
