@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from airlock.server import dotnet_ui as ui
+from airlock.server.tools import core
 from airlock.server.tools import dotnet as dt
 from airlock.server.tools import resources as rt
 from test_dotnet import CSC, add_managed, make_dn_ctx
@@ -49,6 +50,28 @@ namespace Demo.UI {
     private void OnFormLoad(object s, EventArgs e) { }
   }
   public class Plain { public void Run() { } }
+  public class RelayCommand { public RelayCommand(Action execute, Func<bool> can) { } }
+  public class AppViewModel {
+    private RelayCommand _exit;
+    private RelayCommand _save;
+    public RelayCommand ExitApplication {
+      get { return _exit ?? (_exit = new RelayCommand(() => Quit(), () => Ready())); }
+    }
+    public RelayCommand SaveCmd { get { return _save; } }
+    public AppViewModel() { _save = new RelayCommand(Save, null); }
+    private void Quit() { }
+    private bool Ready() { return true; }
+    private void Save() { }
+  }
+  public class InitCommand { public Action ExecuteAction { get; set; } public Func<bool> CanExecutePredicate { get; set; } }
+  public class InitVm {
+    public InitCommand Go { get { return new InitCommand { CanExecutePredicate = () => true, ExecuteAction = () => Run() }; } }
+    private void Run() { }
+  }
+  public class OtherViewModel {
+    public RelayCommand ExitApplication { get { return new RelayCommand(Other, null); } }
+    private void Other() { }
+  }
 }
 """
 
@@ -63,6 +86,16 @@ XAML = """<Window x:Class="Demo.UI.MainForm" xmlns="http://schemas.microsoft.com
     <MenuItem Header="Other" Command="{Binding DoIt}" /></Menu>
   <Button Name="Ok" Content="OK" Click="OnOk" Width="30" />
   <Button Content="Plain" Tag="OnOk" />
+</Window>
+"""
+
+
+VM_XAML = """<Window x:Class="Demo.UI.MainForm" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:vm="clr-namespace:Demo.UI" DataContext="{StaticResource Vm}">
+  <Window.Resources><vm:AppViewModel x:Key="Vm" /></Window.Resources>
+  <Menu><MenuItem Header="E_xit" Command="{Binding ExitApplication}" />
+    <MenuItem Header="Save" Command="{Binding Path=SaveCmd, Mode=OneWay}" />
+    <MenuItem Header="Nothing" Command="{Binding NoSuchCommand}" /></Menu>
 </Window>
 """
 
@@ -160,7 +193,58 @@ def test_xaml_events_and_commands(ui_dll):
     assert any(r.event == "Executed" and r.ctype == "CommandBinding" and r.handler == "OnGenerate" for r in rows)
     assert any(r.control == "" and r.event == "Drop" and r.handler == "OnFormLoad" for r in rows)
     assert not any(r.caption == "Plain" for r in rows)            # Tag="OnOk" is not an event
-    assert ui.xaml_rows("<not xml", "x", None) == []
+    bad: list[str] = []
+    assert ui.xaml_rows("<not xml", "x.baml", None, bad) == [] and bad == ["x.baml"]
+
+
+def test_xaml_control_characters_are_stripped(ui_dll):
+    asm = ui._Asm(ui_dll)
+    xaml = XAML.replace('Content="OK"', 'Content="OK&#x1;"').replace("<Menu>", '<Menu Tag="">')
+    bad: list[str] = []
+    rows = ui.xaml_rows(xaml, "mainform.baml", asm, bad)
+    assert not bad and any(r.event == "Click" and r.handler == "OnOk" for r in rows)
+    assert ui.clean_xaml("ab&#7;c&#10;d&#x41;") == "a b c&#10;d&#x41;"
+    assert ui.clean_xaml("x &amp; y & z &#10;") == "x &amp; y &amp; z &#10;"
+
+
+def test_view_model_commands_from_binding(ui_dll):
+    asm = ui._Asm(ui_dll)
+    lines = [ui.row_line(r, False) for r in ui.xaml_rows(VM_XAML, "mainform.baml", asm)]
+    ex = [ln for ln in lines if ln.startswith('- MenuItem "E_xit" Command')]
+    assert len(ex) == 1 and "via AppViewModel::get_ExitApplication" in ex[0]       # DataContext picks one type
+    assert "-> AppViewModel::<get_ExitApplication>b__" in ex[0] and "(lambda in get_ExitApplication; " in ex[0]
+    assert "; can AppViewModel::<get_ExitApplication>b__" in ex[0]
+    save = [ln for ln in lines if '"Save"' in ln]
+    assert len(save) == 1 and "-> AppViewModel::Save 0x06" in save[0] and "via AppViewModel::get_SaveCmd" in save[0]
+    assert any('"Nothing"' in ln and "-> no CommandBinding in the XAML" in ln for ln in lines)
+    # no DataContext: every type with the property is listed
+    plain = VM_XAML.replace(' DataContext="{StaticResource Vm}"', "")
+    got = [ui.row_line(r, False) for r in ui.xaml_rows(plain, "mainform.baml", asm) if r.caption == "E_xit"]
+    assert len(got) == 2 and any("OtherViewModel::Other" in ln for ln in got)
+    dd = VM_XAML.replace('DataContext="{StaticResource Vm}"', 'xmlns:d="x" d:DataContext="{d:DesignInstance Type=vm:OtherViewModel}"')
+    got = [ui.row_line(r, False) for r in ui.xaml_rows(dd, "mainform.baml", asm) if r.caption == "E_xit"]
+    assert len(got) == 1 and "OtherViewModel::Other" in got[0]
+
+
+def test_view_model_command_roles_from_initializer(ui_dll):
+    asm = ui._Asm(ui_dll)
+    xaml = VM_XAML.replace("{Binding ExitApplication}", "{Binding Go}")
+    (ln,) = [ui.row_line(r, False) for r in ui.xaml_rows(xaml, "m.baml", asm) if r.caption == "E_xit"]
+    import re
+    m = re.search(r"-> InitVm::<get_Go>b__(\d+) 0x06.*; can InitVm::<get_Go>b__(\d+)\)", ln)
+    assert m and int(m.group(1)) == int(m.group(2)) + 1, ln      # the initializer lists CanExecute first
+
+
+def test_wpf_rows_unreadable_fact_line(tmp_path, ui_dll):
+    docs = {"a.baml": "<Window", "b.baml": XAML, "c.baml": "<Window Tag=\"\" />"}
+    monkey_names = [("Demo.g.resources", n) for n in docs]
+    ui_names = ui.baml_names
+    ui.baml_names = lambda path: monkey_names
+    try:
+        rows, note = ui.wpf_rows(ui_dll, lambda n: (docs[n.split("/")[1]].encode(), None), tmp_path)
+    finally:
+        ui.baml_names = ui_names
+    assert note == "(1 XAML documents unreadable: a.baml)" and rows
 
 
 def test_managed_resources_lines(ui_dll):
@@ -181,6 +265,37 @@ def test_dotnet_events_tool(tmp_path, ui_dll):
     assert "Demo.UI.MainForm events 1 of 4" in one
     assert 'btnOk Button "OK" Click -> OnOk 0x06' in one
     assert dt.dotnet_events(ctx, form="Nope").startswith("error not_found:")
+
+
+def test_wired_line_in_xrefs(tmp_path, ui_dll):
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, ui_dll, "ui.dll")
+    bd = dt._scope(ctx, "")[0]
+    tok = next(r.token for r in ui.winforms_rows(ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256)
+               if r.handler == "OnOk")
+    assert dt.wired_notes(ctx, bd, tok) == ['wired: btnOk.Click ("OK") in MainForm']
+    out = core.xrefs(ctx, "ui.dll!Demo.UI.MainForm::OnOk", direction="to")
+    assert 'wired: btnOk.Click ("OK") in MainForm' in out.splitlines()
+    assert "wired:" not in core.xrefs(ctx, "ui.dll!Demo.UI.MainForm::OnOk", direction="from")
+
+
+def test_baml_prefetch_serves_the_first_call(tmp_path, ui_dll, monkeypatch):
+    import dataclasses
+    ctx = make_dn_ctx(tmp_path)
+    bid = add_managed(ctx, ui_dll, "ui.dll")
+    ctx.config = dataclasses.replace(ctx.config, ilspycmd=ui_dll)       # any file: only checked for existence
+    reads: list[str] = []
+    row = ui.UiRow("wpf", "Demo.UI.MainForm", "Ok", "Button", "OK", "Click", "OnOk", 0x06000001)
+    monkeypatch.setattr(ui, "baml_names", lambda path: [("c.g.resources", "a.baml")])
+    monkeypatch.setattr(dt, "_read_wpf", lambda *a: (reads.append("read"), ([row], ""))[1])
+    dt.prefetch_wpf(ctx, "proj", bid)
+    (job,) = [t for t in dt._WPF_JOBS.values() if t.name.startswith("airlock-baml-ui.dll")]
+    job.join(10)
+    bd = dt._scope(ctx, "")[0]
+    art = ctx.indexer.paths("proj").artifacts / bd.binary.sha256
+    assert dt._wpf_rows(ctx, bd, art, "") == ([row], "") and reads == ["read"]       # served from memory
+    dt.prefetch_wpf(ctx, "proj", bid)
+    assert reads == ["read"]
 
 
 def test_pe_resources_lists_managed(tmp_path, ui_dll):

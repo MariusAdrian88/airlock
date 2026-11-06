@@ -39,6 +39,7 @@ class ServerContext:
     def _on_ready(self, project: str, binary_id: int) -> None:
         """A binary became ready: queue a (coalesced) feature derivation + PROJECT.md rewrite on a
         background thread, so the analysis queue never waits for it."""
+        self._prefetch_baml(project, binary_id)
         with self._maps_lock:
             self._maps_pending.add(project)
             if self._maps_thread is not None:
@@ -46,6 +47,14 @@ class ServerContext:
             self._maps_thread = threading.Thread(target=self._maps_loop, name="airlock-maps",
                                                  daemon=True)
             self._maps_thread.start()
+
+    def _prefetch_baml(self, project: str, binary_id: int) -> None:
+        """Read the BAML of a managed binary into XAML on a background thread (``dotnet_events`` serves from it)."""
+        try:
+            from airlock.server.tools import dotnet as dotnet_tools
+            dotnet_tools.prefetch_wpf(self, project, binary_id)
+        except Exception as e:  # noqa: BLE001  an extra
+            log.debug("BAML prefetch skipped: %s", e)
 
     def _maps_loop(self) -> None:
         while True:
@@ -106,4 +115,10 @@ class ServerContext:
                 self.indexer.resume_project(pp.name)
             except Exception as e:  # noqa: BLE001  resuming is an extra; the session stays bound
                 logs.project_log(pp.logs).warning("resume_project(%s) failed: %s", pp.name, e)
+            try:
+                for b in self.indexer.store(pp.name).list_binaries():
+                    if b.toolchain == "dotnet":
+                        self._prefetch_baml(pp.name, b.id)      # a project reopened after a restart
+            except Exception as e:  # noqa: BLE001  an extra
+                log.debug("BAML prefetch skipped: %s", e)
         return None

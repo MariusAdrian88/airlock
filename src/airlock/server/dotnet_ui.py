@@ -44,6 +44,8 @@ class UiRow:
     where: str = ""      # method that holds the wiring when it is not InitializeComponent
     command: str = ""    # WPF: Command value that joined the handler
     key: tuple | None = None   # WinForms: receiver key while the caption pass runs
+    via: str = ""        # WPF: view-model getter (Type::get_X) that a {Binding X} command resolved to
+    alt: tuple = ()      # WPF: other handlers created in that getter (display names)
 
 
 # -- IL decoding -----------------------------------------------------------------------------
@@ -111,9 +113,21 @@ class _Asm:
         self.secs = dn._rva_map(self.pe)
         self.type_by_tok = {t.token: t for t in self.parsed.types}
         self.type_by_name = {t.name: t for t in self.parsed.types}
+        self.getters: dict[str, list[tuple[Any, Any]]] | None = None
         self.methods_of: dict[int, list[Any]] = {}
         for m in self.parsed.methods:
             self.methods_of.setdefault(m.type_token, []).append(m)
+
+    def getters_named(self, prop: str) -> list[tuple[Any, Any]]:
+        """(type, method) of every ``get_<prop>`` in the assembly."""
+        if self.getters is None:
+            self.getters = {}
+            for m in self.parsed.methods:
+                if m.name.startswith("get_"):
+                    t = self.type_by_tok.get(m.type_token)
+                    if t is not None:
+                        self.getters.setdefault(m.name[4:], []).append((t, m))
+        return self.getters.get(prop, [])
 
     def string(self, tok: int) -> str:
         if self.us is None:
@@ -270,13 +284,28 @@ def _scan_method(asm: _Asm, code: bytes, mname: str, form: str, rows: list[UiRow
             resget.setdefault(k2, resget[key])
 
 
+def _real_type(name: str) -> str:
+    """Full type name without compiler-generated closure classes (``Ns.VM+<>c`` -> ``Ns.VM``)."""
+    parts = [p for p in name.split("+") if not p.startswith("<>c")]
+    return "+".join(parts) if parts else name
+
+
+_LAMBDA = re.compile(r"<([^>]+)>b__\d+(?:_\d+)?$")
+
+
+def lambda_outer(handler: str) -> str:
+    """Name of the method that holds a compiler-generated lambda (``Type::<Outer>b__3`` -> ``Outer``)."""
+    m = _LAMBDA.search(handler.rsplit("::", 1)[-1])
+    return m.group(1) if m else ""
+
+
 def _handler(asm: _Asm, ftok: int, form: str) -> tuple[str, int]:
     name = asm.member_name(ftok)
     if ftok >> 24 == 0x06:
         m = asm.parsed.methods[(ftok & 0xFFFFFF) - 1]
         owner = asm.type_by_tok.get(m.type_token)
-        if owner is not None and owner.name != form:
-            return f"{dn._short(owner.name)}::{name}", ftok
+        if owner is not None and _real_type(owner.name) != form:
+            return f"{dn._short(_real_type(owner.name))}::{name}", ftok
         return name, ftok
     owner = asm.owner_name(ftok)
     return (f"{owner}::{name}" if owner else name), 0
@@ -567,11 +596,109 @@ def _norm_cmd(text: str) -> str:
     return t
 
 
-def xaml_rows(xaml: str, source: str, asm: _Asm | None) -> list[UiRow]:
-    """Event and command rows of one XAML document. ``source`` names the document when it has no x:Class."""
+# characters XML 1.0 does not allow (ilspycmd writes them raw into attribute values), raw or as a reference
+_BAD_XML = re.compile("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\ufffe\\uffff]|&#(?:[xX]0*(?:[0-8bBcCeEfF]|1[0-9a-fA-F])|"
+                      "0*(?:[0-8]|1[12]|1[4-9]|2\\d|3[01]));")
+_BINDING = re.compile(r"\{\s*(?:\w+:)?Binding\s+(?:Path\s*=\s*)?((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\s*[,}]")
+_PATH_HOPS = frozenset(["DataContext", "PlacementTarget", "Tag"])     # path steps that still end at a view model
+_TYPE_IN = (re.compile(r"Type\s*=\s*(?:\{x:Type\s+)?(?:\w+:)?([\w.]+)"),
+            re.compile(r"(?:DesignInstance|x:Type)\s+(?:\w+:)?([\w.]+)"))
+_MAX_VM = 6
+
+
+_STRAY_AMP = re.compile(r"&(?!(?:#\d+|#[xX][0-9a-fA-F]+|amp|lt|gt|quot|apos);)")
+
+
+def clean_xaml(xaml: str) -> str:
+    """The text without XML-illegal characters; a bare ``&`` (ilspycmd leaves some in text) becomes ``&amp;``."""
+    return _STRAY_AMP.sub("&amp;", _BAD_XML.sub(" ", xaml))
+
+
+def _data_type(v: str, reskeys: dict[str, str]) -> str:
+    """Short type name a DataContext / x:DataType value names, or ""."""
+    v = v.strip()
+    m = re.match(r"\{\s*(?:StaticResource|DynamicResource)\s+(?:ResourceKey\s*=\s*)?([\w.]+)\s*\}", v)
+    if m:
+        return reskeys.get(m.group(1), "")
+    if v.startswith("{"):
+        m = _TYPE_IN[0].search(v) or _TYPE_IN[1].search(v)
+        return m.group(1).rsplit(".", 1)[-1] if m else ""
+    return v.split(":")[-1].rsplit(".", 1)[-1] if re.fullmatch(r"[\w:.]+", v) else ""
+
+
+def _handlers_in(asm: _Asm, ins: list[tuple[str, int]], lo: int, hi: int) -> list[tuple[int, str]]:
+    """(MethodDef token, role) of each delegate made from a method in ``ins[lo:hi]``. The role is
+    ``execute`` / ``can`` when an object initializer stores the delegate with ``set_*Execute*`` /
+    ``set_*CanExecute*``; "" when it is a constructor argument (position decides)."""
+    out = []
+    for i in range(lo, hi):
+        op, a = ins[i]
+        if op not in ("ldftn", "ldvirtftn"):
+            continue
+        role = ""
+        if i + 2 < len(ins) and ins[i + 1][0] == "newobj" and ins[i + 2][0] in ("call", "callvirt"):
+            nm = asm.member_name(ins[i + 2][1])
+            if nm.startswith("set_"):
+                low = nm.lower()
+                role = "can" if "canexecute" in low or low.startswith("set_can") else "execute" if "execute" in low else ""
+        out.append((a, role))
+    return out
+
+
+def _getter_handlers(asm: _Asm, t: Any, g: Any) -> list[tuple[int, str]]:
+    """Delegates a command property creates: the ``ldftn`` targets in its getter, else those stored into the
+    backing field by the method (constructor) that sets it."""
+    code = asm.code_of(g.token)
+    if code is None:
+        return []
+    ins = decode(code)
+    hs = _handlers_in(asm, ins, 0, len(ins))
+    if hs:
+        return hs
+    fields = {a for op, a in ins if op in ("ldfld", "ldsfld")}
+    for m in asm.methods_of.get(t.token, []):
+        if m.token == g.token:
+            continue
+        mc = asm.code_of(m.token)
+        if mc is None or (bytes([0x7D]) not in mc and bytes([0x80]) not in mc):   # stfld / stsfld
+            continue
+        mi = decode(mc)
+        start = 0
+        for j, (op, a) in enumerate(mi):
+            if op in ("stfld", "stsfld"):
+                if a in fields:
+                    hs = _handlers_in(asm, mi, start, j)
+                    if hs:
+                        return hs
+                start = j + 1
+    return []
+
+
+def view_model_commands(asm: _Asm, prop: str, prefer: set[str]) -> tuple[list[tuple[str, list[tuple[int, str]]]], int]:
+    """([(``Type::get_<prop>``, handler tokens)], types left out). Types named in ``prefer`` (short names) win;
+    else every type with the property."""
+    found = [(t, g) for t, g in asm.getters_named(prop) if "<>c" not in t.name]
+    pref = [(t, g) for t, g in found if dn._short(t.name).rsplit(".", 1)[-1] in prefer]
+    use = pref or found
+    out = []
+    for t, g in use[:_MAX_VM]:
+        try:
+            hs = _getter_handlers(asm, t, g)
+        except (IndexError, ValueError, KeyError):
+            hs = []
+        out.append((f"{dn._short(t.name)}::{g.name}", hs))
+    return out, max(0, len(use) - _MAX_VM)
+
+
+def xaml_rows(xaml: str, source: str, asm: _Asm | None, bad: list[str] | None = None) -> list[UiRow]:
+    """Event and command rows of one XAML document. ``source`` names the document when it has no x:Class;
+    ``bad`` collects the source of a document that does not parse."""
+    xaml = clean_xaml(xaml)
     try:
         root = ET.fromstring(xaml.encode("utf-8") if xaml.startswith("<?xml") else xaml)
     except ET.ParseError:
+        if bad is not None:
+            bad.append(source)
         return []
     cls = ""
     for k, v in root.attrib.items():
@@ -583,21 +710,59 @@ def xaml_rows(xaml: str, source: str, asm: _Asm | None) -> list[UiRow]:
         for m in asm.methods_of.get(asm.type_by_name[cls].token, []):
             methods.setdefault(m.name, m.token)
     cmdb: dict[str, tuple[str, str]] = {}         # command -> (Executed, CanExecute)
+    reskeys: dict[str, str] = {}                  # x:Key -> short type name of the resource element
     for e in root.iter():
         if _local(e.tag) == "CommandBinding":
             c = _norm_cmd(e.attrib.get("Command", ""))
             cmdb[c] = (e.attrib.get("Executed", ""), e.attrib.get("CanExecute", ""))
+        for k, v in e.attrib.items():
+            if _local(k) == "Key" and "." not in _local(e.tag):
+                reskeys[v] = _local(e.tag)
     rows: list[UiRow] = []
+    vm_cache: dict[tuple[str, str], tuple] = {}
 
     def add(ctrl: str, ctype: str, cap: str, ev: str, h: str, cmd: str = "") -> None:
         rows.append(UiRow("wpf", form, ctrl, ctype, cap, ev, h, methods.get(h, 0), "", cmd))
 
-    def walk(e: ET.Element, owner: str, depth: int = 0) -> None:
+    def add_vm(ctrl: str, ctype: str, cap: str, c: str, prop: str, dc: frozenset) -> bool:
+        if asm is None:
+            return False
+        key = (prop, ",".join(sorted(dc)))
+        if key not in vm_cache:
+            vm_cache[key] = view_model_commands(asm, prop, set(dc))
+        cands, left = vm_cache[key]
+        if not cands:
+            return False
+        for n, (via, hs) in enumerate(cands):
+            hs = sorted(hs, key=lambda h: h[1] != "execute")           # a known execute delegate first
+            disp = [(_handler(asm, h, ""), role) for h, role in hs]
+            main = disp[0][0] if disp else ("", 0)
+            r = UiRow("wpf", form, ctrl, ctype, cap, "Command", main[0], main[1], "", c)
+            r.via = via + (f" +{left} more types" if left and n == len(cands) - 1 else "")
+            r.alt = tuple(("can " if (role == "can" or (not role and len(disp) == 2)) else "also ") + d[0]
+                          for d, role in disp[1:])
+            rows.append(r)
+        return True
+
+    def contexts(e: ET.Element, dc: frozenset) -> frozenset:
+        found = set()
+        for k, v in e.attrib.items():
+            if _local(k) in ("DataContext", "DataType"):
+                t = _data_type(v, reskeys)
+                if t:
+                    found.add(t)
+        for c in e:
+            if _local(c.tag) == f"{_local(e.tag)}.DataContext" and len(c) and "." not in _local(c[0].tag):
+                found.add(_local(c[0].tag))
+        return frozenset(found) or dc
+
+    def walk(e: ET.Element, owner: str, dc: frozenset, depth: int = 0) -> None:
         tag = _local(e.tag)
         if "." in tag or depth > 200:               # property element: its children belong to the owner
             for c in e:
-                walk(c, owner, depth + 1)
+                walk(c, owner, dc, depth + 1)
             return
+        dc = contexts(e, dc)
         attrs = {_local(k): v for k, v in e.attrib.items()}
         name = attrs.get("Name", "")
         ctrl = name
@@ -626,15 +791,19 @@ def xaml_rows(xaml: str, source: str, asm: _Asm | None) -> list[UiRow]:
             if cmd:
                 c = _norm_cmd(cmd)
                 ex = cmdb.get(c)
+                bm = _BINDING.search(cmd)
+                path = bm.group(1).split(".") if bm else []
+                if not all(h in _PATH_HOPS for h in path[:-1]):
+                    bm = None
                 if ex is not None and ex[0]:
                     add(ctrl, tag, cap, "Command", ex[0], c)
-                else:
+                elif not (bm and add_vm(ctrl, tag, cap, c, path[-1], dc)):
                     add(ctrl, tag, cap, "Command", "", c)
         nxt = name or owner
         for c in e:
-            walk(c, nxt, depth + 1)
+            walk(c, nxt, dc, depth + 1)
 
-    walk(root, "")
+    walk(root, "", frozenset())
     return rows
 
 
@@ -661,6 +830,7 @@ def wpf_rows(path: Path, run: Callable[[str], tuple[bytes | None, str | None]], 
         sel = [n for n in names if hint in n[1].lower()]
         todo = sel or names
     failed: list[str] = []
+    unreadable: list[str] = []
 
     def fetch(item: tuple[str, str]) -> tuple[tuple[str, str], str | None]:
         cont, ent = item
@@ -684,9 +854,13 @@ def wpf_rows(path: Path, run: Callable[[str], tuple[bytes | None, str | None]], 
     with ThreadPoolExecutor(max_workers=6) as ex:
         for (cont, ent), text in ex.map(fetch, todo):
             if text:
-                rows += xaml_rows(text, ent, asm)
-    note = f"wpf: {len(failed)} of {len(todo)} BAML resources not read ({failed[0]})" if failed else ""
-    return rows, note
+                rows += xaml_rows(text, ent, asm, unreadable)
+    notes = [f"wpf: {len(failed)} of {len(todo)} BAML resources not read ({failed[0]})"] if failed else []
+    if unreadable:
+        names = ", ".join(n.rsplit("/", 1)[-1] for n in unreadable[:5])
+        more = f", +{len(unreadable) - 5} more" if len(unreadable) > 5 else ""
+        notes.append(f"({len(unreadable)} XAML documents unreadable: {names}{more})")
+    return rows, "\n".join(notes)
 
 
 # -- selection and output --------------------------------------------------------------------
@@ -763,6 +937,13 @@ def row_line(r: UiRow, show_form: bool) -> str:
         parts.append(r.event)
     if r.handler:
         parts.append(f"-> {r.handler}" + (f" 0x{r.token:08x}" if r.token else ""))
+        outer = lambda_outer(r.handler)
+        extra = ([f"lambda in {outer}"] if outer else []) + ([f"via {r.via}"] if r.via else [])
+        extra += list(r.alt)
+        if extra:
+            parts.append("(" + "; ".join(extra) + ")")
+    elif r.via:
+        parts.append(f"-> {r.via} (no delegate found in the getter)")
     elif r.event == "Command":
         parts.append("-> no CommandBinding in the XAML")
     if r.where:

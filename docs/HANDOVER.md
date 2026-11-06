@@ -856,6 +856,27 @@ Evidence (copies of the r9dv and r9fpc projects, stored C): vc22 function 0x41e3
 - Open: `xrefs` on a handler does not yet print a `wired:` line; WPF code-behind `Connect` wiring and `ICommand` properties of view
   models are not read; the ICommand join is by XAML text only.
 
+## .NET round 2 fix N2: dotnet_events (R2, R3, R10)
+
+- No schema change; **a re-parse is not needed** (rows are read from the stored assembly and the BAML cache). `DOTNET_VERSION` is not changed here.
+- R2: `dotnet_ui.clean_xaml` removes XML-illegal control characters (raw and `&#7;` references) and escapes a bare `&` before `ET.fromstring`;
+  `wpf_rows` adds one fact line `(N XAML documents unreadable: a.baml, ...)` for a document that still fails. **[verified]** ScreenToGif 2.43.2:
+  36 of 108 documents failed before (control characters, and a bare `&` in `stringresources.ja.baml`), 0 now.
+- R3: `Command="{Binding X}"` (also `Path=X`, `Path=DataContext.X`, `PlacementTarget.DataContext.X`) joins to `get_X` of the view model and the delegates it
+  creates; roles from the setter names of an object initializer (`ExecuteAction` / `CanExecutePredicate`), else execute = first, can = second. Row text:
+  `-> ApplicationViewModel::<get_ExitApplication>b__29_0 0x0600121f (lambda in get_ExitApplication; via ApplicationViewModel::get_ExitApplication; can ...b__29_1)`.
+  Types preferred by `DataContext` / `d:DataContext` / `x:DataType` / `{StaticResource key}` / `Window.DataContext` element; else every type with the getter.
+  **[verified]** ScreenToGif tray menu Exit -> the RelayCommand lambda; Dependencies `OpenNewAppCommand`, `OpenPeviewerCommand` -> `<get_X>b__N` of `DisplayModuleInfo` and `ModuleTreeViewItem`.
+  A getter with no `ldftn` (dependency properties, wrappers) prints `-> Type::get_X (no delegate found in the getter)`.
+- R10 lambda names: `Type::<Outer>b__N (lambda in Outer)` in every `dotnet_events` row; closure classes (`<>c`) are removed from the type name.
+- R10 `xrefs` on a handler: `wired: <control>.<Event> ("<caption>") in <form>` (4 lines at most, then `wired: +N more`); WinForms from IL rows, WPF from the memory rows (waits at most 3 s for a running background read).
+- R10 first-call time: the BAML decompile runs on a background thread (`tools/dotnet.prefetch_wpf`) from `ServerContext._on_ready` and `bind_session`
+  (reopened projects); result kept in `_WPF_MEMO`, files in the existing per-file cache. **[verified]** ScreenToGif: first `dotnet_events` call 0.0 s after the
+  prefetch finished (was 22-25 s); a call during the prefetch waits for the rest of it.
+- Tests: `tests/test_dotnet_ui.py` (control characters, `&`, view-model join, DataContext choice, initializer roles, unreadable fact line, `wired:` in `xrefs`, prefetch).
+- Open: captions given by `{DynamicResource ...}` stay empty (tray menu rows have no caption); `Command={Binding}` on a dependency property of the window prints the
+  no-delegate line; prefetch and a first user call can both run `ilspy_prepare` on a new project (same file copy).
+
 ## .NET fix B: how .NET files enter a project (P1, P8, P15, P18, P20)
 
 - **[verified]** Single-file bundles: `projects.bundle_manifest(path)` reads the file table (header versions 1, 2, 6+;
