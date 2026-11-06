@@ -73,8 +73,7 @@ def _import_endpoint(g: CallGraph, t: tg.ImportTarget, typed: str) -> Endpoint:
 
 def _uncalled(label: str, t: str) -> EndpointError:
     return EndpointError(f"error not_found: import {label} exists but no analysed function calls it "
-                         f"(or the calls are indirect), so '{t}' cannot end a path. Try a caller "
-                         "found with search or xrefs.")
+                         f"(or the calls are indirect), so '{t}' cannot end a path.")
 
 
 def _string_nodes(g: CallGraph, t: tg.StringTarget) -> list[int]:
@@ -89,9 +88,8 @@ def _string_nodes(g: CallGraph, t: tg.StringTarget) -> list[int]:
     return sorted(out)
 
 
-_NO_STRING = "error not_found: no function references a string matching {t}. Use strings(pattern) to find it."
-_NOT_IN_GRAPH = ("error not_found: {t} is a thunk, external or runtime function, not in the call graph. "
-                 "Pass the import name or a function it calls.")
+_NO_STRING = "error not_found: no function references a string matching {t}."
+_NOT_IN_GRAPH = "error not_found: {t} is a thunk, external or runtime function, not in the call graph."
 
 
 def _remap(msg: str, text: str, quoted: bool) -> str:
@@ -101,8 +99,9 @@ def _remap(msg: str, text: str, quoted: bool) -> str:
     if quoted:
         return _NO_STRING.format(t=text)
     if msg.startswith("error not_found: no function or import named"):
-        return (f"error not_found: no function, import, feature, cluster or string '{text}'. "
-                "Use search, features or function_map.")
+        close = msg.partition("close names: ")[2].rstrip(".")
+        return (f"error not_found: no function, import, feature, cluster or string '{text}'."
+                + (f" close names: {close}." if close else ""))
     return msg
 
 
@@ -116,12 +115,26 @@ def _export_node(g: CallGraph, pre: str, name: str, st: Store) -> int | None:
     return None
 
 
+def _follow_stub(ctx: ServerContext, g: CallGraph, r: tg.FunctionTarget, t: str) -> Endpoint | None:
+    """A thunk or external row is not a graph node; the import it stands for is. None when the
+    name is no import with nodes."""
+    if not (r.fn.is_thunk or r.fn.is_external):
+        return None
+    imp = tg.resolve_target(ctx, r.bound.binary.name, r.fn.name, (tg.IMPORT,))
+    if not isinstance(imp, tg.ImportTarget):
+        return None
+    ep = _import_endpoint(g, imp, t)
+    if not ep.nodes:
+        return None
+    ep.desc = f"import {imp.label}, followed from the thunk"
+    return ep
+
+
 def resolve_endpoint(ctx: ServerContext, st: Store, g: CallGraph, text: str) -> Endpoint:
     """Map a ``from``/``to`` text to graph nodes. Raises EndpointError with the one-line error."""
     t = text.strip()
     if not t:
-        raise EndpointError("error bad_args: empty endpoint. Pass a function, import, string, "
-                            "feature key or cluster id.")
+        raise EndpointError("error bad_args: empty endpoint.")
     quoted = len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'"
     r = tg.resolve_target(ctx, "", t, PATH_KINDS, aggregate=True)
     if isinstance(r, str):
@@ -134,6 +147,9 @@ def resolve_endpoint(ctx: ServerContext, st: Store, g: CallGraph, text: str) -> 
     if isinstance(r, tg.FunctionTarget):
         v = g.index.get((r.bound.binary.id, r.fn.space, r.fn.entry))
         if v is None:
+            followed = _follow_stub(ctx, g, r, t)
+            if followed is not None:
+                return followed
             raise EndpointError(_NOT_IN_GRAPH.format(t=t))
         return Endpoint("function", [v])
     if isinstance(r, tg.MultiFunctionTarget):
@@ -167,16 +183,15 @@ def resolve_endpoint(ctx: ServerContext, st: Store, g: CallGraph, text: str) -> 
                         for e in st.feature_entries(r.key)
                         if (e["binary_id"], e["space"], e["entry"]) in g.index})
         if not nodes:
-            raise EndpointError(f"error not_found: feature {r.key} has no entry point in the call "
-                                f"graph. feature(key=\"{r.key}\") lists them.")
+            raise EndpointError(f"error not_found: feature {r.key} has no entry point in the call graph.")
         return Endpoint("feature", nodes[:MAX_ENDPOINT])
     if isinstance(r, tg.ClusterTarget):
         nodes = sorted(g.index[m.key] for m in r.cluster.members if m.key in g.index)   # type: ignore[attr-defined]
         if not nodes:
             raise EndpointError(f"error not_found: cluster {r.id} has no functions in the call graph.")
         return Endpoint("cluster", nodes[:MAX_ENDPOINT])
-    raise EndpointError(f"error bad_target: '{t}' cannot be a path endpoint. Pass a function, import, "
-                        "string, feature key or cluster id.")
+    raise EndpointError(f"error bad_target: '{t}' cannot be a path endpoint (endpoints: function, import, "
+                        "string, feature key, cluster id).")
 
 
 def path_query(ctx: ServerContext, pp: ProjectPaths, st: Store, frm: str, to: str, want: int,

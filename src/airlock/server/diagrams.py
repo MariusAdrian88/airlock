@@ -216,7 +216,7 @@ def subsystems_diagram(env: Env) -> Diagram:
     cs = env.cs
     if not cs.clusters:
         raise ScopeError("error not_found: no subsystem map yet: no analysed binary outside the runtime "
-                         "group. Call list_binaries.")
+                         "group.")
     order = cl.ordered(cs)
     pos = {c.id: i for i, c in enumerate(order)}
     d = Diagram("subsystems", directed=False)
@@ -234,7 +234,7 @@ def cluster_diagram(env: Env, cid: str) -> Diagram:
     c = env.cs.get(cid)
     if c is None:
         have = ", ".join(x.id for x in cl.ordered(env.cs)[:12])
-        raise ScopeError(f"error not_found: no cluster '{cid}' (have: {have}). Call function_map.")
+        raise ScopeError(f"error not_found: no cluster '{cid}' (have: {have}).")
     g = env.g
     d = Diagram(f"cluster {c.id}")
     ids: set[int] = set()
@@ -256,7 +256,8 @@ def feature_diagram(env: Env, key: str) -> Diagram:
     except Exception:  # noqa: BLE001
         feat = None
     if feat is None:
-        raise ScopeError(f"error not_found: no feature '{key}'. Call features.")
+        have = ", ".join(r["key"] for r in st.db.execute("SELECT key FROM feature ORDER BY key LIMIT 13"))
+        raise ScopeError(f"error not_found: no feature '{key}' (have: {have or 'none'}).")
     g, cs = env.g, env.cs
     d = Diagram(f"feature {feat['key']}")
     cl_nodes: dict[str, str] = {}
@@ -280,14 +281,13 @@ def feature_diagram(env: Env, key: str) -> Diagram:
 
 def path_diagram(env: Env, frm: str, to: str, k: int = PATH_DIAGRAM_K, max_depth: int = 8) -> Diagram:
     if env.ctx is None:
-        raise ScopeError("error unbound: no project is open. Call projects, then project_open.")
+        raise ScopeError("error unbound: no project is open.")
     try:
         _a, _b, res = ep.path_query(env.ctx, env.pp, env.st, frm, to, k, max_depth, env.g)
     except ep.EndpointError as e:
         raise ScopeError(e.message) from None
     if not res.paths:
-        raise ScopeError(f"error no_path: no call chain from {frm} to {to} within {max_depth} hops. "
-                         "Raise max_depth.")
+        raise ScopeError(f"error no_path: no call chain from {frm} to {to} within {max_depth} hops.")
     g = env.g
     d = Diagram(f"path {frm} to {to}")
     seen: set[int] = set()
@@ -323,8 +323,8 @@ def build_scope(env: Env, scope: str, k: int = PATH_DIAGRAM_K, max_depth: int = 
             raise ScopeError("error bad_args: path scope is path:<from>-><to>. "
                              "Example: path:Main->ReadFile.")
         return path_diagram(env, parts[0].strip(), parts[1].strip(), k, max_depth)
-    raise ScopeError(f"error bad_args: unknown scope '{scope}'. Use binaries, subsystems, cluster:C3, "
-                     "feature:<key> or path:<from>-><to>.")
+    raise ScopeError(f"error bad_args: unknown scope '{scope}' (scopes: binaries, subsystems, cluster:C3, "
+                     "feature:<key>, path:<from>-><to>).")
 
 
 def diagram_for(env: Env, scope: str, **kw: Any) -> Diagram:

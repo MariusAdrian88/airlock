@@ -96,9 +96,9 @@ def test_xrefs_import_a_w_variants_and_kind(world):
 
 def test_xrefs_direction_from_on_import(world):
     ctx = world[0]
-    assert core.xrefs(ctx, "plug.dll!ReadFile", direction="from") == (
-        "error external: KERNEL32!ReadFile is an imported function with no code. "
-        "Use direction=to to see its callers.")
+    assert core.xrefs(ctx, "plug.dll!ReadFile", direction="from").splitlines()[:2] == [   # turned to "to"
+        "xrefs to KERNEL32!ReadFile, 1 call_imp",
+        "(KERNEL32!ReadFile is an import with no code: direction=to used)"]
     assert _head(core.xrefs(ctx, "host.exe!ReadFile", direction="from")).startswith("xrefs from ReadFile")
     assert _head(core.xrefs(ctx, "KERNEL32!ReadFile", direction="from")) == "xrefs from ReadFile (0x00401300), 1 jump"
 
@@ -114,7 +114,7 @@ def test_xrefs_function_and_address_forms(world):
     amb = core.xrefs(ctx, "Main")
     assert amb.startswith("error ambiguous: 'Main' matches 2 functions: ")
     assert "host.exe!Main 0x00401000" in amb and "tool.exe!Main 0x00501000" in amb
-    assert "\n" not in amb and amb.endswith("Retry with binary!name or binary!address.")
+    assert "\n" not in amb and amb.endswith("tool.exe!Main 0x00501000.")
     nf = core.xrefs(ctx, "Nope")
     assert nf.startswith("error not_found: no function or import named 'Nope' in 3 ready binaries.")
 
@@ -145,12 +145,15 @@ def test_function_accepts_functions_and_import_stubs(world):
     assert core.function(ctx, "host.exe!Main", view="signature").startswith("0x00401000 Main")
     thunk = core.function(ctx, "KERNEL32!ReadFile", view="signature").splitlines()
     assert thunk[0] == "binary host.exe" and thunk[1].startswith("0x00401300 ReadFile")   # the one thunk
-    assert core.function(ctx, "host.exe!CreateFileW") == (
-        "error external: KERNEL32.DLL::CreateFileW is an imported function with no code. "
-        "Use xrefs on it to see its callers.")
-    assert core.function(ctx, "plug.dll!ReadFile") == (      # import row only, no stub
-        "error external: KERNEL32!ReadFile is an imported function with no code. "
-        "Use xrefs on it to see its callers.")
+    assert core.function(ctx, "host.exe!CreateFileW").splitlines() == [     # its references instead
+        "(an import with no code: its references)",
+        "xrefs to KERNEL32.DLL::CreateFileW (EXTERNAL:0x00000002), 1 call_imp",
+        "  0x00401210  Writer                               call_imp"]
+    assert core.function(ctx, "plug.dll!ReadFile").splitlines() == [     # import row only: its references
+        "(an import with no code: its references)", "xrefs to KERNEL32!ReadFile, 1 call_imp",
+        "  0x10001010  Worker                               call_imp"]
+    assert core.function(ctx, "plug.dll!ReadFile", view="signature") == (
+        "error external: KERNEL32!ReadFile is an imported function with no code.")
     ctx.focus.clear()                                       # nothing viewed yet: nothing decides
     assert core.function(ctx, "Main").startswith("error ambiguous: 'Main'")
     assert core.function(ctx, "Nope").startswith("error not_found: no function or import named 'Nope'")
@@ -177,8 +180,7 @@ def test_feature_define_takes_functions_only(world):
     assert ctx.bind_session("dirty", ctx.indexer.paths("proj")) is None
     err = mt.feature_define(ctx, "reads", "Reads", functions="KERNEL32!ReadFile")
     assert err == ("error bad_target: 'KERNEL32!ReadFile' is an import (KERNEL32!ReadFile) with no code of "
-                   "its own, but this tool takes a function name or address. "
-                   "Use xrefs on it, or pass a function that calls it.")
+                   "its own, but this tool takes a function name or address.")
     assert mt.feature_define(ctx, "reads", "Reads", functions="Main").startswith("error ambiguous:")
     ok = mt.feature_define(ctx, "reads", "Reads", functions="host.exe!Main, plug.dll!0x10001010")
     assert ok.startswith("feature reads defined: Reads | 2 functions added")
@@ -223,7 +225,7 @@ def test_resolve_target_kinds_and_errors(world):
     assert isinstance(a, tg.AddressTarget) and a.value == 0x402000
     assert rt(ctx, "host.exe", "0x402000", (tg.FUNCTION,)).startswith("error not_found:")
     assert rt(ctx, "plug.dll", "host.exe!Main", (tg.FUNCTION,)) == (
-        "error bad_args: target names binary 'host.exe' but binary='plug.dll'. Pass one of them.")
+        "error bad_args: target names binary 'host.exe' but binary='plug.dll'.")
     st.define_feature("reading", "Reading", "", "2026-01-01T00:00:00Z")
     f = rt(ctx, "", "reading", (tg.FEATURE,))
     assert isinstance(f, tg.FeatureTarget) and f.key == "reading"

@@ -95,7 +95,7 @@ def _binaries(store: Store, man: dict[str, Any]) -> list[Any]:
 
 def purpose_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[str]:
     src = man.get("source") or {}
-    text = get_purpose(store) or "(not set. Call project_describe with a short paragraph.)"
+    text = get_purpose(store) or "(not set)"
     out = [text]
     bits = [f"root {src.get('root_exe', '?')}"]
     if src.get("path"):
@@ -142,7 +142,7 @@ def _roles(store: Store, man: dict[str, Any], bins: list[Any]) -> dict[int, str]
 def binaries_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[str]:
     bins = _binaries(store, man)
     if not bins:
-        return ["(no binary imported yet. Call project_create or open_binary.)"]
+        return ["(no binary imported yet)"]
     roles = _roles(store, man, bins)
     out = []
     for b in bins:
@@ -161,7 +161,6 @@ def binaries_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list[
         ui = ui_line(store, b.id) or delphi_ui_line(store, b.id) or qt_ui_line(store, b.id)
         if ui:
             out.append(f"  {ui}")
-    out.append("Detail: outline(binary=<name>), search(query), strings(pattern), list_binaries.")
     return out
 
 
@@ -174,8 +173,7 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
             "GROUP BY src_binary, dst_binary ORDER BY n DESC, src_binary, dst_binary"):
         s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
         if s and d:
-            out.append(f"{s.name} -> {d.name}: {r['n']} imports. "
-                       f"xrefs(binary={d.name}, ...) shows the callers on the other side.")
+            out.append(f"{s.name} -> {d.name}: {r['n']} imports")
     for r in store.db.execute(
             "SELECT src_binary, dst_binary, "
             "COUNT(DISTINCT CASE WHEN kind='dynlib' THEN src_addr END) AS nl, "
@@ -189,8 +187,7 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
             via = [f"{r['nl']} via LoadLibrary"] if r["nl"] else []
             if r["ng"]:
                 via.append(f"{r['ng']} via GetProcAddress")
-            out.append(f"{s.name} -> {d.name}: {', '.join(via)} (dynamic). "
-                       f"xrefs(binary={d.name}, kind=\"dynamic\") shows the callers.")
+            out.append(f"{s.name} -> {d.name}: {', '.join(via)} (dynamic)")
     for r in store.db.execute(
             "SELECT src_binary, dst_binary, COUNT(DISTINCT evidence) AS n, "
             "MAX(CASE WHEN evidence LIKE '%folder scan%' THEN 1 ELSE 0 END) AS scan FROM xedge "
@@ -199,14 +196,13 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
         s, d = bins.get(r["src_binary"]), bins.get(r["dst_binary"])
         if s and d:
             out.append(f"{s.name} -> {d.name}: {r['n']} interface names via GetProcAddress "
-                       f"({'folder scan' if r['scan'] else 'run-time path'}, plugin interface). "
-                       f"xrefs(binary={d.name}, kind=\"dynamic\") shows the callers.")
+                       f"({'folder scan' if r['scan'] else 'run-time path'}, plugin interface)")
     for r in store.db.execute(
             "SELECT e.binary_id AS b, COUNT(*) AS n FROM feature_entry e WHERE e.feature_key='plugins' "
             "AND e.depth=0 AND e.reason LIKE 'calls LoadLibrary%' GROUP BY e.binary_id"):
         if r["b"] in bins:
-            out.append(f"{bins[r['b']].name}: {r['n']} functions call LoadLibrary (dynamic loading). "
-                       "feature(key=\"plugins\") lists them.")
+            out.append(f"{bins[r['b']].name}: {r['n']} functions call LoadLibrary (dynamic loading, "
+                       "feature plugins)")
     for b in bins.values():
         names = [e["name"] for e in store.exports_of(b.id) if e["name"]]
         com = [n for n in names if n in _COM_EXPORTS]
@@ -221,14 +217,13 @@ def relations_lines(pp: ProjectPaths, store: Store, man: dict[str, Any]) -> list
 def features_lines(store: Store) -> list[str]:
     rows = fx.stats(store)
     if not rows:
-        return ["(no features derived yet. They appear when a binary is ready; "
-                "feature_define adds one by hand.)"]
+        return ["(no features derived yet. They appear when a binary is ready.)"]
     out = []
     drop = fx.dropped(store)
     for r in rows:
         tag = " [agent]" if r["source"] == "agent" else ""
         out.append(f"{r['key']}{tag} | {r['title']} | {fx.size_text(r, drop.get(r['key'], 0))} | "
-                   f"{fx.coverage(r['n'], r['named'])} | feature(key=\"{r['key']}\")")
+                   f"{fx.coverage(r['n'], r['named'])}")
     return out
 
 
@@ -318,7 +313,7 @@ def frontier_lines(store: Store, runtime_ids: set[int]) -> list[str]:
         ev = [fx._short(s, 28) for s in p["strings"]] + [f"calls {n}" for n in p["imports"]]
         out.append(f"{_fn_label(store, b.name, b.pointer_size or 4, p['space'], p['entry'], p['name'], p['ns'])}"
                    f" | {p['callers']} caller{'s' if p['callers'] != 1 else ''}" + (f" | {'; '.join(ev)}" if ev else "")
-                   + f" | function(binary={b.name}, target={fmt_addr(p['entry'], b.pointer_size, p['space'])})")
+                   )
     return out
 
 
@@ -368,7 +363,7 @@ def framework_lines(store: Store, tools: list[str] | None = None, disabled_sets:
                     fix.append(f"airlock config --set disabled_tools {','.join(rest) or '[]'}")
                 line += f" | off in this profile: {', '.join(off)}"
                 if fix:
-                    line += f". Enable with {' and '.join(fix)}, then restart the server"
+                    line += f" (user fix: {' and '.join(fix)}, then a server restart)"
         out.append(line)
     return out
 
@@ -454,11 +449,10 @@ def render_clean(pp: ProjectPaths, store: Store | None, man: dict[str, Any] | No
            scrub_clean(purpose, names) if purpose else "(not set yet)", "## Specs"]
     specs = published_specs(pp)
     if not specs:
-        out.append("(no published specs yet. spec_list shows the status.)")
+        out.append("(no published specs yet)")
     for s in specs:
         out.append(" | ".join(x for x in (s["topic"], s["title"], f"v{s['version']}" if s["version"] else "",
                                           s["status"]) if x))
-    out.append("Read a spec: spec_read(topic=<topic>).")
     return out
 
 

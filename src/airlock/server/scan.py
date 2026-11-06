@@ -489,12 +489,12 @@ def render_scan(result: ScanResult) -> list[str]:
     head = f"{result.root} | {len(pes)} PE, {len(data)} data | "
     if result.root_ambiguous:
         cand = ", ".join(f"{Path(p).name} (score {sc}: {w})" for p, sc, w in result.root_ranking)
-        lines = [f"{head}root unclear: {cand} — pass root_exe= to choose"]
+        lines = [f"{head}root unclear: {cand} — root_exe= picks one"]
     else:
         why = result.root_reason
         if result.root_candidates:
             oth = ", ".join(f"{Path(p).name} {_mb(c)}" for p, c in result.root_candidates)
-            why += f"; others: {oth} — pass root_exe= to change"
+            why += f"; others: {oth} — root_exe= changes it"
         lines = [f"{head}root: {result.root_exe or 'none'} ({why})"]
     unread = sum(1 for f in files if f.group == "unreadable")
     if unread:
@@ -528,7 +528,7 @@ def render_scan(result: ScanResult) -> list[str]:
         why = ("own plugins present" if result.recommended == "B"
                else "core only" if result.recommended == "A" else "first available option")
         if result.root_ambiguous:
-            lines.append(f"recommended: choose root_exe first (then {result.recommended})")
+            lines.append(f"recommended: {result.recommended} after the root_exe choice")
         else:
             lines.append(f"recommended: {result.recommended} ({why})")
     else:

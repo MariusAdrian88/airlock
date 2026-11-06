@@ -306,7 +306,7 @@ def test_summary_lines(proj):
     assert lines[0].startswith("coverage: ")
     assert lines[1].startswith("C1 ") and any("more subsystems" in ln for ln in lines) or len(
         [c for c in cs.clusters if c.kind == "c"]) <= 2
-    assert lines[-1].startswith("function_map(")
+    assert not any("function_map(" in ln for ln in lines)
     assert cl.cluster_summary_lines(cl.ClusterSet("x", "f", [], {}), 5) == []
 
 
@@ -456,7 +456,7 @@ def test_function_map_hides_runtime_by_default(rtproj):
     assert ctx.bind_session("dirty", pp) is None
     out = fmap.function_map(ctx)
     assert "runtime: MFC" not in out and "plugin interface" in out
-    assert "1 runtime clusters (8 fns) hidden" in out and "include_runtime=true" in out
+    assert "1 runtime clusters (8 fns) hidden" in out and "include_runtime=true" not in out
     full = fmap.function_map(ctx, include_runtime=True)
     assert "runtime: MFC" in full and "hidden" not in full.replace("coverage:", "")
     cid = cl.get_clusters(ctx, "proj").of((b, "ram", 0x1000)).id

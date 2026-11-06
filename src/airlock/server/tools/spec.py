@@ -19,7 +19,7 @@ from airlock.server.tools.common import budget_for
 def _project(ctx: ServerContext) -> ProjectPaths | str:
     pp = ctx.session.project
     if pp is None:
-        return "error unbound: no project is open. Call projects, then project_open."
+        return "error unbound: no project is open."
     return pp
 
 
@@ -49,13 +49,11 @@ def spec_write(ctx: ServerContext, topic: str, title: str, body: str, sources: s
     if bad:
         return bad
     if status not in sp.STATUSES:
-        return sp.err("bad_status", f"status '{status}' is not valid", "Use draft, reviewed or final")
+        return sp.err("bad_status", f"status '{status}' is not one of draft, reviewed, final")
     if not title or len(title) > sp.MAX_TITLE:
-        return sp.err("bad_title", f"the title must be 1 to {sp.MAX_TITLE} characters",
-                      "Give a short one-line title")
+        return sp.err("bad_title", f"the title must be 1 to {sp.MAX_TITLE} characters")
     if not body.strip() or len(body) > sp.MAX_BODY:
-        return sp.err("bad_body", f"the body must be 1 to {sp.MAX_BODY} characters",
-                      "Write prose and data-layout tables; split a long topic")
+        return sp.err("bad_body", f"the body must be 1 to {sp.MAX_BODY} characters")
     st = ctx.indexer.store(pp.name)
     ranges = sp.image_ranges(st)
     refusal = specfilter.check(title, ranges) or specfilter.check(body, ranges)
@@ -94,8 +92,14 @@ def spec_list(ctx: ServerContext, topic_prefix: str = "", cursor: str = "", budg
             f"published v{pub[r['topic']]}" if r["topic"] in pub else "unpublished")
         lines.append(f"{r['topic']} | {r['title']} | v{r['version']} | {r['status']} | {mark} | id {r['id']}")
     if not lines:
-        return "no specs" + (f" under '{prefix}'" if prefix else "") + ". Write one with spec_write."
+        return "no specs" + (f" under '{prefix}'" if prefix else "") + "."
     return _page(ctx, lines, "spec_list", args, "", budget)
+
+
+def _have(topics: list[str], n: int = 12) -> str:
+    """`topics: a, b, …`: the candidates for a wrong topic, so it needs no listing call."""
+    more = f", +{len(topics) - n} more" if len(topics) > n else ""
+    return f"topics: {', '.join(sorted(topics)[:n]) or 'none'}{more}"
 
 
 @tool("spec_read", "Read a specification page by topic (latest version unless version is given).")
@@ -108,25 +112,25 @@ def spec_read(ctx: ServerContext, topic: str = "", version: int = 0, id: int = 0
     args = {"topic": topic, "version": version, "id": id}
     if cursor:
         return _page(ctx, [], "spec_read", args, cursor, budget)
+    if not topic and not id:        # nothing named: the list is the answer
+        return "(no topic given: the spec list)\n" + spec_list(ctx, budget=budget)
     if _is_clean(ctx):
-        if id or not topic:
-            return sp.err("bad_args", "a clean session reads a spec by topic", "Call spec_list, then spec_read(topic=...)")
+        topics = [e["topic"] for e in sp.published(pp)]
+        if id:
+            return sp.err("bad_args", "a clean session reads a spec by topic", _have(topics))
         got = sp.read_published(pp, topic)
         if got is None:
-            return sp.err("not_found", f"no published spec '{topic}'", "Call spec_list")
+            return sp.err("not_found", f"no published spec '{topic}'", _have(topics))
         entry, body = got
-        if version and str(version) != str(entry.get("version")):
-            return sp.err("not_found", f"only version {entry.get('version')} of '{topic}' is published",
-                          "Read without version")
         head = f"{entry['topic']} | {entry.get('title', '')} | v{entry.get('version', '')} | {entry.get('status', '')}"
+        if version and str(version) != str(entry.get("version")):
+            head += f" (v{version} is not published)"
         return _page(ctx, [head, *body.splitlines()], "spec_read", args, "", budget)
-    if not topic and not id:
-        return sp.err("bad_args", "give a topic or an id", "Call spec_list")
     st = ctx.indexer.store(pp.name)
     row = sp.get_spec(st, topic, id, version)
     if row is None:
         return sp.err("not_found", f"no spec {topic or id}" + (f" v{version}" if version else ""),
-                      "Call spec_list")
+                      _have([r["topic"] for r in sp.latest(st)]))
     head = f"{row['topic']} | {row['title']} | v{row['version']} | {row['status']}"
     return _page(ctx, [head, *row["body"].splitlines()], "spec_read", args, "", budget)
 
@@ -138,11 +142,11 @@ def spec_export(ctx: ServerContext, topic_prefix: str = "", format: str = "md") 
     if isinstance(pp, str):
         return pp
     if format.strip().lower() != "md":
-        return sp.err("bad_format", f"format '{format}' is not supported", "Use md")
+        return sp.err("bad_format", f"format '{format}' is not supported (formats: md)")
     prefix = topic_prefix.strip()
     if _is_clean(ctx):
         n = len([e for e in sp.published(pp) if e["topic"].startswith(prefix)])
-        return f"{n} published specs in {pp.specs}. Read them with spec_read(topic=...)."
+        return f"{n} published specs in {pp.specs}."
     st = ctx.indexer.store(pp.name)
     final, skipped, gone = sp.publish(st, pp, ctx.session.role, prefix)
     extra = (f", {skipped} not final and left out" if skipped else "") + (

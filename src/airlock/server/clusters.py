@@ -740,17 +740,16 @@ def cluster_summary_lines(cs: ClusterSet, limit: int = 8) -> list[str]:
     regular = [c for c in ordered(cs) if c.kind == "c" and not c.runtime]
     lines = [cluster_line(cs, c, key_limit=MAP_KEY_FUNCTIONS) for c in regular[:max(0, limit)]]
     if len(regular) > limit:
-        lines.append(f"… {len(regular) - limit} more subsystems. function_map() lists them.")
+        lines.append(f"… {len(regular) - limit} more subsystems")
     rt = [c for c in ordered(cs) if c.runtime]
     if rt:
         fams = Counter(c.auto_label.partition(": ")[2] or "other" for c in rt)
         lines.append(f"runtime: {len(rt)} clusters, {sum(c.total for c in rt)} fns ("
                      + ", ".join(f"{k} {v}" for k, v in sorted(fams.items(), key=lambda kv: (-kv[1], kv[0])))
-                     + '). function_map(include_runtime=true) lists them.')
+                     + ")")
     for c in ordered(cs):
         if c.kind != "c":
             lines.append(cluster_line(cs, c, link_limit=3, key_limit=MAP_KEY_FUNCTIONS))
     if lines:
         lines.insert(0, coverage_line(cs))
-        lines.append('function_map(cluster="C1") lists the functions of a subsystem.')
     return lines

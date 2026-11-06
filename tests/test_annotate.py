@@ -224,7 +224,7 @@ def test_patch_bytes_note_invalidation_and_restore(ctx):
     out = an.patch_bytes(ctx, "0x00401001", "90 90 90", why="skip the check")
     assert out.startswith("patched 3 bytes at 0x00401001 in main: old 8bff55, new 909090; note #1; "
                           "invalidated 1 cached decompile"), out
-    assert "re-disassembled 3 instructions" in out and out.endswith("Undo with patch_bytes(restore=1).")
+    assert "re-disassembled 3 instructions" in out and "patch_bytes(" not in out
     w = ctx.worker.writes[-1]
     assert w[0] == "patch_bytes" and w[1]["hex"] == "909090" and w[1]["address"] == 0x401001
     assert st.get_function(fn.id).version == fn.version + 1           # decompile and asm are recomputed

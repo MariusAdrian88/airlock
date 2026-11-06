@@ -288,7 +288,7 @@ CREATE TABLE mfc_class (
   base          TEXT NOT NULL DEFAULT '',     -- base class: owner of the base message map, else of the base CRuntimeClass
   map_addr      INTEGER NOT NULL DEFAULT 0,   -- its AFX_MSGMAP (0: none)
   dialog        TEXT NOT NULL DEFAULT '',     -- dialog resource id passed to the CDialog constructor
-  source        TEXT NOT NULL,                -- rc | dialog | inherited
+  source        TEXT NOT NULL,                -- rc | dialog | inherited | routes (route table, routes.py)
   PRIMARY KEY (binary_id, vtable_addr)
 );
 CREATE INDEX mfc_class_by_name ON mfc_class(binary_id, name);

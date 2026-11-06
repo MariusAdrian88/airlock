@@ -42,39 +42,38 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
                    add: str = "", remove: str = "") -> str:
     if not name.strip():
         # TODO: ask the user through MCP elicitation when the client supports it.
-        return ("error need_name: a project name is required. Ask the user for a project "
-                "name and call again with name=.")
+        return "error need_name: the project name comes from the user."
     cfg = ctx.config
     if ctx.profile_role and ctx.profile_role != "dirty":
         return f"error wrong_role: this server was started with --profile {ctx.profile_role}."
     slug = slugify(name)
     pp = project_paths(cfg.projects_root, slug, create=False)
     if pp.root.exists():
-        return f"error exists: project '{slug}' already exists at {pp.root}. Choose another name."
+        return f"error exists: project '{slug}' already exists at {pp.root}."
     oh, spc = priors(cfg.defaults)
     try:
         scan = scan_program(Path(path).expanduser(), None, spc, oh)
     except FileNotFoundError:
-        return f"error not_found: {path} does not exist. Give an existing folder or executable."
+        return f"error not_found: {path} does not exist."
     keys = [o.key for o in scan.options]
     if not keys:
-        return "error no_binaries: no analysable executable found. Check the path."
+        return f"error no_binaries: no analysable executable found under {path}."
     if not option.strip():
         span = keys[0] if len(keys) == 1 else f"{keys[0]}..{keys[-1]}"
         return "\n".join([*render_scan(scan),
-                          f"Choose option={span} (recommended {scan.recommended}), optional "
-                          "add=/remove= comma lists, then call again."])
+                          f"option={span} picks the files (recommended {scan.recommended}); "
+                          "add= and remove= take comma lists"])
     key = option.strip().upper()
     opt = next((o for o in scan.options if o.key == key), None)
     if opt is None:
-        return f"error bad_option: option '{option}' is not offered. Choose one of {', '.join(keys)}."
+        return f"error bad_option: option '{option}' is not offered (options: {', '.join(keys)})."
 
     selected = list(opt.files)
     have = {f.rel_path for f in selected}
     for tok in _csv(add):
         f = _match(scan.files, tok)
         if f is None:
-            return f"error bad_file: '{tok}' is not a file of the scan (add=). Use paths from the scan."
+            return f"error bad_file: '{tok}' is not a file of the scan (add=)."
         if f.rel_path not in have:
             selected.append(f)
             have.add(f.rel_path)
@@ -85,7 +84,7 @@ def project_create(ctx: ServerContext, path: str, name: str = "", option: str = 
         selected = [x for x in selected if x.rel_path != f.rel_path]
     pes = [f for f in selected if f.kind == "pe"]
     if not pes:
-        return "error no_binaries: the selection has no executable. Adjust add=/remove=."
+        return "error no_binaries: the selection has no executable."
     root_f = next((f for f in pes if f.rel_path == scan.root_exe), None) \
         or next((f for f in pes if not f.is_dll), pes[0])
 

@@ -46,12 +46,11 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
     try:
         man = read_manifest(pp.manifest)
     except (OSError, ValueError):
-        return f"error no_manifest: project '{project}' has no manifest. Create it with project_create."
+        return f"error no_manifest: project '{project}' has no manifest."
     src = (man.get("source") or {})
     folder = src.get("path")
     if not folder or not Path(folder).is_dir():
-        return (f"error no_source: the program folder {folder or '(unknown)'} is not available. "
-                "Use open_binary with a file path instead.")
+        return f"error no_source: the program folder {folder or '(unknown)'} is not available."
     oh, spc = priors(ctx.config.defaults)
     scan = scan_program(Path(folder), src.get("root_exe") or None, spc, oh)
     have = {f.get("path") for f in man.get("files") or []}
@@ -61,19 +60,19 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
         if not any(pend.values()):
             return "nothing to add: every file of the scan is already in the project."
         txt = ", ".join(f"{k} +{n}" for k, n in pend.items() if n)
-        return f"files not yet in the project per option: {txt}. Call again with option= or files=."
+        return f"files not yet in the project per option: {txt}"
 
     picked: list[ScannedFile] = []
     if option.strip():
         opt = next((o for o in scan.options if o.key == option.strip().upper()), None)
         if opt is None:
             keys = ", ".join(o.key for o in scan.options)
-            return f"error bad_option: option '{option}' is not offered. Choose one of {keys}."
+            return f"error bad_option: option '{option}' is not offered (options: {keys})."
         picked += list(opt.files)
     for tok in _csv(files):
         f = _match(scan.files, tok)
         if f is None:
-            return f"error bad_file: '{tok}' is not a file of the scan. Use paths from program_scan."
+            return f"error bad_file: '{tok}' is not a file of the scan."
         picked.append(f)
     new: list[ScannedFile] = []
     for f in picked:
@@ -105,4 +104,4 @@ def program_add(ctx: ServerContext, option: str = "", files: str = "") -> str:
     names = ", ".join(Path(e["path"]).name for e in entries[:6])
     more = f", +{len(entries) - 6} more" if len(entries) > 6 else ""
     return (f"queued {len(entries)} files, {code / _MB:.1f} MB code, ~{max(1, round(est / 60))} min: "
-            f"{names}{more}. Call index_status for progress.")
+            f"{names}{more}")

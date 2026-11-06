@@ -168,8 +168,9 @@ def test_path_to_and_from_import(proj):
     assert lines(out)[1:] == ["→ [plug.dll] plug_open 0x00001000",
                               "→ [plug.dll] plug_inner 0x00001100   call at 0x00001010"]
     # an unresolved import has no callees
-    out = gt.path(ctx, "ReadFile", "Boot")
-    assert out.startswith("error no_path:") and "swap from and to" in out and "8 hops" in out
+    out = gt.path(ctx, "ReadFile", "Boot")      # swapped by the tool: the import is the end
+    assert "from and to swapped: an import has no callees" in out
+    assert out.startswith("path Boot") or out.startswith("error no_path: no call chain from Boot")
 
 
 def test_path_from_string(proj):
@@ -212,7 +213,7 @@ def test_path_errors(proj):
     out = gt.path(ctx, "AppLog", "Boot")
     assert out.startswith("error no_path:") and "within 8 hops" in out
     out = gt.path(ctx, "Boot", "Read", max_depth=2)
-    assert out.startswith("error no_path:") and "within 2 hops" in out and "Raise max_depth to 3" in out
+    assert lines(out)[0].startswith("path Boot") and "(max_depth 2 -> 3)" in lines(out)[0]   # widened
     out = gt.path(ctx, "dup_fn", "Read")
     assert lines(out)[0] == "path dup_fn (2 functions in 2 binaries) → Read, 1 hops"
     assert lines(gt.path(ctx, "app.exe!dup_fn", "Read"))[0].startswith("path app.exe!dup_fn → Read, 1 hops")
@@ -359,7 +360,7 @@ def test_subsystems_section(proj):
     heads = [ln[3:] for ln in dirty.splitlines() if ln.startswith("## ")]
     assert heads.index("Subsystems") == heads.index("Features") + 1
     sec = dirty.split("## Subsystems")[1].split("\n## ")[0]
-    assert "C1 " in sec and "function_map(cluster=\"C1\")" in sec
+    assert "C1 " in sec and "function_map(" not in sec
     clean = "\n".join(pm.render_clean(pp, st))
     assert "Subsystems" not in clean and "C1" not in clean
     pm.write_maps(pp, st)

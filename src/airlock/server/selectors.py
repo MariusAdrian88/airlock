@@ -80,8 +80,47 @@ def split_binary_suffix(store: Store, target: str) -> tuple[str, str]:
     return "", t
 
 
-def _error(code: str, what: str, nxt: str) -> Resolved:
-    return Resolved(error=f"error {code}: {what}. {nxt}.")
+def _error(code: str, what: str, nxt: str = "") -> Resolved:
+    return Resolved(error=f"error {code}: {what}." + (f" {nxt}." if nxt else ""))
+
+
+MAX_CLOSE = 8   # close names listed in a not_found error
+
+
+def close_functions(store: Store, binary_id: int, name: str, limit: int = MAX_CLOSE) -> tuple[list[Function], bool]:
+    """Functions whose name is close to ``name``: (rows, exact_ignoring_case). First the names
+    equal to it ignoring case (also ``ns::name``); else names that contain its last segment
+    (after ``::``, ``.`` or ``!``), shortest first. Only the first kind is safe to resolve to."""
+    t = name.strip()
+    if not t:
+        return [], False
+    rows = store.db.execute(
+        "SELECT entry, space FROM function WHERE binary_id=? AND (lower(name)=lower(?) OR "
+        "(namespace IS NOT NULL AND namespace<>'' AND lower(namespace || '::' || name)=lower(?))) "
+        "ORDER BY space, entry LIMIT ?", (binary_id, t, t, limit + 1)).fetchall()
+    if rows:
+        exact = True
+    else:
+        tail = re.split(r"::|[.!]", t)[-1]
+        if len(tail) < 3:
+            return [], False
+        like = "%" + tail.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = store.db.execute(
+            "SELECT entry, space FROM function WHERE binary_id=? AND name LIKE ? ESCAPE '\\' "
+            "ORDER BY length(name), entry LIMIT ?", (binary_id, like, limit + 1)).fetchall()
+        exact = False
+    fns = [f for f in (store.function_at(binary_id, r[0], r[1]) for r in rows) if f is not None]
+    local = [f for f in fns if not f.is_external]
+    if exact and len(fns) > 1 and len(local) == 1:   # an import's EXTERNAL row and its thunk
+        fns = local
+    return fns, exact
+
+
+def close_text(names: list[str], more: bool) -> str:
+    """``close names: a 0x.., b 0x..`` for a not_found error, or empty."""
+    if not names:
+        return ""
+    return "close names: " + ", ".join(names) + (" …" if more else "")
 
 
 def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
@@ -93,7 +132,7 @@ def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
     """
     target = target.strip()
     if not target:
-        return _error("bad_target", "empty target", "Pass a function name or an address like 0x00401000")
+        return _error("bad_target", "empty target")
     binary = store.get_binary_by_id(binary_id)
     psize = binary.pointer_size if binary else 4
 
@@ -117,13 +156,17 @@ def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
         return _error(
             "ambiguous",
             f"'{target}' matches {len(fns)} functions: {cands}{more}",
-            "Retry with one of the addresses",
         )
 
     if _BARE_HEX.match(target):
         return _by_address(store, binary_id, "ram", int(target, 16), psize, target)
 
-    return _error("not_found", f"no function named '{target}'", "Use search to find the name or pass an address")
+    close, exact = close_functions(store, binary_id, target)
+    if exact and len(close) == 1:
+        f = close[0]
+        return Resolved(function=f, note=f"resolved '{target}' to {f.qualified_name} (case differs)")
+    names = [f"{f.qualified_name} {fmt_addr(f.entry, psize, f.space)}" for f in close[:MAX_CLOSE]]
+    return _error("not_found", f"no function named '{target}'", close_text(names, len(close) > MAX_CLOSE))
 
 
 def _by_address(
@@ -140,5 +183,4 @@ def _by_address(
     return _error(
         "not_found",
         f"no function at or containing {fmt_addr(value, psize, space)}",
-        "Check the address or use search to find a function",
     )

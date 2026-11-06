@@ -18,9 +18,9 @@ _IGNORED_ARGS = frozenset({"cursor", "budget"})
 class CursorError(Exception):
     """Carries a ready-to-return one-line error string in project format (.message)."""
 
-    def __init__(self, code: str, what: str, action: str) -> None:
+    def __init__(self, code: str, what: str, action: str = "") -> None:
         self.code = code
-        self.message = f"error {code}: {what}. {action}."
+        self.message = f"error {code}: {what}." + (f" {action}." if action else "")
         super().__init__(self.message)
 
 
@@ -82,7 +82,7 @@ class CursorStore:
 
         If `args` is given they must match the ones the cursor was issued for.
         """
-        redo = f"Repeat the {tool} call without cursor"
+        redo = ""     # the call without cursor is the only way on; the error says why
         with self._lock:
             cur = self._items.get(cid or "")
             if cur is None:

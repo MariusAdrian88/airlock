@@ -120,7 +120,10 @@ def test_read_and_list_dirty(dctx):
     sid = dctx.indexer.store("proj").db.execute("SELECT id FROM spec WHERE version=1").fetchone()[0]
     assert "fmt/header" in registry.call(dctx, "spec_read", id=sid)
     assert registry.call(dctx, "spec_read", topic="nope").startswith("error not_found:")
-    assert registry.call(dctx, "spec_read").startswith("error bad_args:")
+    listed = registry.call(dctx, "spec_read")       # no topic: the list instead of an error
+    assert listed.startswith("(no topic given: the spec list)") and "fmt/header" in listed
+    nf = registry.call(dctx, "spec_read", topic="nope")
+    assert nf.startswith("error not_found:") and "topics: fmt/header" in nf
 
 
 def test_read_dirty_never_returns_provenance(dctx):
@@ -192,7 +195,9 @@ def test_clean_reads_without_opening_the_index(tmp_path):
         {"specs": [{"topic": "a", "title": "T", "version": 3, "status": "final", "file": "a.md"}]}))
     _as(c, roles.CLEAN)
     assert registry.call(c, "spec_read", topic="a").splitlines() == ["a | T | v3 | final", "Body."]
-    assert registry.call(c, "spec_read", topic="a", version=2).startswith("error not_found:")
+    v2 = registry.call(c, "spec_read", topic="a", version=2).splitlines()  # the published one, said so
+    assert v2 == ["a | T | v3 | final (v2 is not published)", "Body."]
+    assert registry.call(c, "spec_read", topic="b") == "error not_found: no published spec 'b'. topics: a."
     assert not pp.index_db.exists()
 
 

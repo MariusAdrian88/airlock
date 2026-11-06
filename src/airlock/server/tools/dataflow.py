@@ -31,7 +31,7 @@ def _function(ctx: ServerContext, binary: str, target: str):
     assert isinstance(ft, tg.FunctionTarget)
     bd, fn = ft.bound, ft.fn
     if fn.is_external or bd.binary.format == "dotnet":
-        return f"error not_native: '{fn.qualified_name}' has no native code to analyse. Pass a function with a body."
+        return f"error not_native: '{fn.qualified_name}' has no native code to analyse."
     return bd, fn, ft.any_note
 
 
@@ -43,7 +43,7 @@ def _call(ctx: ServerContext, bd: Bound, op: str, args: dict, timeout: int = 600
     except IndexerError as e:
         return e.message
     except WorkerError as e:
-        return worker_error(e, "Check the function and retry, or call index_status")
+        return worker_error(e)
 
 
 # ── switch_tables ──────────────────────────────────────────────────────────
@@ -94,10 +94,10 @@ def switch_tables(ctx: ServerContext, function: str, binary: str = "", cursor: s
 def trace_values(ctx: ServerContext, function: str, variable: str = "", param: int = 0, depth: int = 2,
                  binary: str = "", cursor: str = "", budget: int = 0) -> str:
     if not variable.strip() and param < 1:
-        return ("error bad_args: pass variable= (a name from the decompiled C, e.g. local_10 or iVar2) or "
-                "param= (1 for the first parameter). Fix and retry.")
+        return ("error bad_args: needs variable= (a name from the decompiled C, e.g. local_10 or iVar2) or "
+                "param= (1 for the first parameter).")
     if not 0 <= depth <= 5:
-        return "error bad_args: depth must be 0 to 5. Fix and retry."
+        return "error bad_args: depth must be 0 to 5."
     got = _function(ctx, binary, function)
     if isinstance(got, str):
         return got
@@ -118,7 +118,7 @@ def trace_values(ctx: ServerContext, function: str, variable: str = "", param: i
     if len(r["rows"]) == 0:
         lines.append("  no definition or use found")
     if r.get("truncated"):
-        lines.append("… trace cut at the line limit. Trace a narrower variable or lower depth.")
+        lines.append(f"… trace cut at the line limit (depth {depth})")
     return fit_lines(lines, bud, "code", tool="trace_values", args=args)[0]
 
 
@@ -137,12 +137,11 @@ def constants(ctx: ServerContext, value: str, limit: int = 30, binary: str = "",
               budget: int = 0) -> str:
     v = parse_value(str(value))
     if v is None:
-        return "error bad_args: value must be a number like 0x4d5a or 1234. Fix and retry."
+        return "error bad_args: value must be a number like 0x4d5a or 1234."
     if abs(v) < 0x80:
-        return ("error bad_args: values below 0x80 are encoded in one byte and occur in every function. "
-                "Use 0x80 or more, or search the decompiled text with search.")
+        return "error bad_args: values below 0x80 are encoded in one byte and occur in every function."
     if limit < 1:
-        return "error bad_args: limit must be at least 1. Fix and retry."
+        return "error bad_args: limit must be at least 1."
     got = bind_many(ctx, binary)
     if isinstance(got, str):
         return got
@@ -171,5 +170,5 @@ def constants(ctx: ServerContext, value: str, limit: int = 30, binary: str = "",
         return f"no function uses {hex(v)} as an immediate."
     shown = lines[:limit]
     if len(lines) > limit:
-        shown.append(f"… {len(lines) - limit} more functions beyond limit={limit}. Raise limit.")
+        shown.append(f"… {len(lines) - limit} more functions beyond limit={limit}")
     return fit_lines([f"{hex(v)} used by {len(lines)} functions", *shown], bud, "code", tool="constants", args=args)[0]

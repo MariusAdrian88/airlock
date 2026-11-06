@@ -34,6 +34,9 @@ Design: `docs/DESIGN.md` (source of truth). Current state and next steps:
   `defaults.token_budget` (2000 tokens); cut and end with
   `… N more lines. cursor=<id>` when longer.
 - Errors are one line: `error <code>: <what happened>. <what to do next>.`
+- A tool does the next step itself and does not tell the agent what to do: it retries, widens
+  or forwards and says so in one fact line; "what to do next" is only data (candidates, a cursor)
+  or a fix only the user can make. `tests/test_no_hints.py` enforces it.
 - Address formatting: `0x` + lowercase hex, zero-padded to pointer size.
 
 ## Clean-room rules

@@ -24,10 +24,20 @@ class SessionState:
     project: ProjectPaths | None = None
 
 
+UNBOUND_ERROR = "error unbound: no project is open."
+
+
+def unbound_error(projects: list[str] | None = None) -> str:
+    """The unbound refusal; with ``projects`` it lists them, so choosing one needs no extra call."""
+    if projects is None:
+        return UNBOUND_ERROR
+    return UNBOUND_ERROR + (f" projects: {', '.join(projects)}." if projects else " No project exists yet.")
+
+
 def role_locked(session: SessionState) -> str:
     name = session.project.name if session.project else "-"
-    return (f"error role_locked: this session is already {session.role} for {name}. "
-            "Start a new session for other work.")
+    return (f"error role_locked: this session is already {session.role} for {name}; "
+            "other work needs a new session.")
 
 
 def usable(session: SessionState, names: list[str]) -> list[str]:
@@ -40,14 +50,13 @@ def gate(session: SessionState, tool: str) -> str | None:
     if session.role == UNBOUND:
         if tool in UNBOUND_TOOLS:
             return None
-        return ("error unbound: no project is open. Call projects, then project_open "
-                "(name, role), or project_create for a new program.")
+        return UNBOUND_ERROR
     if tool in BIND_TOOLS:
         return role_locked(session)
     if session.role == CLEAN:
         info = CATALOG.get(tool)
         if info is not None and info.clean_safe:
             return None
-        return (f"error wrong_role: {tool} is not available in a clean-room session. "
-                "Use spec_read, spec_list or spec_export.")
+        return (f"error wrong_role: {tool} is not available in a clean-room session "
+                "(clean tools: spec_read, spec_list, spec_export).")
     return None

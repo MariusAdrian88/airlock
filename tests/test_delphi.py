@@ -518,7 +518,8 @@ def test_delphi_forms_tool(proj):
     assert any(ln == "    Check1: TCheckBox \"Verbose\" events 2" for ln in tree)
     assert "0x" not in "\n".join(tree)                                         # no addresses by default
     assert dtools.delphi_forms(ctx, form="mainform").startswith('TMainForm MainForm')
-    assert dtools.delphi_forms(ctx, form="zzz").startswith("error not_found:")
+    nf = dtools.delphi_forms(ctx, form="zzz")       # the forms as data: no listing call needed
+    assert nf.startswith("error not_found: no form 'zzz' (have: ") and "TMainForm" in nf
     assert dtools.delphi_forms(ctx, form="Form").startswith("error ambiguous:")
 
 

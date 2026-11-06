@@ -17,5 +17,5 @@ def program_scan(ctx: ServerContext, path: str, root_exe: str = "") -> str:
     try:
         res = scan_program(Path(path), root_exe or None, spc, oh)
     except FileNotFoundError:
-        return f"error not_found: {path} does not exist. Give an existing folder or executable."
+        return f"error not_found: {path} does not exist."
     return "\n".join(render_scan(res))

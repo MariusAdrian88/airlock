@@ -18,7 +18,7 @@ from typing import Any, Callable
 from airlock.index.store import Store
 from airlock.worker.protocol import WorkerError
 
-FIX_VERSION = 4          # 4: MFC dispatch map handlers; 3: Delphi property accessors; 2: Delphi method and event addresses
+FIX_VERSION = 5          # 5: route table handlers; 4: MFC dispatch map handlers; 3: Delphi property accessors; 2: Delphi method and event addresses
 BATCH = 500           # addresses per worker call: one transaction and one save each (the op accepts 20000)
 RESTARTED = ("worker_exited", "timeout")     # errors after which the worker process is gone
 

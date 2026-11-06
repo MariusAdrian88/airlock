@@ -19,7 +19,7 @@ from airlock.server.tools.common import budget_for
 def _roots(ctx: ServerContext) -> list[Path] | str:
     pp = ctx.session.project
     if pp is None:
-        return "error unbound: no project is open. Call projects, then project_open."
+        return "error unbound: no project is open."
     roots: list[Path] = []
     src = (load_manifest(pp).get("source") or {}).get("path")
     if src:
@@ -36,7 +36,7 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
         return roots
     text = path.strip().strip('"')
     if not text:
-        return "error bad_args: path is empty. Pass a file path relative to the program folder."
+        return "error bad_args: path is empty."
     p = Path(text)
     cands = [p] if p.is_absolute() else [r / p for r in roots]
     inside = False
@@ -53,9 +53,32 @@ def resolve_path(ctx: ServerContext, path: str) -> Path | str:
     if not inside:
         names = ", ".join(str(r) for r in roots)
         return (f"error outside_project: '{path}' is not inside the program folder or dirty\\work "
-                f"({names}). Use a relative path.")
-    return (f"error not_found: no file '{path}' under the program folder or dirty\\work. "
-            "Use a relative path such as sub\\file.ext.")
+                f"({names}).")
+    near = _same_name(roots, p.name)
+    return (f"error not_found: no file '{path}' under the program folder or dirty\\work"
+            + (f". Files with that name: {', '.join(near)}." if near else "."))
+
+
+MAX_NEAR = 6        # same-name files listed in a not_found error
+MAX_WALK = 20000    # files looked at for them
+
+
+def _same_name(roots: list[Path], name: str) -> list[str]:
+    """Paths (relative to their root) of files named ``name`` anywhere under the roots."""
+    out: list[str] = []
+    if not name:
+        return out
+    low, seen = name.lower(), 0
+    for r in roots:
+        if not r.is_dir():
+            continue
+        for f in r.rglob("*"):
+            seen += 1
+            if seen > MAX_WALK or len(out) > MAX_NEAR:
+                return out
+            if f.name.lower() == low and f.is_file():
+                out.append(str(f.relative_to(r)))
+    return out
 
 
 def _page(ctx: ServerContext, lines: list[str], name: str, args: dict, cursor: str, budget: int,
@@ -82,8 +105,7 @@ def _dump(ctx: ServerContext, data: bytes, offset: int, length: int, label: str,
     if cursor:
         return _page(ctx, [], name, args, cursor, budget, "code")
     if offset < 0 or (offset >= len(data) and len(data) > 0):
-        return (f"error bad_args: offset 0x{offset:x} is past the end ({len(data)} bytes). "
-                f"Use 0 to {max(len(data) - 1, 0)}.")
+        return f"error bad_args: offset 0x{offset:x} is past the end ({len(data)} bytes)."
     n = max(1, min(length, ff.MAX_DUMP))
     chunk = data[offset:offset + n]
     head = f"{label} {len(data)} bytes, showing 0x{offset:x}-0x{offset + len(chunk):x}"
@@ -124,8 +146,7 @@ def hexdump(ctx: ServerContext, path: str, offset: int = 0, length: int = 256, s
         return _page(ctx, [], "hexdump", args, cursor, budget, "code")
     src = ff.FileSrc(p)
     if offset < 0 or (offset >= src.size and src.size > 0):
-        return (f"error bad_args: offset 0x{offset:x} is past the end ({src.size} bytes). "
-                f"Use 0 to {max(src.size - 1, 0)}.")
+        return f"error bad_args: offset 0x{offset:x} is past the end ({src.size} bytes)."
     n = max(1, min(length, ff.MAX_DUMP))
     chunk = src.read(offset, n)
     head = f"{p.name} {src.size} bytes, showing 0x{offset:x}-0x{offset + len(chunk):x}"
@@ -150,12 +171,11 @@ def file_diff(ctx: ServerContext, path_a: str, path_b: str, stream: str = "", cu
     if isinstance(pb, str):
         return pb
     both_ole = ff.is_ole(pa) and ff.is_ole(pb)
-    if stream and not both_ole:
-        return "error not_ole: stream= needs two OLE files. Omit stream for a byte diff."
+    note = "(stream ignored: not two OLE files) " if stream and not both_ole else ""
     if not both_ole:
         a, b = ff.FileSrc(pa), ff.FileSrc(pb)
         res = ff.diff_sources(a, b)
-        head = f"diff {pa.name} {a.size}B vs {pb.name} {b.size}B: "
+        head = f"{note}diff {pa.name} {a.size}B vs {pb.name} {b.size}B: "
         if not res.range_count:
             return head + "identical."
         return _page(ctx, [head + ff.summary_of(res)] + ff.range_lines(res, a, b), "file_diff", args,

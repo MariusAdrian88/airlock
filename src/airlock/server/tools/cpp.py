@@ -199,6 +199,15 @@ def _entry_line(bd: Bound, r, ui: uijoin.UiIndex | None = None) -> str:
     return line
 
 
+def _route_note(bd: Bound, map_addr: int) -> str:
+    """`` route table, vtable 0x.., base anon_..`` for a map of an MFC look-alike framework."""
+    r = bd.store.db.execute("SELECT vtable_addr, base FROM mfc_class WHERE binary_id=? AND map_addr=? "
+                            "AND source='routes' LIMIT 1", (bd.binary.id, map_addr)).fetchone()
+    if r is None:
+        return ""
+    return f" route table, vtable {bd.addr(r['vtable_addr'])}" + (f", base {r['base']}" if r["base"] else "")
+
+
 def _dispatch_line(bd: Bound, r) -> str:
     """One line of a dispatch / interface / event sink map entry."""
     kind = r["kind"]
@@ -260,7 +269,7 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                     "GROUP BY class, map_addr ORDER BY class, map_addr", (bd.binary.id,)):
                 dlg = ui.class_dialog_text(r["class"])
                 lines.append(f"{_prefix(bd, several)}{r['class']} map {bd.addr(r['map_addr'])} entries {r['n']}"
-                             + (f" {dlg}" if dlg else ""))
+                             + _route_note(bd, r["map_addr"]) + (f" {dlg}" if dlg else ""))
             for r in bd.store.db.execute(
                     "SELECT class, kind, map_addr, COUNT(*) AS n FROM mfc_map_entry WHERE binary_id=? "
                     "GROUP BY class, kind, map_addr ORDER BY class, kind, map_addr", (bd.binary.id,)):
@@ -332,7 +341,7 @@ def mfc_message_maps(ctx: ServerContext, target: str = "", binary: str = "", cur
                 (bd.binary.id, m["class"], m["map_addr"])).fetchall()
             dlg = ui.class_dialog_text(m["class"])
             lines.append(f"{_prefix(bd, several)}{m['class']} map {bd.addr(m['map_addr'])} entries {len(rows)}"
-                         + (f" {dlg}" if dlg else ""))
+                         + _route_note(bd, m["map_addr"]) + (f" {dlg}" if dlg else ""))
             lines += [_entry_line(bd, r, ui) for r in rows]
         for m in extra_maps:
             found = True

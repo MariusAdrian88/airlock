@@ -1613,8 +1613,17 @@ rejected for it.
 
 ### 7.5 Errors
 
-One line, a code and the next action:
-`error not_analysed: binary 'app.exe' is still analysing (62%). Retry later or call index_status.`
+One line, a code and what happened:
+`error not_analysed: binary 'app.exe' is analysing (62%, 41s).`
+
+**A tool does the next step itself and does not tell the agent what to do** (agents ignore
+advice in output, HANDOVER "Agent evaluation"). It retries, widens, follows or forwards on its
+own and says so in one short fact line (`(regex used: no literal match)`); where only the agent
+can choose it lists the candidates or the cursor as data; where only the user can act it names
+the fix in one fact line (`allow_writes is off in config.jsonc`). A name that is not found
+resolves when one function matches it ignoring case (`resolved 'x' to X (case differs)`), else
+the error lists close names (`close names: a 0x.., b 0x..`). `tests/test_no_hints.py` scans
+the server's string literals for imperative hints. **[verified]**
 
 ### 7.6 No output schemas
 
@@ -1984,7 +1993,7 @@ formats is the primary use case of this project.
 
 ### MFC classes without RTTI
 
-Server side, from the PE bytes (`server/mfc.py`, called by `cpp.derive_binary`, `CPP_VERSION` 2). Most
+Server side, from the PE bytes (`server/mfc.py`, called by `cpp.derive_binary`, `CPP_VERSION` 3). Most
 program classes of an MFC application are built without `/GR`, so `find_msgmaps` only knows their map as
 `anon_<map address>`. The framework offers more sources, all found without symbols:
 
@@ -2019,7 +2028,8 @@ program classes of an MFC application are built without `/GR`, so `find_msgmaps`
   match the class purpose). 64-bit constructors (`lea rax,[rip+d]`) are not scanned.
 - **`mfc_class`** (schema v14): `name`, `vtable_addr` (the `GetRuntimeClass` slot), `rc_addr`, `obj_size`,
   `schema`, `base` (the owner of the base message map, else the base runtime class), `map_addr`,
-  `dialog` (resource id), `source` (`rc` | `dialog` | `inherited`). Rows only for classes without RTTI.
+  `dialog` (resource id), `source` (`rc` | `dialog` | `inherited` | `routes`, see "Route tables").
+  Rows only for classes without RTTI.
 
 **Handler names.** Nothing is renamed in Ghidra. `UiIndex.suggest` builds a ClassWizard style name from
 the message and the UI element: `OnCommand_<id>_<menu leaf>` for a menu item, `OnUpdateCommand_<id>_<leaf>`,
@@ -2028,7 +2038,37 @@ the message and the UI element: `OnCommand_<id>_<menu leaf>` for a menu item, `O
 ... for window messages (table `STD_HANDLERS`), `OnMessage_<WM name>` otherwise. It is shown where a
 handler has no name of its own (`uijoin.is_unnamed`: no function row, or `name_state` auto with a `FUN_`
 style name): `menus` / `dialogs` lines as `Class::OnXxx (FUN_00401000)`, `mfc_message_maps` entry lines as
-`as OnXxx`, and `function` as the hint `likely Class::OnXxx`.
+`as OnXxx`, and `function` as the hint `likely Class::OnXxx`. The target tools (`function`, `xrefs`, ...)
+accept these names: `Class::OnXxx`, also with the ` (FUN_..)` tail or without the class, any case
+(`targets._mfc_handler_addrs`, after the real names and the Qt / Delphi names; one handler only).
+
+### Route tables (MFC look-alike frameworks)
+
+Some programs drop MFC for an own framework that keeps the MFC class names (`CWnd`, `CFrameWnd`,
+`CCmdUI`) and the command routing but not `AFX_MSGMAP` (`server/routes.py`, `CPP_VERSION` 3). Seen in
+WinDirStat 2.9.3 (`UiTypes.h`: `RouteEntry`, `RouteTable`, `MessageTarget<Derived, Base>`). **[verified]**
+on that binary (64-bit) against its source.
+
+- **Entry** `RouteEntry {u32 message, code, firstId, lastId; invoke; registeredMessage}`: 32 bytes in
+  64-bit, 24 in 32-bit. `invoke` is a template thunk `InvokeCommandHandler<&Class::OnX>` that calls the
+  member function; `registeredMessage` points to the id of a registered message (`message` is then 0,
+  stored as 0xC000). `Route::Command` has code 0, `Route::Update` 0xFFFFFFFF (as MFC), `Route::Window`
+  carries no code or ids. The tables are `static constexpr std::array` without terminator, often side by
+  side in `.rdata`, so nothing marks where one ends.
+- **Table** `RouteTable {base, span<entries>}` is a function-local static that `GetStaticRouteTable`
+  fills on first use, so it is zero in the file. The initialiser names everything: 64-bit
+  `mov qword [rip+T+16], count` ... `lea r, [rip+entries]; mov [rip+T+8], r`, and the base table goes to
+  `[rip+T]` (`lea rax, [rip+B]`, or `call` of the base's getter). Each candidate is kept only when all
+  `count` rows are valid (invoke a code address, message 1..0xFFFF or a registered one, first <= last,
+  window messages without code and ids). 32-bit: `mov dword [T+4], entries` / `[T+8], count` **[verify]**.
+- **Class**: `GetRouteTable` (a vtable slot, often folded with `GetStaticRouteTable`, or a `jmp` to it)
+  ends in `lea rax, [rip+T]; ... ret`. The vtable starts at the closest address before that slot that
+  code loads (`lea r, [rip+X]`), with only code pointers in between. Without RTTI the map keeps the name
+  `anon_<entries address>`; `mfc_class` gets a row with `source` `routes`, the vtable and the base map's
+  name, and `mfc_message_maps` prints `route table, vtable 0x.., base anon_..` on the map line.
+- **Handler**: the first direct `call` in the invoker whose `rcx` holds the incoming `rdx` (the target
+  object; register moves tracked, loads clear a register). An invoker with the handler inlined keeps its
+  own address. Only 64-bit invokers are followed.
 
 ### MFC dispatch, interface and event sink maps (OLE automation)
 

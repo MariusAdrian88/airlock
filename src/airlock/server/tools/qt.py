@@ -50,7 +50,7 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         qtb = [bd for bd in got[0] if qt.is_qt(bd.binary)]
         if qtb:
             return "no Qt metaobjects: no QMetaObject found in the binary (a static Qt build is not detected)."
-        return "error not_qt: the project has no Qt binary. Pass a Qt program (project_info lists toolchains)."
+        return "error not_qt: the project has no Qt binary."
     return bounds, len(bounds) > 1, ident
 
 
@@ -166,7 +166,7 @@ def _connections(bd: Bound, several: bool, cls: dict | None) -> list[str]:
 def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LIMIT, connections: bool = False,
                    binary: str = "", cursor: str = "", budget: int = 0) -> str:
     if limit < 1:
-        return "error bad_args: limit must be at least 1. Fix and retry."
+        return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary, class_)
     if isinstance(sc, str):
         return sc
@@ -203,15 +203,15 @@ def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LI
                 lines.append(line)
         shown = lines[:limit]
         if len(lines) > limit:
-            shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}. Raise limit or pass class=.")
+            shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}")
         return fit_lines(shown, bud, "code", tool="qt_metaobjects", args=args)[0]
     hits = [(bd, c) for bd in bounds for c in _find_classes(bd, ident)]
     if not hits:
-        return f"error not_found: no Qt class '{ident}'. Call qt_metaobjects without arguments for the list."
+        return f"error not_found: no Qt class '{ident}'."
     if len(hits) > 1 and not any(c["name"].lower() == ident.lower() for _bd, c in hits):
         names = [f"{_prefix(bd, several)}{c['name']}" for bd, c in hits]
         shown = ", ".join(names[:10]) + (f" (+{len(names) - 10} more)" if len(names) > 10 else "")
-        return f"error ambiguous: '{ident}' matches {len(names)} classes: {shown}. Retry with the full class name."
+        return f"error ambiguous: '{ident}' matches {len(names)} classes: {shown}."
     for bd, c in hits[:3]:
         db, bid, meta = bd.store.db, bd.binary.id, c["meta_addr"]
         head = f"{_prefix(bd, several)}{c['name']}"
@@ -258,5 +258,7 @@ def qt_metaobjects(ctx: ServerContext, class_: str = "", limit: int = DEFAULT_LI
             lines.append("connections:")
             lines += ["  " + x for x in conns]
     if len(hits) > 3:
-        lines.append(f"… {len(hits) - 3} more classes match. Narrow class=.")
+        rest = [f"{_prefix(bd, several)}{c['name']}" for bd, c in hits[3:]]
+        lines.append(f"… {len(rest)} more classes match: " + ", ".join(rest[:10])
+                     + (f" (+{len(rest) - 10} more)" if len(rest) > 10 else ""))
     return fit_lines(lines, bud, "code", tool="qt_metaobjects", args=args)[0]

@@ -29,7 +29,7 @@ _CURSOR = re.compile(r"cursor=(\S+)\s*$")
 def _session(ctx: ServerContext) -> ProjectPaths | str:
     pp = ctx.session.project
     if pp is None:
-        return "error unbound: no project is open. Call projects, then project_open."
+        return "error unbound: no project is open."
     return pp
 
 
@@ -82,34 +82,36 @@ def path(ctx: ServerContext, from_: Annotated[str, Field(alias="from")] = "", to
         return pp
     frm, dst = from_.strip(), to.strip()
     if not frm or not dst:
-        return ("error bad_args: from and to are required. Pass a function (binary!name or 0xaddress), "
-                "an import (KERNEL32!ReadFile), a quoted string, a feature key or a cluster id.")
+        return "error bad_args: from and to are required."
     k = max(1, min(int(k), MAX_K))
     max_depth = max(1, min(int(max_depth), MAX_DEPTH))
     st = ctx.indexer.store(pp.name)
     g = gr.get_graph(pp, st)
     if not g.nodes:
-        return "error not_ready: no analysed binary outside the runtime group. Call list_binaries."
+        return "error not_ready: no analysed binary outside the runtime group."
     try:
         a, b, res = ep.path_query(ctx, pp, st, frm, dst, k + MORE_PATHS, max_depth, g)
+        used = ""
+        if not res.paths and res.reach and res.reach <= MAX_DEPTH:      # a longer chain exists
+            max_depth, used = res.reach, f"max_depth {max_depth} -> {res.reach}"
+            a, b, res = ep.path_query(ctx, pp, st, frm, dst, k + MORE_PATHS, max_depth, g)
+        elif not res.paths and a.kind == "import" and all(g.is_import(v) for v in a.nodes):
+            frm, dst, used = dst, frm, "from and to swapped: an import has no callees"
+            a, b, res = ep.path_query(ctx, pp, st, frm, dst, k + MORE_PATHS, max_depth, g)
     except ep.EndpointError as e:
         return e.message
     if not res.paths:
-        if res.reach:
-            tail = f"A chain of {res.reach} hops exists. Raise max_depth to {res.reach}."
-        elif a.kind == "import" and all(g.is_import(v) for v in a.nodes):
-            tail = "An import has no callees: swap from and to."
-        else:
-            tail = ("Calls through function pointers are not in the graph. "
-                    "Try an intermediate function.")
-        return f"error no_path: no call chain from {frm} to {dst} within {max_depth} hops. {tail}"
+        tail = (f"A chain of {res.reach} hops exists." if res.reach
+                else "Calls through function pointers are not in the graph.")
+        return (f"error no_path: no call chain from {frm} to {dst} within {max_depth} hops"
+                + (f" ({used})" if used else "") + f". {tail}")
     blocks = _blocks(g, res)
     total = len(blocks)
     shown = min(k, total)
     first = len(res.paths[0]) - 1
     fd = f" ({a.desc})" if a.desc else ""
     td = f" ({b.desc})" if b.desc else ""
-    head = f"path {frm}{fd} → {dst}{td}, {first} hops" + _via(res, 0)
+    head = f"path {frm}{fd} → {dst}{td}, {first} hops" + _via(res, 0) + (f" ({used})" if used else "")
     lines = [head] + [ln for blk in blocks for ln in blk]
     upto = 1 + sum(len(blk) for blk in blocks[:shown])
     need = (sum(_cost(x) for x in lines[:upto]) + _cost(footer(99999, "c_0000")))
@@ -133,7 +135,7 @@ def graph_export(ctx: ServerContext, scope: str, format: str = "mermaid", inline
         return pp
     fmt = format.strip().lower()
     if fmt not in dg.FORMATS:
-        return f"error bad_args: format '{format}' is not one of mermaid, dot, graphml. Pass one of them."
+        return f"error bad_args: format '{format}' is not one of mermaid, dot, graphml."
     st = ctx.indexer.store(pp.name)
     env = dg.Env(pp, st, ctx)
     try:
@@ -149,5 +151,5 @@ def graph_export(ctx: ServerContext, scope: str, format: str = "mermaid", inline
         return head
     text = dg.render(d, fmt, fence=False).rstrip("\n")
     if estimate_tokens(head + "\n" + text, "prose") > budget_for(ctx, budget):
-        return head + "\ninline omitted: the graph is larger than the response budget. Open the file."
+        return head + "\ninline omitted: the graph is larger than the response budget."
     return head + "\n" + text

@@ -25,7 +25,7 @@ from airlock.server import notes as nt
 from airlock.server import roles
 from airlock.server import targets as tg
 from airlock.server.context import ServerContext
-from airlock.server.indexer import worker_error
+from airlock.server.indexer import WORKER_LOG_FACT, worker_error
 from airlock.server.registry import tool
 from airlock.server.selectors import fmt_addr, parse_address, split_binary_target
 from airlock.server.tools.common import Bound, bind_binary, bind_scope
@@ -42,19 +42,13 @@ MAX_FIELDS = 512
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
 _NAME_BAD = re.compile(r"[\s\x00-\x1f]")
 
+# The next step after a worker error, only where it is data the agent needs (the force flag is
+# the agent's decision to cut instructions or overwrite) or a fix only the user can make.
 _HINTS = {
-    "uninitialized": "Patch bytes that the file maps; uninitialised memory has none",
-    "boundary": "Patch whole instructions, or pass force=true to cut or re-decode them",
-    "changed": "The bytes were changed since; pass force=true to restore anyway",
-    "bad_name": "Use a name without spaces or special characters",
-    "bad_type": "Use a C type such as int, char *, or a struct defined with struct_define",
-    "exists": "Choose another name",
-    "no_variable": "Use a name from the list, as the decompile shows it",
-    "no_function": "Check the address",
-    "wrong_kind": "Use the matching kind",
-    "ambiguous": "Pass the address instead",
-    "not_found": "Check the name or pass an address",
-    "decompile_failed": "Try again, or raise defaults.decompile_timeout_s",
+    "uninitialized": "uninitialised memory has no file bytes",
+    "boundary": "force=true cuts or re-decodes them",
+    "changed": "the bytes changed since the patch; force=true restores anyway",
+    "decompile_failed": "the limit is defaults.decompile_timeout_s in config.jsonc",
 }
 
 
@@ -68,25 +62,35 @@ def _gate(ctx: ServerContext) -> str | None:
     if ctx.session.role == roles.CLEAN:
         return "error wrong_role: write tools are not available in a clean-room session."
     if not ctx.config.allow_writes:
-        return "error writes_disabled: allow_writes is off. Set allow_writes in config.jsonc and restart."
+        return "error writes_disabled: allow_writes is off in config.jsonc."
     return None
 
 
 def _bad_name(name: str, what: str = "name") -> str | None:
     if not name or _NAME_BAD.search(name):
-        return f"error bad_args: {what} must be non-empty with no spaces. Fix and retry."
+        return f"error bad_args: {what} must be non-empty with no spaces."
     return None
 
 
 def _worker(ctx: ServerContext, bd: Bound, op: str, args: dict[str, Any]) -> tuple[dict | None, str | None]:
     """(reply, error line) for a worker write op on the binary's program."""
     ix = ctx.indexer
-    try:
-        ix.ensure_open(bd.project)
-        r = ctx.worker.request(op, {"program": ix.program_of(bd.store, bd.binary), **args}, timeout=600)
-    except WorkerError as e:
-        return None, worker_error(e, _HINTS.get(e.code, "Check logs\\worker.log or call index_status"))
-    return r, None
+    for attempt in (1, 2):      # a decompile the write needs may fail once on a busy worker
+        try:
+            ix.ensure_open(bd.project)
+            r = ctx.worker.request(op, {"program": ix.program_of(bd.store, bd.binary), **args}, timeout=600)
+        except WorkerError as e:
+            if e.code == "decompile_failed" and attempt == 1:
+                continue
+            hint = _HINTS.get(e.code, "" if e.code in _SELF_EXPLAINED else WORKER_LOG_FACT)
+            return None, worker_error(e, hint)
+        return r, None
+    return None, None   # not reached
+
+
+# worker error codes whose message says all there is (names, kinds, candidates)
+_SELF_EXPLAINED = frozenset({"bad_name", "bad_type", "exists", "no_variable", "no_function",
+                             "wrong_kind", "ambiguous", "not_found"})
 
 
 def _managed_fn(bd: Bound, fn: Function) -> bool:
@@ -95,10 +99,10 @@ def _managed_fn(bd: Bound, fn: Function) -> bool:
 
 def _managed_refusal(fn: Function, what: str) -> str:
     """One line for a write that has no target: a .NET method has no Ghidra function."""
-    return (f"error managed: {fn.qualified_name} is a .NET method; {what} "
-            "Use annotate with a note only.")
+    return f"error managed: {fn.qualified_name} is a .NET method; {what} {_NOTE_ONLY}"
 
 
+_NOTE_ONLY = "A note is the only annotation it takes."
 _NAME_FACT = "its name comes from metadata."
 _VAR_FACT = "its variables and types come from metadata, not from Ghidra."
 _CMT_FACT = "it has no Ghidra function to hold a comment."
@@ -106,7 +110,7 @@ _CMT_FACT = "it has no Ghidra function to hold a comment."
 
 def _managed_only_refusal(bd: Bound, what: str) -> str:
     return (f"error managed: {bd.binary.name} is a managed-only .NET assembly with no Ghidra program; "
-            f"{what} Use annotate with a note on a method.")
+            f"{what} A note on a method is the only annotation it takes.")
 
 
 def _function_target(ctx: ServerContext, binary: str, text: str, external_ok: bool = False,
@@ -120,8 +124,7 @@ def _function_target(ctx: ServerContext, binary: str, text: str, external_ok: bo
     if managed_what and _managed_fn(ft.bound, ft.fn):
         return _managed_refusal(ft.fn, managed_what)
     if ft.fn.is_external and not external_ok:
-        return tg.err("external", f"{ft.fn.qualified_name} is an imported function with no code",
-                      "Rename or annotate a function that calls it, or use annotate for a note")
+        return tg.err("external", f"{ft.fn.qualified_name} is an imported function with no code")
     return ft.bound, ft.fn, ft.any_note
 
 
@@ -174,12 +177,12 @@ def rename(ctx: ServerContext, target: str, new_name: str, kind: str = "function
         return refused
     new_name = new_name.strip()
     if kind not in KINDS:
-        return f"error bad_args: unknown kind '{kind}'. Use function, global, label or local."
+        return f"error bad_args: unknown kind '{kind}' (kinds: function, global, label, local)."
     bad = _bad_name(new_name, "new_name")
     if bad:
         return bad
     if not target.strip():
-        return "error bad_target: target is empty. Pass a name or an address."
+        return "error bad_target: target is empty."
     if kind == "function":
         return _rename_function(ctx, target, new_name, binary)
     if kind == "local":
@@ -213,7 +216,7 @@ def _rename_function(ctx: ServerContext, target: str, new_name: str, binary: str
 def _rename_local(ctx: ServerContext, variable: str, new_name: str, function: str, binary: str) -> str:
     if not function.strip():
         return ("error bad_args: kind=local needs function=<name or address>; target is the "
-                "variable's current name. Fix and retry.")
+                "variable's current name.")
     r = _function_target(ctx, binary, function, managed_what=_VAR_FACT)
     if isinstance(r, str):
         return r
@@ -235,21 +238,22 @@ def _rename_label(ctx: ServerContext, target: str, new_name: str, kind: str, bin
     if isinstance(sc, str):
         return sc
     if len(sc.bounds) != 1:
-        return ("error ambiguous_binary: the project has several binaries. "
-                "Pass binary=<name> or binary!0xaddress.")
+        return ("error ambiguous_binary: the project has several binaries: "
+                f"{', '.join(b.binary.name for b in sc.bounds)}.")
     bd = sc.bounds[0]
     st = bd.store
     if dn.is_managed_only(bd.binary):
         return _managed_only_refusal(bd, "labels and names come from metadata.")
+    used = ""
     parsed = parse_address(sc.bare)
     if parsed is not None:
         space, value = parsed
         if dn.is_managed_site(bd.binary, space, value):
             return (f"error managed: {fmt_addr(value, bd.psize, space)} is a .NET metadata token, not "
-                    "Ghidra code; its name comes from metadata. Use annotate with a note only.")
+                    f"Ghidra code; its name comes from metadata. {_NOTE_ONLY}")
         if kind == "label" and st.function_containing(bd.binary.id, value, space) is None:
-            return tg.err("bad_target", f"{fmt_addr(value, bd.psize, space)} is not inside a function",
-                          "Use kind=global for a data label")
+            kind = "global"     # a label outside every function is a global data label
+            used = f"(kind=global used: {fmt_addr(value, bd.psize, space)} is not inside a function)\n"
         args: dict[str, Any] = {"space": space, "address": value}
     else:
         args = {"name": sc.bare}
@@ -264,7 +268,7 @@ def _rename_label(ctx: ServerContext, target: str, new_name: str, kind: str, bin
     st.bump_versions(ids)
     what = (f"renamed {kind} {res['old']} -> {new_name}" if res.get("old")
             else f"named {kind} {new_name}")
-    return f"{what} at {bd.addr(addr, space)}; {_invalidated(len(ids))}"
+    return f"{used}{what} at {bd.addr(addr, space)}; {_invalidated(len(ids))}"
 
 
 # -- retype ----------------------------------------------------------------------------------------
@@ -277,7 +281,7 @@ def retype(ctx: ServerContext, function: str, variable: str, type: str, binary: 
         return refused
     variable, type_ = variable.strip(), type.strip()
     if not variable or not type_:
-        return "error bad_args: variable and type are required. Fix and retry."
+        return "error bad_args: variable and type are required."
     r = _function_target(ctx, binary, function, managed_what=_VAR_FACT)
     if isinstance(r, str):
         return r
@@ -298,21 +302,34 @@ def retype(ctx: ServerContext, function: str, variable: str, type: str, binary: 
     c_text, derr = _get_decompiled(ctx, bd, fresh)
     if derr or c_text is None:
         return head + "\n" + (derr or "no decompile available")
-    return head + "\n" + _excerpt(c_text, variable)
+    return head + "\n" + _excerpt(c_text, variable, res.get("type") or type_)
 
 
-def _excerpt(c_text: str, variable: str) -> str:
-    """Decompile lines that mention the variable, numbered, at most EXCERPT_LINES."""
-    rx = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(variable) + r"(?![A-Za-z0-9_])")
+def _word(name: str) -> re.Pattern[str]:
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+
+
+def _excerpt(c_text: str, variable: str, type_: str = "") -> str:
+    """Decompile lines that mention the variable, numbered, at most EXCERPT_LINES. When the
+    decompiler renamed it (automatic variables are named by type), the lines with the new type."""
     lines = [(i, ln.rstrip()) for i, ln in enumerate(c_text.splitlines(), 1) if ln.strip()]
-    hits = [(i, ln) for i, ln in lines if rx.search(ln)]
+    hits = [(i, ln) for i, ln in lines if _word(variable).search(ln)]
+    what = variable
     if not hits:
-        return (f"no decompile line names '{variable}' now (the decompiler renames automatic "
-                "variables by type). Call function to read it.")
+        base = re.sub(r"[\s*&\[\]0-9]+$", "", type_.strip()).split()[-1:] if type_.strip() else []
+        if base:
+            hits = [(i, ln) for i, ln in lines if _word(base[0]).search(ln)]
+            what = base[0]
+        if not hits:
+            return (f"no decompile line names '{variable}' now (the decompiler renames automatic "
+                    "variables by type)")
+        hits = [(0, f"no line names '{variable}' now (renamed by type); lines with {what}:")] + hits
     shown = hits[:EXCERPT_LINES]
-    out = [f"{i:>5}  {ln}" for i, ln in shown]
+    out = [f"{i:>5}  {ln}" if i else ln for i, ln in shown]
     if len(hits) > len(shown):
-        out.append(f"… {len(hits) - len(shown)} more lines use {variable}. Call function lines=a-b.")
+        rest = [str(i) for i, _ln in hits[len(shown):]]
+        out.append(f"… {len(rest)} more lines use {what}: " + " ".join(rest[:20])
+                   + (" …" if len(rest) > 20 else ""))
     return "\n".join(out)
 
 
@@ -324,11 +341,11 @@ def comment(ctx: ServerContext, address: str, text: str, kind: str = "plate", bi
     if refused:
         return refused
     if kind not in COMMENT_KINDS:
-        return f"error bad_args: unknown kind '{kind}'. Use plate, pre or eol."
+        return f"error bad_args: unknown kind '{kind}' (kinds: plate, pre, eol)."
     if len(text) > MAX_COMMENT:
-        return f"error bad_args: text is {len(text)} characters, the limit is {MAX_COMMENT}. Shorten it."
+        return f"error bad_args: text is {len(text)} characters, the limit is {MAX_COMMENT}."
     if not address.strip():
-        return "error bad_target: address is empty. Pass an address like 0x00401000 or a function name."
+        return "error bad_target: address is empty."
     site = _site(ctx, binary, address)
     if isinstance(site, str):
         if site.startswith("error bad_target"):      # a P/Invoke thunk or external callee by name
@@ -341,8 +358,7 @@ def comment(ctx: ServerContext, address: str, text: str, kind: str = "plate", bi
         return _managed_only_refusal(bd, "Ghidra comments do not apply.")
     if dn.is_managed_site(bd.binary, space, value) or (fn is not None and _managed_fn(bd, fn)):
         what = fn.qualified_name if fn is not None else fmt_addr(value, bd.psize, space)
-        return (f"error managed: {what} is a .NET method; {_CMT_FACT} "
-                "Use annotate with a note only.")
+        return f"error managed: {what} is a .NET method; {_CMT_FACT} {_NOTE_ONLY}"
     res, err = _worker(ctx, bd, "set_comment", {"space": space, "address": value, "text": text,
                                                 "kind": kind})
     if err:
@@ -369,10 +385,10 @@ def annotate(ctx: ServerContext, target: str, summary: str, tags: str = "", conf
         return "error bad_args: summary is empty. Say what the function does."
     if len(summary) > nt.MAX_SUMMARY:
         return (f"error bad_args: summary is {len(summary)} characters, the limit is "
-                f"{nt.MAX_SUMMARY}. Shorten it.")
+                f"{nt.MAX_SUMMARY}.")
     confidence = confidence.strip().lower()
     if confidence and confidence not in nt.CONFIDENCE:
-        return "error bad_args: confidence must be low, medium or high. Fix and retry."
+        return "error bad_args: confidence must be low, medium or high."
     new_name = new_name.strip()
     if new_name:
         bad = _bad_name(new_name, "new_name")
@@ -388,11 +404,10 @@ def annotate(ctx: ServerContext, target: str, summary: str, tags: str = "", conf
     refused_rename = ""
     if rename_to and managed:              # the note is agent data and is kept; the name is a fact
         refused_rename = _managed_refusal(fn, _NAME_FACT).replace(
-            "Use annotate with a note only.", "The rename was not applied; the note was saved.")
+            _NOTE_ONLY, "The rename was not applied; the note was saved.")
         rename_to = ""
     elif rename_to and fn.is_external:
-        return tg.err("external", f"{fn.qualified_name} is an imported function with no code",
-                      "Rename or annotate a function that calls it, or use annotate for a note")
+        return tg.err("external", f"{fn.qualified_name} is an imported function with no code")
     tag_text = nt.normalise_tags(tags)
     mirror = (bool(ctx.config.defaults.get("mirror_notes_to_ghidra"))
               and fn.space == "ram" and not fn.is_external and not managed)
@@ -440,7 +455,7 @@ def struct_define(ctx: ServerContext, name: str, fields: list[dict[str, Any]], s
         return refused
     name = name.strip()
     if not _IDENT.match(name):
-        return f"error bad_args: '{name}' is not a C identifier. Use letters, digits and underscore."
+        return f"error bad_args: '{name}' is not a C identifier (letters, digits, underscore)."
     if not fields or len(fields) > MAX_FIELDS:
         return f"error bad_args: fields needs 1 to {MAX_FIELDS} entries of {{offset, type, name}}."
     bd = bind_binary(ctx, binary)
@@ -484,11 +499,11 @@ def patch_bytes(ctx: ServerContext, address: str = "", hex: str = "", why: str =
     if restore:
         return _restore_patch(ctx, restore, why, force, binary)
     if not address.strip():
-        return "error bad_target: address is empty. Pass an address like 0x00401000 (binary!0x... to pick a binary)."
+        return "error bad_target: address is empty."
     data = _hex_bytes(hex)
     if data is None or len(data) > MAX_PATCH:
         return (f"error bad_args: hex must be 1 to {MAX_PATCH} bytes of hex digits, e.g. '90 90' or "
-                "8BFF55. Fix and retry.")
+                "8BFF55.")
     site = _site(ctx, binary, address)
     if isinstance(site, str):
         return site
@@ -525,7 +540,7 @@ def _do_patch(ctx: ServerContext, bd: Bound, space: str, offset: int, fn: Functi
            f"note #{nid}; {_invalidated(len(ids))}")
     if res.get("cleared"):
         out += f"; re-disassembled {res.get('instructions', 0)} instructions"
-    return out + f". Undo with patch_bytes(restore={nid})."
+    return out + "."
 
 
 def _restore_patch(ctx: ServerContext, note_id: int, why: str, force: bool, binary: str) -> str:
@@ -541,7 +556,7 @@ def _restore_patch(ctx: ServerContext, note_id: int, why: str, force: bool, bina
         bd = Bound(bd.project, bd.store, bd.store.get_binary_by_id(other))   # type: ignore[arg-type]
     p = parse_address(m.group(1))
     if p is None:
-        return f"error bad_args: note #{note_id} has no readable address. Patch by address instead."
+        return f"error bad_args: note #{note_id} has no readable address."
     space, offset = p
     fn = bd.store.function_containing(bd.binary.id, offset, space)
     return _do_patch(ctx, bd, space, offset, fn, bytes.fromhex(m.group(3)), why or "", force,

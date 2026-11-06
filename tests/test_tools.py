@@ -278,7 +278,7 @@ def test_not_ready_and_binary_selection(ctx):
     assert out.startswith("strings matching") and "1 binaries not ready, skipped" in out
     assert core.strings(ctx, "open", binary="app.exe").startswith("strings matching")
     out = core.strings(ctx, "open", binary="other.dll")
-    assert out.startswith("error not_analysed:") and "analysing" in out and "index_status" in out
+    assert out.startswith("error not_analysed:") and "analysing" in out and "index_status" not in out
     assert core.strings(ctx, "open", binary="zzz").startswith("error not_found:")
     assert core.strings(ctx, "open", binary="cdcd").startswith("error not_analysed:")  # sha prefix
 
@@ -318,9 +318,13 @@ def test_strings(ctx):
     assert "utf16le" in core.strings(ctx, "oth")
     assert "(no refs)" not in core.strings(ctx, "oth")  # 0x403100 is read by OnFoo
     assert core.strings(ctx, "^open.*failed$", regex=True).count("\n") == 1
-    assert core.strings(ctx, "(", regex=True).startswith("error bad_regex:")
+    bad = core.strings(ctx, "(", regex=True)        # a bad regex is searched as literal text
+    assert bad.startswith("no strings match '('") and "(literal used: bad regex:" in bad
     assert core.strings(ctx, "zzz") == "no strings match 'zzz'"
-    assert core.strings(ctx, "zzz|yyy").endswith("Pass regex=true.")
+    assert core.strings(ctx, "zzz|yyy") == "no strings match 'zzz|yyy' (regex used: no literal match)"
+    alt = core.strings(ctx, "zzz|other")            # literal `a|b` found nothing: the regex did
+    assert alt.startswith("strings matching 'zzz|other': ") and "(regex used: no literal match)" in alt
+    assert '"other"' in alt
     assert core.strings(ctx, "zzz|yyy", regex=True) == "no strings match 'zzz|yyy'"
     assert core.strings(ctx, "").startswith("error bad_args:")
 
@@ -338,7 +342,7 @@ def test_search(ctx):
     assert core.search(ctx, "onfoo", kind="function").splitlines()[1].startswith(
         "function CMainFrame::OnFoo 0x00401100")
     assert core.search(ctx, "zzzz") == "no hits for 'zzzz'"
-    assert core.search(ctx, "x", kind="class").startswith("error not_supported:")
+    assert core.search(ctx, "x", kind="class").startswith("error unbound:")   # forwarded to rtti_classes
     assert core.search(ctx, "x", kind="bogus").startswith("error bad_args:")
     assert len(core.search(ctx, "file", limit=2).splitlines()) == 3
 
@@ -554,8 +558,8 @@ def test_function_views_and_errors(ctx):
     assert core.function(ctx, "main", view="zz").startswith("error bad_args:")
     assert core.function(ctx, "").startswith("error bad_target:")
     assert core.function(ctx, "nosuch").startswith("error not_found:")
-    ext = core.function(ctx, "EXTERNAL:0x1")
-    assert ext.startswith("error external:")
+    ext = core.function(ctx, "EXTERNAL:0x1")      # an import has no code: its references
+    assert ext.splitlines()[0] == "(an import with no code: its references)"
     assert core.function(ctx, "0x00401104").startswith("// resolved from interior address")
     ctx.worker.decompile_reply = {"status": "timeout", "error": "took too long"}
     lst = core.function(ctx, "FUN_00401200")             # a failed decompile shows the block listing
@@ -578,7 +582,10 @@ def test_function_lines_and_cursor(ctx):
     assert lines[-1].startswith("… ") and "more lines. cursor=c_" in lines[-1]
     cid = lines[-1].split("cursor=")[1]
     second = core.function(ctx, "main", cursor=cid, budget=100)
-    assert second.splitlines()[0].startswith("// lines 12-") and second.splitlines()[1].startswith("  x11 =")
+    head = second.splitlines()[0]
+    assert head.startswith("// lines 1") and "More:" not in head
+    n = int(head.split()[2].split("-")[0])
+    assert second.splitlines()[1].startswith(f"  x{n - 1} =")
     assert core.function(ctx, "main", cursor="c_dead").startswith("error bad_cursor:")
     assert core.function(ctx, "OnFoo", cursor=cid, budget=100).startswith("error bad_cursor:")
     part = core.function(ctx, "main", lines="2-3").splitlines()
@@ -709,7 +716,7 @@ def test_function_outline_over_budget(ctx):
     out = core.function(ctx, "main", budget=400)
     ls = out.splitlines()
     assert ls[0].startswith("// main 0x00401000: ") and "(budget 400)" in ls[0]
-    assert "outline=false" in ls[0] and "lines=a-b" in ls[0]
+    assert ls[0].endswith("outline:") and "outline=false" not in ls[0]
     assert estimate_tokens(out, "code") <= 400
     assert ls[1] == "int main(void)"
     assert any("switch(iVar0)" in x for x in ls) and any("case 0..3,0x10,default (6 cases)" in x for x in ls)

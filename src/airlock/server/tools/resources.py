@@ -53,13 +53,12 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         left, _, right = ident.partition("!")
         if left == "*" or any(b.name.lower() == left.strip().lower() for b in st.list_binaries()):
             if binary and binary != left.strip():
-                return (f"error bad_args: id names binary '{left}' but binary='{binary}'. "
-                        "Pass one of them.")
+                return f"error bad_args: id names binary '{left}' but binary='{binary}'."
             binary, ident = left.strip(), right.strip()
     if binary in ("*", "all"):
         every = st.list_binaries()
         if not every:
-            return f"error no_binary: project '{proj}' has no binaries. Call open_binary with a file path."
+            return f"error no_binary: project '{proj}' has no binaries."
         bounds = [Bound(proj, st, b) for b in every]
     elif binary:
         bd = bind_binary(ctx, binary, require_ready=False)
@@ -70,10 +69,8 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         every = st.list_binaries()
         if len(every) > 1:
             root = _root_binary(ctx, proj, every)
-            if root is None:
-                return (f"error ambiguous_binary: project '{proj}' has {len(every)} binaries "
-                        f"({', '.join(x.name for x in every)}). Pass binary=<name> or binary=*.")
-            bounds = [Bound(proj, st, root)]
+            # no root executable: look in every binary (lines carry the binary name)
+            bounds = [Bound(proj, st, root)] if root is not None else [Bound(proj, st, b) for b in every]
         else:
             bd = bind_binary(ctx, "", require_ready=False)
             if isinstance(bd, str):
@@ -84,12 +81,11 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         try:
             if not (art / bd.binary.sha256).is_file():
                 if len(bounds) == 1:
-                    return (f"error not_found: the stored file of '{bd.binary.name}' is missing. "
-                            "Call open_binary again.")
+                    return f"error not_found: the stored file of '{bd.binary.name}' is missing."
                 continue
             peres.ensure(st, bd.binary, art / bd.binary.sha256)
         except Exception as e:  # noqa: BLE001
-            return f"error resources_failed: cannot read resources of {bd.binary.name} ({type(e).__name__}). Check logs."
+            return f"error resources_failed: cannot read resources of {bd.binary.name} ({type(e).__name__}: {e})."
     return bounds, ident, len(bounds) > 1
 
 
@@ -214,18 +210,17 @@ def dialogs(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, 
         if k is None:
             if not multi:
                 have = ", ".join(ids[:12]) + (f", … {len(ids) - 12} more" if len(ids) > 12 else "")
-                return (f"error not_found: no dialog '{ident}' in {bd.binary.name} (have: {have or 'none'}). "
-                        "Call dialogs without id.")
+                return f"error not_found: no dialog '{ident}' in {bd.binary.name} (have: {have or 'none'})."
             continue
         lg = _pick_lang(set(by[k]), lang)
+        miss = f" (no {_lang(lang)})" if lg < 0 else ""      # that language is missing: the default one
         if lg < 0:
-            return (f"error not_found: dialog {k} has no language {_lang(lang)} "
-                    f"(have: {' '.join(_lang(x) for x in sorted(by[k]))}). Omit lang.")
+            lg = _pick_lang(set(by[k]), -1)
         r = by[k][lg]
         others = [_lang(x) for x in sorted(by[k]) if x != lg]
         owners = ui.dialog_classes(k)
         lines.append(f"{tag}dialog {k} {preview(r['caption'] or '', 80)} {r['x']},{r['y']},{r['cx']},{r['cy']} "
-                     f"lang {_lang(lg)}" + (f" (also {' '.join(others)})" if others else "")
+                     f"lang {_lang(lg)}{miss}" + (f" (also {' '.join(others)})" if others else "")
                      + (f" class {', '.join(owners[:3])}" if owners else ""))
         for c in db.execute("SELECT ctrl_id, class, caption, style FROM res_control "
                             "WHERE binary_id=? AND dialog_id=? AND lang=? ORDER BY seq", (bid, k, lg)):
@@ -237,7 +232,7 @@ def dialogs(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, 
                          + (f" {c['style']}" if c["style"] else "") + (f" {hs}" if hs else ""))
     if not lines:
         if ident:
-            return f"error not_found: no dialog '{ident}' in any binary. Call dialogs binary=* without id."
+            return f"error not_found: no dialog '{ident}' in any binary."
         return "no dialog templates"
     return _page(lines, bud, "dialogs", args)
 
@@ -282,15 +277,14 @@ def menus(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, cu
         if k is None:
             if not multi:
                 have = ", ".join(ids[:12]) + (f", … {len(ids) - 12} more" if len(ids) > 12 else "")
-                return (f"error not_found: no menu '{ident}' in {bd.binary.name} (have: {have or 'none'}). "
-                        "Call menus without id.")
+                return f"error not_found: no menu '{ident}' in {bd.binary.name} (have: {have or 'none'})."
             continue
         lg = _pick_lang(langs[k], lang)
+        miss = f" (no {_lang(lang)})" if lg < 0 else ""
         if lg < 0:
-            return (f"error not_found: menu {k} has no language {_lang(lang)} "
-                    f"(have: {' '.join(_lang(x) for x in sorted(langs[k]))}). Omit lang.")
+            lg = _pick_lang(langs[k], -1)
         others = [_lang(x) for x in sorted(langs[k]) if x != lg]
-        lines.append(f"{tag}menu {k} lang {_lang(lg)}" + (f" (also {' '.join(others)})" if others else ""))
+        lines.append(f"{tag}menu {k} lang {_lang(lg)}{miss}" + (f" (also {' '.join(others)})" if others else ""))
         for m in db.execute("SELECT item_id, caption, path FROM res_menu_item "
                             "WHERE binary_id=? AND menu_id=? AND lang=? ORDER BY seq", (bid, k, lg)):
             depth = m["path"].count(" > ")
@@ -301,7 +295,7 @@ def menus(ctx: ServerContext, id: str = "", binary: str = "", lang: int = -1, cu
                 lines.append(f"{tag}{'  ' * depth}id={m['item_id']} {m['path']}" + (f" {hs}" if hs else ""))
     if not lines:
         if ident:
-            return f"error not_found: no menu '{ident}' in any binary. Call menus binary=* without id."
+            return f"error not_found: no menu '{ident}' in any binary."
         return "no menu templates"
     return _page(lines, bud, "menus", args)
 
@@ -345,7 +339,7 @@ def string_tables(ctx: ServerContext, query: str = "", limit: int = 50, binary: 
             if n <= limit:
                 lines.append(f"{_tag(bd, multi)}{sid} | {preview(text, 200)}")
         if n > limit:
-            lines.append(f"{_tag(bd, multi)}… {n - limit} more matches. Narrow the query or raise limit.")
+            lines.append(f"{_tag(bd, multi)}… {n - limit} more matches beyond limit={limit}")
     if not lines:
         return f"no string-table entries match '{q}'" if q else "no string tables"
     return _page([f"string table entries: {total}", *lines], bud, "string_tables", args)

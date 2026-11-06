@@ -123,7 +123,7 @@ def ole_tree_lines(path: Path) -> list[str] | str:
     try:
         ole = olefile.OleFileIO(str(path))
     except Exception as e:  # noqa: BLE001
-        return f"error not_ole: {path.name} is not an OLE compound file ({type(e).__name__}). Use hexdump."
+        return f"error not_ole: {path.name} is not an OLE compound file ({type(e).__name__})."
     try:
         streams, storages = ole_entries(ole)
         total = sum(s for _, s in streams)
@@ -141,14 +141,15 @@ def read_ole_stream(path: Path, name: str, cap: int = 256 << 20) -> bytes | str:
     try:
         ole = olefile.OleFileIO(str(path))
     except Exception:  # noqa: BLE001
-        return f"error not_ole: {path.name} is not an OLE compound file. Omit stream, or use hexdump."
+        return f"error not_ole: {path.name} is not an OLE compound file."
     try:
         parts = find_stream(ole, name)
         if parts is None:
-            return (f"error not_found: no stream '{name}' in {path.name}. "
-                    "Call ole_streams without stream to list them.")
+            have = [disp_path(p) for p in ole.listdir(streams=True, storages=False)]
+            more = f", +{len(have) - 12} more" if len(have) > 12 else ""
+            return f"error not_found: no stream '{name}' in {path.name} (have: {', '.join(have[:12]) or 'none'}{more})."
         if ole.get_size(parts) > cap:
-            return f"error too_big: stream {disp_path(parts)} is over {cap >> 20} MiB. Use another approach."
+            return f"error too_big: stream {disp_path(parts)} is over {cap >> 20} MiB."
         return ole.openstream(parts).read()
     finally:
         ole.close()
@@ -1034,7 +1035,7 @@ def _extra_guesses(d: bytes, offset: int, full: bool, entropy: float) -> list[Gu
 
 def record_guess(src: Src, offset: int = 0) -> list[str]:
     if offset < 0 or offset >= src.size:
-        return [f"error bad_args: offset 0x{offset:x} is outside the data ({src.size} bytes). Use 0 to {max(src.size - 1, 0)}."]
+        return [f"error bad_args: offset 0x{offset:x} is outside the data ({src.size} bytes)."]
     d = src.read(offset, GUESS_WINDOW)
     full = offset + len(d) >= src.size
     head = f"record_guess region 0x{offset:x}-0x{offset + len(d):x} ({len(d)} bytes{'' if full else ', window cut'})"

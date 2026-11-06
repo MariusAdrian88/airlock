@@ -59,15 +59,18 @@ OPEN_WAIT_S = 30.0
 class IndexerError(Exception):
     """Carries a ready-to-return one-line error in project format (.message)."""
 
-    def __init__(self, code: str, what: str, action: str) -> None:
+    def __init__(self, code: str, what: str, action: str = "") -> None:
         self.code = code
-        self.message = f"error {code}: {what}. {action}."
+        self.message = f"error {code}: {what}." + (f" {action}." if action else "")
         super().__init__(self.message)
 
 
-def worker_error(e: WorkerError, action: str = "Check logs\\worker.log or call index_status") -> str:
+WORKER_LOG_FACT = "details in logs\\worker.log"
+
+
+def worker_error(e: WorkerError, action: str = WORKER_LOG_FACT) -> str:
     msg = e.message.rstrip(". ")
-    return f"error {e.code}: {msg}. {action}."
+    return f"error {e.code}: {msg}." + (f" {action}." if action else "")
 
 
 def program_name_for(file_name: str) -> str:
@@ -285,8 +288,8 @@ class Indexer:
         if project:
             slug = slugify(project)
             if slug not in self.projects():
-                raise IndexerError("no_project", f"project '{project}' does not exist",
-                                   "Call open_binary with this project name to create it")
+                have = ", ".join(self.projects()) or "none"
+                raise IndexerError("no_project", f"project '{project}' does not exist (have: {have})")
             return slug
         if self.current:
             return self.current
@@ -294,10 +297,8 @@ class Indexer:
         if len(known) == 1:
             return known[0]
         if not known:
-            raise IndexerError("no_project", "no project exists yet",
-                               "Call open_binary with a project name and a file path")
-        raise IndexerError("ambiguous_project", f"{len(known)} projects exist: {', '.join(known)}",
-                           "Call open_binary on one of them first")
+            raise IndexerError("no_project", "no project exists yet")
+        raise IndexerError("ambiguous_project", f"{len(known)} projects exist: {', '.join(known)}")
 
     # -- status ------------------------------------------------------------
 
@@ -326,8 +327,7 @@ class Indexer:
         if status == "finishing" and job is not None:
             return status, job.step or "tables"
         if job is None:
-            return "interrupted", (f"was {status} when the server stopped. "
-                                   "Call index_status or open_binary on the file to resume")
+            return "interrupted", f"was {status} when the server stopped"
         if status == "queued":
             with self._lock:
                 waiting = sorted(self._queue, key=lambda j: j.priority)
@@ -351,19 +351,28 @@ class Indexer:
         status, detail = self.describe(project, store, b)
         if status in USABLE:
             return None
+        if status == "interrupted" and self._requeue(project, store, b):
+            status, detail = self.describe(project, store, b)
+            detail += "; resumed after a server stop"
         if status == "error":
-            return (f"error not_analysed: binary '{b.name}' failed to index ({detail}). "
-                    "Fix the cause and call open_binary again.")
-        return (f"error not_analysed: binary '{b.name}' is {status} ({detail}). "
-                "Retry later or call index_status.")
+            return f"error not_analysed: binary '{b.name}' failed to index ({detail})."
+        return f"error not_analysed: binary '{b.name}' is {status} ({detail})."
+
+    def _requeue(self, project: str, store: Store, b: Binary) -> bool:
+        """Queue an interrupted binary again from its stored artifact. True when queued."""
+        try:
+            if not (self.paths(project).artifacts / b.sha256).is_file():
+                return False
+            return bool(self.enqueue(project, [{"sha256": b.sha256, "path": b.name, "group": "core"}]))
+        except Exception:  # noqa: BLE001  resuming is an extra; the error line stays
+            return False
 
     # -- open_binary / queue -------------------------------------------------
 
     def open_binary(self, project: str, path: str, wait_s: float = OPEN_WAIT_S) -> OpenResult:
         src = Path(path).expanduser()
         if not src.is_file():
-            raise IndexerError("not_found", f"file '{path}' does not exist",
-                               "Pass the full path of a PE file")
+            raise IndexerError("not_found", f"file '{path}' does not exist")
         info = detect(src)
         if info.format == "not-pe":
             raise IndexerError("unsupported", f"'{src.name}' is not a PE file",
@@ -700,8 +709,8 @@ class Indexer:
                 self._run_job(job)
                 while not job.finished.wait(2.0):
                     if not self.worker.running():
-                        self._fail(job, "worker stopped while the binary was being processed. "
-                                        "Restart the server to resume")
+                        self._fail(job, "worker stopped while the binary was being processed; "
+                                        "a server restart resumes it")
                         break
             except Exception as e:  # keep the queue alive
                 self._fail(job, f"{type(e).__name__}: {e}")
@@ -1123,7 +1132,7 @@ class Indexer:
                 job = self._running
             if job is not None and job.project != slug and not job.finished.is_set():
                 raise WorkerError("busy", f"the worker is indexing project '{job.project}' "
-                                          f"({job.program}). Retry when index_status shows it ready")
+                                          f"({job.program})")
             w.ensure_ghidra()
             s = w.request("status", timeout=30)
             paths = self.paths(project)

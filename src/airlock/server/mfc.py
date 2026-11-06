@@ -516,6 +516,13 @@ def analyse(img: cpp.Image, classes: list[cpp.RttiClass], slots: dict[int, list[
         for name in dict.fromkeys(c.name for c in cs):
             res.maps.append(ExtraMap(name, kind, a, ents))
 
+    # route tables (MFC look-alike): the vtable of the GetRouteTable slot, the base table's class
+    route_names = {m.map_addr: m.cls for m in maps if m.kind == "routes"}
+    for m in maps:
+        if m.kind == "routes" and m.vtable:
+            res.classes.append(MfcClass(m.cls, m.vtable, 0, 0, 0, route_names.get(m.base_map, ""), m.map_addr,
+                                        "", "routes"))
+
     # classes without RTTI: through the CRuntimeClass slot
     rcs = find_runtime_classes(img)
     if not rcs:

@@ -211,7 +211,7 @@ def test_pinvoke_links_to_project_export(tmp_path, managed_dll):
     cg = core.callgraph(ctx, "nativelib.dll!DoWork", direction="callers")
     assert "[t.dll]" in cg and "Demo.Native.Api" in cg
     c = core.function(ctx, "t.dll!DoWork", view="c")
-    assert c.startswith("error managed:") and "dotnet_decompile" in c
+    assert c.startswith("error managed:") and c.endswith("no machine code => nativelib.dll!DoWork.")
 
 
 def test_link_when_native_arrives_later(tmp_path, managed_dll):
@@ -235,7 +235,7 @@ def test_dotnet_types_output(tmp_path, managed_dll):
     assert out[0] == "dotnet_types t.dll: 4 types, 8 methods, 3 pinvokes, 1 com"
     assert "type Demo.Native.Api class public,static 4m" in out
     assert any(ln.startswith("type Demo.Native.IFoo interface public,abstract,com") for ln in out)
-    assert out[-1].startswith("methods and P/Invokes:")
+    assert not any(ln.startswith("methods and P/Invokes:") for ln in out)
     pin = dt.dotnet_types(ctx, kind="pinvoke").splitlines()
     assert "pinvoke Demo.Native.Api::DoWork int(int) -> nativelib.dll!DoWork ansi => nativelib.dll!DoWork" in pin
     assert "pinvoke Demo.Native.Api::ByOrdinal int(int) -> nativelib.dll!#3 => nativelib.dll!ThirdFn" in pin
@@ -266,7 +266,7 @@ def test_decompile_tool_missing(tmp_path, managed_dll):
     ctx = make_dn_ctx(tmp_path)
     add_managed(ctx, managed_dll)
     out = dt.dotnet_decompile(ctx, "Demo.Native.Api")
-    assert out.startswith("error tool_missing: ilspycmd is not configured.") and "\n" not in out
+    assert out.startswith('error tool_missing: "ilspycmd" is not set in config.jsonc') and "\n" not in out
     ctx2 = make_dn_ctx(tmp_path / "b", ilspy=tmp_path / "nope" / "ilspycmd.exe")
     add_managed(ctx2, managed_dll)
     out2 = dt.dotnet_decompile(ctx2, "Demo.Native.Api")
@@ -289,10 +289,25 @@ def test_decompile_with_ilspycmd(tmp_path, managed_dll):
     assert "from cache" in again
     mem = dt.dotnet_decompile(ctx, "Demo.Native.Api", member="A")
     assert "int A() { return 1; }" in mem and "class X" not in mem
-    assert dt.dotnet_decompile(ctx, "Demo.Native.Api", member="Zzz").startswith("error not_found:")
+    zzz = dt.dotnet_decompile(ctx, "Demo.Native.Api", member="Zzz")
+    assert zzz.startswith("error not_found: no member 'Zzz' in Demo.Native.Api (members: ")
     assert dt.dotnet_decompile(ctx, "Demo.Native.Nope").startswith("error not_found:")
+    inner = dt.dotnet_decompile(ctx, "Inne")              # the only type containing it: used, said so
+    assert "// type 'Inne' not found: Demo.Native.Holder+Inner used" in inner
     nested = dt.dotnet_decompile(ctx, "Demo.Native.Holder+Inner")
     assert "class Inner" in nested
+
+
+def test_decompile_candidates_are_data(tmp_path, managed_dll):
+    """A wrong type widens to the names that contain it; a wrong member lists the members."""
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, managed_dll)
+    bd = dt._scope(ctx, "")[0]
+    assert dt._types_like(bd, "Holder") == ["Demo.Native.Holder", "Demo.Native.Holder+Inner"]
+    assert dt._types_like(bd, "ld") == []                 # too short to guess
+    mem = dt._members(bd, "Demo.Native.Holder")
+    assert mem.startswith("(members: ") and "Run" in mem and ".ctor" in mem
+    assert dt._members(bd, "Demo.Native.Nope") == "(members: none)"
 
 
 def test_member_text():
@@ -567,7 +582,8 @@ def test_managed_call_path_to_native_export(tmp_path, managed_dll, app_dll):
     assert [ln.split(" ")[1] for ln in out[1:4]] == ["[app.dll]", "[t.dll]", "[nativelib.dll]"]
 
     c = core.function(ctx, "app.dll!Run", view="c")
-    assert c.startswith("error managed:") and "dotnet_decompile type=Demo.App.Prog member=Run" in c and "\n" not in c
+    assert c.startswith("// IL (MSIL), not machine code; no C# (dotnet_decompile unavailable)")   # IL instead
+    assert "\n" in c and "error" not in c.splitlines()[1]
     asm = core.function(ctx, "app.dll!Run", view="asm").splitlines()
     assert asm[1] == "; IL (MSIL), not machine code"
     assert 'IL_0001 ldstr "a"' in asm and "IL_000b call System.String::Concat(string, string)" in asm
@@ -687,7 +703,7 @@ def test_write_tools_refuse_managed_without_worker(tmp_path, managed_dll, fmt):
                     an.retype(ctx, t, "v", "int"),
                     an.comment(ctx, t, "hello")):
             assert out.startswith("error managed:") and "\n" not in out, (t, out)
-            assert "annotate with a note" in out
+            assert "note" in out and "Use " not in out
     for addr in ("0x06000001", "t.dll!0x06000003"):
         assert an.comment(ctx, addr, "c").startswith("error managed:")
         assert an.rename(ctx, addr, "g", kind="label").startswith("error managed:")

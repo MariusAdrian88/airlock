@@ -35,7 +35,7 @@ def dirty_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
     except Exception as e:  # noqa: BLE001  the map is an extra; the session line is enough
         return "\n".join(head + [f"(project map unavailable: {e})"])
     text = fit_lines(body, OPEN_MAP_BUDGET, "prose", tool="overview", args={})[0]
-    return "\n".join(head) + "\n" + text + "\nMore: overview() (relations, knowledge, frontier)."
+    return "\n".join(head) + "\n" + text
 
 
 def clean_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
@@ -54,7 +54,7 @@ def projects(ctx: ServerContext) -> str:
     root = ctx.config.projects_root
     names = list_projects(root)
     if not names:
-        return "no projects. Call project_create with the path of a program."
+        return "no projects"
     hide = redacted(ctx)
     out = []
     for n in names:
@@ -75,12 +75,13 @@ def projects(ctx: ServerContext) -> str:
 def project_open(ctx: ServerContext, name: str, role: str) -> str:
     role = role.strip().lower()
     if role not in (roles.DIRTY, roles.CLEAN):
-        return f"error bad_role: role '{role}' is not dirty or clean. Use dirty or clean."
+        return f"error bad_role: role '{role}' is not dirty or clean."
     if ctx.session.role != roles.UNBOUND:
         return roles.role_locked(ctx.session)
     pp = find_project(ctx.config.projects_root, name)
     if pp is None:
-        return f"error not_found: no project '{name}'. Call projects."
+        return (f"error not_found: no project '{name}' "
+                f"(have: {', '.join(list_projects(ctx.config.projects_root)) or 'none'}).")
     err = ctx.bind_session(role, pp)
     if err:
         return err

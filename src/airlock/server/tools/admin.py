@@ -93,7 +93,7 @@ def index_status(ctx: ServerContext, project: str = "") -> str:
     except IndexerError as e:
         return e.message
     if not names:
-        out.append("no projects. Call open_binary with a project and a file path.")
+        out.append("no projects")
     for p in names:
         ix.resume_project(p)
         st = ix.store(p)

@@ -60,13 +60,13 @@ def test_dirty_map_sections_and_identifiers(proj):
     # relations: who imports whom with counts
     assert "app.exe -> lib.dll: " in text and " imports" in text
     # features with coverage and the drill-in call; data-format from the manifest extension
-    assert 'file-io | File input/output |' in text and 'feature(key="file-io")' in text
-    assert "named 0 of " in text and "seeds " in text and 'feature(key="data-format:blg")' in text
+    assert 'file-io | File input/output |' in text and 'feature(key=' not in text
+    assert "named 0 of " in text and "seeds " in text and "data-format:blg | " in text
     # knowledge with zero counts, frontier with address and the next call, where to write
     assert "notes 0 | specs 0 | published specs 0" in text
     front = text.split("## Frontier")[1].split("## Where to write")[0]
     assert "FUN_a (0x00401100) in app.exe" in front and "caller" in front
-    assert "function(binary=app.exe, target=0x00401100)" in front
+    assert "function(" not in front
     assert "FUN_a (0x00401100) in app.exe | 1 caller | calls ReadFile" in front
     assert "FUN_rt" not in front                       # runtime library excluded
     assert str(pp.dirty / "work") in text.split("## Where to write")[1]
@@ -157,7 +157,7 @@ def test_project_describe(proj):
 def test_features_and_feature_tools(proj):
     ctx, pp, st = bound(proj)
     out = mt.features(ctx)
-    assert "file-io | File input/output | " in out and 'feature(key="config")' in out
+    assert "file-io | File input/output | " in out and "config | " in out and "feature(" not in out
     f = mt.feature(ctx, "file-io", depth=2)
     lines = f.splitlines()
     assert lines[0].startswith("feature file-io: File input/output |")
@@ -222,8 +222,8 @@ def test_project_open_dirty_returns_first_sections(proj):
     assert lines[0].startswith("session dirty for proj: write notes and scratch files only under")
     assert lines[1].startswith("binaries: ")
     assert [ln for ln in lines if ln.startswith("## ")] == ["## Purpose", "## Binaries", "## Features"]
-    assert PURPOSE in out and "app.exe | core | ready" in out and 'feature(key="file-io")' in out
-    assert "## Relations" not in out and "More: overview()" in lines[-1]
+    assert PURPOSE in out and "app.exe | core | ready" in out and "file-io | " in out
+    assert "## Relations" not in out and "overview()" not in out
     assert estimate_tokens(out) <= 1500 + 100
     assert ctx.session.role == "dirty" and (pp.dirty / "PROJECT.md").exists()
 
@@ -302,8 +302,8 @@ def test_feature_seed_first_ranking_and_filters(proj):
     assert _fn_names(lib_only) == ["FUN_lr", "Impl"] and "in lib.dll" in lib_only
     assert mt.feature(ctx, "rank-demo", binary="nope.exe").startswith("error not_found: no binary")
     listing = mt.features(ctx)
-    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 in 2 binaries | named 0 of 6 (0%) | " in listing
-    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 | named 0 of 6 (0%) | " in mt.overview(ctx)
+    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 in 2 binaries | named 0 of 6 (0%)" in listing
+    assert "rank-demo [agent] | Rank demo | seeds 4, total 6 | named 0 of 6 (0%)" in mt.overview(ctx)
 
 
 def test_derive_cap_counts_dropped(proj, monkeypatch):

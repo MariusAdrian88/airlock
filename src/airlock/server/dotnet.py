@@ -714,9 +714,8 @@ def managed_error(b: Binary, fn: Function, store: Store) -> str:
     """One-line error for ``function view=c`` on a managed method."""
     if fn.is_thunk:
         return (f"error managed: {fn.qualified_name} is a P/Invoke declaration with no machine "
-                "code. Use dotnet_decompile on its type, or xrefs for the native target.")
-    return (f"error managed: {fn.qualified_name} is managed code. Use dotnet_decompile type={fn.namespace} "
-            f"member={fn.name}, or view=asm for the IL.")
+                f"code{bound_label(store, b.id, fn.entry)}.")
+    return f"error managed: {fn.qualified_name} is managed code with no machine code and no IL listing."
 
 
 def ensure(store: Store, b: Binary, artifact: Path, force: bool = False) -> bool:

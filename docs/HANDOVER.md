@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1056 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1088 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -184,8 +184,19 @@ underscore rule; `Store.set_meta` commits outside a transaction and
 derived name (`CFoo`, `Dialog_<caption>`, `anon_<Base>_<addr>`, `anon_<addr>`). `UiIndex.suggest` gives
 ClassWizard style names (`OnCommand_<id>_<menu leaf>`, `OnBnClicked_<caption>`, `OnSize`) that
 `menus` / `dialogs` / `mfc_message_maps` / `function` show for functions without a name of their own.
-Tests: `tests/test_mfc.py` (synthetic 32/64-bit images). `fnfix.FIX_VERSION` 4 (dispatch handlers join the
-missing-function pass).
+Tests: `tests/test_mfc.py` (synthetic 32/64-bit images). `fnfix.FIX_VERSION` 5 (dispatch and route table
+handlers join the missing-function pass).
+
+Route tables (`server/routes.py`, `CPP_VERSION` 3, DESIGN §11 "Route tables"): programs with an own MFC
+look-alike framework (WinDirStat 2.9.3) keep `RouteEntry {msg, code, first, last, invoke, registered}` in
+`constexpr` arrays that only a lazy initialiser names (count and start), with no terminator and no getter
+of the entries. Decoded from the initialiser code, tied to the vtable of the `GetRouteTable` slot and to the
+base table, handlers followed through the invoker thunk. Stored as `msgmap_entry` rows (kind `routes` in
+`MsgMap`, `mfc_class.source` `routes`), so `menus`, `function` hints and the target names work as for MFC.
+Verified on WinDirStat x64 against its source (CMainFrame 75 routes, base CFrameWnd; CDirStatApp 7, base
+CWinApp). The 32-bit initialiser form is unverified. Class names stay `anon_<entries>` (no RTTI).
+Target tools accept the generated handler names (`Class::OnCommand_<id>_<leaf>`, `targets._mfc_handler_addrs`).
+Tests: `tests/test_routes.py`.
 
 ## M2 join (menus, dialogs, message maps)
 
@@ -393,10 +404,10 @@ openhardwaremonitor, WinMerge, windirstat.
 | t6 ExifToolGUI: settings file | v 16 | v 8 | v 25 | v 13 |
 | t7 OHM: Run On Windows Startup | v 11 (2 err) | v 5 | v 10 (3 err) | v 8 (r4: 9, 0 err) |
 | t8 OHM: settings file | v 6 | v 9 | v 15 (5 err) | v 11 |
-| t9 WinDirStat: Tools > Recovery | x 33 | x 45 | x 37 | x 40 |
+| t9 WinDirStat: Tools > Recovery | x 33 | x 45, r3: v 11 | x 37 | x 40, r3: v 17 |
 | t10 WinDirStat: options storage | v 15 | v 6 | v 12 | v 11 |
-| t11 WinMerge: Edit > Options | (new) | v 5 | (new) | v 10 |
-| t12 WinMerge: options storage | (new) | v 12 | (new) | v 15 |
+| t11 WinMerge: Edit > Options | (new) | v 5, r3: v 5 | (new) | v 10, r3: v 9 |
+| t12 WinMerge: options storage | (new) | v 12, r3: v 9 (1 err) | (new) | v 15, r3: v 17 |
 
 "~" in t3: the signal and the command-line slot are found; the QML handler is invisible in the binary. "Before" is the
 state after the first round (instructions, Frameworks lines, search, no auto-retry); "after" includes the round-2 fixes.
@@ -413,15 +424,23 @@ Failure patterns and fixes (round 2):
   member lookup maps constructors, lambdas and accessors to the C# name (`dotnet.member_alias`).
 - `overview` has a `Win32 resources` line (dialogs, menus, string_tables) for any binary with dialogs, so an MFC binary
   whose message maps are not decoded still points at the id route. The empty `mfc_message_maps` answer now says so.
+- Rule since then (DESIGN 7.5): no advice in tool output. Tools retry, widen (`strings` falls back to
+  regex, `path` raises max_depth or swaps from/to, `function_map` drops an empty scope), follow (an
+  import's references for `function`, a thunk's import in `path`, IL when C# is unavailable) or forward
+  (`search kind=class|const`), list candidates as data (close names, forms, members, topics, binaries)
+  and name a fix only when the user must make it. `tests/test_no_hints.py` scans for new hints.
 - Haiku wanders more than Sonnet (24 turns where Sonnet needs 6) mostly in unnamed code: it reads big FUN_ functions
   and repeats `constants`/`xrefs`. Tools that name things (Qt, Delphi events, MFC maps, .NET) cut it to 8-18 calls.
 - Both models call `overview` rarely (Haiku sometimes, Sonnet never). It does not matter where a framework tool is
   reached by name (qt_metaobjects, delphi_forms, dotnet_*), so the Frameworks lines were not needed in these runs.
 
-Not solved: WinDirStat 2.9.3 (t9). Its message map entries are `{msg, code, id, lastid, handler thunk, 0}` in one
-contiguous table without a zero terminator and no `AFX_MSGMAP` getter that the decoder finds (`mfc_message_maps` says
-none). Both models find the menu item (id 32876) and the dialog but not the handler. Classic MFC (WinMerge) works.
-Open: decode that layout; the QML side of Qt signals; the virtual call `this+0xf0 -> +0x34` without RTTI (t4).
+Round 3 (t9, t11, t12): WinDirStat 2.9.3 is no MFC program. It has an own MFC look-alike framework whose
+route tables `{msg, code, first, last, invoke thunk, registered}` only a lazy initialiser names (see the MFC part
+above, `server/routes.py`). Now decoded: both models go menu id -> `anon_<table>::OnCommand_32876_IDS_MENU_RECOVERY`
+-> `function` and answer correctly (elevation check, modal dialog 111, update handler enables only when elevated).
+`function` / `xrefs` accept the generated handler names (WinMerge `CMainFrame::OnCommand_32786_Options`). t11/t12
+unchanged in result; the t12 error is a `delphi_classes` call on an MFC project.
+Open: the QML side of Qt signals; the virtual call `this+0xf0 -> +0x34` without RTTI (t4).
 
 Files (tasks, launcher, transcripts, source copies) are in the session scratchpad, `agenteval\`.
 

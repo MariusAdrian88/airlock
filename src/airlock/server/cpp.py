@@ -36,7 +36,7 @@ from airlock.index.store import Binary, Store
 
 log = logging.getLogger("airlock")
 
-CPP_VERSION = 2                   # 2: names for classes without RTTI, dispatch / interface / event maps
+CPP_VERSION = 3                   # 3: route tables (routes.py); 2: names for classes without RTTI, dispatch maps
 CPP_META = "cpp_version"          # meta key prefix; the full key is ``cpp_version:<binary id>``
 
 MAX_SLOTS = 1024                  # slots read per vtable
@@ -447,6 +447,9 @@ class MsgMap:
     cls: str
     map_addr: int
     entries: list[MsgEntry]
+    kind: str = "afx"             # afx: AFX_MSGMAP; routes: route table of an MFC look-alike (routes.py)
+    vtable: int = 0               # routes: vtable whose GetRouteTable slot returns the table, 0 unknown
+    base_map: int = 0             # routes: map address of the base class table, 0 unknown
 
 
 ANON_PREFIX = "anon_"           # a message map whose class has no RTTI: ``anon_<map address>``
@@ -621,6 +624,9 @@ def parse_image(img: Image) -> tuple[list[RttiClass], dict[int, list[int]], list
         if c.vtable is not None and c.vtable not in slots:
             slots[c.vtable] = vtable_slots(img, c.vtable)
     maps = find_msgmaps(img, classes, slots)
+    from airlock.server import routes                               # lazy: routes imports this module
+    have = {m.map_addr for m in maps}
+    maps += [m for m in routes.find_route_maps(img) if m.map_addr not in have]
     return classes, slots, maps
 
 

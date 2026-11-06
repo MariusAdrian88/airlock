@@ -115,8 +115,8 @@ def test_project_open_dirty_then_locked(tmp_path):
         f"session dirty for demo: write notes and scratch files only under {pp.dirty}")
     assert out.splitlines()[1] == "binaries: 1 ready, 1 queued"
     assert ctx.session.role == "dirty" and ctx.indexer.current == "demo"
-    locked = ("error role_locked: this session is already dirty for demo. "
-              "Start a new session for other work.")
+    locked = ("error role_locked: this session is already dirty for demo; "
+              "other work needs a new session.")
     assert _call(server, "project_open", {"name": "demo", "role": "clean"}) == locked
     assert _call(server, "project_open", {"name": "nope", "role": "dirty"}) == locked
     assert _call(server, "project_create", {"path": str(tmp_path), "name": "z"}) == locked
@@ -143,7 +143,7 @@ def test_project_open_clean_and_redaction(tmp_path):
 def test_project_open_errors(tmp_path):
     server, ctx, _ = _server(tmp_path)
     assert _call(server, "project_open", {"name": "nope", "role": "dirty"}).startswith(
-        "error not_found: no project 'nope'. Call projects")
+        "error not_found: no project 'nope' (have: demo")
     assert _call(server, "project_open", {"name": "demo", "role": "x"}).startswith("error bad_role:")
     assert ctx.session.role == "unbound"  # failures do not bind
     assert _call(server, "project_open", {"name": "DEMO", "role": "Dirty"}).startswith("session dirty")
@@ -199,14 +199,14 @@ def fake_scan(tmp_path, monkeypatch):
 def test_project_create_need_name(tmp_path, fake_scan):
     ctx = make_ctx(tmp_path)
     out = pc.project_create(ctx, str(fake_scan))
-    assert out.startswith("error need_name:") and "name=" in out
+    assert out == "error need_name: the project name comes from the user."
 
 
 def test_project_create_table_then_create_then_exists(tmp_path, fake_scan):
     ctx = make_ctx(tmp_path)
     out = pc.project_create(ctx, str(fake_scan), name="My Prog")
     assert out.splitlines()[0] == "SCANTABLE"
-    assert "Choose option=A..B (recommended B)" in out
+    assert "option=A..B picks the files (recommended B)" in out
     assert not (tmp_path / "projects" / "My_Prog").exists()
 
     out = pc.project_create(ctx, str(fake_scan), name="My Prog", option="b", remove="core.dll",

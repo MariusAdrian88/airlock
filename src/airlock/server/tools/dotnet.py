@@ -38,8 +38,9 @@ def _scope(ctx: ServerContext, binary: str) -> list[Bound] | str:
         if isinstance(bd, str):
             return bd
         if bd.binary.toolchain != "dotnet":
+            managed = ", ".join(b.name for b in dn.dotnet_binaries(bd.store)) or "none"
             return (f"error not_dotnet: '{bd.binary.name}' is a {bd.binary.toolchain or 'native'} binary "
-                    "without .NET metadata. Pass a managed assembly or omit binary.")
+                    f"without .NET metadata (managed assemblies: {managed}).")
         bounds = [bd]
     else:
         try:
@@ -50,19 +51,18 @@ def _scope(ctx: ServerContext, binary: str) -> list[Bound] | str:
         bounds = [Bound(proj, st, b) for b in dn.dotnet_binaries(st)
                   if ix.not_ready_error(proj, st, b) is None]
         if not bounds:
-            return (f"error not_dotnet: project '{proj}' has no ready managed assembly. "
-                    "Add one with program_add or open_binary.")
+            return f"error not_dotnet: project '{proj}' has no ready managed assembly."
     art = ix.paths(bounds[0].project).artifacts
     for bd in bounds:
         try:
             dn.ensure(bd.store, bd.binary, art / bd.binary.sha256)
         except Exception as e:  # noqa: BLE001
-            return f"error dotnet_failed: cannot read metadata of {bd.binary.name} ({type(e).__name__}). Check logs."
+            return f"error dotnet_failed: cannot read metadata of {bd.binary.name} ({type(e).__name__}: {e})."
     return bounds
 
 
 @tool("dotnet_types", "List .NET types, methods and P/Invoke declarations from metadata, with the "
-                      "native export each P/Invoke binds to.")
+                      "native export each P/Invoke binds to; methods and P/Invokes show with a query or kind.")
 def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: str = "",
                  kind: str = "", cursor: str = "", budget: int = 0) -> str:
     args = {"query": query, "limit": limit, "binary": binary, "kind": kind}
@@ -70,7 +70,7 @@ def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: s
         return _page(ctx, [], "dotnet_types", args, cursor, budget)
     k = kind.strip().lower()
     if k and k not in dn.KINDS:
-        return f"error bad_args: kind '{kind}' is not one of {', '.join(dn.KINDS)}. Fix and retry."
+        return f"error bad_args: kind '{kind}' is not one of {', '.join(dn.KINDS)}."
     bounds = _scope(ctx, binary)
     if isinstance(bounds, str):
         return bounds
@@ -89,11 +89,9 @@ def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: s
     lines = ["dotnet_types " + "; ".join(head) + (f" | {what}: {len(items)} matches" if what else "")]
     lines += shown
     if len(items) > limit:
-        lines.append(f"… {len(items) - limit} more. Raise limit or narrow query/kind.")
+        lines.append(f"… {len(items) - limit} more")
     elif not items:
-        lines.append("no matches" + ("" if what else ". Use query= or kind=pinvoke|method|com."))
-    elif not what:
-        lines.append("methods and P/Invokes: pass query= or kind=method|pinvoke|com.")
+        lines.append("no matches")
     return _page(ctx, lines, "dotnet_types", args, "", budget)
 
 
@@ -108,28 +106,30 @@ def dotnet_decompile(ctx: ServerContext, type: str, member: str = "", binary: st
     if cursor:
         return _page(ctx, [], "dotnet_decompile", args, cursor, budget, "code", "function_budget")
     if not type.strip():
-        return "error bad_args: type is empty. Pass a type name from dotnet_types."
+        return "error bad_args: type is empty."
     exe = ctx.config.ilspycmd
     if exe is None:
-        return ('error tool_missing: ilspycmd is not configured. Run "dotnet tool install ilspycmd '
-                '--tool-path <folder>" and set "ilspycmd" in config.jsonc to its ilspycmd.exe.')
+        return ('error tool_missing: "ilspycmd" is not set in config.jsonc '
+                '(install: dotnet tool install ilspycmd --tool-path <folder>).')
     if not Path(exe).is_file():
-        return (f"error tool_missing: ilspycmd not found at {exe}. Fix \"ilspycmd\" in config.jsonc "
-                'or install it with "dotnet tool install ilspycmd --tool-path <folder>".')
+        return f'error tool_missing: ilspycmd not found at {exe} ("ilspycmd" in config.jsonc).'
     bounds = _scope(ctx, binary)
     if isinstance(bounds, str):
         return bounds
     hits: list[tuple[Bound, str]] = []
     for bd in bounds:
         hits += [(bd, n) for n in dn.find_type(bd.store, bd.binary.id, type)]
+    used = ""
+    if not hits:            # widen: the types whose name contains the text
+        hits = [(bd, n) for bd in bounds for n in _types_like(bd, type.strip())]
+        if len(hits) == 1:
+            used = f"// type '{type.strip()}' not found: {hits[0][1]} used (the only name containing it)"
     if not hits:
-        return (f"error not_found: no type '{type.strip()}' in {', '.join(b.binary.name for b in bounds)}. "
-                "Call dotnet_types with query= to find it.")
+        return f"error not_found: no type '{type.strip()}' in {', '.join(b.binary.name for b in bounds)}."
     if len(hits) > 1:
         shown = ", ".join(f"{bd.binary.name}!{n}" for bd, n in hits[:6])
         more = f" (+{len(hits) - 6} more)" if len(hits) > 6 else ""
-        return (f"error ambiguous: '{type.strip()}' matches {len(hits)} types: {shown}{more}. "
-                "Pass the full name, and binary= when several assemblies have it.")
+        return f"error ambiguous: '{type.strip()}' matches {len(hits)} types: {shown}{more}."
     bd, full = hits[0]
     code = _decompiled(ctx, bd, full, Path(exe))
     if code.startswith("error "):
@@ -139,11 +139,30 @@ def dotnet_decompile(ctx: ServerContext, type: str, member: str = "", binary: st
         part = dn.member_text(code, member.strip()) or dn.member_text(
             code, dn.member_alias(member.strip(), full))
         if part is None:
-            return (f"error not_found: no member '{member.strip()}' in {full}. "
-                    "Call dotnet_types with kind=method and query= to list members.")
+            return f"error not_found: no member '{member.strip()}' in {full} {_members(bd, full)}."
         text = f"// member {member.strip()} of {full}\n{part}"
-    lines = [dn.REMINDER, f"// binary {bd.binary.name}, type {full}", *text.split("\n")]
+    lines = [dn.REMINDER, *([used] if used else []), f"// binary {bd.binary.name}, type {full}",
+             *text.split("\n")]
     return _page(ctx, lines, "dotnet_decompile", args, "", budget, "code", "function_budget")
+
+
+def _types_like(bd: Bound, text: str, n: int = 7) -> list[str]:
+    """Type full names containing ``text`` (compiler-generated ones left out)."""
+    if len(text) < 3:
+        return []
+    return [r[0] for r in bd.store.db.execute(
+        "SELECT name FROM dn_type WHERE binary_id=? AND instr(lower(name), lower(?)) > 0 "
+        "AND name NOT LIKE '%<%' ORDER BY length(name), name LIMIT ?", (bd.binary.id, text, n))]
+
+
+def _members(bd: Bound, full: str, n: int = 20) -> str:
+    """`(members: A, B, …)`: the method names of the type, so a wrong member needs no listing call."""
+    names = [r[0] for r in bd.store.db.execute(
+        "SELECT DISTINCT m.name FROM dn_method m JOIN dn_type t ON t.binary_id=m.binary_id "
+        "AND t.token=m.type_token WHERE m.binary_id=? AND t.name=? AND m.name NOT LIKE '%<%' "
+        "ORDER BY m.token", (bd.binary.id, full))]
+    more = f", +{len(names) - n} more" if len(names) > n else ""
+    return f"(members: {', '.join(names[:n]) or 'none'}{more})"
 
 
 def _decompiled(ctx: ServerContext, bd: Bound, full: str, exe: Path) -> str:
@@ -159,7 +178,7 @@ def _decompiled(ctx: ServerContext, bd: Bound, full: str, exe: Path) -> str:
         pass
     src = paths.artifacts / b.sha256
     if not src.is_file():
-        return f"error not_found: the stored file of '{b.name}' is missing. Call open_binary again."
+        return f"error not_found: the stored file of '{b.name}' is missing."
     folder.mkdir(parents=True, exist_ok=True)
     asm = folder / b.name          # ilspycmd wants a real assembly file name
     if not asm.is_file() or asm.stat().st_size != src.stat().st_size:
@@ -168,8 +187,7 @@ def _decompiled(ctx: ServerContext, bd: Bound, full: str, exe: Path) -> str:
     ref = Path(b.original_path).parent if b.original_path else None
     out, err = dn.run_ilspy(exe, asm, full, timeout, ref)
     if out is None:
-        return (f"error decompile_failed: ilspycmd on {full}: {err}. "
-                "Check the ilspycmd path and the .NET runtime, then retry.")
+        return f"error decompile_failed: ilspycmd on {full}: {err}."
     try:
         cached.write_text(out, encoding="utf-8")
     except OSError:

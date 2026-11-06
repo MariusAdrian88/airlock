@@ -332,7 +332,8 @@ def test_tools_single_binary(tmp_path):
     assert rt.dialogs(ctx, "0x81").startswith("dialog 129")
     assert rt.dialogs(ctx, "idd_ex").startswith("dialog IDD_EX")
     assert rt.dialogs(ctx, "999").startswith("error not_found")
-    assert "has no language" in rt.dialogs(ctx, "129", lang=0x999)
+    other = rt.dialogs(ctx, "129", lang=0x999)     # a missing language: the default one, said so
+    assert other.startswith('dialog 129 "About"') and "lang 0x0409 (no 0x0999)" in other.splitlines()[0]
     m = rt.menus(ctx, "128").splitlines()
     assert "  id=100 File > Open..." in m and "File >" in m and "    id=110 File > Recent > One" in m
     assert rt.menus(ctx).splitlines()[0].startswith("128 | 4 items, 3 popups")
@@ -353,7 +354,8 @@ def test_tools_single_binary(tmp_path):
 
 def test_tools_multi_binary(tmp_path):
     ctx, st, _ = _project(tmp_path, with_second=True)
-    assert rt.dialogs(ctx).startswith("error ambiguous_binary")      # no manifest, no root
+    every = rt.dialogs(ctx)        # no manifest, no root: every binary, lines tagged with it
+    assert "[app.exe] 129 |" in every and "[lib.dll] 129 |" in every
     assert rt.dialogs(ctx, binary="lib.dll").startswith("129 |")
     both = rt.dialogs(ctx, binary="*")
     assert "[app.exe] 129" in both and "[lib.dll] 129" in both

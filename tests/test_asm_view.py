@@ -36,7 +36,9 @@ def test_view_asm_output_and_cache(ctx):  # noqa: F811
     assert core.function(ctx, "main", view="asm", lines="2-3").splitlines()[1:] == [
         "0x00401001  MOV EBP,ESP", "0x00401003  CALL 0x00401100  ; → CMainFrame::OnFoo"]
     assert core.function(ctx, "main", view="asm", lines="50-60").startswith("error bad_args:")
-    assert core.function(ctx, "EXTERNAL:0x1", view="asm").startswith("error external:")
+    ext = core.function(ctx, "EXTERNAL:0x1", view="asm")   # no code: its references instead
+    assert ext.splitlines()[0] == "(an import with no code: its references)"
+    assert ext.splitlines()[1].startswith("xrefs to ")
 
 
 def test_view_asm_cursor_paging(ctx):  # noqa: F811

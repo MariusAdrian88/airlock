@@ -33,8 +33,8 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def err(code: str, what: str, nxt: str) -> str:
-    return f"error {code}: {what}. {nxt}."
+def err(code: str, what: str, nxt: str = "") -> str:
+    return f"error {code}: {what}." + (f" {nxt}." if nxt else "")
 
 
 def check_topic(topic: str) -> str | None:
@@ -42,7 +42,7 @@ def check_topic(topic: str) -> str | None:
     if (not t or len(t) > 120 or not _TOPIC.match(t)
             or any(seg.split(".")[0] in _RESERVED or seg.endswith(".") for seg in t.split("/"))):
         return err("bad_topic", f"'{topic}' is not a valid topic",
-                   "Use lowercase path segments like file-format/document/record-header")
+                   "topics are lowercase path segments, e.g. file-format/document/record-header")
     return None
 
 
@@ -61,7 +61,7 @@ def parse_sources(st: Store, text: str) -> list[Source] | str:
     items = [x.strip() for x in re.split(r"[\n;,]+", text or "") if x.strip()]
     if not items:
         return err("sources_required", "spec_write needs sources",
-                   "Pass what you used, like 'app.exe!LoadDocument' or 'observation'")
+                   "sources: binary!function, binary!0xADDRESS or a method word such as 'observation'")
     out: list[Source] = []
     for item in items:
         method, rest = "", item
@@ -77,7 +77,7 @@ def parse_sources(st: Store, text: str) -> list[Source] | str:
         bins = st.find_binaries(bname) if bname else st.list_binaries()
         if len(bins) != 1:
             return err("bad_source", f"source '{item}' does not name one binary",
-                       "Write it as binary!function or binary!0xADDRESS")
+                       "the forms are binary!function or binary!0xADDRESS")
         res = resolve_function(st, bins[0].id, bare)
         if not res.ok:
             if method and method != "decompile":
@@ -85,7 +85,7 @@ def parse_sources(st: Store, text: str) -> list[Source] | str:
                 continue
             why = (res.error or "").partition(": ")[2].rstrip(".")
             return err("bad_source", f"source '{item}': {why}",
-                       "Fix it or use a method word like 'observation'")
+                       "method words such as 'observation' count too")
         fn = res.function
         out.append(Source(bins[0].id, fn.id, fn.entry, method or "decompile"))
     return list(dict.fromkeys(out))

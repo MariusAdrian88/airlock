@@ -36,7 +36,7 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
     if not bounds:
         what = f"'{got[0][0].binary.name}' is a {got[0][0].binary.toolchain or 'native'} binary" if binary \
             else "the project has no ready Delphi binary"
-        return f"error not_delphi: {what}. Pass a Delphi binary (project_info lists toolchains)."
+        return f"error not_delphi: {what}."
     for bd in bounds:
         art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
         delphi.ensure(bd.store, bd.binary, art)
@@ -67,7 +67,7 @@ def _quote(text: str, n: int = 50) -> str:
 def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIMIT, binary: str = "",
                    cursor: str = "", budget: int = 0) -> str:
     if limit < 1:
-        return "error bad_args: limit must be at least 1. Fix and retry."
+        return "error bad_args: limit must be at least 1."
     sc = _scope(ctx, binary)
     if isinstance(sc, str):
         return sc
@@ -104,7 +104,7 @@ def delphi_classes(ctx: ServerContext, query: str = "", limit: int = DEFAULT_LIM
         return f"no Delphi class matches '{query}' ({have} classes)."
     shown = lines[:limit]
     if len(lines) > limit:
-        shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}. Raise limit or narrow query.")
+        shown.append(f"… {len(lines) - limit} more classes beyond limit={limit}")
     return fit_lines(shown, bud, "code", tool="delphi_classes", args=args)[0]
 
 
@@ -122,6 +122,14 @@ def _find_forms(bd: Bound, ident: str) -> list[dict]:
         return exact
     return [r for r in rows if want in r["res_name"].lower() or want in r["class"].lower()
             or want in r["name"].lower()]
+
+
+def _have_forms(bounds: list[Bound], several: bool, n: int = 12) -> str:
+    """`(have: TMain, TAbout, …)`: the form classes, so a wrong name needs no listing call."""
+    names = [f"{_prefix(bd, several)}{r[0]}" for bd in bounds for r in bd.store.db.execute(
+        "SELECT class FROM dl_form WHERE binary_id=? ORDER BY class", (bd.binary.id,))]
+    more = f", +{len(names) - n} more" if len(names) > n else ""
+    return f"(have: {', '.join(names[:n]) or 'none'}{more})"
 
 
 @tool("delphi_forms", "List Delphi DFM forms, or show one form's component tree: name, class, caption, event count.")
@@ -153,11 +161,11 @@ def delphi_forms(ctx: ServerContext, form: str = "", binary: str = "", cursor: s
         return fit_lines(lines, bud, "code", tool="delphi_forms", args=args)[0]
     hits = [(bd, f) for bd in bounds for f in _find_forms(bd, form)]
     if not hits:
-        return f"error not_found: no form '{form}'. Call delphi_forms without arguments for the list."
+        return f"error not_found: no form '{form}' {_have_forms(bounds, several)}."
     if len(hits) > 1:
         names = [f"{_prefix(bd, several)}{f['class']}" for bd, f in hits]
         shown = ", ".join(names[:10]) + (f" (+{len(names) - 10} more)" if len(names) > 10 else "")
-        return f"error ambiguous: '{form}' matches {len(names)} forms: {shown}. Retry with the full class name."
+        return f"error ambiguous: '{form}' matches {len(names)} forms: {shown}."
     bd, f = hits[0]
     ev_by: dict[int, int] = {}
     for r in bd.store.db.execute("SELECT seq, COUNT(*) AS n FROM dl_event WHERE binary_id=? AND form=? "
@@ -199,7 +207,7 @@ def _event_line(bd: Bound, r, show_form: bool) -> str:
 def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binary: str = "",
                   cursor: str = "", budget: int = 0) -> str:
     if not form.strip() and not component.strip():
-        return "error bad_args: pass form (class or resource name) or component (name). See delphi_forms."
+        return "error bad_args: needs form (class or resource name) or component (name)."
     sc = _scope(ctx, binary, form or component)
     if isinstance(sc, str):
         return sc
@@ -216,11 +224,11 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
     if form.strip():
         hits = [(bd, f) for bd in bounds for f in _find_forms(bd, ident)]
         if not hits:
-            return f"error not_found: no form '{ident}'. Call delphi_forms without arguments for the list."
+            return f"error not_found: no form '{ident}' {_have_forms(bounds, several)}."
         if len(hits) > 1:
             names = [f"{_prefix(bd, several)}{f['class']}" for bd, f in hits]
             shown = ", ".join(names[:10]) + (f" (+{len(names) - 10} more)" if len(names) > 10 else "")
-            return f"error ambiguous: '{ident}' matches {len(names)} forms: {shown}. Retry with the full class name."
+            return f"error ambiguous: '{ident}' matches {len(names)} forms: {shown}."
         bd, f = hits[0]
         rows = bd.store.db.execute(base + "AND e.form=? ORDER BY e.seq, e.prop", (bd.binary.id, f["res_name"])).fetchall()
         lines.append(f"{_prefix(bd, several)}{f['class']} events {len(rows)}")
@@ -239,5 +247,5 @@ def delphi_events(ctx: ServerContext, form: str = "", component: str = "", binar
                 total += 1
                 lines.append(f"{_prefix(bd, several)}" + _event_line(bd, r, True))
         if not lines:
-            return f"error not_found: no component '{ident}' with event handlers. Use delphi_forms to see components."
+            return f"error not_found: no component '{ident}' with event handlers."
     return fit_lines(lines, bud, "code", tool="delphi_events", args=args)[0]

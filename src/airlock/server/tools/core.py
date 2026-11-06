@@ -24,7 +24,7 @@ from airlock.server.cview import (
     OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, block_listing, format_asm, outline_lines, reduce_c,
 )
 from airlock.server.indexer import IndexerError, worker_error
-from airlock.server.registry import tool
+from airlock.server.registry import call as call_tool, tool
 from airlock.server.selectors import fmt_addr
 from airlock.server import cpp, delphi, dotnet, notes, qt, uijoin
 from airlock.server import targets as tg
@@ -62,7 +62,7 @@ def _binary_line(b, status: str, project: str | None = None) -> str:
                      "returns at once, then poll index_status.")
 def open_binary(ctx: ServerContext, project: str, path: str) -> str:
     if not project.strip():
-        return "error bad_args: project is empty. Pass a project name."
+        return "error bad_args: project is empty."
     try:
         res = ctx.indexer.open_binary(project, path)
     except IndexerError as e:
@@ -73,7 +73,7 @@ def open_binary(ctx: ServerContext, project: str, path: str) -> str:
                                         ctx.indexer.store(ctx.indexer.current or project),
                                         res.binary)[1])
     elif res.status not in ("finishing", "ready"):
-        out.append("Analysis takes minutes. Call index_status; tools work from status finishing on.")
+        out.append("analysis takes minutes; tools work from status finishing on")
     if res.note:
         out.append(res.note)
     return "\n".join(out)
@@ -105,7 +105,7 @@ def list_binaries(ctx: ServerContext, project: str = "") -> str:
             out_n, in_n = st.cross_counts(b.id)
             line += f" fns={st.counts(b.id)['functions']} links={out_n}/{in_n}"
             out.append(line)
-    return "\n".join(out) if out else "no binaries. Call open_binary with a project and a file path."
+    return "\n".join(out) if out else "no binaries"
 
 
 def _size(n: int) -> str:
@@ -156,6 +156,7 @@ def outline(ctx: ServerContext, binary: str = "") -> str:
 _SEARCH_KINDS = {"function": ("function",), "string": ("string",), "import": ("import",),
                  "note": ("note",), "any": ("function", "string", "import", "note")}
 _UNINDEXED_KINDS = ("const", "class")
+_FORWARD_KINDS = {"const": ("constants", "value"), "class": ("rtti_classes", "query")}
 
 
 @tool("search", "Full-text search over function names, strings and imports; hits are one line each.")
@@ -165,12 +166,15 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
     if cursor:
         return _cursor_page(cursor, "search", bud)
     if not query.strip():
-        return "error bad_args: query is empty. Pass words to look for."
-    if kind in _UNINDEXED_KINDS:
-        return (f"error not_supported: kind '{kind}' is not indexed yet. "
-                "Use function, string, import, note or any.")
+        return "error bad_args: query is empty."
+    if kind in _UNINDEXED_KINDS:      # not in the full-text index: the tool that has them answers
+        name, param = _FORWARD_KINDS[kind]
+        if name not in ctx.config.tools:
+            return f"error not_supported: kind '{kind}' needs {name}, which is off in config.jsonc."
+        out = call_tool(ctx, name, **{param: query, "binary": binary})
+        return out if out.startswith("error ") else f"({name} used for kind={kind})\n{out}"
     if kind not in _SEARCH_KINDS:
-        return f"error bad_args: unknown kind '{kind}'. Use function, string, import, note or any."
+        return f"error bad_args: unknown kind '{kind}' (kinds: function, string, import, note, any, const, class)."
     many = bind_many(ctx, binary)
     if isinstance(many, str):
         return many
@@ -373,9 +377,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _timeout_error(fn: Function, what: Any) -> str:
+def _timeout_error(fn: Function, what: Any, top: int) -> str:
     return (f"error decompile_timeout: {fn.qualified_name}: {what}. "
-            "Try view=signature, view=asm or xrefs, or raise defaults.decompile_timeout_max_s.")
+            f"The limit is defaults.decompile_timeout_max_s={top} in config.jsonc.")
 
 
 SECONDS_PER_KB = 6          # extra decompile time per KB of code beyond ADAPT_FROM (measured, DESIGN 5)
@@ -402,11 +406,10 @@ def _block_listing(ctx: ServerContext, bd: Bound, fn: Function, why: str) -> tup
         r = ctx.worker.request("disassemble", {"program": ix.program_of(bd.store, bd.binary),
                                                "entry": fn.entry, "max_instructions": 20000}, timeout=300)
     except WorkerError as e:
-        return None, worker_error(e, "Call index_status to check the worker")
+        return None, worker_error(e)
     total = r.get("total") if r.get("truncated") else None
     lines = block_listing(r["rows"], bd.psize, total)
-    head = (f"// decompile failed: {fn.qualified_name}: {why}. Block listing from the disassembly "
-            "(not C); view=asm has the instructions, retry=true decompiles again.")
+    head = f"// decompile failed: {fn.qualified_name}: {why}. Block listing from the disassembly (not C)."
     return head + "\n" + "\n".join(lines), None
 
 
@@ -433,6 +436,11 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
             out = dn_tools.dotnet_decompile(ctx, type=fn.namespace or "", member=fn.name, binary=b.name)
             if not out.startswith("error "):
                 return out, None
+        if not fn.is_thunk:     # no C#: the IL listing is the code there is
+            lines, _why = dotnet.il_listing(ctx.indexer.paths(bd.project).artifacts / b.sha256, fn.entry)
+            if lines is not None:
+                return "\n".join(["// IL (MSIL), not machine code; no C# (dotnet_decompile unavailable)",
+                                  *lines]) + "\n", None
         return None, dotnet.managed_error(b, fn, st)
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
@@ -442,7 +450,7 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
             and not (cached.error or "").startswith(BG_TIMEOUT) and not _infra_error(cached.error)):
         if listing_ok:
             return _block_listing(ctx, bd, fn, cached.error or "timeout")
-        return None, _timeout_error(fn, cached.error or "timeout") + " Pass retry=true to try again."
+        return None, _timeout_error(fn, cached.error or "timeout", adaptive_timeout(ctx, fn)[1])
     ix = ctx.indexer
     timeout, top = adaptive_timeout(ctx, fn)
     d: dict[str, Any] = {}
@@ -466,7 +474,7 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
             transient = d.get("status") == "error" and _infra_error(d.get("error"))
         except WorkerError as e:
             if round_ == 2 or e.code not in ("worker_exited", "busy") and not _infra_error(e.message):
-                return None, worker_error(e, "Call index_status to check the worker")
+                return None, worker_error(e)
             transient = True
         if not transient:
             break
@@ -479,11 +487,10 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
         if d.get("status") == "timeout":
             if listing_ok:
                 return _block_listing(ctx, bd, fn, f"{what} after {args['timeout']} s")
-            return None, _timeout_error(fn, what)
+            return None, _timeout_error(fn, what, top)
         if listing_ok:
             return _block_listing(ctx, bd, fn, str(what))
-        return None, (f"error decompile_failed: {fn.qualified_name}: {what}. "
-                      "Try view=signature, view=asm or xrefs.")
+        return None, f"error decompile_failed: {fn.qualified_name}: {what}."
     st.upsert_decomp(fn.id, fn.version, profile, "ok", c_text=d["c_text"], produced_at=_now())
     cols = d["ast_columns"]
     st.insert_ast_nodes(fn.id, [dict(zip(cols, row)) for row in d["ast"]])
@@ -515,7 +522,7 @@ def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | N
             return None, dotnet.managed_error(b, fn, st)
         lines, why = dotnet.il_listing(ctx.indexer.paths(bd.project).artifacts / b.sha256, fn.entry)
         if lines is None:
-            return None, f"error managed: {fn.qualified_name}: {why}. Use dotnet_decompile on its type."
+            return None, f"error managed: {fn.qualified_name}: no IL listing ({why})."
         return ["; IL (MSIL), not machine code", *lines], None
     profile = b.analysis_profile or "unknown"
     path = _asm_cache_file(ctx, bd, fn)
@@ -530,7 +537,7 @@ def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | N
         ix.ensure_open(bd.project)
         r = ctx.worker.request("disassemble", {"program": ix.program_of(st, b), "entry": fn.entry}, timeout=300)
     except WorkerError as e:
-        return None, worker_error(e, "Call index_status to check the worker")
+        return None, worker_error(e)
     total = r.get("total") if r.get("truncated") else None
     lines = format_asm(r["rows"], bd.psize, total)
     try:
@@ -560,40 +567,44 @@ def _asm_response(ctx: ServerContext, bd: Bound, fn: Function, note: str | None,
         c = reduce_c(annotate_calls(c_text, bd.store.get_ast_nodes(fn.id, "call"), bd.psize).rstrip(chr(10)), detail)
         body = ["// C"] + c.split(chr(10)) + [f"// asm ({len(asm)} lines)"]
     first = 1
+    full_asm = asm
     if span:
         asm = asm[span[0] - 1: span[1]]
         first = span[0]
         if not asm:
-            return f"error bad_args: lines {lines} is past the end of the function. Use a smaller range."
+            return f"error bad_args: lines {lines} is past the end of the function ({len(full_asm)} lines)."
     head = f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)} asm: lines {first}-{first + len(asm) - 1}"
     out = ([f"// {note}"] if note else []) + ([head] if view == "asm" else []) + body + asm
     return fit_lines(out, bud, "code", tool="function", args=args)[0]
 
 
 @tool("function", "Show a function's decompiled C with call addresses (view=c), its assembly (view=asm), "
-                  "both (view=both) or its signature (view=signature), by name or address.")
+                  "both (view=both) or its signature (view=signature), by name or address; lines=a-b "
+                  "reads a range of a long function's outline.")
 def function(ctx: ServerContext, target: str = "", binary: str = "", view: str = "c",
              lines: str = "", cursor: str = "", budget: int = 0, detail: str = "brief",
              outline: bool = True, retry: bool = False,
              outline_depth: int = OUTLINE_DEFAULT_DEPTH) -> str:
     bud = budget_for(ctx, budget, "function_budget")
     if not target.strip():
-        return "error bad_target: target is empty. Pass a function name or an address like 0x00401000."
+        return "error bad_target: target is empty."
     if view not in ("c", "asm", "both", "signature"):
-        return f"error bad_args: unknown view '{view}'. Use c, asm, both or signature."
+        return f"error bad_args: unknown view '{view}' (views: c, asm, both, signature)."
     if not 0 <= outline_depth <= OUTLINE_MAX_DEPTH:
-        return f"error bad_args: outline_depth must be 0 to {OUTLINE_MAX_DEPTH}. Fix and retry."
+        return f"error bad_args: outline_depth must be 0 to {OUTLINE_MAX_DEPTH}."
     if view == "both" and lines:
-        return "error bad_args: lines applies to view=c or view=asm. Drop lines or choose one view."
+        return "error bad_args: lines applies to view=c or view=asm, not both."
     if detail not in ("brief", "full"):
-        return f"error bad_args: unknown detail '{detail}'. Use brief or full."
+        return f"error bad_args: unknown detail '{detail}' (details: brief, full)."
     span = None
     if lines:
         span = _parse_lines(lines)
         if span is None:
-            return "error bad_args: lines must look like 40-80. Fix and retry."
+            return "error bad_args: lines must look like 40-80."
     ft = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT_FN))
     if isinstance(ft, str):
+        if ft.startswith("error external:") and view != "signature":    # an import row: no code
+            return _import_refs(ctx, target, binary, bud)
         return ft
     assert isinstance(ft, tg.FunctionTarget)
     bd, fn, note = ft.bound, ft.fn, ft.any_note
@@ -619,9 +630,8 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
         out = ([note] if note else []) + [
             f"{bd.addr(fn.entry, fn.space)} {sig} [{flags}] callers {callers}"]
         return "\n".join(out)
-    if fn.is_external:
-        return (f"error external: {fn.qualified_name} is an imported function with no code. "
-                "Use xrefs on it to see its callers.")
+    if fn.is_external:      # no code to show: its callers are the useful answer
+        return _import_refs(ctx, target, binary, bud)
     args = {"binary": binary, "target": target, "view": view, "lines": lines, "detail": detail}
     if view in ("asm", "both"):
         if cursor:
@@ -651,11 +661,16 @@ def function(ctx: ServerContext, target: str = "", binary: str = "", view: str =
     if outline and not cursor and not span and estimate_tokens(full, "code") > bud:
         all_lines = full.split("\n")
         head = (f"// {fn.qualified_name} {bd.addr(fn.entry, fn.space)}: {len(all_lines)} lines, "
-                f"~{estimate_tokens(full, 'code')} tokens (budget {bud}). "
-                "Read with lines=a-b, or outline=false to page.")
+                f"~{estimate_tokens(full, 'code')} tokens (budget {bud}), outline:")
         olines = ([f"// {note}"] if note else []) + outline_lines(all_lines, head, outline_depth)
         return fit_lines(olines, bud, "code", tool="function", args=oargs)[0]
     return _function_page(full, bud, span, lines, offset, note, args, identity)
+
+
+def _import_refs(ctx: ServerContext, target: str, binary: str, bud: int) -> str:
+    """``function`` on an import with no code: its references, which is what the agent wants next."""
+    return "(an import with no code: its references)\n" + xrefs(ctx, target=target, binary=binary,
+                                                                 direction="to", budget=bud)
 
 
 def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str,
@@ -674,15 +689,14 @@ def _function_page(full: str, bud: int, span: tuple[int, int] | None, lines: str
         first = span[0]
         body = "\n".join(all_lines[span[0] - 1: span[1]])
         if not body:
-            return f"error bad_args: lines {lines} is past the end of the function. Use a smaller range."
+            return f"error bad_args: lines {lines} is past the end of the function ({n_total} lines)."
     prefix = [f"// {note}"] if note else []
     total_tok = estimate_tokens(full, "code")
     if not span and offset == 0 and estimate_tokens("\n".join(prefix + [body]), "code") <= bud:
         return "\n".join(prefix + [body])
 
     def make_header(start: int, end: int) -> str:
-        return (f"// lines {start}-{end} of {n_total}, function ~{total_tok} tokens "
-                f"(budget {bud}). More: cursor, lines=a-b or budget=<n>.")
+        return f"// lines {start}-{end} of {n_total}, function ~{total_tok} tokens (budget {bud})"
 
     # Reserve note + header (worst-case digit width) before cutting the body.
     reserved = sum(estimate_tokens(ln + "\n", "code")
@@ -725,27 +739,31 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     if cursor:
         return _cursor_page(cursor, "xrefs", bud)
     if not target.strip():
-        return "error bad_target: target is empty. Pass a function name or an address."
+        return "error bad_target: target is empty."
     if direction not in ("to", "from"):
-        return "error bad_args: direction must be to or from. Fix and retry."
+        return "error bad_args: direction must be to or from."
     kinds = None
     if kind:
         kinds = _KIND_MAP.get(kind)
         if kinds is None:
-            return (f"error bad_args: unknown kind '{kind}'. "
-                    "Use call, jump, read, write, data, import, dynamic or table.")
+            return (f"error bad_args: unknown kind '{kind}' "
+                    "(kinds: call, jump, read, write, data, import, dynamic, table).")
     limit = max(1, min(int(limit), 1000))
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS))
     if isinstance(tr, str):
         return tr
+    swapped = ""
     if isinstance(tr, tg.ImportTarget) and direction == "from":
         ft = tg.function_of_import(tr)   # only library code or a thunk has outgoing references
         if isinstance(ft, str) or ft.fn.is_external:
-            return tg.err("external", f"{tr.label} is an imported function with no code",
-                          "Use direction=to to see its callers")
-        tr = ft
+            direction = "to"             # nothing goes out of an import: its callers are the answer
+            swapped = f"({tr.label} is an import with no code: direction=to used)"
+        else:
+            tr = ft
     assert not isinstance(tr, (tg.StringTarget, tg.FeatureTarget, tg.ClusterTarget))
     notes: list[str] = [tr.binary_note] if tr.binary_note else []
+    if swapped:
+        notes.append(swapped)
     entries: list[tuple[str, str]] = []   # (kind, line)
     refs: list[tuple[Bound, Xref]] = []
     cross: list[CrossRef] = []            # callers from other binaries (direction=to)
@@ -838,7 +856,7 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     out = [f"xrefs {direction} {label}, {summary}{'+' if over else ''}", *notes]
     out += [ln for _, ln in entries]
     if over:
-        out.append(f"… limit {limit} reached. Raise limit or filter with kind.")
+        out.append(f"… limit {limit} reached")
     args = {"binary": binary, "target": target, "direction": direction, "kind": kind,
             "limit": limit}
     return _page(out, "xrefs", args, bud)
@@ -862,9 +880,9 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     if cursor:
         return _cursor_page(cursor, "callgraph", bud)
     if not target.strip():
-        return "error bad_target: target is empty. Pass a function name or an address."
+        return "error bad_target: target is empty."
     if direction not in ("callees", "callers"):
-        return "error bad_args: direction must be callees or callers. Fix and retry."
+        return "error bad_args: direction must be callees or callers."
     depth = max(1, min(int(depth), MAX_DEPTH))
     tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT))
     if isinstance(tr, str):
@@ -1007,18 +1025,50 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     if cursor:
         return _cursor_page(cursor, "strings", bud)
     if not pattern:
-        return "error bad_args: pattern is empty. Pass text or a regex."
+        return "error bad_args: pattern is empty."
+    used = ""
     if regex:
         try:
             re.compile(pattern)
-        except re.error as e:
-            return f"error bad_regex: {e}. Fix the pattern and retry."
+        except re.error as e:           # an invalid regex is searched as literal text
+            regex, used = False, f"(literal used: bad regex: {e})"
     many = bind_many(ctx, binary)
     if isinstance(many, str):
         return many
     bounds, skipped = many
-    multi = len(bounds) > 1
     limit = max(1, min(int(limit), 500))
+    merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
+    if not merged and not regex and _REGEX_CHARS.search(pattern) and _compiles(pattern):
+        regex, used = True, "(regex used: no literal match)"    # `a|b`, `^foo`: meant as a regex
+        merged, capped = _string_lines(bounds, pattern, regex, with_refs, limit)
+    if not merged:
+        return f"no strings match '{pattern}'" + (f" {used}" if used else "")
+    head = f"strings matching '{pattern}': {len(merged)}{'+' if capped else ''}"
+    if used:
+        head += f" {used}"
+    if skipped:
+        head += f" ({skipped} binaries not ready, skipped)"
+    out = [head, *merged]
+    args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
+            "limit": limit}
+    return _page(out, "strings", args, bud)
+
+
+_REGEX_CHARS = re.compile(r"[|\^$*+?\[\](){}]")
+
+
+def _compiles(pattern: str) -> bool:
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
+def _string_lines(bounds: list[Bound], pattern: str, regex: bool, with_refs: bool,
+                  limit: int) -> tuple[list[str], bool]:
+    """String hit lines over the binaries, round-robin, cut at ``limit``; (lines, capped)."""
+    multi = len(bounds) > 1
     per_binary: list[list[str]] = []
     capped = False
     for bd in bounds:
@@ -1048,15 +1098,4 @@ def strings(ctx: ServerContext, pattern: str = "", binary: str = "", regex: bool
     for i in range(max((len(x) for x in per_binary), default=0)):
         merged += [x[i] for x in per_binary if i < len(x)]
     capped = capped or len(merged) > limit
-    merged = merged[:limit]
-    if not merged:
-        hint = (". Substring mode is on and the pattern has regex characters. Pass regex=true."
-                if not regex and re.search(r"[|\^$*+?\[\](){}]", pattern) else "")
-        return f"no strings match '{pattern}'{hint}"
-    head = f"strings matching '{pattern}': {len(merged)}{'+' if capped else ''}"
-    if skipped:
-        head += f" ({skipped} binaries not ready, skipped)"
-    out = [head, *merged]
-    args = {"binary": binary, "pattern": pattern, "regex": regex, "with_refs": with_refs,
-            "limit": limit}
-    return _page(out, "strings", args, bud)
+    return merged[:limit], capped

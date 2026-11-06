@@ -90,7 +90,7 @@ class ServerContext:
     def bind_session(self, role: str, pp: ProjectPaths) -> str | None:
         """Bind the process to (project, role) once. None on success, else the error line."""
         if role not in (roles.DIRTY, roles.CLEAN):
-            return f"error bad_role: role '{role}' is not dirty or clean. Use dirty or clean."
+            return f"error bad_role: role '{role}' is not dirty or clean."
         with self._bind_lock:
             if self.session.role != roles.UNBOUND:
                 return roles.role_locked(self.session)

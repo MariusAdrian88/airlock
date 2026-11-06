@@ -18,7 +18,8 @@ from typing import Iterable
 from airlock.index.store import CODE_EDGES, Function, StringHit, Xref
 from airlock.server.context import ServerContext
 from airlock.server.graph import dll_stem, norm_import
-from airlock.server.selectors import MAX_CANDIDATES, parse_address, resolve_function
+from airlock.server.selectors import (MAX_CANDIDATES, MAX_CLOSE, close_functions, close_text,
+                                      parse_address, resolve_function)
 from airlock.server.tools.common import Bound, Scope, bind_scope
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -129,8 +130,10 @@ Target = (FunctionTarget | AddressTarget | ImportTarget | MultiFunctionTarget | 
 
 # -- errors (one wording for every tool) ---------------------------------------------------------
 
-def err(code: str, what: str, nxt: str) -> str:
-    return f"error {code}: {what}. {nxt}."
+def err(code: str, what: str, nxt: str = "") -> str:
+    """``error code: what.`` plus the next step only when it is data the agent needs (candidates)
+    or a fix only the user can make."""
+    return f"error {code}: {what}." + (f" {nxt}." if nxt else "")
 
 
 def _where(sc: Scope) -> str:
@@ -140,20 +143,32 @@ def _where(sc: Scope) -> str:
     return f" in {len(sc.bounds)} ready binaries{extra}"
 
 
-def not_found(sc: Scope, text: str) -> str:
+def close_matches(sc: Scope, text: str) -> tuple[list[tuple[Bound, Function]], bool]:
+    """Functions named like ``text`` in the scope: the names equal to it ignoring case when there
+    are any (exact=True), else names containing its last segment."""
+    exact_hits: list[tuple[Bound, Function]] = []
+    near: list[tuple[Bound, Function]] = []
+    for bd in sc.bounds:
+        fns, exact = close_functions(bd.store, bd.binary.id, text)
+        (exact_hits if exact else near).extend((bd, f) for f in fns)
+    return (exact_hits, True) if exact_hits else (near, False)
+
+
+def not_found(sc: Scope, text: str, close: list[tuple[Bound, Function]] | None = None) -> str:
+    close = close or []
+    names = [f"{'' if sc.explicit else bd.binary.name + '!'}{f.qualified_name} {bd.addr(f.entry, f.space)}"
+             for bd, f in close[:MAX_CLOSE]]
     return err("not_found", f"no function or import named '{text}'{_where(sc)}",
-               "Use search to find the name, or pass an address like 0x00401000 (binary!0x... "
-               "to pick a binary)")
+               close_text(names, len(close) > MAX_CLOSE))
 
 
 def ambiguous(text: str, listed: list[str], total: int) -> str:
     shown = listed[:MAX_CANDIDATES]
     more = f" (+{total - len(shown)} more)" if total > len(shown) else ""
-    return err("ambiguous", f"'{text}' matches {total} functions: {', '.join(shown)}{more}",
-               "Retry with binary!name or binary!address")
+    return err("ambiguous", f"'{text}' matches {total} functions: {', '.join(shown)}{more}")
 
 
-def wrong_kind(text: str, got: str, accepted: Iterable[str], nxt: str) -> str:
+def wrong_kind(text: str, got: str, accepted: Iterable[str], nxt: str = "") -> str:
     words = sorted({_KIND_WORDS[k] for k in accepted if k in _KIND_WORDS})
     return err("bad_target", f"'{text}' is {got}, but this tool takes {' or '.join(words)}", nxt)
 
@@ -289,8 +304,7 @@ def function_of_import(t: ImportTarget) -> FunctionTarget | str:
                                   t.binary_note or (None if t.explicit else f"binary {bd.binary.name}"))
         if rank:
             return ambiguous(t.label, _cands(rank), len(rank))
-    return err("external", f"{t.label} is an imported function with no code",
-               "Use xrefs on it to see its callers")
+    return err("external", f"{t.label} is an imported function with no code")
 
 
 def import_refs(t: ImportTarget, kinds: tuple[str, ...] | None, limit: int) -> list[tuple[Bound, Xref]]:
@@ -392,12 +406,11 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         return sc
     t = sc.bare
     if not t:
-        return err("bad_target", "empty target", "Pass a function name or an address like 0x00401000")
+        return err("bad_target", "empty target")
     if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
         if STRING not in ks:
-            return wrong_kind(t, "a quoted string", ks, "Pass a name or an address")
-        return _strings(sc, t[1:-1]) or err(
-            "not_found", f"no string matching {t}{_where(sc)}", "Use strings(pattern) to find it")
+            return wrong_kind(t, "a quoted string", ks)
+        return _strings(sc, t[1:-1]) or err("not_found", f"no string matching {t}{_where(sc)}")
     if parse_address(t) is not None:
         return _by_address(sc, t, ks)
     cands = {bd.binary.id: _candidates(bd) for bd in sc.bounds}
@@ -426,7 +439,12 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         s = _strings(sc, t)
         if s:
             return s
-    return not_found(sc, t)
+    close, exact = close_matches(sc, t)
+    if exact and len(close) == 1 and (FUNCTION in ks or IMPORT_FN in ks):   # only the case differs
+        bd, f = close[0]
+        return FunctionTarget(bd, f, f"resolved '{t}' to {f.qualified_name} (case differs)",
+                              None if sc.explicit else f"binary {bd.binary.name}")
+    return not_found(sc, t, close)
 
 
 def _attempts(t: str, cands: dict[int, list[_Cand]]) -> list[tuple[str, str]]:
@@ -537,9 +555,36 @@ def _qt_method_addr(sc: Scope, text: str) -> int | None:
                 found |= {int(r[0]) for r in bd.store.db.execute(sql, args)}
             except Exception:  # noqa: BLE001  no framework tables
                 continue
+        if not found:
+            found = _mfc_handler_addrs(bd, qcls, qmeth or name)
         if len(found) == 1:
             return found.pop()
     return None
+
+
+def _mfc_handler_addrs(bd: Bound, cls: str, meth: str) -> set[int]:
+    """Handlers of message map entries whose ClassWizard style name (``OnCommand_32786_Options``,
+    ``uijoin.UiIndex.suggest``, printed by ``mfc_message_maps`` / ``menus``) is ``meth``; ``cls`` (may
+    be empty) narrows to one class."""
+    if not meth.lower().startswith("on"):
+        return set()
+    from airlock.server import uijoin            # late: uijoin imports features
+    sql = ("SELECT class, map_addr, message, code, ctrl_id, last_id, handler FROM msgmap_entry "
+           "WHERE binary_id=?")
+    args: tuple = (bd.binary.id,)
+    if cls:
+        sql += " AND lower(class)=lower(?)"
+        args += (cls,)
+    try:
+        rows = bd.store.db.execute(sql, args).fetchall()
+    except Exception:  # noqa: BLE001  no message map tables
+        return set()
+    if not rows:
+        return set()
+    ui = uijoin.UiIndex(bd.store, bd.binary.id)
+    want = meth.lower()
+    return {int(r[6]) for r in rows
+            if ui.suggest(uijoin.Handler(r[0], r[1], r[2], r[3], r[4], r[5], r[6])).lower() == want}
 
 
 def _single(bd: Bound, name: str) -> Target | str:
@@ -555,8 +600,7 @@ def _policy(sc: Scope, r: Target | str, text: str, ks: frozenset[str]) -> Target
         return r
     if IMPORT_FN in ks:
         return function_of_import(r)
-    return wrong_kind(text, f"an import ({r.label}) with no code of its own", ks,
-                      "Use xrefs on it, or pass a function that calls it")
+    return wrong_kind(text, f"an import ({r.label}) with no code of its own", ks)
 
 
 def _by_address(sc: Scope, raw: str, ks: frozenset[str]) -> Target | str:
@@ -588,8 +632,7 @@ def _by_address(sc: Scope, raw: str, ks: frozenset[str]) -> Target | str:
         return FunctionTarget(bd, f, note, f"binary {bd.binary.name}")
     if found:
         return ambiguous(raw, _cands([(bd, f) for bd, f, _n in found]), len(found))
-    return err("not_found", f"no function at or containing {raw}{_where(sc)}",
-               "Check the address, or pass binary!0xaddress")
+    return err("not_found", f"no function at or containing {raw}{_where(sc)}")
 
 
 def _strings(sc: Scope, text: str) -> StringTarget | None:

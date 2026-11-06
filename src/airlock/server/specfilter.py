@@ -64,28 +64,28 @@ def check(text: str, ranges: list[tuple[int, int]] | None = None) -> str | None:
             continue
         if _FENCE.match(s):
             return _err("spec_has_code", n, line, "opens a fenced block",
-                        "Describe the behaviour in prose or use a field/offset/size/meaning table")
+                        "allowed: prose and field/offset/size/meaning tables")
         if _GHIDRA.search(s):
             return _err("spec_has_ghidra_names", n, line, "contains a Ghidra artefact name",
-                        "Describe the role in prose instead of copying decompiler names")
+                        "allowed: the role in prose, no decompiler names")
         for pat, what in ((_C_PREPROC, "is a preprocessor line"), (_C_BLOCK, "is a code block line"),
                           (_C_ASSIGN, "is an assignment statement"), (_C_CALL, "is a call or return statement"),
                           (_C_DECL, "is a declaration"), (_PASCAL, "is a Pascal statement")):
             if pat.match(s):
                 return _err("spec_has_code", n, line, what,
-                            "Rewrite it as prose or as a data-layout table (field, offset, size, meaning)")
+                            "allowed: prose and field/offset/size/meaning tables")
         if _BYTE_RUN.search(s) or _LONG_HEX.search(s):
             return _err("spec_has_bytes", n, line,
                         f"carries a run of {MAX_HEX_BYTES} or more hex bytes",
-                        "Describe the byte layout as fields, not as dumped bytes")
+                        "allowed: the byte layout as fields, not dumped bytes")
         if _POINTER_LIT.search(s):
             return _err("spec_has_address", n, line, "carries a pointer-sized hex literal",
-                        "Remove the address; describe the thing by role")
+                        "allowed: the thing by role, no address")
         for m in _HEX_LIT.finditer(s):
             digits = m.group(1) or m.group(2) or m.group(3)
             if m.group(3) and len(digits) != 8 and not re.search("[A-Fa-f]", digits):
                 continue          # a plain decimal number, not an address
             if digits and _in_ranges(int(digits, 16), ranges):
                 return _err("spec_has_address", n, line, "carries an address inside a binary's image",
-                            "Remove the address; describe the thing by role")
+                            "allowed: the thing by role, no address")
     return None

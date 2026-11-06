@@ -55,15 +55,26 @@ _TOOL_MILESTONE = {"qt_metaobjects": "M8"}
 def not_implemented_error(name: str) -> str:
     info = CATALOG.get(name)
     if info is None:
-        return f"error unknown_tool: {name} is not a tool of this server. Call project_info for the list."
+        return f"error unknown_tool: {name} is not a tool of this server."
     ms = _TOOL_MILESTONE.get(name) or _SET_MILESTONE.get(info.set, "a later milestone")
     return f"error not_implemented: {name} is planned for {ms} and not available yet."
+
+
+def _refusal(ctx: Any, name: str) -> str | None:
+    """The role gate; an unbound refusal lists the projects (the choice is the agent's)."""
+    refusal = roles.gate(ctx.session, name)
+    if refusal == roles.UNBOUND_ERROR:
+        try:
+            return roles.unbound_error(ctx.indexer.projects())
+        except Exception:  # noqa: BLE001  the list is an extra
+            return refusal
+    return refusal
 
 
 def call(ctx: Any, name: str, *args: Any, **kwargs: Any) -> str:
     """Direct (non-MCP) call with the same gate as the MCP path; never raises for a tool that
     exists in the catalog but has no implementation yet."""
-    refusal = roles.gate(ctx.session, name)
+    refusal = _refusal(ctx, name)
     if refusal is not None:
         return refusal
     impl = IMPLEMENTED.get(name)
@@ -83,7 +94,7 @@ def bind(impl: ToolImpl, ctx: Any) -> Callable[..., Any]:
               for p in list(sig.parameters.values())[1:]]
 
     async def bound(*args: Any, **kwargs: Any) -> str:
-        refusal = roles.gate(ctx.session, impl.name)
+        refusal = _refusal(ctx, impl.name)
         if refusal is not None:
             return refusal
         if "from" in kwargs:      # `from` is a Python keyword: tools name the parameter `from_`

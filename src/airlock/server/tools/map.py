@@ -32,7 +32,7 @@ def _now() -> str:
 def _session(ctx: ServerContext) -> tuple[ProjectPaths, Store] | str:
     pp = ctx.session.project
     if pp is None:
-        return "error unbound: no project is open. Call projects, then project_open."
+        return "error unbound: no project is open."
     return pp, ctx.indexer.store(pp.name)
 
 
@@ -81,10 +81,9 @@ def project_describe(ctx: ServerContext, purpose: str = "") -> str:
     pp, st = s
     text = " ".join(purpose.split())
     if not text:
-        return ("error empty_purpose: purpose is empty. Pass one short paragraph about what the "
-                "program does.")
+        return "error empty_purpose: purpose is empty."
     if len(text) > 1500:
-        return f"error too_long: purpose has {len(text)} characters, the limit is 1500. Shorten it."
+        return f"error too_long: purpose has {len(text)} characters, the limit is 1500."
     pm.set_purpose(st, text)
     pm.write_maps(pp, st, mermaid=bool(ctx.config.defaults.get("mermaid")))
     return f"purpose set ({len(text)} chars). Maps updated: {pp.dirty / 'PROJECT.md'}, {pp.clean / 'PROJECT.md'}."
@@ -105,11 +104,11 @@ def features(ctx: ServerContext, refresh: bool = False, cursor: str = "", budget
             refresh_maps(ctx, pp, st, derive=True)
     rows = fx.stats(st)
     if not rows:
-        return "no features yet. They are derived when a binary is ready; feature_define adds one."
+        return "no features yet. They are derived when a binary is ready."
     drop = fx.dropped(st)
     lines = [f"{r['key']}{' [agent]' if r['source'] == 'agent' else ''} | {r['title']} | "
              f"{fx.size_text(r, drop.get(r['key'], 0), binaries=True)} | "
-             f"{fx.coverage(r['n'], r['named'])} | feature(key=\"{r['key']}\")" for r in rows]
+             f"{fx.coverage(r['n'], r['named'])}" for r in rows]
     return _page(lines, bud, "features")
 
 
@@ -154,14 +153,15 @@ def feature(ctx: ServerContext, key: str = "", depth: int = 0, binary: str = "",
     row = st.get_feature(key) if key else None
     if row is None:
         have = ", ".join(r["key"] for r in fx.stats(st)) or "none"
-        return f"error not_found: no feature '{key}' (have: {have}). Call features."
+        return f"error not_found: no feature '{key}' (have: {have})."
     bins = st.list_binaries()
     names = {b.id: (b.name, b.pointer_size or 4) for b in bins}
     only: int | None = None
     if binary.strip():
         only = next((b.id for b in bins if b.name.lower() == binary.strip().lower()), None)
         if only is None:
-            return f"error not_found: no binary '{binary.strip()}'. Call list_binaries."
+            return (f"error not_found: no binary '{binary.strip()}' "
+                    f"(have: {', '.join(b.name for b in bins) or 'none'}).")
     depth = max(0, min(int(depth), fx.MAX_DEPTH))
     ents = st.feature_entries(key)
     seeds = sum(1 for r in ents if r["depth"] == 0)
@@ -222,12 +222,12 @@ def feature_define(ctx: ServerContext, key: str, title: str = "", functions: str
     pp, st = s
     key = key.strip().lower()
     if not _KEY_RE.match(key):
-        return (f"error bad_key: '{key}' is not a feature key. Use lowercase letters, digits and - : _ ., "
-                "e.g. open-project-file.")
+        return (f"error bad_key: '{key}' is not a feature key (lowercase letters, digits and - : _ ., "
+                "e.g. open-project-file).")
     cur = st.get_feature(key)
     title = " ".join(title.split()) or (cur["title"] if cur else "")
     if not title:
-        return f"error need_title: new feature '{key}' needs a title. Pass title=."
+        return f"error need_title: new feature '{key}' needs a title."
     toks = [t.strip() for t in functions.replace("\n", ",").split(",") if t.strip()]
     targets, err = _resolve_targets(ctx, toks)
     if err:
@@ -243,4 +243,4 @@ def feature_define(ctx: ServerContext, key: str, title: str = "", functions: str
     refresh_maps(ctx, pp, st)
     n = len(st.feature_entries(key))
     return (f"feature {key} {'updated' if cur else 'defined'}: {title} | {pm.plural(len(targets), 'function')} added, "
-            f"{pm.plural(n, 'entry point')}. feature(key=\"{key}\") lists them.")
+            f"{pm.plural(n, 'entry point')}.")

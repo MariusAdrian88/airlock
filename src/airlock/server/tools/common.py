@@ -39,20 +39,18 @@ def bind_binary(ctx: ServerContext, binary: str = "", *, require_ready: bool = T
         found = st.find_binaries(binary)
         if not found:
             names = ", ".join(b.name for b in st.list_binaries()) or "none"
-            return (f"error not_found: no binary '{binary}' in project '{proj}' (have: {names}). "
-                    "Call list_binaries.")
+            return f"error not_found: no binary '{binary}' in project '{proj}' (have: {names})."
         if len(found) > 1:
-            return (f"error ambiguous_binary: '{binary}' matches {len(found)} binaries. "
-                    "Use a longer sha256 prefix.")
+            return (f"error ambiguous_binary: '{binary}' matches {len(found)} binaries: "
+                    f"{', '.join(f'{x.name} ({x.sha256[:12]})' for x in found[:MAX_CANDIDATES])}.")
         b = found[0]
     else:
         every = st.list_binaries()
         if not every:
-            return (f"error no_binary: project '{proj}' has no binaries. "
-                    "Call open_binary with a file path.")
+            return f"error no_binary: project '{proj}' has no binaries."
         if len(every) > 1:
-            return (f"error ambiguous_binary: project '{proj}' has {len(every)} binaries "
-                    f"({', '.join(x.name for x in every)}). Pass binary=<name>.")
+            return (f"error ambiguous_binary: project '{proj}' has {len(every)} binaries: "
+                    f"{', '.join(x.name for x in every)}.")
         b = every[0]
     if require_ready:
         err = ix.not_ready_error(proj, st, b)
@@ -109,8 +107,7 @@ def bind_target(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, st
     pre, bare = split_binary_target(st, target)
     if pre:
         if binary and not any(b.name.lower() == pre.lower() for b in st.find_binaries(binary)):
-            return (f"error bad_args: target names binary '{pre}' but binary='{binary}'. "
-                    "Pass one of them.")
+            return f"error bad_args: target names binary '{pre}' but binary='{binary}'."
         bd = bind_binary(ctx, pre)
         return bd if isinstance(bd, str) else (bd, bare, None)
     if binary or len(st.list_binaries()) <= 1:
@@ -132,14 +129,12 @@ def bind_target(ctx: ServerContext, binary: str, target: str) -> tuple[Bound, st
         return bd, bare, f"binary {bd.binary.name}"
     if not cands:
         extra = f" ({skipped} not ready)" if skipped else ""
-        return (f"error not_found: no function '{bare}' in {len(bounds)} ready binaries{extra}. "
-                "Use search, or pass binary!name or binary!0xaddress.")
+        return f"error not_found: no function '{bare}' in {len(bounds)} ready binaries{extra}."
     shown = cands[:MAX_CANDIDATES]
     lst = ", ".join(f"{bd.binary.name}!{f.qualified_name} {bd.addr(f.entry, f.space)}"
                     for bd, f in shown)
     more = f" (+{len(cands) - len(shown)} more)" if len(cands) > len(shown) else ""
-    return (f"error ambiguous: '{bare}' matches {len(cands)} functions: {lst}{more}. "
-            "Retry with binary!name or binary!address.")
+    return f"error ambiguous: '{bare}' matches {len(cands)} functions: {lst}{more}."
 
 
 @dataclass(frozen=True)
@@ -172,8 +167,7 @@ def bind_scope(ctx: ServerContext, binary: str, target: str) -> Scope | str:
         pre, bare = split_binary_suffix(st, t)
     if pre:
         if binary and not any(b.name.lower() == pre.lower() for b in st.find_binaries(binary)):
-            return (f"error bad_args: target names binary '{pre}' but binary='{binary}'. "
-                    "Pass one of them.")
+            return f"error bad_args: target names binary '{pre}' but binary='{binary}'."
         bd = bind_binary(ctx, pre)
         return bd if isinstance(bd, str) else Scope(proj, st, (bd,), bare, True)
     if binary or len(st.list_binaries()) <= 1:

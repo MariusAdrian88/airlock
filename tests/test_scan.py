@@ -141,8 +141,8 @@ def test_root_ambiguous_render(tmp_path):
     assert r.root_ambiguous and r.root_exe == "alpha.exe"
     lines = S.render_scan(r)
     assert "root unclear: alpha.exe (score 1: largest code), beta.exe (score 0: none)" in lines[0]
-    assert "pass root_exe= to choose" in lines[0]
-    assert lines[-1].startswith("recommended: choose root_exe first")
+    assert "root_exe= picks one" in lines[0]
+    assert lines[-1].startswith("recommended: ") and "after the root_exe choice" in lines[-1]
     named = scan_program(d, root_exe="beta.exe")
     assert not named.root_ambiguous and named.root_exe == "beta.exe"
 
