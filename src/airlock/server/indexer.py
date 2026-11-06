@@ -34,10 +34,10 @@ from airlock import logs
 from airlock.config import Config
 from airlock.index.store import USABLE_STATES, Binary, Store
 from airlock.server import estimate as est
-from airlock.server import cpp, delphi, dotnet, fnfix, linking, peres, qt
+from airlock.server import cpp, delphi, dotnet, dotnet_meta, fnfix, linking, peres, qt
 from airlock.server.bulk import SKIP_GROUPS, BulkScheduler
 from airlock.projects import (
-    ProjectPaths, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
+    ProjectPaths, bundle_entry_name, copy_artifact, detect, hash_file, list_projects, project_paths, read_manifest,
     read_sections, slugify, write_manifest,
 )
 from airlock.worker.protocol import WorkerError
@@ -418,7 +418,7 @@ class Indexer:
             if not (paths.artifacts / sha).is_file():
                 self._mf_update(paths.name, sha, state="error", error="artifact missing")
                 continue
-            job = self._enqueue_one(paths, store, sha, Path(str(rel).replace("\\", "/")).name,
+            job = self._enqueue_one(paths, store, sha, bundle_entry_name(str(rel)),
                                     rel, f.get("group") or "other", f.get("code_size"),
                                     str(f.get("source") or rel), int(f.get("est_funcs") or 0))
             if job is not None:
@@ -603,6 +603,32 @@ class Indexer:
             "missing functions of %s: %s of %s created, %s failed (%.0fs)", b.name,
             res["created"], res["requested"], res["failed"], time.monotonic() - t0)
         return int(res["created"])
+
+    def bind_native_methods(self, project: str, store: Store, b: Binary) -> int:
+        """C++/CLI: make Ghidra functions at the RVA of every native MethodDef, name the ones that still
+        carry the default name after the method (library-like source), read them back and write the
+        ``native`` edges from the method tokens (DESIGN.md section 11). Once per DOTNET_VERSION and binary
+        for the Ghidra part. Returns the number of edges."""
+        program = store.get_meta(f"program:{b.id}")
+        cands = dotnet_meta.native_candidates(store, b) if program else []
+        if not cands:
+            return 0
+        key = f"dotnet_native:{b.id}"
+        if store.get_meta(key) != str(dotnet.DOTNET_VERSION):
+            self.ensure_open(project)
+            have = {r[0] for r in store.db.execute(
+                "SELECT entry FROM function WHERE binary_id=? AND space='ram'", (b.id,))}
+            missing = [a for a, _n, _t in cands if a not in have]
+            if missing:
+                self.worker.request("create_functions", {"program": program, "addresses": missing,
+                                                         "conventions": True}, timeout=3600)
+            self.worker.request("name_functions", {"program": program, "names": [
+                {"address": a, "name": n, "namespace": t or None} for a, n, t in cands]}, timeout=600)
+            self.reextract_code(store, b, program)
+            with store.db:
+                store.set_meta(key, str(dotnet.DOTNET_VERSION))
+            dotnet.ensure(store, b, self.paths(project).artifacts / b.sha256, force=True)   # edges of the re-read
+        return dotnet_meta.link_native(store, b)
 
     def refresh_missing_functions(self, project: str, store: Store) -> int:
         """``create_missing_functions`` for the ready binaries not done at this version. Returns
@@ -1101,6 +1127,7 @@ class Indexer:
         if me.toolchain == "dotnet":    # mixed-mode: native code through Ghidra, plus the metadata
             try:
                 dotnet.ensure(st, me, self.paths(job.project).artifacts / me.sha256, force=True)
+                self.bind_native_methods(job.project, st, me)
             except Exception as e:  # noqa: BLE001  metadata is an extra
                 self._plog(job).warning(".NET metadata of %s: %s", me.name, e)
         try:
@@ -1117,7 +1144,10 @@ class Indexer:
         qt.ensure(st, me, self.paths(job.project).artifacts / me.sha256)   # QMetaObjects, string connects
         job.step = "functions"
         try:
-            self.create_missing_functions(job.project, st, me, progress=self._fn_progress(job))   # handlers, vtable targets
+            made = self.create_missing_functions(job.project, st, me, progress=self._fn_progress(job))   # handlers, vtable targets
+            if made and me.toolchain == "dotnet":    # the re-read replaced all edges: write the managed ones again
+                dotnet.ensure(st, me, self.paths(job.project).artifacts / me.sha256, force=True)
+                self.bind_native_methods(job.project, st, me)
         except Exception as e:  # noqa: BLE001  an extra; the binary becomes ready
             self._plog(job).warning("missing functions of %s: %s", me.name, e)
         delphi.ensure(st, me, self.paths(job.project).artifacts / me.sha256, self.config.idr_kb_dir,

@@ -27,7 +27,7 @@ from airlock.server.cview import (
 from airlock.server.indexer import IndexerError, worker_error
 from airlock.server.registry import add_note, call as call_tool, tool
 from airlock.server.selectors import fmt_addr, parse_address
-from airlock.server import classfwd, cpp, delphi, dotnet, notes, qt, uijoin
+from airlock.server import classfwd, cpp, delphi, dotnet, dotnet_meta, notes, qt, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
     Bound, bind_binary, bind_many, bind_scope, bound_of, budget_for, fn_desc, normalize_kind, preview,
@@ -58,8 +58,9 @@ def _page(lines: list[str], tool_name: str, args: dict, budget: int, max_lines: 
 
 def _binary_line(b, status: str, project: str | None = None) -> str:
     head = f"{project}/" if project else ""
-    return (f"{head}#{b.id} {b.name} {b.format or '?'} {b.arch or '?'} {b.toolchain or '?'} "
-            f"sha256:{b.sha256[:12]} {status}")
+    host = (b.original_path or "").partition("!")[0] if "!" in (b.original_path or "") else ""
+    return (f"{head}#{b.id} {b.name}{f' (in {host})' if host else ''} {b.format or '?'} "
+            f"{b.arch or '?'} {b.toolchain or '?'} sha256:{b.sha256[:12]} {status}")
 
 
 @tool("open_binary", "Register a PE file in a project and start Ghidra analysis in the background; "
@@ -131,7 +132,12 @@ def outline(ctx: ServerContext, binary: str = "") -> str:
     if artifact.is_file():
         from airlock.projects import detect
         info = detect(artifact)
-        if info.entry_point is not None and b.image_base is not None:
+        if b.toolchain == "dotnet":    # the managed entry point, not the native stub
+            tok = info.cli_entry
+            fn = st.function_containing(b.id, tok) if tok else None
+            out.append(f"entry {fn.qualified_name} 0x{tok:08x}" if fn else
+                       f"entry managed 0x{tok:08x}" if tok else "entry none (no managed entry point)")
+        if not info.managed_only and info.entry_point is not None and b.image_base is not None:
             ep = b.image_base + info.entry_point
             fn = st.function_containing(b.id, ep)
             out.append(f"entry {bd.addr(ep)}" + (f" {fn.qualified_name}" if fn else ""))
@@ -513,16 +519,21 @@ def _get_decompiled(ctx: ServerContext, bd: Bound, fn: Function,
     (one `// decompile_timeout` note line, then one line per basic block) instead of an error."""
     st, b = bd.store, bd.binary
     if dotnet.is_managed(b, fn):
+        nat = dotnet_meta.native_function(st, b.id, fn)      # C++/CLI: the method body is native code
+        if nat is not None:
+            text, err = _get_decompiled(ctx, bd, nat, retry, listing_ok)
+            return (f"// native body of {fn.qualified_name} at 0x{nat.entry:x}" + chr(10) + f"{text}" if text else text), err
         if not fn.is_thunk and "dotnet_decompile" in ctx.config.tools:
             from airlock.server.tools import dotnet as dn_tools     # late: the tool modules import core
-            out = dn_tools.dotnet_decompile(ctx, type=fn.namespace or "", member=fn.name, binary=b.name)
+            out = dn_tools.dotnet_decompile(ctx, type=fn.namespace or "", member=f"0x{fn.entry:08x}",
+                                           binary=b.name)
             if not out.startswith("error "):
                 return out, None
         if not fn.is_thunk:     # no C#: the IL listing is the code there is
             lines, _why = dotnet.il_listing(ctx.indexer.paths(bd.project).artifacts / b.sha256, fn.entry)
             if lines is not None:
                 return "\n".join(["// IL (MSIL), not machine code; no C# (dotnet_decompile unavailable)",
-                                  *lines]) + "\n", None
+                                  *_body_fact(st, fn, "// "), *lines]) + "\n", None
         return None, dotnet.managed_error(b, fn, st)
     profile = b.analysis_profile or "unknown"
     cached = st.get_decomp(fn, profile)
@@ -602,12 +613,16 @@ def _get_asm(ctx: ServerContext, bd: Bound, fn: Function) -> tuple[list[str] | N
     (derived data, safe to delete)."""
     st, b = bd.store, bd.binary
     if dotnet.is_managed(b, fn):
+        nat = dotnet_meta.native_function(st, b.id, fn)      # C++/CLI: the method body is native code
+        if nat is not None:
+            lines, err = _get_asm(ctx, bd, nat)
+            return ([f"; native body of {fn.qualified_name} at 0x{nat.entry:x}", *lines] if lines else lines), err
         if fn.is_thunk:
             return None, dotnet.managed_error(b, fn, st)
         lines, why = dotnet.il_listing(ctx.indexer.paths(bd.project).artifacts / b.sha256, fn.entry)
         if lines is None:
             return None, f"error managed: {fn.qualified_name}: no IL listing ({why})."
-        return ["; IL (MSIL), not machine code", *lines], None
+        return ["; IL (MSIL), not machine code", *_body_fact(st, fn, "; "), *lines], None
     profile = b.analysis_profile or "unknown"
     path = _asm_cache_file(ctx, bd, fn)
     try:
@@ -911,6 +926,10 @@ def _describe_addr(bd: Bound, addr: int, fn: Function | None) -> str:
     st, b = bd.store, bd.binary
     if fn is not None and fn.entry == addr:
         return fn.qualified_name
+    if dotnet_meta.FIELD_LO <= addr < dotnet_meta.FIELD_HI and b.toolchain == "dotnet":
+        lab = dotnet_meta.field_label(st, b.id, addr)             # a .NET field: Type::Field
+        if lab:
+            return lab
     s = st.string_at(b.id, addr)
     if s is not None:
         return preview(s.value, 40)
@@ -947,7 +966,14 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
                     "(kinds: call, jump, code, read, write, data, import, dynamic, table).")
     page = max(1, min(int(limit), 1000))
     limit = XREFS_FETCH      # fetch deep; `page` lines are shown, the rest sits behind a cursor
-    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)   # a read never writes
+    tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)
+    if isinstance(tr, str) and "::" in target and tr.startswith("error not_found"):
+        fld = dotnet_meta.resolve_field(ctx, binary, target)        # a .NET field: Type::Field
+        if isinstance(fld, str):
+            return fld
+        if fld is not None:
+            binary, target = fld
+            tr = tg.resolve_target(ctx, binary, target, (tg.FUNCTION, tg.IMPORT, tg.ADDRESS), create=False)
     if isinstance(tr, str):
         return tr
     swapped = ""
@@ -984,6 +1010,8 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         if tr.note:
             notes.append(tr.note)
         label = fn_desc(bd, fn)
+        if dotnet.is_managed(b, fn):
+            notes += dotnet_meta.link_notes(st, b.id, fn.entry)      # implements / overrides / impl / override
         if fn.space != "ram":  # imported function: callers reach it through its IAT slot
             slots = [i["address"] for i in st.imports_by_name(b.id, fn.name)
                      if i["address"] is not None]
@@ -1039,22 +1067,42 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     for rb, x in refs:
         pfx = f"[{rb.binary.name}] " if multi else ""
         if direction == "to":
-            who = x.src_fn.qualified_name if x.src_fn else "-"
+            who = (x.src_fn.qualified_name if x.src_fn else "-") + _il_site(x)
             entries.append((x.kind, f"  {pfx}{rb.addr(x.src_addr)}  {who:<36} {x.kind}"))
         else:
             what = _describe_addr(rb, x.dst_addr, x.dst_fn)
-            entries.append((x.kind, f"  {rb.addr(x.src_addr)}  -> {rb.addr(x.dst_addr)} {what:<30} "
+            entries.append((x.kind, f"  {rb.addr(x.src_addr)}{_il_site(x)}  -> {rb.addr(x.dst_addr)} {what:<30} "
                                     f"{x.kind}"))
+    slots_expanded = 0
+    seen_callers: set[tuple[int, int, str]] = set()
     for x in cross:
+        sb = bound_of(bd, x.src_binary)
+        if x.kind in ("mcall", "pinvoke"):          # a MemberRef slot or P/Invoke thunk: its callers
+            callers = (sb.store.xrefs_to_function(x.src_fn, kinds or CODE_EDGES, limit + 1)
+                       if x.src_fn is not None and x.src_fn.space == "ram"
+                       else sb.store.xrefs_to_address(x.src_binary, x.src_addr, kinds or CODE_EDGES, limit + 1))
+            if callers:
+                slots_expanded += 1
+                for c in callers:
+                    key = (x.src_binary, c.src_addr, x.kind)
+                    if key in seen_callers:
+                        continue
+                    seen_callers.add(key)
+                    who = c.src_fn.qualified_name if c.src_fn else "-"
+                    entries.append((c.kind, f"  [{sb.binary.name}] {sb.addr(c.src_addr)}  {who:<36} "
+                                            f"{c.kind} (via {x.kind})"))
+                continue
         if kinds is not None and x.kind not in kinds:
             continue
-        sb = bound_of(bd, x.src_binary)
         imp = sb.store.import_at(x.src_binary, x.src_addr)
         who = (x.src_fn.qualified_name if x.src_fn else
                sb.store.import_label(imp) if imp else "-")
         entries.append((x.kind, f"  [{sb.binary.name}] {sb.addr(x.src_addr)}  {who:<36} {x.kind}"))
     over = len(entries) > limit      # a hard cap: the real count is unknown
     entries = entries[:limit]
+    if slots_expanded:
+        notes.append(f"{slots_expanded} cross-assembly reference slot{'s' if slots_expanded != 1 else ''} "
+                     "listed as their callers")
     counts: dict[str, int] = {}
     for k, _ in entries:
         counts[k] = counts.get(k, 0) + 1
@@ -1070,6 +1118,16 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
     args = {"binary": binary, "target": target, "direction": direction, "kind": kind,
             "limit": limit}
     return _page(out, "xrefs", args, bud, page + 1 + len(notes), page)   # header and notes
+
+
+def _body_fact(st: Any, fn: Function, pfx: str) -> list[str]:
+    """``body: Ns.Type+<Run>d__3::MoveNext (async)``: where the code of an async or iterator stub is."""
+    return [f"{pfx}body: {c.qualified_name} ({how.split()[0]})" for c, how in st.body_links(fn, True, 3)]
+
+
+def _il_site(x: Xref) -> str:
+    """``+IL_0012``: the IL offset of a .NET call site, empty elsewhere."""
+    return f"+IL_{x.site:04x}" if x.site is not None else ""
 
 
 def _cross_target(bd: Bound, x: CrossRef) -> str:
@@ -1129,6 +1187,7 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
     state = {"truncated": False}
     dyn: set[tuple[int, int]] = set()   # (binary id, entry) of hops that are run-time loaded
     ptr: set[tuple[int, int]] = set()   # (binary id, entry) of hops through a function pointer
+    bodies: dict[tuple[int, int], str] = {}   # (binary id, entry) of .NET state machine hops -> label
 
     def children(cb: Bound, fn: Function, lim: int = CALLGRAPH_FANOUT + 1
                  ) -> list[tuple[Bound, Function | None, str, int | None]]:
@@ -1147,6 +1206,18 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
                     seen_p.add(c.id)
                     ptr.add((cb.binary.id, c.entry))
                     kids.append((cb, c, "", None))
+        seen_b = {c.id for _, c, _, _ in kids if c is not None}
+        for c, how in s_.body_links(fn, direction == "callees", lim):     # .NET async / iterator state machine
+            if c.id not in seen_b:
+                seen_b.add(c.id)
+                bodies[(cb.binary.id, c.entry)] = how
+                kids.append((cb, c, "", None))
+        if dotnet.is_managed(cb.binary, fn):       # interface / virtual dispatch: implementations or the declaration
+            for obid, f_, how in dotnet_meta.dispatch_links(s_, cb.binary.id, fn.entry, direction == "callees", lim):
+                if f_.id not in seen_b:
+                    seen_b.add(f_.id)
+                    bodies[(obid, f_.entry)] = how
+                    kids.append((bound_of(cb, obid), f_, "", None))
         if direction == "callees":
             hops: set[tuple[int, int]] = set()
             for x in s_.cross_from_function(fn, lim):
@@ -1161,7 +1232,7 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
             seen = {c.id for _, c, _, _ in kids if c is not None}
             for x in s_.cross_to_function(fn, lim):
                 sb = bound_of(cb, x.src_binary)
-                if x.src_fn is not None and x.src_fn.entry == x.src_addr:
+                if x.src_fn is not None and x.src_fn.space == "ram" and x.src_fn.entry == x.src_addr:
                     srcs = [x.src_fn]   # a thunk: its own callers come with expanding it
                 else:                   # an import slot: the functions that call through it
                     srcs = [r_.src_fn for r_ in sb.store.xrefs_to_address(
@@ -1179,6 +1250,8 @@ def callgraph(ctx: ServerContext, target: str = "", binary: str = "", direction:
         suffix = ""
         if mark and (cb.binary.id, f.entry if f is not None else raw) in dyn:
             suffix = " (dynamic)"
+        elif f is not None and not mark and (cb.binary.id, f.entry) in bodies:
+            suffix = f" ({bodies[(cb.binary.id, f.entry)]})"
         elif f is not None and not mark and (cb.binary.id, f.entry) in ptr:
             suffix = " (ptr)"
         if f is None:

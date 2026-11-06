@@ -73,7 +73,7 @@ KEYS: tuple[Key, ...] = (
         "Folder of the JDK that runs Ghidra. null means java on PATH, then the one Ghidra finds.",
         "When PATH has no Java 21 or newer.", nullable=True),
     Key("ilspycmd", "path", None, "Locations",
-        "Path of ilspycmd.exe, used to decompile .NET code. Optional.",
+        "Path of ilspycmd.exe (version 11.2 or newer, a single file without .NET runtime; `airlock doctor --fix` downloads it), used to decompile .NET code. Optional.",
         "When you analyse .NET programs.", nullable=True),
     Key("idr_kb_dir", "path", None, "Locations",
         "Folder with IDR knowledge bases (kb2010.bin, syskb2012.bin ...) that name Delphi RTL and VCL functions. 32-bit files go in the folder or its x86 subfolder, 64-bit files in its x64 subfolder. Optional.",

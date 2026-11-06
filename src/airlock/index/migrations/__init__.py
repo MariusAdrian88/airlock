@@ -277,3 +277,33 @@ def _v14(db: sqlite3.Connection) -> None:
 
 
 MIGRATIONS.setdefault(14, _v14)
+
+
+def _v15(db: sqlite3.Connection) -> None:
+    """Edge column ``site``: the IL offset of a .NET call site (derived; the .NET tables are rebuilt)."""
+    if not any(r[1] == "site" for r in db.execute("PRAGMA table_info(edge)")):
+        db.execute("ALTER TABLE edge ADD COLUMN site INTEGER")
+
+
+MIGRATIONS.setdefault(15, _v15)
+
+
+def _v16(db: sqlite3.Connection) -> None:
+    """.NET type-system tables (implementations, overrides, fields, layouts, properties, events, native
+    methods); derived, filled by server/dotnet_meta.py."""
+    from importlib import resources
+    sql = resources.files("airlock.index").joinpath("schema.sql").read_text("utf-8")
+    block = sql[sql.index("CREATE TABLE dn_rel"):sql.index("-- Delphi (schema v12)")]
+    block = chr(10).join(ln.split("--", 1)[0] for ln in block.splitlines())
+    for stmt in block.split(";"):
+        text = " ".join(stmt.split())
+        if not text:
+            continue
+        if text.startswith("CREATE TABLE"):
+            text = text.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+        else:
+            text = text.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1)
+        db.execute(text)
+
+
+MIGRATIONS.setdefault(16, _v16)

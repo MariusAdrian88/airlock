@@ -11,12 +11,16 @@ import os
 import re
 import struct
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pefile
 
-from airlock.projects import COR_ILONLY, cor_flags
+from airlock.projects import (
+    BUNDLE_SEP, COR_ILONLY, _cli_header, apphost_targets, bundle_manifest, bundle_marker,
+    cli_entry_token, cor_flags, is_nativeaot, is_r2r, read_bundle_entry,
+)
 from airlock.server import estimate as est
 
 _MB = 1024 * 1024
@@ -59,7 +63,13 @@ class ScannedFile:
     subsystem: int = 0                 # PE optional header Subsystem (1 = native/driver)
     description: str | None = None     # version FileDescription
     est_funcs: int = 0                 # estimated function count (see estimate_functions)
-    managed: bool = False              # IL-only assembly: indexed with dnfile, never sent to Ghidra
+    managed: bool = False              # IL-only or ReadyToRun assembly: indexed with dnfile, never sent to Ghidra
+    apphost: str = ""                  # apphost or single-file bundle host: rel path of its managed app dll
+    has_entry: bool = False            # managed file with a CLI entry point (an application)
+    meta_size: int = 0                 # managed: size of the metadata (stands in for code size)
+    refs: tuple[str, ...] = ()         # managed: AssemblyRef names, lowercase
+    r2r: bool = False                  # ReadyToRun image
+    nativeaot: bool = False            # NativeAOT image (no .NET metadata)
 
 
 @dataclass(frozen=True)
@@ -111,7 +121,7 @@ _INSTALLER_RE = re.compile(r"setup|install|uninst|vcredist|redist|runtime|update
 
 def is_root_candidate(f: ScannedFile) -> bool:
     """Executables that may be chosen as root automatically (no installers, no drivers)."""
-    if f.kind != "pe" or f.group == "unreadable" or f.is_dll or f.subsystem == 1:
+    if f.kind != "pe" or f.group == "unreadable" or f.is_dll or f.subsystem == 1 or f.apphost:
         return False
     name = Path(f.rel_path).name
     if name.lower().endswith(".sys") or _INSTALLER_RE.search(name):
@@ -209,13 +219,43 @@ def estimate_functions(pe: pefile.PE) -> int:
     return len(starts)
 
 
-def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
+_FRAMEWORK_RE = re.compile(
+    r"^(system|microsoft|windowsbase|presentation\w*|netstandard|mscorlib|uiautomation\w*)(\.|$)", re.I)
+# well-known NuGet libraries: referenced by the app but not part of it
+_THIRD_PARTY_RE = re.compile(
+    r"^(newtonsoft|mono\.|sharpdx|sharpcompress|zstdsharp|nlog|log4net|autofac|commandline|"
+    r"communitytoolkit|harmony|dnlib|fody|castle|serilog|icsharpcode|kgysoft)", re.I)
+
+
+def is_framework_name(name: str) -> bool:
+    """A managed file name of the .NET runtime or the SDK (System.*, Microsoft.*, WindowsBase, ...)."""
+    return bool(_FRAMEWORK_RE.match(Path(name.rpartition(BUNDLE_SEP)[2]).name))
+
+
+def _assembly_refs(src: "Path | bytes") -> tuple[str, ...]:
+    """Lowercase AssemblyRef names of a managed file (dnfile); () when unreadable."""
+    try:
+        import logging
+
+        import dnfile
+        logging.getLogger("dnfile").setLevel(logging.ERROR)
+        pe = dnfile.dnPE(data=src, fast_load=True) if isinstance(src, bytes) \
+            else dnfile.dnPE(str(src), fast_load=True)
+        pe.parse_data_directories(directories=[14])
+        tb = pe.net.mdtables.AssemblyRef
+        return tuple(dict.fromkeys(str(r.Name.value).lower() for r in (tb.rows if tb else ())))
+    except Exception:  # noqa: BLE001  the refs are an extra for grouping
+        return ()
+
+
+def _read_pe(path: "Path | None", rel: str, size: int, data: "bytes | None" = None) -> ScannedFile:
     def unreadable() -> ScannedFile:
         return ScannedFile(rel, "pe", "unreadable", size, 0, None, False, False, False,
                            None, None, (), 0)
 
     try:
-        pe = pefile.PE(str(path), fast_load=True)
+        pe = pefile.PE(str(path), fast_load=True) if data is None \
+            else pefile.PE(data=data, fast_load=True)
     except (pefile.PEFormatError, OSError, ValueError, MemoryError):
         return unreadable()
     try:
@@ -245,17 +285,26 @@ def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
         except Exception:
             rich = False
         company, product = extract_vendor(pe)
-        managed = bool(dotnet and (cor_flags(pe) or 0) & COR_ILONLY)
+        r2r = bool(dotnet and is_r2r(pe))
+        managed = bool(dotnet and (r2r or (cor_flags(pe) or 0) & COR_ILONLY))
+        aot = bool(not dotnet and is_nativeaot(pe))
+        entry = cli_entry_token(pe) if dotnet else 0
+        meta = 0
+        refs: tuple[str, ...] = ()
         if managed:
             code = 0       # IL is not code for Ghidra: the assembly costs seconds, not analysis time
+            h = _cli_header(pe)
+            meta = int.from_bytes(h[12:16], "little") if h else 0
         try:
             funcs = 0 if dotnet else estimate_functions(pe)
         except Exception:  # the estimate is an extra: the code size alone still gives a time
             funcs = 0
+        is_dll = bool(pe.FILE_HEADER.Characteristics & 0x2000) and not entry
         return ScannedFile(rel, "pe", "", size, code, bits,
-                           bool(pe.FILE_HEADER.Characteristics & 0x2000), bool(dotnet), rich,
+                           is_dll, bool(dotnet), rich,
                            company, product, tuple(dict.fromkeys(names)), n_exports,
-                           opt.Subsystem, _description(pe), funcs, managed)
+                           opt.Subsystem, _description(pe), funcs, managed,
+                           has_entry=bool(entry), meta_size=meta, refs=refs, r2r=r2r, nativeaot=aot)
     except Exception:
         return unreadable()
     finally:
@@ -264,26 +313,56 @@ def _read_pe(path: Path, rel: str, size: int) -> ScannedFile:
 
 # --- grouping -------------------------------------------------------------------
 
-def assign_groups(files: list[ScannedFile], root_rel: str | None) -> list[ScannedFile]:
-    """Set `group` on PE files (data/unreadable keep theirs). Pure function of the features."""
+def assign_groups(files: list[ScannedFile], root_rel: str | None,
+                  refs_of: "Callable[[ScannedFile], tuple[str, ...]] | None" = None) -> list[ScannedFile]:
+    """Set `group` on PE files (data/unreadable keep theirs). Pure function of the features;
+    `refs_of` reads the AssemblyRef names of a managed file on demand (default: `f.refs`)."""
+    refs_of = refs_of or (lambda f: f.refs)
     pes = [f for f in files if f.kind == "pe" and f.group != "unreadable"]
     by_name: dict[str, list[ScannedFile]] = defaultdict(list)
     for f in pes:
         by_name[Path(f.rel_path).name.lower()].append(f)
 
     groups: dict[str, str] = {}
+    fw_root = root_rel is not None and is_framework_name(root_rel)   # a framework assembly chosen as root
     for f in pes:
-        if is_runtime_name(Path(f.rel_path).name):
+        if is_runtime_name(Path(f.rel_path).name) or (f.dotnet and not fw_root
+                                                      and is_framework_name(f.rel_path)):
             groups[f.rel_path] = "runtime"
+        elif f.apphost:
+            groups[f.rel_path] = "apphost"      # the managed app dll is analysed instead
 
     root = next((f for f in pes if f.rel_path == root_rel), None)
     root_vendor = normalise_vendor(root.company) if root else None
     core: set[str] = set()
+
+    def where(f: ScannedFile) -> str:      # assemblies resolve by simple name beside the referrer
+        return f.rel_path.rpartition(BUNDLE_SEP)[0] or str(Path(f.rel_path).parent)
+
+    def stem(f: ScannedFile) -> str:
+        return Path(f.rel_path.rpartition(BUNDLE_SEP)[2]).stem.lower()
+
+    by_stem: dict[tuple[str, str], list[ScannedFile]] = defaultdict(list)
+    for f in pes:
+        if f.dotnet:
+            by_stem[(where(f), stem(f))].append(f)
     if root and root.rel_path not in groups:
         core.add(root.rel_path)
         stack = [root]
         while stack:
             cur = stack.pop()
+            for ref in refs_of(cur):   # managed: own assemblies are the ones the app references
+                for cand in by_stem.get((where(cur), ref), ()):
+                    if cand.rel_path in core or cand.rel_path in groups:
+                        continue
+                    v = normalise_vendor(cand.company)
+                    if v is None:
+                        ok = not _THIRD_PARTY_RE.match(stem(cand))
+                    else:
+                        ok = vendor_matches(root_vendor, v)
+                    if ok:
+                        core.add(cand.rel_path)
+                        stack.append(cand)
             for imp in cur.imports:
                 for cand in by_name.get(imp, ()):
                     if cand.rel_path in core or cand.rel_path in groups or not cand.is_dll:
@@ -306,6 +385,45 @@ def assign_groups(files: list[ScannedFile], root_rel: str | None) -> list[Scanne
             for f in files]
 
 
+# --- apphosts and single-file bundles -----------------------------------------------
+
+def _host_files(full: Path, rel: str, sf: ScannedFile, files: list[ScannedFile]) -> ScannedFile:
+    """A single-file bundle contributes its managed entries as virtual files ``host.exe!X.dll``; an
+    apphost points at the managed dll beside it. Returns the host file (``apphost`` = the app dll);
+    a plain native exe comes back unchanged."""
+    entries = bundle_manifest(full)
+    if entries:
+        hstem = Path(rel).stem.lower()
+        app = ""
+        found: list[ScannedFile] = []
+        for e in entries:
+            if e.kind != "assembly":
+                continue
+            erel = f"{rel}{BUNDLE_SEP}{e.path}"
+            if is_framework_name(e.path):      # framework assemblies are not parsed: names only
+                found.append(ScannedFile(erel, "pe", "", e.size, 0, None, True, True, False, None,
+                                         None, (), 0, managed=True))
+                continue
+            try:
+                data = read_bundle_entry(full, e)
+            except Exception:  # noqa: BLE001  damaged entry: listed as unreadable
+                found.append(ScannedFile(erel, "pe", "unreadable", e.size, 0, None, False, False,
+                                         False, None, None, (), 0))
+                continue
+            found.append(_read_pe(None, erel, e.size, data))
+        for f in found:
+            if f.has_entry and (Path(f.rel_path.partition(BUNDLE_SEP)[2]).stem.lower() == hstem
+                                or not app):
+                app = f.rel_path
+        files.extend(found)
+        return dataclasses.replace(sf, apphost=app) if app else sf
+    if bundle_marker(full) == 0:                    # an apphost: the managed dll lies beside it
+        for name in apphost_targets(full):
+            if (full.parent / name).is_file():
+                return dataclasses.replace(sf, apphost=(name if "/" not in rel else rel.rsplit("/", 1)[0] + "/" + name))
+    return sf
+
+
 # --- scan -----------------------------------------------------------------------
 
 def _pick_root(files: list[ScannedFile], named: str | None,
@@ -324,7 +442,10 @@ def _pick_root(files: list[ScannedFile], named: str | None,
         hits = [f for f in pes if f.rel_path.lower() == low] or \
                [f for f in pes if Path(f.rel_path).name.lower() == low.rsplit("/", 1)[-1]]
         if hits:
-            return min(hits, key=lambda f: f.rel_path.count("/")).rel_path, "named by user", [], False, []
+            hit = min(hits, key=lambda f: f.rel_path.count("/"))
+            if hit.apphost:
+                return hit.apphost, f"named by user: apphost {Path(hit.rel_path).name}", [], False, []
+            return hit.rel_path, "named by user", [], False, []
         return None, f"named executable '{named}' not found as a PE", [], False, []
     elig = [f for f in pes if is_root_candidate(f)]
     fallback = ""
@@ -365,7 +486,7 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
     ref = _tokens(folder)
     if prod_count:
         ref |= _tokens(max(prod_count, key=prod_count.get))
-    biggest = max(f.code_size for f in pool)
+    biggest = max(f.code_size or f.meta_size for f in pool)
     dlls = [f for f in pes if f.is_dll]
     out = []
     for f in pool:
@@ -384,10 +505,10 @@ def _score_roots(pool: list[ScannedFile], pes: list[ScannedFile],
                      for d in dlls):
             score += 1
             why.append("plugins")
-        if f.code_size == biggest:
+        if (f.code_size or f.meta_size) == biggest:
             score += 1
             why.append("largest code")
-        out.append((f.rel_path, score, ", ".join(why) or "none", f.code_size))
+        out.append((f.rel_path, score, ", ".join(why) or "none", f.code_size or f.meta_size))
     out.sort(key=lambda t: (-t[1], -t[3]))
     return [(r, sc, w) for r, sc, w, _ in out]
 
@@ -431,14 +552,34 @@ def scan_program(path: Path, root_exe: str | None = None,
                                          False, None, None, (), 0))
                 continue
             if size >= 64 and _is_pe_magic(full):
-                files.append(_read_pe(full, rel, size))
+                sf = _read_pe(full, rel, size)
+                if not sf.dotnet and not sf.is_dll and sf.group != "unreadable":
+                    sf = _host_files(full, rel, sf, files)
+                files.append(sf)
             else:
                 files.append(ScannedFile(rel, "data", "data", size, 0, None, False, False,
                                          False, None, None, (), 0))
     files.sort(key=lambda f: f.rel_path.lower())
 
     root_rel, reason, others, amb, ranking = _pick_root(files, root_exe, base)
-    files = assign_groups(files, root_rel)
+    cache: dict[str, tuple[str, ...]] = {}
+
+    def refs_of(f: ScannedFile) -> tuple[str, ...]:     # only the assemblies the root reaches are read
+        if f.refs or not f.managed:
+            return f.refs
+        if f.rel_path not in cache:
+            host, sep, ename = f.rel_path.partition(BUNDLE_SEP)
+            refs: tuple[str, ...] = ()
+            if not sep:
+                refs = _assembly_refs(base / f.rel_path)
+            else:
+                e = next((x for x in bundle_manifest(base / host) or [] if x.path == ename), None)
+                if e is not None:
+                    refs = _assembly_refs(read_bundle_entry(base / host, e))
+            cache[f.rel_path] = refs
+        return cache[f.rel_path]
+
+    files = assign_groups(files, root_rel, refs_of)
 
     present = {Path(f.rel_path).name.lower() for f in files}
     system = sorted({i for f in files if f.kind == "pe" for i in f.imports
@@ -513,6 +654,17 @@ def render_scan(result: ScanResult) -> list[str]:
                      f"{_fmt_time(o.est_seconds)} | largest (added): {_largest(added)}")
         prev = o
 
+    for h in (f for f in files if f.apphost):
+        n = sum(1 for f in files if f.rel_path.startswith(h.rel_path + BUNDLE_SEP))
+        kind = f"single-file bundle, {n} assemblies" if n else "apphost"
+        lines.append(f"host {Path(h.rel_path).name}: {kind}; starts "
+                     f"{Path(h.apphost.rpartition(BUNDLE_SEP)[2]).name}; not analysed (add= to include)")
+    r2 = sum(1 for f in files if f.r2r)
+    if r2:
+        lines.append(f"ReadyToRun: {r2} assemblies, read from IL and metadata; native code not imported")
+    for f in files:
+        if f.nativeaot:
+            lines.append(f"NativeAOT: {Path(f.rel_path).name} has no .NET metadata; names only from symbols")
     rt = [f for f in files if f.group == "runtime"]
     if rt:
         lines.append(f"runtime | {len(rt)} files | {_mb(sum(f.code_size for f in rt))} code | "

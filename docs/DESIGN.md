@@ -1333,6 +1333,7 @@ program was available. 32-bit own libraries work the same way and are listed bes
 |---|---|---|
 | `dotnet_types` | `query?`, `limit=50`, `binary?`, `kind?`, `cursor?`, `budget?` | types/methods from `dnfile` metadata, incl. P/Invoke declarations (`module!entry`, `=> binary!export` when bound) and COM imports. Without `kind`: types, plus P/Invokes and methods that match `query`. `kind` = `type`, `method`, `pinvoke` or `com` |
 | `dotnet_decompile` | `type`, `member?`, `binary?`, `cursor?`, `budget?` | C# from `ilspycmd`, one type at a time, cached in `dirty\.airlock\cache\dotnet\`; first line marks it as a reconstruction. `type` is the full name, or a unique suffix. `error tool_missing` without a configured ilspycmd |
+| `dotnet_events` | `form?`, `component?`, `event?`, `binary?`, `cursor?`, `budget?` | controls with captions and the event handlers wired to them (`server/dotnet_ui.py`). WinForms: IL of `InitializeComponent` and of the other methods of `System.Windows.Forms` types (`ldftn`, `newobj`, `callvirt add_<Event>`, `set_Text`; receiver = `ldfld` field, the form, or a local stored into a field); captions also from the form `.resources`. WPF: BAML read as XAML by `ilspycmd --resource` (11.x, cached in `cache\dotnet\...aml\`): event attributes, `EventSetter`, `Command` joined to `CommandBinding Executed`. Filters match exact, then prefix, then part (control, caption, handler or command for `component`); a widened match gets a fact line. Handler tokens are MethodDef tokens. **[verified]** on KeePass 2.60 (830 WinForms events; `m_menuToolsGeneratePwList` "Generate Password &List..." Click -> `OnToolsGeneratePasswordList`) and Dependencies 1.11.1 (64 WPF rows; `UserSettingsItem` "_Properties" Command `local:MainWindow.OpenUserSettingsCommand` -> `OpenUserSettingsCommandBinding_Executed`). |
 
 Both are dirty-role only. Tables: `dn_type`, `dn_method`, `dn_pinvoke` (schema v11, meta
 `dotnet_version:<id>`). Every managed method is a function (space ram, entry = MethodDef token, size 1,
@@ -1358,7 +1359,7 @@ MFC message map entries.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `pe_resources` | `type?` | resource inventory: type, id/name, language, size |
+| `pe_resources` | `type?` | resource inventory: type, id/name, language, size; managed assembly: `managed` lines per ManifestResource (name, size, embedded or linked) and the entries of `*.g.resources` (BAML names, **[verified]**: 37 entries in Dependencies' `g.resources`); `type=managed\|resources\|baml` lists the entries of all `.resources` (string entries with a text preview, others with the type) or only the BAML names |
 | `dialogs` | `id?` | no id: one line per dialog (caption, control count, size, languages). With id: DLGTEMPLATE/DLGTEMPLATEEX controls with id, class (predefined atoms by name), caption, short style words (`BS_DEFPUSHBUTTON,tabstop,hidden`); each control line ends with `-> BN_CLICKED Class::Handler, EN_CHANGE Class::Other` when a message map handles its id (the handlers of the dialog's own class win over other classes that share the id); the dialog line names its class |
 | `menus` | `id?` | no id: one line per menu (item and popup counts, top-level captions). With id: MENU/MENUEX tree, one line per item: `id=<n> <popup path>`, popups as `<caption> >`; an item with handlers ends with `-> Class::OnOpen; update -> Class::OnUpdateOpen` |
 | `string_tables` | `query?`, `limit=50` | id → string (RT_STRING id = (block-1)*16 + index); query is an id or a substring |
@@ -2518,6 +2519,14 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   runtimes are installed: airlock sets that for the child process only. With SDK 7 the tool installs
   from nuget.org with `dotnet tool install ilspycmd --version 8.2.0.7535 --tool-path <folder>
   --add-source https://api.nuget.org/v3/index.json`. One type of a 6 MB assembly takes under 1 s.
+  **[verified 2026-11-06]** ilspycmd 11.2.0.10050 (NativeAOT, nuget `ilspycmd.win-x64`, file
+  `tools/any/win-x64/ilspycmd.exe`, 21 MB, no runtime): `-m 0x06xxxxxx` prints one method (0.1-0.3 s per call
+  on ILSpy.dll and KeePass; also MoveNext of an async state machine and a closure lambda `<X>b__0`),
+  `--list-resources`, `--resource <name>` (BAML to XAML), `-t` as before. It decompiles the .NET 10
+  assemblies ILSpy.dll and ICSharpCode.ILSpyX.dll that 8.2 rejects. `-m` in 9.x/10.x **[verify]**.
+  Use: `dotnet_decompile member=` resolves the name to method tokens (type, then its nested types, then
+  `get_/set_/add_/remove_` accessors) and runs `-m` per token; with ilspycmd below 11 the type is
+  decompiled and the member cut out of the text (`member_text`, nested members at deeper tab levels).
 - P/Invoke declarations link managed code to the native exports of the same project (xedge kind
   `pinvoke`). COM interop declarations (`ComImport`) are listed in `dotnet_types kind=com` only,
   with the GUID from the `GuidAttribute` (flag `guid=<lower>` in `dn_type.flags`).
@@ -2545,12 +2554,48 @@ Free Pascal programs go through the same tools (`delphi_classes`, `delphi_forms`
   label/global renames and `comment` are refused as well. `annotate` stores the note (index `note`
   table, no plate mirror) and, when `new_name` is given, adds the `error managed` line after the
   note line.
-- ilspycmd output is cached in `cache\dotnet\<sha16>-<ilspycmd version>\` (version from
+- ilspycmd output is cached in `cache\dotnet\<sha16>-<ilspycmd version>\t_<type token>.cs` and `m_<method token>.cs` (version from
   `ilspycmd --version`, asked once per process; the file size stands in when it prints none).
   **[verified]** System.Windows.Forms.dll (6 MB): 2416 types, 30149 methods, 625 P/Invokes,
   227 COM types, 92977 call edges, 2535 external callees, indexed in 8 s (dnfile alone takes 6 s).
 
 ---
+
+Managed names and cross-assembly callers: see HANDOVER ".NET (M7)": `Type::Name(params)` selectors, signature
+candidates, token over IJW thunk, `xrefs` callers of `mcall`/`pinvoke` slots **[verified]**.
+
+- IL sites and strings **[verified]**: edge column `site` (IL offset); `ldstr` rows at `US_BASE | #US
+  offset` (`US_BASE = 1 << 48`, own window; shown as `us:0x0002ece7`, accepted by selectors; `ensure`
+  deletes only that window) with `data` edges; DOTNET_VERSION 6, SCHEMA_VERSION 15; `ldftn` is one `fnptr` edge; edge kind `body` links an async or
+  iterator stub to `MoveNext` (`function` prints `body: <MoveNext> (async)`); generic instances keep their type arguments in external labels.
+
+- Type-system facts (P5, P7, P10; `server/dotnet_meta.py`) **[verified]**: tables `dn_rel` (base type and interfaces per type,
+  by full name), `dn_override` (method -> the interface method it implements or the virtual it overrides: explicit `MethodImpl`
+  rows first, then name + parameter list along the local `Extends` chain, a `newslot` method starts a new chain; a base in
+  another assembly is stored by type name and matched at query time), `dn_field` (+ `FieldLayout` offset, `Constant`),
+  `dn_layout` (`ClassLayout`, explicit/sequential), `dn_prop`, `dn_event` (`MethodSemantics` accessors), `dn_native`.
+  They are in `schema.sql` (schema v16, migration `_v16`, derived) and rebuilt with the other `dn_*` tables.
+  `dotnet_types kind=impl|field|property|event`: `impl IStatusLogger` lists implementers (transitive: `implements`,
+  `extends`, `inherits`), `impl IStatusLogger::SetText` or `impl Control::OnPaint` lists `impl` / `override` methods across
+  all managed binaries of the project; `type` lines show `: Base, IFace`. `field Type` prints the layout
+  (`struct ... explicit size=40`, `+0x08 ushort Y`, enum members `Green = 2`); `field Type::Field` adds `read by` and
+  `written by` methods. IL operands of fields print as `Type::Field`. `ldfld/ldflda/ldsfld/ldsflda` write edges kind `read`,
+  `stfld/stsfld` kind `write` to the field token (`0x04xxxxxx`); `xrefs` shows them as `Type::Field`. `xrefs` of an
+  interface or virtual method adds `impl`/`override` lines, of an implementation `implements`/`overrides`; `callgraph`
+  adds `(impl)`, `(override)`, `(declaration)`, `(native)` children. A query that names no project type is looked up in
+  the framework assemblies on the machine (`Environment.SpecialFolder` -> `ApplicationData = 26`; first call 5 s,
+  .NET Framework 4 folder first, else the newest `Microsoft.NETCore.App`). Probe: KeePass.exe 2.60 `impl IStatusLogger`
+  = 8 types in 1 s (all that exist in the binary), `SpecializedKeyboardINPUT64` explicit size 40 with 6 offsets.
+- C++/CLI native methods (P7) **[verified]**: a MethodDef with `miNative|miUnmanaged`, an RVA, no ImplMap row and no IL
+  goes to `dn_native`. After the Ghidra analysis `Indexer.bind_native_methods` creates a function at image base + RVA
+  (worker `create_functions`), names functions that still have the default name after the method (worker op
+  `name_functions`, source IMPORTED = name_state `library`, namespace = the type, e.g. `<Module>`), reads the functions
+  back and writes an edge `native` from the token function. `function`/`decompile`/`asm` on the token forward to the
+  native function (`// native body of <Module>::PhLoadMappedImage at 0x180001220`). ClrPhlib.dll (Dependencies 1.11.1):
+  34 native methods, 34 edges; `PhLoadMappedImage` (RVA 0x1220) decompiles through the token.
+  Not done **[verify]**: sequential-layout offsets and sizes (only explicit layouts print offsets), enum names for
+  integer arguments inside IL listings (the enum lookup above is a separate query). `xrefs` accepts `Type::Field`
+  (one match -> the field token, several -> `error ambiguous` with candidates).
 
 ## 12. Milestones
 
@@ -2620,3 +2665,12 @@ left there, waited W s.`; `function` does not retry that error. Internal callers
 session bound to that project, and `waiting for analysis` only while the queue is busy.
 `project_create` shows the real states of the other executables: `(1 importing, 2 queued)`.
 - Round 10 (B), function creation (§7.3): never from `xrefs`; never over a string, the middle of a string or its Delphi header (error line with the string and its references); a failed trial is undone; an address with no call reference inside the flow of an earlier call target resolves to that routine (created from its start). The fix pass also creates direct call targets that lie in no function (`FIX_VERSION` 6) and adds operand data references for the new code. **[verified]** TS.exe: 92 functions created, the writer at 0x004c1984 is found from an interior address, its strings show their references.
+
+### 5.0a .NET files in the scan (single-file bundles, apphosts, R2R, NativeAOT)
+
+- A single-file bundle (marker `8b 12 02 b9 ... 6a ae` with a header offset) is read by `projects.bundle_manifest`; managed entries
+  appear as virtual files `Host.exe!Entry.dll`, are stored as artifacts by their own bytes and indexed as normal managed binaries
+  (named `Entry.dll`). The host is group `apphost` and not analysed unless added. **[verified]** bundle v6 (real), v1/v2 (synthetic);
+  **[verify]** compressed entries on a real self-contained bundle (raw deflate).
+- An apphost (marker with offset 0) names the managed dll beside it; that dll is the root.
+- `BinaryInfo.r2r` (RTR header) is managed-only: IL path, no Ghidra import (**[verified]** on System.Diagnostics.Process.dll 8.0.33: 1.0 s, 1182 managed functions, instead of 62 s and 2592 Ghidra functions). Toolchain `nativeaot` = no CLI header and export `DotNetRuntimeDebugHeader` (**[verified]** on ilspycmd 11.2: detect = nativeaot, scan line).

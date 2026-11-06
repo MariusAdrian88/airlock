@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from airlock.index.store import Function, Store
+from airlock.index.store import DN_METHOD_HI, DN_METHOD_LO, US_BASE, Function, Store
 
 _SPACE_ADDR = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(?:0[xX])?([0-9a-fA-F]+)$")
 _BARE_HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -30,6 +30,8 @@ class Resolved:
 
 def fmt_addr(value: int, pointer_size: int | None = 4, space: str = "ram") -> str:
     """``0x`` + lowercase hex zero-padded to pointer size; non-ram spaces get a prefix."""
+    if value >= US_BASE:                      # a .NET user string: space ``us``, offset in the #US heap
+        return f"us:0x{value - US_BASE:08x}"
     width = (pointer_size or 4) * 2
     s = f"0x{value:0{width}x}"
     return s if space == "ram" else f"{space}:{s}"
@@ -49,6 +51,8 @@ def parse_address(target: str) -> tuple[str, int] | None:
         space = "EXTERNAL" if m.group(1).lower() == "external" else m.group(1)
         if m.group(1).lower() == "ram":
             space = "ram"
+        if m.group(1).lower() == "us":        # .NET user string: an address in its own window
+            return "ram", US_BASE | int(m.group(2), 16)
         return space, int(m.group(2), 16)
     return None
 
@@ -209,6 +213,129 @@ def alias_functions(store: Store, binary_id: int, target: str) -> list[Function]
     return out
 
 
+# -- managed overloads (P19) ----------------------------------------------------------------------
+
+_TYPE_ALIAS = {"string": "string", "boolean": "bool", "int32": "int", "int64": "long", "uint32": "uint",
+               "uint64": "ulong", "int16": "short", "uint16": "ushort", "byte": "byte", "sbyte": "sbyte",
+               "single": "float", "double": "double", "object": "object", "char": "char", "void": "void",
+               "intptr": "intptr", "uintptr": "uintptr"}
+_QUALIFIER = re.compile(r"\b(?:ref|out|in)\s+")
+_IDENT_PART = re.compile(r"[A-Za-z_][\w.`+]*")
+_SELECTOR = re.compile(r"^([^()]+?)\s*\((.*)\)\s*$", re.S)
+
+
+def is_managed(f: Function) -> bool:
+    """A .NET method row (token entry), not its IJW native body or an import."""
+    return f.space == "ram" and DN_METHOD_LO <= f.entry < DN_METHOD_HI
+
+
+def _norm_type(t: str) -> str:
+    """Loose form of a type name: no namespace, no generic arity, no ref/out/in, ``String`` = ``string``."""
+    t = _QUALIFIER.sub("", t.strip())
+
+    def one(m: re.Match) -> str:
+        w = m.group(0).split("`", 1)[0].rsplit(".", 1)[-1].replace("+", ".")
+        return _TYPE_ALIAS.get(w.lower(), w.lower())
+    return re.sub(r"\s+", "", _IDENT_PART.sub(one, t.replace("&", "")))
+
+
+def _split_params(text: str) -> list[str]:
+    out: list[str] = []
+    depth, cur = 0, ""
+    for ch in text:
+        if ch in "<[":
+            depth += 1
+        elif ch in ">]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip() or out:
+        out.append(cur)
+    return [_norm_type(p) for p in out if p.strip()]
+
+
+def sig_params(sig: str | None) -> list[str] | None:
+    """Normalised parameter types of a stored managed signature ``ret(p1, p2)``; None when unknown."""
+    if not sig or "(" not in sig or ")" not in sig:
+        return None
+    return _split_params(sig[sig.index("(") + 1:sig.index(")")])
+
+
+def parse_selector(target: str) -> tuple[str, list[str] | None]:
+    """``(name, params)`` of ``Type::Name(int, string)``; params is None without parentheses."""
+    m = _SELECTOR.match(target.strip())
+    if not m:
+        return target.strip(), None
+    return m.group(1).strip(), _split_params(m.group(2))
+
+
+def managed_named(store: Store, binary_id: int, name: str) -> list[Function]:
+    """Managed methods named ``Type::Name`` or ``Type.Name`` (namespace and type before the last separator)."""
+    out = [f for f in store.functions_by_name(binary_id, name) if is_managed(f)]
+    if out:
+        return out
+    head, sep, meth = name.rpartition(".")
+    if not (sep and head and meth):
+        return []
+    rows = store.db.execute(
+        "SELECT entry, space FROM function WHERE binary_id=? AND space='ram' AND entry>=? AND entry<? "
+        "AND name=? AND namespace=? ORDER BY entry", (binary_id, DN_METHOD_LO, DN_METHOD_HI, meth, head)).fetchall()
+    return [f for f in (store.function_at(binary_id, r[0], r[1]) for r in rows) if f is not None]
+
+
+def describe(fns: list[Function], psize: int | None, qualified: bool = False) -> list[str]:
+    """Candidate texts: ``0xaddr`` for native functions, ``0xtoken Name(sig)`` for managed ones (the qualified
+    name when the candidates do not all share one)."""
+    qual = qualified or len({f.qualified_name for f in fns if is_managed(f)}) > 1
+    out = []
+    for f in fns:
+        a = fmt_addr(f.entry, psize, f.space)
+        if is_managed(f):
+            sig = f.signature or ""
+            ret, _, rest = sig.partition("(")
+            out.append(f"{a} {f.qualified_name if qual else f.name}({rest}" if rest else f"{a} {f.qualified_name}")
+        else:
+            out.append(a)
+    return out
+
+
+def prefer_token(fns: list[Function], psize: int | None) -> tuple[Function, str] | None:
+    """One managed token plus native bodies of the same name (C++/CLI IJW thunk): the token and a fact line."""
+    managed = [f for f in fns if is_managed(f)]
+    native = [f for f in fns if not is_managed(f) and not f.is_external]
+    if len(managed) == 1 and native and len(managed) + len(native) == len(fns):
+        return managed[0], "native thunk " + ", ".join(fmt_addr(f.entry, psize, f.space) for f in native)
+    return None
+
+
+def _ambiguous(target: str, fns: list[Function], psize: int | None) -> Resolved:
+    shown = fns[:MAX_CANDIDATES]
+    more = f" (+{len(fns) - len(shown)} more)" if len(fns) > len(shown) else ""
+    return _error("ambiguous", f"'{target}' matches {len(fns)} functions: "
+                  + ", ".join(describe(shown, psize)) + more)
+
+
+def by_selector(store: Store, binary_id: int, target: str, psize: int | None) -> Resolved | None:
+    """``Type::Name(params)`` and ``Type.Name`` for managed methods; None when it is not one."""
+    name, params = parse_selector(target)
+    if params is None and "." not in name:
+        return None
+    cands = managed_named(store, binary_id, name)
+    if not cands:
+        return None
+    picked = cands if params is None else [f for f in cands if sig_params(f.signature) == params]
+    if len(picked) == 1:
+        f = picked[0]
+        return Resolved(function=f, note=f"resolved '{target}' to {describe([f], psize)[0]}")
+    if not picked:
+        return _error("not_found", f"no overload of '{name}' takes ({', '.join(params or [])}); "
+                      f"overloads: " + ", ".join(describe(cands[:MAX_CANDIDATES], psize)))
+    return _ambiguous(target, picked, psize)
+
+
 def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
     """Resolve ``target`` to a function of the binary.
 
@@ -235,14 +362,14 @@ def resolve_function(store: Store, binary_id: int, target: str) -> Resolved:
         local = [f for f in fns if not f.is_external]
         if len(local) == 1:
             return Resolved(function=local[0])
-    if len(fns) > 1:
-        shown = fns[:MAX_CANDIDATES]
-        cands = ", ".join(fmt_addr(f.entry, psize, f.space) for f in shown)
-        more = f" (+{len(fns) - len(shown)} more)" if len(fns) > len(shown) else ""
-        return _error(
-            "ambiguous",
-            f"'{target}' matches {len(fns)} functions: {cands}{more}",
-        )
+        pt = prefer_token(fns, psize)
+        if pt is not None:
+            return Resolved(function=pt[0], note=pt[1])
+        return _ambiguous(target, fns, psize)
+    if not fns:
+        sel = by_selector(store, binary_id, target, psize)
+        if sel is not None:
+            return sel
 
     if _BARE_HEX.match(target):
         return _by_address(store, binary_id, "ram", int(target, 16), psize, target)

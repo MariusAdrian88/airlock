@@ -18,7 +18,7 @@ import pytest
 
 from airlock.config.loader import deep_merge, default_config_text, parse_jsonc, resolve
 from airlock.index.migrations import MIGRATIONS
-from airlock.index.store import SCHEMA_VERSION, Store
+from airlock.index.store import SCHEMA_VERSION, US_BASE, Store
 from airlock.projects import detect, hash_file, read_manifest, write_manifest
 from airlock.server import dotnet as dn
 from airlock.server import registry
@@ -31,7 +31,11 @@ from test_tools import FakeWorker
 
 CSC = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe")
 SWF = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Windows.Forms.dll")
-ILSPY = Path(__file__).resolve().parents[1] / ".venv" / "dotnet-tools" / "ilspycmd.exe"
+ILSPY = next((c for c in (Path(__file__).resolve().parents[1] / ".venv" / "dotnet-tools" / "ilspycmd.exe",
+                          Path(__file__).resolve().parents[4] / ".venv" / "dotnet-tools" / "ilspycmd.exe")
+              if c.is_file()), Path(__file__).resolve().parents[1] / ".venv" / "dotnet-tools" / "ilspycmd.exe")
+# ilspycmd 11 (NativeAOT, no .NET runtime) for the per-method tests: the tool folder (`airlock doctor --fix` installs it)
+ILSPY11 = ILSPY if ILSPY.is_file() and dn.ilspy_major(ILSPY) >= 11 else None
 
 SOURCE = """
 using System;
@@ -514,7 +518,8 @@ def app_dll(tmp_path_factory, managed_dll) -> Path:
 def test_il_scan_and_headers():
     code = (b"\x28\x01\x00\x00\x06" b"\x6f\x02\x00\x00\x0a" b"\xfe\x06\x03\x00\x00\x06"
             b"\x45\x02\x00\x00\x00" + b"\x00" * 8 + b"\x73\x04\x00\x00\x2b" b"\x1f\x28\x2b\x00\x2a")
-    assert dn._scan_calls(code) == [(0, 0x06000001), (0, 0x0A000002), (1, 0x06000003), (0, 0x2B000004)]
+    assert dn._scan_calls(code) == [(0, 0x06000001, 0), (0, 0x0A000002, 5), (3, 0x06000003, 10),
+                                    (0, 0x2B000004, 29)]
     assert dn._scan_calls(b"\xa6\x28\x01\x00\x00\x06") == []               # undefined opcode stops the scan
     tiny = bytes([(len(code) << 2) | 2]) + code
     assert dn.il_body(b"\x00" + tiny, 1) == (code, 1)
@@ -534,7 +539,8 @@ def test_call_edges_parse(app_dll):
     assert (run, local, "call") in edges
     assert (run, gen_set, "call") in edges               # MemberRef on Gen<int> resolved to the local MethodDef
     assert (gen_set, touch, "call") in edges
-    assert (ptr, local, "data") in edges                 # ldftn
+    assert (ptr, local, "fnptr") in edges                # ldftn: one edge kind, no data twin
+    assert (ptr, local, "data") not in edges
     ext = {label: (tk, dll) for tk, (dll, label) in p.refs.items()}
     assert ext["Demo.Native.Api::Managed(int)"][1] == "t.dll"
     assert ext["System.String::Concat(string, string)"][1] == "mscorlib.dll"
@@ -654,8 +660,8 @@ def il_dll(tmp_path_factory) -> Path:
 def test_il_scan_jmp_ldtoken_calli_bytes():
     code = (b"\x27\x01\x00\x00\x06" b"\xd0\x02\x00\x00\x06" b"\xd0\x01\x00\x00\x02"
             b"\x29\x01\x00\x00\x11" b"\x2a")
-    assert dn._scan_calls(code) == [(0, 0x06000001), (1, 0x06000002), (1, 0x02000001)]   # calli: no entry
-    assert dn.DOTNET_VERSION == 3
+    assert dn._scan_calls(code) == [(0, 0x06000001, 0), (1, 0x06000002, 5), (1, 0x02000001, 10)]   # calli: no entry
+    assert dn.DOTNET_VERSION >= 4
 
 
 def test_jmp_ldtoken_calli_edges_and_listing(tmp_path, il_dll):
@@ -847,3 +853,269 @@ def test_mixed_mode_assembly_through_ghidra(tmp_path):
         assert "type " in dt.dotnet_types(ctx, binary=b.name)
     finally:
         ctx.worker.stop()
+
+
+# -- IL sites, user strings, generics, state machines -------------------------------------------
+
+SITES_SOURCE = """
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+namespace Demo.Sites {
+  public class Form {
+    public const string Long = "Generate a long password with the selected profile and copy it now";
+    public void Hello() { Console.WriteLine("Password List"); Console.WriteLine("Password List"); }
+    public void Wire() { Action a = Handler; Func<int> f = Counter; }
+    void Handler() { }
+    int Counter() { return 3; }
+    public object Gen() {
+      uint? n = 5u;
+      var t = Tuple.Create("a", 1);
+      var u = new Tuple<string, long>("b", 2);
+      return n.HasValue ? (object)t : u;
+    }
+    public string LongText() { return "Generate a long password with the selected profile and copy it now"; }
+    public async Task<int> RunAsync() { await Task.Delay(1); return 1; }
+    public IEnumerable<int> Iter() { yield return 1; yield return 2; }
+  }
+}
+"""
+
+
+@pytest.fixture(scope="session")
+def sites_dll(tmp_path_factory) -> Path:
+    if not CSC.is_file():
+        pytest.skip("needs the .NET Framework C# compiler")
+    d = tmp_path_factory.mktemp("sites")
+    (d / "s.cs").write_text(SITES_SOURCE, encoding="utf-8")
+    r = subprocess.run([str(CSC), "/nologo", "/target:library", "/out:sites.dll", "s.cs"], cwd=d,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return d / "sites.dll"
+
+
+def test_schema_has_edge_site(tmp_path):
+    st = Store(tmp_path / "i.db")
+    assert any(r[1] == "site" for r in st.db.execute("PRAGMA table_info(edge)"))
+    assert SCHEMA_VERSION >= 15 and 15 in MIGRATIONS
+
+
+def test_ldstr_rows_and_edges(tmp_path, sites_dll):
+    ctx = make_dn_ctx(tmp_path)
+    bid = add_managed(ctx, sites_dll, "sites.dll")
+    st = ctx.indexer.store("proj")
+    long_txt = "Generate a long password with the selected profile and copy it now"
+    rows = {r["value"]: r for r in st.db.execute("SELECT address, encoding, value FROM string WHERE binary_id=?", (bid,))}
+    assert long_txt in rows and "Password List" in rows
+    assert rows["Password List"]["encoding"] == "utf16le" and rows["Password List"]["address"] >= US_BASE
+    out = core.strings(ctx, "Password List")
+    assert "us:0x" in out and "utf16le" in out and "Demo.Sites.Form::Hello" in out
+    xr = core.xrefs(ctx, f"us:0x{rows['Password List']['address'] - US_BASE:08x}", direction="to")
+    lines = [ln for ln in xr.splitlines() if "Hello" in ln]
+    assert len(lines) == 2 and all("+IL_" in ln and ln.rstrip().endswith("data") for ln in lines), xr
+    assert core.strings(ctx, "copy it now").count("Demo.Sites.Form::") >= 1          # found in full
+    asm = core.function(ctx, "sites.dll!LongText", view="asm")
+    assert f'ldstr "{long_txt}"' in asm                                                # not cut at 40
+    p = dn.parse_file(sites_dll)
+    assert all(uo < 0x1000000 for uo in p.strings)
+    assert not core.strings(ctx, "zzz-nothing").startswith("strings")
+
+
+def test_ldftn_one_line_with_il_offset(tmp_path, sites_dll):
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, sites_dll, "sites.dll")
+    out = core.xrefs(ctx, "sites.dll!Handler", direction="to").splitlines()
+    body = [ln for ln in out[1:] if "Form::Wire" in ln]
+    assert len(body) == 1 and "+IL_" in body[0] and body[0].rstrip().endswith("fnptr"), out
+    assert not any(ln.rstrip().endswith(" data") and "Wire" in ln for ln in out)
+    frm = core.xrefs(ctx, "sites.dll!Wire", direction="from")
+    assert "+IL_" in frm
+
+
+def test_generic_instances_keep_arguments(sites_dll):
+    p = dn.parse_file(sites_dll)
+    labels = {label for _tk, (_dll, label) in p.refs.items()}
+    assert any(l.startswith("System.Nullable<uint>::.ctor") for l in labels), sorted(labels)
+    assert any(l.startswith("System.Tuple<string, long>::.ctor") for l in labels), sorted(labels)
+    assert not any("`" in l.split("::")[0] for l in labels if "Nullable" in l or "Tuple" in l)
+    assert dn._open_name("System.Tuple<string, long>") == "System.Tuple`2"
+    assert dn._open_name("System.Tuple<string, List<int>, long>") == "System.Tuple`3"
+    assert dn._open_name("Plain.Type") == "Plain.Type"
+
+
+def test_generic_instance_listing(tmp_path, sites_dll):
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, sites_dll, "sites.dll")
+    asm = core.function(ctx, "sites.dll!Gen", view="asm")
+    assert "call System.Nullable<uint>::.ctor(T0)" in asm
+    assert "System.Tuple<string, long>::.ctor(T0, T1)" in asm
+
+
+def test_state_machine_body_edges(tmp_path, sites_dll):
+    p = dn.parse_file(sites_dll)
+    tname = {t.token: t.name for t in p.types}
+    meth = {(tname[m.type_token], m.name): m.token for m in p.methods}
+    body = {(a, b) for a, b, k in p.calls if k == "body"}
+    move_a = next(t for (tn, n), t in meth.items() if n == "MoveNext" and "RunAsync" in tn)
+    move_i = next(t for (tn, n), t in meth.items() if n == "MoveNext" and "Iter" in tn)
+    assert (meth["Demo.Sites.Form", "RunAsync"], move_a) in body
+    assert (meth["Demo.Sites.Form", "Iter"], move_i) in body
+    assert len(body) == 2
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, sites_dll, "sites.dll")
+    cg = core.callgraph(ctx, "sites.dll!RunAsync", direction="callees", depth=1)
+    assert "MoveNext" in cg and "(async body)" in cg, cg
+    cg2 = core.callgraph(ctx, "sites.dll!Iter", direction="callees", depth=1)
+    assert "(iterator body)" in cg2, cg2
+    up = core.callgraph(ctx, "sites.dll!MoveNext", direction="callers", depth=1)
+    assert "RunAsync" in up or "Iter" in up
+    xr = core.xrefs(ctx, "sites.dll!Iter", direction="from")
+    assert any(ln.rstrip().endswith("body") for ln in xr.splitlines())
+
+
+# -- ilspycmd 11: one method by token, token-keyed cache, nested members (P2, P17) --------------
+
+def test_member_text_finds_members_of_nested_types():
+    code = ("public class Outer\n{\n\tpublic int A() { return 1; }\n\n\tprivate sealed class Inner\n\t{\n"
+            "\t\tpublic void SetText(string s)\n\t\t{\n\t\t\tx = s;\n\t\t}\n\n"
+            "\t\t[Attr]\n\t\tpublic void StartLogging()\n\t\t{\n\t\t}\n\t}\n}\n")
+    st = dn.member_text(code, "SetText")
+    assert st.splitlines()[0] == "\t\tpublic void SetText(string s)" and st.rstrip().endswith("}")
+    sl = dn.member_text(code, "StartLogging")
+    assert sl.splitlines()[0] == "\t\t[Attr]"
+    assert dn.member_text(code, "A").strip().startswith("public int A()")      # depth one still first
+
+
+def test_ilspy_version_helpers_and_env(tmp_path):
+    fake = tmp_path / "ilspycmd.exe"
+    fake.write_bytes(b"not an executable")
+    assert dn.ilspy_major(fake) == 0 and dn.ilspy_major(tmp_path / "none.exe") == 0
+    assert dn._ilspy_env(str(fake))["DOTNET_ROLL_FORWARD"]            # for a .NET 6 apphost (8.x); 11 ignores it
+    out, err = dn.run_ilspy_args(fake, tmp_path / "a.dll", ["--list-resources"], 10)
+    assert out is None and err
+
+
+def test_member_tokens_overloads_nested_and_accessors(tmp_path, managed_dll):
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, managed_dll)
+    bd = dt._scope(ctx, "")[0]
+    run = dt._member_tokens(bd, "Demo.Native.Holder", "Run")
+    assert len(run) == 1 and 0x06000000 <= run[0] < 0x07000000
+    assert dt._member_tokens(bd, "Demo.Native.Holder", "0x%08x" % run[0]) == run
+    assert dt._member_tokens(bd, "Demo.Native.Holder", "0x06ffffff") == []
+    assert len(dt._member_tokens(bd, "Demo.Native.Holder", "Holder")) == 1        # the type's name: its .ctor
+    assert dt._member_tokens(bd, "Demo.Native.Holder", "Nope") == []
+    inner = bd.store.db.execute("SELECT token FROM dn_type WHERE name='Demo.Native.Holder+Inner'").fetchone()[0]
+    for tok, name in ((0x06000f01, "SetText"), (0x06000f02, "get_Size")):
+        bd.store.db.execute("INSERT INTO dn_method(binary_id,token,type_token,name,sig,flags) VALUES(?,?,?,?,?,?)",
+                            (bd.binary.id, tok, inner, name, "void()", "public"))
+    assert dt._member_tokens(bd, "Demo.Native.Holder", "SetText") == [0x06000f01]   # nested type, one level down
+    assert dt._member_tokens(bd, "Demo.Native.Holder+Inner", "Size") == [0x06000f02]  # property accessor
+
+
+@pytest.mark.skipif(ILSPY11 is None, reason="needs ilspycmd 11")
+def test_decompile_one_method_by_token_and_token_cache(tmp_path, managed_dll):
+    ctx = make_dn_ctx(tmp_path, ilspy=ILSPY11)
+    add_managed(ctx, managed_dll)
+    bd = dt._scope(ctx, "")[0]
+    tok = dt._member_tokens(bd, "Demo.Native.Holder", "Run")[0]
+    out = dt.dotnet_decompile(ctx, "Demo.Native.Holder", member="Run")
+    assert "// member Run of Demo.Native.Holder: 1 method(s)" in out and "void Run()" in out
+    assert "class Holder" not in out                                  # a method, not the whole type
+    by_token = dt.dotnet_decompile(ctx, "Demo.Native.Holder", member="0x%08x" % tok)
+    assert "void Run()" in by_token
+    dt.dotnet_decompile(ctx, "Demo.Native.Holder")
+    names = sorted(p.name for p in (ctx.indexer.paths("proj").cache / "dotnet").rglob("*.cs"))
+    ttok = bd.store.db.execute("SELECT token FROM dn_type WHERE name='Demo.Native.Holder'").fetchone()[0]
+    assert names == [f"m_{tok:08x}.cs", f"t_{ttok:08x}.cs"]
+
+
+@pytest.mark.skipif(ILSPY11 is None, reason="needs ilspycmd 11")
+def test_ilspy_run_helper(tmp_path, managed_dll):
+    ctx = make_dn_ctx(tmp_path, ilspy=ILSPY11)
+    add_managed(ctx, managed_dll)
+    bd = dt._scope(ctx, "")[0]
+    out, err = dt.ilspy_run(ctx, bd, ["--list-resources"])
+    assert out is not None or err                                    # an assembly without resources may print nothing
+    out2, err2 = dt.ilspy_run(ctx, bd, ["--resource", "nope.resources"])
+    assert out2 is None and err2
+    ctx2 = make_dn_ctx(tmp_path / "b")
+    add_managed(ctx2, managed_dll)
+    assert dt.ilspy_run(ctx2, dt._scope(ctx2, "")[0], ["--list-resources"])[0] is None
+
+
+def test_decompile_cache_names_do_not_collide(tmp_path, managed_dll):
+    """Two types whose names differ only in characters the old file name replaced share no cache file:
+    the key is the type token."""
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, managed_dll)
+    bd = dt._scope(ctx, "")[0]
+    names = ("N.аб", "N.вг")                      # two Cyrillic names
+    for tok, name in ((0x02000f01, names[0]), (0x02000f02, names[1])):
+        bd.store.db.execute("INSERT INTO dn_type(binary_id,token,name,kind,base,flags) VALUES(?,?,?,?,?,?)",
+                            (bd.binary.id, tok, name, "class", None, "public"))
+    fake = tmp_path / "ilspycmd.exe"
+    fake.write_bytes(b"x")
+    folder = dt._cache_folder(ctx, bd, fake)
+    folder.mkdir(parents=True)
+    (folder / "t_02000f01.cs").write_text("// first\n", encoding="utf-8")
+    (folder / "t_02000f02.cs").write_text("// second\n", encoding="utf-8")
+    assert dt._decompiled(ctx, bd, names[0], fake) == "// first\n"
+    assert dt._decompiled(ctx, bd, names[1], fake) == "// second\n"
+
+
+def test_us_space_leaves_native_string_rows(tmp_path, sites_dll):
+    """A mixed-mode binary has Ghidra strings in ram space, e.g. at 0x70001000: ensure must keep them."""
+    ctx = make_dn_ctx(tmp_path)
+    ix = ctx.indexer
+    paths = ix.paths("proj", create=True)
+    sha = hash_file(sites_dll)
+    shutil.copyfile(sites_dll, paths.artifacts / sha)
+    st = ix.store("proj")
+    bid = st.upsert_binary(sha, "mixed.dll", original_path=str(sites_dll), format="pe32", arch="x86",
+                           pointer_size=4, image_base=0x70000000, toolchain="dotnet")
+    st.insert_strings(bid, [(0x70001000, "ascii", "native text"), (0x700f0000, "utf16le", "wide native")])
+    assert dn.ensure(st, st.get_binary_by_id(bid), paths.artifacts / sha)
+    assert dn.ensure(st, st.get_binary_by_id(bid), paths.artifacts / sha, force=True)        # twice
+    vals = {r["address"]: r["value"] for r in st.db.execute("SELECT address, value FROM string WHERE binary_id=?", (bid,))}
+    assert vals[0x70001000] == "native text" and vals[0x700f0000] == "wide native"
+    assert any(a >= US_BASE and v == "Password List" for a, v in vals.items())
+    ix.set_status(st, bid, "ready")
+    ix.current = "proj"
+    out = core.strings(ctx, "native text")
+    assert "0x70001000" in out and "us:" not in out
+    from airlock.server.selectors import fmt_addr, parse_address
+    assert fmt_addr(US_BASE | 0x2ece7) == "us:0x0002ece7" and parse_address("us:0x0002ece7") == ("ram", US_BASE | 0x2ece7)
+
+
+def test_function_view_shows_body_link(tmp_path, sites_dll):
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, sites_dll, "sites.dll")
+    asm = core.function(ctx, "sites.dll!RunAsync", view="asm").splitlines()
+    assert any(ln.startswith("; body: ") and "MoveNext" in ln and ln.endswith("(async)") for ln in asm), asm[:4]
+    it = core.function(ctx, "sites.dll!Iter", view="asm")
+    assert "(iterator)" in it
+
+
+def test_bundle_entry_reference_folders(tmp_path, managed_dll):
+    """`Host.exe!X.dll`: the host's folder plus a cache folder with the other entries; never the cwd."""
+    ctx = make_dn_ctx(tmp_path)
+    add_managed(ctx, managed_dll)
+    st = ctx.indexer.store("proj")
+    host_dir = tmp_path / "hostdir"
+    host_dir.mkdir()
+    host = str(host_dir / "Host.exe")
+    b = st.list_binaries()[0]
+    st.db.execute("UPDATE binary SET original_path=? WHERE id=?", (host + "!t.dll", b.id))
+    sib = ctx.indexer.paths("proj").artifacts / ("a" * 64)
+    sib.write_bytes(b"MZ-sibling")
+    st.db.execute("INSERT INTO binary(sha256,name,original_path,format,arch,pointer_size,image_base,toolchain) "
+                  "VALUES(?,?,?,?,?,?,?,?)", ("a" * 64, "Other.dll", host + "!Other.dll", "dotnet", "x86", 4, 0, "dotnet"))
+    bd = dt._scope(ctx, "t.dll")[0]
+    folder = tmp_path / "cache"
+    refs = dt._ref_dirs(ctx, bd, folder)
+    assert refs == [host_dir, folder / "refs"] and (folder / "refs" / "Other.dll").read_bytes() == b"MZ-sibling"
+    st.db.execute("UPDATE binary SET original_path=? WHERE id=?", ("Host.exe!t.dll", b.id))   # no folder known
+    bd = dt._scope(ctx, "t.dll")[0]
+    assert Path(".") not in dt._ref_dirs(ctx, bd, tmp_path / "cache2")
+    assert dt._ref_dirs(ctx, bd, tmp_path / "cache2") == []

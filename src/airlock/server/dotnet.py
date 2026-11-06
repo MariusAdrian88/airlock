@@ -12,7 +12,8 @@ follow it like a native import. A module no project binary provides (a system DL
 unresolved import.
 
 IL bodies are scanned for ``call``, ``callvirt``, ``newobj`` and ``jmp`` (edge kind ``call``) and ``ldftn``,
-``ldvirtftn`` and ``ldtoken`` of a method (edge kind ``data``, which ``Store.link_fnptr`` turns into ``fnptr``). A target in
+``ldvirtftn`` (edge kind ``fnptr``) and ``ldtoken`` of a method (kind ``data``); each site keeps its IL offset in ``edge.site``.
+``ldstr`` writes a string row (address ``US_BASE | #US offset``) and a ``data`` edge from the method. A state machine stub gets a ``body`` edge to its ``MoveNext``. A target in
 the same assembly is an edge to its function. A MemberRef/MethodSpec target in another assembly
 is an external function (space EXTERNAL, entry = ``0x0A000000 | MemberRef row``) plus an import row
 (dll = assembly name + ``.dll``, name = ``Ns.Type::Method(params)``); ``link_managed`` binds it to a
@@ -33,11 +34,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from airlock.index.store import DN_METHOD_HI, DN_METHOD_LO, Binary, Function, Store
+from airlock.index.store import DN_METHOD_HI, DN_METHOD_LO, US_BASE, Binary, Function, Store
 
 log = logging.getLogger(__name__)
 
-DOTNET_VERSION = 3            # meta key ``dotnet_version:<binary id>``; older rows are parsed again
+DOTNET_VERSION = 6            # meta key ``dotnet_version:<binary id>``; older rows are parsed again
 TYPE_TOKEN = 0x02000000
 METHOD_TOKEN = 0x06000000
 REF_LO, REF_HI = 0x0A000000, 0x0B000000      # MemberRef tokens: import slots of external callees
@@ -81,6 +82,10 @@ class Parsed:
     calls: list[tuple[int, int, str]] = field(default_factory=list)   # caller token, callee token, edge kind
     refs: dict[int, tuple[str, str]] = field(default_factory=dict)    # MemberRef token -> (dll, label)
     res: Any = None                                                   # _Resolver (not stored)
+    meta: Any = None                                                  # dotnet_meta.Meta (type-system facts)
+    sites: list[tuple[int, int, str, int]] = field(default_factory=list)   # caller, callee, kind, IL offset (one per site)
+    strings: dict[int, str] = field(default_factory=dict)             # #US offset -> literal text
+    str_sites: list[tuple[int, int, int]] = field(default_factory=list)    # caller, #US offset, IL offset
 
 
 # -- IL opcodes --------------------------------------------------------------------------------
@@ -132,27 +137,34 @@ for _o in OP2:
                 else 1 if _o in (0x12, 0x19) else 0)
 
 
-def _scan_calls(code: bytes) -> list[tuple[int, int]]:
-    """(kind, token) of the call-like instructions of an IL body: kind 0 = call/callvirt/newobj/jmp,
-    1 = ldftn/ldvirtftn/ldtoken (the caller keeps method tokens only; calli has no static target).
+def _scan_calls(code: bytes) -> list[tuple[int, int, int]]:
+    """(kind, token, IL offset) of the call-like instructions of an IL body: kind 0 =
+    call/callvirt/newobj/jmp, 1 = ldtoken (the caller keeps method tokens only; calli has no
+    static target), 2 = ldstr (token 0x70xxxxxx = #US offset), 3 = ldftn/ldvirtftn, 4 = initobj.
     Stops at an undefined opcode (data, damaged body)."""
-    out: list[tuple[int, int]] = []
+    out: list[tuple[int, int, int]] = []
     i, n, sz, sz2 = 0, len(code), _SZ, _SZ2
     frm = int.from_bytes
     while i < n:
         op = code[i]
         if op == 0x28 or op == 0x6F or op == 0x73 or op == 0x27:
-            out.append((0, frm(code[i + 1:i + 5], "little")))
+            out.append((0, frm(code[i + 1:i + 5], "little"), i))
             i += 5
         elif op == 0xD0:
-            out.append((1, frm(code[i + 1:i + 5], "little")))
+            out.append((1, frm(code[i + 1:i + 5], "little"), i))
+            i += 5
+        elif op == 0x72:
+            out.append((2, frm(code[i + 1:i + 5], "little"), i))
             i += 5
         elif op == 0xFE:
             if i + 1 >= n:
                 break
             o2 = code[i + 1]
             if o2 == 6 or o2 == 7:
-                out.append((1, frm(code[i + 2:i + 6], "little")))
+                out.append((3, frm(code[i + 2:i + 6], "little"), i))
+                i += 6
+            elif o2 == 0x15:
+                out.append((4, frm(code[i + 2:i + 6], "little"), i))
                 i += 6
             else:
                 s = sz2[o2]
@@ -307,10 +319,14 @@ def _s(v: Any) -> str:
     return "" if v is None else str(v)
 
 
+_SO_NAME_RE = re.compile(r"\.(so|dylib)(\.\d+)*$", re.I)
+
+
 def normal_module(module: str) -> str:
-    """The file name the P/Invoke probes for: base name, ``.dll`` added without a known extension."""
+    """The file name the P/Invoke probes for: base name, ``.dll`` added without a known extension;
+    Unix names (``libgcrypt.so.20``, ``libc.dylib``) stay as written."""
     base = re.split(r"[\\/]", module.strip())[-1]
-    return base if base.lower().endswith(MODULE_EXT) else base + ".dll"
+    return base if base.lower().endswith(MODULE_EXT) or _SO_NAME_RE.search(base) else base + ".dll"
 
 
 def _open(path: Path | None = None, data: bytes | None = None) -> Any:
@@ -401,6 +417,7 @@ class _Resolver:
         self.asm = [_s(r.Name) for r in md.AssemblyRef.rows] if md.AssemblyRef is not None else []
         self._tref: dict[int, tuple[str, str | None]] = {}
         self._memo: dict[int, tuple[int | None, str | None, str | None] | None] = {}
+        self.field_owner: dict[int, str] = {}                  # Field row -> declaring type (dotnet_meta)
 
     def tref(self, rid: int, depth: int = 0) -> tuple[str, str | None]:
         """(full name with ``+`` nesting, assembly name or None) of a TypeRef row."""
@@ -434,6 +451,28 @@ class _Resolver:
             return (("TypeDef", "TypeRef")[tag], enc >> 2) if tag < 2 else None
         except (ValueError, IndexError, AttributeError):
             return None
+
+    def _inst(self, rid: int) -> str:
+        """``<uint>`` / ``<string, int>``: the type arguments of a generic-instance TypeSpec, else empty."""
+        try:
+            r = _Blob(bytes(self.md.TypeSpec.rows[rid - 1].Signature.value))
+            if r.byte() != 0x15:
+                return ""
+            r.byte()
+            r.uint()
+            return "<" + ", ".join(_type(r, self.names) for _ in range(r.uint())) + ">"
+        except (ValueError, IndexError, AttributeError):
+            return ""
+
+    def _method_inst(self, rid: int) -> str:
+        """``<int>``: the method type arguments of a MethodSpec, else empty."""
+        try:
+            r = _Blob(bytes(self.md.MethodSpec.rows[rid - 1].Instantiation.value))
+            if r.byte() != 0x0A:
+                return ""
+            return "<" + ", ".join(_type(r, self.names) for _ in range(r.uint())) + ">"
+        except (ValueError, IndexError, AttributeError):
+            return ""
 
     def _local(self, tok: int, name: str, params: str) -> int | None:
         cands = self.local.get((tok, name))
@@ -473,7 +512,9 @@ class _Resolver:
         tn, ri = (cls.table.name if cls.table is not None else ""), cls.row_index
         name = _s(r.Name)
         params = _params(method_sig(raw, self.names))
+        inst = ""
         if tn == "TypeSpec":
+            inst = self._inst(ri)
             ts = self._typespec(ri)
             if ts is None:
                 return None
@@ -490,6 +531,8 @@ class _Resolver:
             tdef = self.by_name.get(full)
             t = self._local(tdef, name, params) if tdef is not None else None
             return (t, None, None) if t is not None else None
+        if inst:                                               # System.Nullable`1 -> System.Nullable<uint>
+            full = re.sub(r"`\d+(?=\+|$)", "", full, count=1) + inst
         return (None, normal_module(asm), f"{full}::{name}{params}")
 
     def stand_alone(self, rid: int) -> str:
@@ -515,10 +558,12 @@ class _Resolver:
                     return _s(r.Name) or "?"
                 if got is None:
                     return "?"
+                spec = self._method_inst(rid) if table == 0x2B else ""
                 if got[0] is not None:
                     m = self.p.methods[(got[0] & 0xFFFFFF) - 1]
-                    return f"{self.type_name.get(m.type_token, '?')}::{m.name}{_params(m.sig)}"
-                return got[2] or "?"
+                    return f"{self.type_name.get(m.type_token, '?')}::{m.name}{spec}{_params(m.sig)}"
+                name, sep, par = (got[2] or "?").partition("(")
+                return f"{name}{spec}{sep}{par}"
             if table == 0x11:                                  # StandAloneSig (calli)
                 return self.stand_alone(rid)
             if table == 0x02:
@@ -526,7 +571,8 @@ class _Resolver:
             if table == 0x01:
                 return self.tref(rid)[0]
             if table == 0x04:
-                return _s(self.md.Field.rows[rid - 1].Name)
+                owner = self.field_owner.get(rid)
+                return f"{owner}::{_s(self.md.Field.rows[rid - 1].Name)}" if owner else _s(self.md.Field.rows[rid - 1].Name)
             if table == 0x1B:
                 ts = self._typespec(rid)
                 if ts is not None:
@@ -549,10 +595,25 @@ def _rva_off(secs: list[tuple[int, int, int]], rva: int) -> int | None:
     return None
 
 
+_STATE_NAME = re.compile(r"^(.*)\+<([^>]+)>d__\d+$")
+
+
+def _user_string_text(us: Any, offset: int) -> str | None:
+    """Full text of a #US entry, or None when it cannot be read."""
+    try:
+        s = us.get(offset, errors="replace")
+        return None if s is None else str(s.value if hasattr(s, "value") else s)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _collect_calls(md: Any, pe: Any, out: Parsed, res: _Resolver) -> None:
     data = pe.__data__
     secs = _rva_map(pe)
-    seen: set[tuple[int, int, int]] = set()
+    us = getattr(pe.net, "user_strings", None)
+    seen: set[tuple[int, int, str]] = set()
+    sites: list[tuple[int, int, str, int]] = []
+    inits: list[tuple[int, int]] = []                  # caller, TypeDef token of an initobj
     for i, r in enumerate(md.MethodDef.rows, 1):
         rva = r.Rva
         if not rva or not getattr(r.ImplFlags, "miIL", False):
@@ -562,7 +623,20 @@ def _collect_calls(md: Any, pe: Any, out: Parsed, res: _Resolver) -> None:
         if body is None:
             continue
         caller = METHOD_TOKEN | i
-        for kind, tok in _scan_calls(body[0]):
+        for kind, tok, at in _scan_calls(body[0]):
+            if kind == 2:
+                if tok >> 24 == 0x70 and us is not None:
+                    uo = tok & 0xFFFFFF
+                    if uo not in out.strings:
+                        text = _user_string_text(us, uo)
+                        out.strings[uo] = text if text is not None else ""
+                    if out.strings[uo]:
+                        out.str_sites.append((caller, uo, at))
+                continue
+            if kind == 4:
+                if tok >> 24 == 0x02:
+                    inits.append((caller, tok))
+                continue
             got = res.resolve(tok) if (tok >> 24) in (0x06, 0x0A, 0x2B) else None
             if got is None:
                 continue
@@ -571,8 +645,84 @@ def _collect_calls(md: Any, pe: Any, out: Parsed, res: _Resolver) -> None:
             else:
                 callee = REF_LO | (tok & 0xFFFFFF if tok >> 24 == 0x0A else _spec_ref(res, tok))
                 out.refs.setdefault(callee, (got[1] or "", got[2] or ""))
-            seen.add((caller, callee, kind))
-    out.calls = [(a, b, "data" if k else "call") for a, b, k in sorted(seen)]
+            ek = "call" if kind == 0 else "fnptr" if kind == 3 else "data"
+            seen.add((caller, callee, ek))
+            sites.append((caller, callee, ek, at))
+    out.sites = sites
+    out.calls = sorted(seen)
+    try:
+        _state_machine_edges(md, out, inits)
+    except Exception as e:  # noqa: BLE001  an extra link
+        log.warning("state machine links stopped: %s: %s", type(e).__name__, e)
+
+
+_MACHINE_ATTRS = frozenset({"AsyncStateMachineAttribute", "IteratorStateMachineAttribute",
+                            "AsyncIteratorStateMachineAttribute"})
+
+
+def _machine_attributes(md: Any) -> list[tuple[int, str]]:
+    """(stub MethodDef token, machine type name with ``+`` nesting) from the state machine attributes."""
+    ca, mr = md.CustomAttribute, md.MemberRef
+    if ca is None or mr is None or not ca.rows:
+        return []
+    trefs = md.TypeRef.rows if md.TypeRef is not None else []
+    ctors: set[int] = set()
+    for i, r in enumerate(mr.rows, 1):
+        c = r.Class
+        if c.table is not None and c.table.name == "TypeRef" and r.Name == ".ctor":
+            if _s(trefs[c.row_index - 1].TypeName) in _MACHINE_ATTRS:
+                ctors.add(i)
+    out: list[tuple[int, str]] = []
+    if not ctors:
+        return out
+    for r in ca.rows:
+        p, t = r.Parent, r.Type
+        if (p.table is not None and p.table.name == "MethodDef" and t.table is not None
+                and t.table.name == "MemberRef" and t.row_index in ctors):
+            name = _blob_string(r.Value.value if r.Value is not None else b"")
+            if name:
+                out.append((METHOD_TOKEN | p.row_index, name.split(",")[0].strip()))
+    return out
+
+
+def _state_machine_edges(md: Any, out: Parsed, inits: list[tuple[int, int]]) -> None:
+    """Edge kind ``body`` from the stub of an async or iterator method to ``MoveNext`` of its
+    compiler-generated state machine ``Outer+<Name>d__N``: found by the ``newobj`` of the machine's
+    constructor or the ``initobj`` of the machine struct inside a method named ``Name`` of ``Outer``."""
+    tname = {t.token: t.name for t in out.types}
+    mname = {m.token: m for m in out.methods}
+    move: dict[int, int] = {}
+    for m in out.methods:
+        if m.name == "MoveNext" and m.type_token in tname and _STATE_NAME.match(tname[m.type_token]):
+            move[m.type_token] = m.token
+    if not move:
+        return
+    cands: list[tuple[int, int]] = []                  # caller, machine type token
+    for caller, callee, kind in out.calls:
+        m = mname.get(callee)
+        if kind == "call" and m is not None and m.name == ".ctor" and m.type_token in move:
+            cands.append((caller, m.type_token))
+    cands += [(c, t) for c, t in inits if t in move]
+    have = {(a, b) for a, b, k in out.calls if k == "body"}
+    by_name = {n: t for t, n in tname.items()}
+    for stub, mach in _machine_attributes(md):                # [AsyncStateMachine(typeof(X))] on the stub
+        tt = by_name.get(mach)
+        if stub in mname and tt in move and (stub, move[tt]) not in have:
+            out.calls.append((stub, move[tt], "body"))
+            out.sites.append((stub, move[tt], "body", -1))
+            have.add((stub, move[tt]))
+    for caller, tt in sorted(set(cands)):
+        stub = mname.get(caller)
+        mt = _STATE_NAME.match(tname[tt])
+        if stub is None or mt is None or mt.group(1) != tname.get(stub.type_token):
+            continue
+        name = mt.group(2)
+        if name != stub.name and not name.endswith(stub.name):
+            continue
+        if (caller, move[tt]) not in have:
+            out.calls.append((caller, move[tt], "body"))
+            out.sites.append((caller, move[tt], "body", -1))
+            have.add((caller, move[tt]))
 
 
 def _spec_ref(res: _Resolver, tok: int) -> int:
@@ -671,6 +821,13 @@ def _parse_tables(md: Any, pe: Any = None) -> Parsed:
             tok, module, entry or (None if ordinal is not None else _s(r.Name)), ordinal,
             ",".join(_flag_names(im.MappingFlags, _PM_FLAGS))))
     out.res = _Resolver(md, out, names)
+    from airlock.server import dotnet_meta               # late: dotnet_meta imports this module
+    try:
+        out.res.field_owner = dotnet_meta.field_owners(md, out)
+        if pe is not None:
+            out.meta = dotnet_meta.parse(md, out, pe)
+    except Exception as e:  # noqa: BLE001  type-system facts are an extra
+        log.warning("type-system metadata stopped: %s: %s", type(e).__name__, e)
     if pe is not None and mdefs:
         try:
             _collect_calls(md, pe, out, out.res)
@@ -726,15 +883,19 @@ def ensure(store: Store, b: Binary, artifact: Path, force: bool = False) -> bool
         return False
     if not force and not stale(store, b.id):
         return False
+    from airlock.server import dotnet_meta
     parsed = parse_file(artifact)
     db = store.db
     sig_of = {m.token: m.sig for m in parsed.methods} if parsed else {}
     with db:
         for t in ("dn_type", "dn_method", "dn_pinvoke"):
             db.execute(f"DELETE FROM {t} WHERE binary_id=?", (b.id,))
+        dotnet_meta.clear(db, b.id)
         db.execute("DELETE FROM xedge WHERE src_binary=? AND kind IN ('pinvoke','mcall')", (b.id,))
         db.execute("DELETE FROM edge WHERE binary_id=? AND src_addr>=? AND src_addr<?",
                    (b.id, DN_METHOD_LO, DN_METHOD_HI))
+        db.execute("DELETE FROM string WHERE binary_id=? AND address>=? AND address<?",
+                   (b.id, US_BASE, US_BASE + (1 << 32)))
         db.execute("DELETE FROM function WHERE binary_id=? AND ((space='ram' AND entry>=? AND entry<?) "
                    "OR (space=? AND entry>=? AND entry<?))",
                    (b.id, DN_METHOD_LO, DN_METHOD_HI, EXT_SPACE, REF_LO, REF_HI))
@@ -751,6 +912,8 @@ def ensure(store: Store, b: Binary, artifact: Path, force: bool = False) -> bool
                             for p in parsed.pinvokes])
     if parsed is not None:
         _write_functions(store, b, parsed, sig_of)
+        if parsed.meta is not None:
+            dotnet_meta.write(store, b.id, parsed.meta)
     store.rebuild_fts(b.id)
     store.set_meta(_meta_key(b.id), str(DOTNET_VERSION))
     return True
@@ -783,16 +946,28 @@ def _write_functions(store: Store, b: Binary, parsed: Parsed, sig_of: dict[int, 
     store.insert_imports(b.id, [(normal_module(p.module), p.entry, p.ordinal, p.token)
                                 for p in parsed.pinvokes]
                          + [(dll, label, None, tok) for tok, (dll, label) in ext])
-    if not parsed.calls:
+    if not parsed.sites:
         return
     ids = {r["entry"]: r["id"] for r in store.db.execute(
         "SELECT id, entry FROM function WHERE binary_id=? AND space='ram' AND entry>=? AND entry<?",
         (b.id, DN_METHOD_LO, DN_METHOD_HI))}
-    rows = [(b.id, ids[a], a, ids.get(c), c, k) for a, c, k in parsed.calls if a in ids]
+    _write_edges(store, b, parsed, ids)
+
+
+def _write_edges(store: Store, b: Binary, parsed: Parsed, ids: dict[int, int]) -> None:
+    """Edge rows with the IL offset of each call site (``site``; NULL for a ``body`` link), the
+    user-string rows (address ``US_BASE | #US offset``) and one ``data`` edge per ``ldstr``."""
+    rows = [(b.id, ids[a], a, ids.get(c), c, k, at if at >= 0 else None)
+            for a, c, k, at in parsed.sites if a in ids]
+    srows = [(b.id, ids[a], a, None, US_BASE | uo, "data", at)
+             for a, uo, at in parsed.str_sites if a in ids]
     with store.db:
-        store.db.executemany("INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind) "
-                             "VALUES (?,?,?,?,?,?)", rows)
-    store.link_fnptr(b.id)
+        store.db.executemany(
+            "INSERT INTO edge(binary_id, src_fn, src_addr, dst_fn, dst_addr, kind, site) "
+            "VALUES (?,?,?,?,?,?,?)", rows + srows)
+        store.db.executemany(
+            "INSERT INTO string(binary_id, address, encoding, value) VALUES (?,?,'utf16le',?)",
+            [(b.id, US_BASE | uo, text) for uo, text in sorted(parsed.strings.items()) if text])
 
 
 def ensure_project(store: Store, artifacts: Path, ready: list[int]) -> int:
@@ -816,6 +991,25 @@ def dotnet_binaries(store: Store) -> list[Binary]:
 def _stem(name: str | None) -> str:
     n = (name or "").strip().lower()
     return n[:-4] if n.endswith(MODULE_EXT) else n
+
+
+def _open_name(name: str) -> str:
+    """Metadata name of a readable generic instance: ``System.Tuple<string, int>`` -> ``System.Tuple`2``."""
+    i = name.find("<")
+    if i < 0:
+        return name
+    depth, n = 0, 1
+    for ch in name[i:]:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            n += 1
+    j = name.rfind(">")
+    return f"{name[:i]}`{n}{name[j + 1:]}"
 
 
 def link_managed(store: Store, src_id: int, dst_id: int) -> int:
@@ -846,7 +1040,7 @@ def link_managed(store: Store, src_id: int, dst_id: int) -> int:
     for r in refs:
         head, _, tail = (r["name"] or "").partition("::")
         meth, par, rest = tail.partition("(")
-        tok = types.get(head)
+        tok = types.get(_open_name(head))
         cands = methods.get((tok, meth)) if tok is not None else None
         if not cands:
             continue
@@ -975,6 +1169,9 @@ def il_listing(path: Path, token: int) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
+LISTING_STRING_CUT = 200
+
+
 def _user_string(us: Any, offset: int) -> str:
     try:
         s = us.get(offset, errors="replace")
@@ -982,12 +1179,12 @@ def _user_string(us: Any, offset: int) -> str:
     except Exception:  # noqa: BLE001
         return '"?"'
     v = v.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-    return '"' + (v[:40] + "…" if len(v) > 40 else v) + '"'
+    return '"' + (v[:LISTING_STRING_CUT] + f"…({len(v)} chars)" if len(v) > LISTING_STRING_CUT else v) + '"'
 
 
 # -- listing -----------------------------------------------------------------------------------
 
-KINDS = ("type", "method", "pinvoke", "com")
+KINDS = ("type", "method", "pinvoke", "com", "impl", "field", "property", "event")
 
 
 def counts(store: Store, bid: int) -> tuple[int, int, int, int]:
@@ -1034,14 +1231,17 @@ def list_lines(store: Store, bid: int, query: str = "", kind: str = "") -> list[
     out: list[str] = []
     if kind in ("", "type", "com"):
         extra = f" AND {_COM_SQL}" if kind == "com" else ""
+        from airlock.server import dotnet_meta
+        ifs = dotnet_meta.iface_map(store, bid)
         for r in db.execute(
-                "SELECT t.name, t.kind, t.base, t.flags, (SELECT COUNT(*) FROM dn_method m "
+                "SELECT t.token, t.name, t.kind, t.base, t.flags, (SELECT COUNT(*) FROM dn_method m "
                 "WHERE m.binary_id=t.binary_id AND m.type_token=t.token) AS n FROM dn_type t "
                 f"WHERE t.binary_id=? AND t.name LIKE ? ESCAPE '\\'{hide.replace('name', 't.name')}"
                 f"{extra} ORDER BY t.name", (bid, like)):
             fl = _flags_text(r["flags"])
-            base = (f" : {r['base']}" if r["base"] and r["kind"] in ("class", "struct")
-                    and r["base"] != "System.Object" else "")
+            heads = ([r["base"]] if r["base"] and r["kind"] in ("class", "struct")
+                     and r["base"] != "System.Object" else []) + ifs.get(r["token"], [])
+            base = f" : {', '.join(heads)}" if heads else ""
             out.append(f"{'com' if kind == 'com' else 'type'} {r['name']} {r['kind']}"
                        f"{' ' + fl if fl else ''}{base} {r['n']}m")
     if kind in ("", "pinvoke") and (q or kind == "pinvoke"):
@@ -1085,8 +1285,10 @@ def find_type(store: Store, bid: int, name: str) -> list[str]:
 
 # -- ilspycmd ----------------------------------------------------------------------------------
 
-def _ilspy_env() -> dict[str, str]:
+def _ilspy_env(exe: str = "") -> dict[str, str]:
     env = dict(os.environ)
+    # ilspycmd 8.x is a .NET 6 apphost: roll forward to a newer runtime (child process only).
+    # ilspycmd 11 is NativeAOT and ignores it.
     env.setdefault("DOTNET_ROLL_FORWARD", "LatestMajor")
     env.setdefault("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
     return env
@@ -1095,7 +1297,7 @@ def _ilspy_env() -> dict[str, str]:
 @functools.lru_cache(maxsize=8)
 def _ilspy_version(exe: str, size: int, mtime: int) -> str:
     try:
-        r = subprocess.run([exe, "--version"], capture_output=True, timeout=30, env=_ilspy_env(),
+        r = subprocess.run([exe, "--version"], capture_output=True, timeout=30, env=_ilspy_env(exe),
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         m = re.search(r"\d+(?:\.\d+)+", r.stdout.decode("utf-8", "replace"))
         if m:
@@ -1113,27 +1315,46 @@ def ilspy_version(exe: Path) -> str:
         return "unknown"
     return _ilspy_version(str(exe), st.st_size, st.st_mtime_ns)
 
-def run_ilspy(exe: Path, assembly: Path, type_name: str, timeout: int,
-              ref_dir: Path | None = None) -> tuple[str | None, str | None]:
-    """(C# text, error text) of ``ilspycmd -t <type> <assembly>``. ilspycmd 8.x targets .NET 6;
-    ``DOTNET_ROLL_FORWARD=LatestMajor`` (child process only) lets it run on a newer runtime."""
-    cmd = [str(exe), "--disable-updatecheck", "-t", type_name]
-    if ref_dir is not None and ref_dir.is_dir():
-        cmd += ["-r", str(ref_dir)]
+
+def ilspy_major(exe: Path) -> int:
+    """Major version of ilspycmd (0 when unknown). `-m <token>`, `--list-resources` and `--resource`
+    need 11 (verified on 11.2.0.10050)."""
+    m = re.match(r"(\d+)\.", ilspy_version(exe))
+    return int(m.group(1)) if m else 0
+
+
+def run_ilspy_args(exe: Path, assembly: Path, args: list[str], timeout: int,
+                   ref_dir: Path | list[Path] | None = None) -> tuple[bytes | None, str | None]:
+    """(stdout bytes, error text) of ``ilspycmd --disable-updatecheck <args> [-r ref_dir] <assembly>``.
+    The general helper: ``["--list-resources"]``, ``["--resource", name]``, ``["-m", "0x06000005"]``,
+    ``["-t", type]``. Bytes are returned as written, so binary resources stay intact."""
+    cmd = [str(exe), "--disable-updatecheck", *args]
+    for d in ([] if ref_dir is None else ref_dir if isinstance(ref_dir, list) else [ref_dir]):
+        if d.is_dir() and d != Path("."):          # never the server's working directory
+            cmd += ["-r", str(d)]
     cmd.append(str(assembly))
-    env = _ilspy_env()
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env, cwd=str(assembly.parent),
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_ilspy_env(str(exe)),
+                           cwd=str(assembly.parent), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
     except OSError as e:
         return None, f"cannot start ilspycmd ({e.strerror or e})"
-    out = r.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
-    if r.returncode != 0 or not out.strip():
-        err = (r.stderr.decode("utf-8", "replace") or out).strip().splitlines()
+    if r.returncode != 0 or not r.stdout.strip():
+        err = (r.stderr.decode("utf-8", "replace") or r.stdout.decode("utf-8", "replace")).strip().splitlines()
         return None, (err[0] if err else f"exit code {r.returncode}")[:200]
-    return out, None
+    return r.stdout, None
+
+
+def run_ilspy(exe: Path, assembly: Path, type_name: str, timeout: int,
+              ref_dir: Path | list[Path] | None = None, token: int | None = None) -> tuple[str | None, str | None]:
+    """(C# text, error text) of ``ilspycmd -t <type>`` or, with ``token`` (ilspycmd 11), of
+    ``ilspycmd -m 0x<token>``: one method, also a lambda or MoveNext."""
+    args = ["-m", f"0x{token:08x}"] if token is not None else ["-t", type_name]
+    out, err = run_ilspy_args(exe, assembly, args, timeout, ref_dir)
+    if out is None:
+        return None, err
+    return out.decode("utf-8", "replace").replace("\r\n", "\n"), None
 
 
 def member_alias(member: str, full_type: str) -> str:
@@ -1151,27 +1372,32 @@ def member_alias(member: str, full_type: str) -> str:
 
 def member_text(code: str, member: str) -> str | None:
     """The declaration(s) named ``member`` inside the C# of one type: a line at member depth (one
-    tab) that names it, the attributes above it and the body (brace matched), or None."""
+    tab) that names it, the attributes above it and the body (brace matched), or None. Members of
+    nested types sit deeper (two tabs and more): tried when depth one has none."""
     lines = code.split("\n")
     want = re.compile(r"(?<![\w.])" + re.escape(member) + r"\s*(?:<[^>]*>)?\s*(?:\(|\{|=|;|$)")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        if (ln.startswith("\t") and not ln.startswith("\t\t") and ln.strip()
-                and not ln.strip().startswith(("[", "//")) and want.search(ln)):
-            j = i
-            while j > 0 and lines[j - 1].startswith("\t") and lines[j - 1].strip().startswith("["):
-                j -= 1
-            depth, k, seen = 0, i, False
-            while k < len(lines):
-                depth += lines[k].count("{") - lines[k].count("}")
-                seen = seen or "{" in lines[k]
-                if (seen and depth <= 0) or (not seen and lines[k].rstrip().endswith(";")):
-                    break
-                k += 1
-            out += lines[j:k + 1] + [""]
-            i = k + 1
-        else:
-            i += 1
-    return "\n".join(out).rstrip("\n") if out else None
+    for depth_tabs in range(1, 5):
+        pre = "\t" * depth_tabs
+        out: list[str] = []
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            if (ln.startswith(pre) and not ln.startswith(pre + "\t") and ln.strip()
+                    and not ln.strip().startswith(("[", "//")) and want.search(ln)):
+                j = i
+                while j > 0 and lines[j - 1].startswith(pre) and lines[j - 1].strip().startswith("["):
+                    j -= 1
+                depth, k, seen = 0, i, False
+                while k < len(lines):
+                    depth += lines[k].count("{") - lines[k].count("}")
+                    seen = seen or "{" in lines[k]
+                    if (seen and depth <= 0) or (not seen and lines[k].rstrip().endswith(";")):
+                        break
+                    k += 1
+                out += lines[j:k + 1] + [""]
+                i = k + 1
+            else:
+                i += 1
+        if out:
+            return "\n".join(out).rstrip("\n")
+    return None

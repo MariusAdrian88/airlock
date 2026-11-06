@@ -244,3 +244,43 @@ def create_functions(args: dict[str, Any]) -> dict[str, Any]:
             "conventions": stats.get("conventions", {}),
             "resolved": {hex(k): hex(v) for k, v in (extra.get("resolved") or {}).items()},
             "data": {hex(k): v for k, v in (extra.get("data") or {}).items()}, "secs": round(time.monotonic() - t0, 1)}
+
+
+@op("name_functions")
+@guarded
+def name_functions(args: dict[str, Any]) -> dict[str, Any]:
+    """name_functions(program, names=[{address, name, namespace}], space=None): give the functions at the
+    addresses the name the metadata states (C++/CLI native methods). Only functions that still carry
+    Ghidra's default name are renamed; the source is IMPORTED (index name_state 'library'), never
+    USER_DEFINED. Returns named and kept (a function with another name, or none there)."""
+    from ghidra.app.util import NamespaceUtils  # type: ignore
+    from ghidra.program.model.symbol import SourceType  # type: ignore
+
+    items = args.get("names")
+    if not isinstance(items, list) or not items:
+        raise WorkerError("bad_args", "names must be a non-empty list")
+    if len(items) > MAX_ADDRESSES:
+        raise WorkerError("bad_args", f"at most {MAX_ADDRESSES} names per call")
+    space = args.get("space")
+    stats = {"named": 0, "kept": 0}
+
+    def body(e: Any, program: Any) -> dict[str, Any]:
+        fm = program.getFunctionManager()
+        for it in items:
+            addr = _address(program, space, it["address"])
+            f = fm.getFunctionAt(addr)
+            if f is None or str(f.getSymbol().getSource().name()) != "DEFAULT":
+                stats["kept"] += 1
+                continue
+            ns = None
+            if it.get("namespace"):
+                ns = NamespaceUtils.createNamespaceHierarchy(
+                    str(it["namespace"]), program.getGlobalNamespace(), program, SourceType.IMPORTED)
+            f.setName(str(it["name"]), SourceType.IMPORTED)
+            if ns is not None:
+                f.setParentNamespace(ns)
+            stats["named"] += 1
+        return {}
+
+    _write(args, "name functions", body)
+    return {"program": args.get("program"), **stats}

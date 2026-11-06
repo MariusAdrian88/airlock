@@ -67,6 +67,32 @@ def install_pyghidra(info: ghidra_install.GhidraInstall) -> tuple[bool, str]:
     return True, f"installed pyghidra from {info.pypkg_dist}"
 
 
+ILSPY_VERSION = "11.2.0.10050"
+ILSPY_URL = (f"https://api.nuget.org/v3-flatcontainer/ilspycmd.win-x64/{ILSPY_VERSION}/"
+             f"ilspycmd.win-x64.{ILSPY_VERSION}.nupkg")
+ILSPY_MEMBER = "tools/any/win-x64/ilspycmd.exe"
+
+
+def install_ilspycmd(dest: Path, url: str = ILSPY_URL) -> tuple[bool, str]:
+    """Download the NativeAOT ilspycmd (nuget package ilspycmd.win-x64, no .NET runtime needed) and
+    write ``ilspycmd.exe`` to ``dest``."""
+    import io
+    import urllib.request
+    import zipfile
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r:
+            data = r.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            exe = z.read(ILSPY_MEMBER)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".new")
+        tmp.write_bytes(exe)
+        tmp.replace(dest)
+    except (OSError, KeyError, zipfile.BadZipFile) as e:
+        return False, str(e)
+    return True, f"installed ilspycmd {ILSPY_VERSION} at {dest}"
+
+
 def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -> int:
     checks: list[Check] = []
     add = checks.append
@@ -188,10 +214,22 @@ def run(config_path: Path | None, profile: str | None, fix: bool, start: bool) -
         else:
             add(Check("FAIL", "pyghidra", f"{problem}; run `airlock doctor --fix`"))
 
-    # ilspycmd
+    # ilspycmd (11 or newer: per-method decompile, resources, .NET 9 and 10 assemblies)
     if cfg.ilspycmd:
-        add(Check("OK" if cfg.ilspycmd.exists() else "WARN", "ilspycmd",
-                  str(cfg.ilspycmd) + ("" if cfg.ilspycmd.exists() else " not found")))
+        from airlock.server import dotnet as _dn
+        have = cfg.ilspycmd.exists()
+        major = _dn.ilspy_major(cfg.ilspycmd) if have else 0
+        if have and major >= 11:
+            add(Check("OK", "ilspycmd", f"{cfg.ilspycmd} ({_dn.ilspy_version(cfg.ilspycmd)})"))
+        else:
+            problem = (f"{cfg.ilspycmd} not found" if not have else
+                       f"{cfg.ilspycmd} is version {_dn.ilspy_version(cfg.ilspycmd)}: no per-method decompile, "
+                       "fails on .NET 9 and 10 assemblies")
+            if fix:
+                ok, msg = install_ilspycmd(cfg.ilspycmd)
+                add(Check("FIXED" if ok else "WARN", "ilspycmd", msg if ok else f"{problem}; install failed: {msg}"))
+            else:
+                add(Check("WARN", "ilspycmd", f"{problem}; run `airlock doctor --fix`"))
 
     # IDR knowledge bases
     if cfg.idr_kb_dir:

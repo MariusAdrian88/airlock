@@ -20,7 +20,8 @@ from airlock.server import classfwd
 from airlock.server.context import ServerContext
 from airlock.server.graph import dll_stem, norm_import
 from airlock.server.selectors import (alias_functions, default_name_address, MAX_CANDIDATES, MAX_CLOSE,
-                                      close_functions, close_text, parse_address, resolve_function)
+                                      close_functions, close_text, parse_address, resolve_function,
+                                      by_selector, describe, is_managed, prefer_token)
 from airlock.server.tools.common import Bound, Scope, bind_scope, preview
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -180,13 +181,21 @@ def _cand(bd: Bound, fn: Function) -> str:
 
 def _cands(pairs: list[tuple[Bound, Function]]) -> list[str]:
     """Candidates as ready-to-use ``binary!name 0xaddr`` forms. A name that repeats inside one
-    binary (overloads) is not a selector there, so that candidate is ``binary!0xaddr name``."""
+    binary (overloads) is not a selector there, so that candidate is ``binary!0xaddr name``; managed
+    overloads show ``binary!0xtoken Name(sig)`` (a ``Type::Name(params)`` selector picks one)."""
     seen: dict[tuple[int, str], int] = {}
     for bd, f in pairs:
         k = (bd.binary.id, f.qualified_name)
         seen[k] = seen.get(k, 0) + 1
-    return [_cand(bd, f) if seen[(bd.binary.id, f.qualified_name)] == 1
-            else f"{bd.binary.name}!{bd.addr(f.entry, f.space)} {f.qualified_name}" for bd, f in pairs]
+    out = []
+    for bd, f in pairs:
+        if is_managed(f):
+            out.append(f"{bd.binary.name}!" + describe([f], bd.binary.pointer_size, True)[0])
+        elif seen[(bd.binary.id, f.qualified_name)] == 1:
+            out.append(_cand(bd, f))
+        else:
+            out.append(f"{bd.binary.name}!{bd.addr(f.entry, f.space)} {f.qualified_name}")
+    return out
 
 
 # -- imports -------------------------------------------------------------------------------------
@@ -537,6 +546,10 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         r = _by_name(sc, name, stem, cands, aggregate, IMPORT in ks)
         if r is not None:
             return _policy(sc, r, t, ks)
+    if FUNCTION in ks or IMPORT_FN in ks:
+        ms = _managed_selector(sc, t)
+        if ms is not None:
+            return ms
     qa = _qt_method_addr(sc, t)
     if qa is not None:
         return _by_address(sc, f"0x{qa:x}", ks)
@@ -583,6 +596,28 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
         if al:
             return ambiguous(t, _cands(al), len(al))
     return not_found(sc, t, close)
+
+
+def _managed_selector(sc: Scope, text: str) -> Target | str | None:
+    """``Type::Name(params)`` / ``Type.Name`` of a managed method: the overload the parameter types pick."""
+    found: list[tuple[Bound, Function, str | None]] = []
+    errors: list[str] = []
+    for bd in sc.bounds:
+        r = by_selector(bd.store, bd.binary.id, text, bd.binary.pointer_size)
+        if r is None:
+            continue
+        if r.function is not None:
+            found.append((bd, r.function, r.note))
+        elif r.error:
+            errors.append(r.error)
+    if len(found) == 1:
+        bd, f, note = found[0]
+        return FunctionTarget(bd, f, note, None if sc.explicit else f"binary {bd.binary.name}")
+    if found:
+        return ambiguous(text, _cands([(bd, f) for bd, f, _n in found]), len(found))
+    if len(errors) == 1:
+        return errors[0]
+    return None
 
 
 def _attempts(t: str, cands: dict[int, list[_Cand]]) -> list[tuple[str, str]]:
@@ -663,6 +698,12 @@ def _by_name(sc: Scope, name: str, stem: str, cands: dict[int, list[_Cand]],
             listed = _cands(fcands) + [_stub_cand(b, imp.label) for b in imp.bindings]
             return ambiguous(name, listed, len(listed))
         fcands = bound                                    # the import is this definition
+    if len(fcands) > 1:
+        for bd in {id(b): b for b, _f in fcands}.values():     # a C++/CLI token and its IJW native body
+            mine = [f for b, f in fcands if b is bd]
+            pt = prefer_token(mine, bd.binary.pointer_size) if len(mine) == len(fcands) else None
+            if pt is not None:
+                return FunctionTarget(bd, pt[0], pt[1], f"binary {bd.binary.name}")
     if len(fcands) == 1:
         bd, f = fcands[0]
         return FunctionTarget(bd, f, None, f"binary {bd.binary.name}")
