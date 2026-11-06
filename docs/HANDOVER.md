@@ -442,6 +442,59 @@ above, `server/routes.py`). Now decoded: both models go menu id -> `anon_<table>
 unchanged in result; the t12 error is a `delphi_classes` call on an MFC project.
 Open: the QML side of Qt signals; the virtual call `this+0xf0 -> +0x34` without RTTI (t4).
 
+Round 4 (transcripts `r5_b_*`, code at 10e5574: no hints, route tables, MFC handler names in `search`). All 12 old
+tasks plus three new tests, Sonnet and Haiku, same method. New program: HeidiSQL 12.22 64-bit (Delphi 12 VCL, x64,
+official portable zip; source tag `v12.22-Windows`, the plain `v12.22` tag is the Lazarus port).
+
+| Task | Sonnet r3 | Sonnet r5_b | Haiku r3 | Haiku r5_b |
+|---|---|---|---|---|
+| t1-t8 (DB4S, RPi, ExifToolGUI, OHM) | as above | same grades; 68 calls (r3 58) | as above | same grades; 123 calls (r3 96) |
+| t9 WinDirStat: Tools > Recovery | v 11 | v 12 | v 17 | v 7 |
+| t10 WinDirStat: options storage | v 6 | v 18 (2 err) | v 11 | ~ 23 (INI trigger not found) |
+| t11 WinMerge: Edit > Options | v 5 | v 5 | v 9 | v 10 |
+| t12 WinMerge: options storage | v 9 | v 8 | v 17 | v 20 |
+| t13 HeidiSQL: Tools > Flush > Tables with read lock | (new) | v 7 | (new) | v 11 |
+| t14 HeidiSQL: settings storage | (new) | v 6 | (new) | ~ 17 (format guessed as JSON) |
+| cr1 dirty: write and publish settings specs (ExifToolGUI) | (new) | ~ 54 calls, 4 specs | (new) | ~ 58 calls, 4 specs |
+| cr2 clean: answer from the specs only | (new) | ~ 7, faithful | (new) | ~ 7, faithful |
+| long: t9, t11, t10, t12, recall, compare in one session | (new) | 4 v, 2 ~ | (new) | 4 v, 2 ~ |
+
+Totals t1-t12: Sonnet 111 calls, 6 errors, 0 repeated calls (r3: 126, 2, 2); Haiku 183 calls, 8 errors, 0 repeated
+(r3: 172, 7, 0). The hint removal shows no measurable effect: repeated calls were already near zero and the
+errors are other kinds (below). t6 answers name the INI file `<title>.ini`; the real name is `ExifToolGUIV6.ini` and an
+`-IniPath=` switch exists; r3 had the same gaps and was graded v, so the grade is kept.
+
+Clean-room test: a dirty session (own project copy, `rd_cr_<model>`) writes `settings.*` specs and runs `spec_export`; a
+new session in a server started with `--profile clean` answers from them. The clean tool list has only the 6 clean tools,
+and no result carried code, addresses, bytes or notes. Both clean answers report the specs faithfully and list what the
+specs leave out; their errors are the dirty side's (Sonnet got the V6 name and the load order right, both missed the
+`-IniPath` switch and said no switch selects the folder). The clean `project_open` text names the absolute path of the
+sibling `dirty\` folder in its "never read ..." line; that tells a clean agent where the dirty data is.
+
+Long session (one `claude -p --input-format stream-json` process, project `mfc2` with both exes): no binary confusion
+(every call names the right exe, L6 keeps the two registry keys apart), 0 repeated calls across tasks, 0 calls for the
+recall and compare questions, `--max-turns` counts per message. Context at the end 77k (Sonnet) and 84k (Haiku) tokens.
+Per-task calls 9/6/5/3 (Sonnet) and 18/7/14/11 (Haiku); the later tasks are cheaper because menus and names are
+already in context. The two ~ are the WinDirStat INI trigger (L3, and so L6), missed by both, as in Haiku t10.
+
+Failure patterns (round 4):
+- `spec_write` `bad_source` in every dirty run (4 of 4 first writes, both models): agents put prose into `sources`
+  ("Static analysis of ...: the routine that builds the path"). The list is split on commas and the first fragment is
+  resolved as a function name; the error says `no function named '<prose>'` plus "method words such as 'observation'
+  count too", without the accepted forms. Both models then retried with `binary!FUN_x` and succeeded. Fix: show the
+  forms (`binary!function`, `binary!0xADDRESS`, method words) in that error, or store an item with spaces as an
+  `observation` with its text.
+- `spec_has_bytes` false positive: a table row of decimal column widths (`64, 64, 48, 73, 73, 56, 88, 80`) was taken
+  for a hex byte run.
+- Delphi x64 (HeidiSQL): the handler header of `TMainForm.actFlushExecute` lists 4 of its 6 `OnExecute` bindings
+  (`actFlushTableswithreadlock` and `actFlushStatus` are missing), so both models call the read-lock branch
+  `actFlushTables`. Unicode string literals passed as `0x124ab50` stay numbers in the C, so the exact SQL suffix and
+  the portable-file delimiter `<|||>` were not read (Haiku then guessed JSON for the settings file).
+- Binary named by project name: Haiku passed `binary=ohm` (4 errors in t7/t8); the error lists the one binary, but
+  with a single binary the tool could just use it.
+- Other errors are wrong tool choices: `delphi_classes` on a Qt project, `dotnet_types kind=methods`,
+  `xrefs DAT_14026ebc8` (a data name the decompiler prints is not accepted as a target), `function` on a string address.
+
 Files (tasks, launcher, transcripts, source copies) are in the session scratchpad, `agenteval\`.
 
 ## Next
