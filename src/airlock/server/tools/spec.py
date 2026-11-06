@@ -65,7 +65,8 @@ def spec_write(ctx: ServerContext, topic: str, title: str, body: str, sources: s
     sid, ver, created = sp.write_spec(st, ctx.session.role, topic, title, body, status, srcs)
     if not created:
         return f"spec {sid} {topic} v{ver} {status} unchanged: the text is the same as the latest version."
-    return f"spec {sid} {topic} v{ver} {status}"
+    notes = "".join(f' (stored as observation: "{x.note}")' for x in srcs if x.note)
+    return f"spec {sid} {topic} v{ver} {status}{notes}"
 
 
 @tool("spec_list", "List specification topics with title, version and status.")

@@ -551,8 +551,64 @@ def test_not_delphi_binary_error(proj):
     other = st.upsert_binary("ef" * 32, "m.dll", format="pe32", arch="x86", pointer_size=4, toolchain="msvc",
                              analysis_profile="p")
     ctx.indexer.set_status(st, other, "ready")
-    assert dtools.delphi_classes(ctx, binary="m.dll").startswith("error not_delphi:")
+    assert dtools.delphi_classes(ctx, binary="m.dll") == \
+        "error not_delphi: 'm.dll' is not a Delphi binary; frameworks: none (msvc: m.dll)."
     assert len(dtools.delphi_classes(ctx).splitlines()) == 6        # without binary: Delphi binaries only
+
+
+def test_not_delphi_project_names_frameworks(tmp_path):
+    """A Delphi tool on a project without Delphi states what the project has, as data."""
+    ctx = make_ctx(tmp_path)
+    ix = ctx.indexer
+    st = ix.store("proj")
+    ix.current = "proj"
+    q = st.upsert_binary("ab" * 32, "imager.exe", format="pe32", arch="x86", pointer_size=4, toolchain="qt",
+                         analysis_profile="p")
+    m = st.upsert_binary("ac" * 32, "helper.dll", format="pe32", arch="x86", pointer_size=4, toolchain="msvc",
+                         analysis_profile="p")
+    for b in (q, m):
+        ix.set_status(st, b, "ready")
+    st.db.execute("INSERT INTO qt_class(binary_id, meta_addr, name, major, revision, data_addr, nsignals, "
+                  "nmethods, nprops, nenums, nctors) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (q, 0x1000, "MainWindow", 5, 8, 0x2000, 1, 2, 0, 0, 0))
+    st.db.commit()
+    for fn in (dtools.delphi_classes, dtools.delphi_forms):
+        assert fn(ctx) == "error not_delphi: no Delphi binaries; frameworks: qt (imager.exe), " \
+                          "none (msvc: helper.dll)."
+    out = dtools.delphi_events(ctx, form="TMainForm")
+    assert out.startswith("error not_delphi: no Delphi binaries; frameworks: qt (imager.exe)")
+
+
+def test_shared_handler_lists_every_binding(proj):
+    """One OnExecute handler shared by six actions: the function header names all six (it had a
+    limit of four, so the fifth and sixth action were missing)."""
+    ctx, st, bid, pe = proj
+    res = st.db.execute("SELECT res_name FROM dl_form WHERE binary_id=? AND class='TMainForm'", (bid,)).fetchone()[0]
+    a = pe.code["TMainForm.Refresh"]
+    names = ["actFlushHosts", "actFlushLogs", "actFlushPrivileges", "actFlushTables",
+             "actFlushTableswithreadlock", "actFlushStatus"]
+    caps = ["Hosts", "Logs", "Privileges", "Tables", "Tables with read lock", "Status"]
+    for i, (n, c) in enumerate(zip(names, caps)):
+        st.db.execute("INSERT INTO dl_component(binary_id, form, seq, parent, depth, name, class, caption) "
+                      "VALUES (?,?,?,?,?,?,?,?)", (bid, res, 900 + i, 0, 2, n, "TAction", c))
+        st.db.execute("INSERT INTO dl_event(binary_id, form, seq, prop, handler, owner, addr) VALUES (?,?,?,?,?,?,?)",
+                      (bid, res, 900 + i, "OnExecute", "actFlushExecute", "TMainForm", a))
+    st.db.execute("INSERT INTO dl_component(binary_id, form, seq, parent, depth, name, class, caption) "
+                  "VALUES (?,?,?,?,?,?,?,?)", (bid, res, 950, 0, 1, "btnFlush", "TButton", "Flush"))
+    st.db.execute("INSERT INTO dl_event(binary_id, form, seq, prop, handler, owner, addr) VALUES (?,?,?,?,?,?,?)",
+                  (bid, res, 950, "OnClick", "actFlushExecute", "TMainForm", a))
+    st.db.commit()
+    hints = delphi.hints_for(st, bid, a)
+    ev = [h for h in hints if h.startswith("handler ")]
+    assert ev == [
+        'handler OnExecute of 6 TAction: actFlushHosts "Hosts", actFlushLogs "Logs", actFlushPrivileges '
+        '"Privileges", actFlushTables "Tables", actFlushTableswithreadlock "Tables with read lock", '
+        'actFlushStatus "Status" in form TMainForm',
+        'handler OnClick of btnFlush (TButton "Flush") in form TMainForm']
+    many = [("OnClick", f"b{i}", "TButton", "", "TF") for i in range(30)]
+    one = delphi._event_hints(many)
+    assert len(one) == 1 and one[0].startswith("handler OnClick of 30 TButton: b0, b1,") \
+        and one[0].endswith(f"b{delphi._EVENT_SHOWN - 1}, +{30 - delphi._EVENT_SHOWN} more in form TF")
 
 
 def test_hints_and_candidates(proj):

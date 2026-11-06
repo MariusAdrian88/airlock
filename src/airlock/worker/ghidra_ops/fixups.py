@@ -351,7 +351,10 @@ def apply_all(program: Any, monitor: Any = None, parameter_id: bool = True) -> d
        PARAM_ID_MIN_UNKNOWN of the functions have no convention;
     3. functions it called `__fastcall` that only take ECX become `__thiscall` (it tries
        fastcall first, which is wrong for plain this-calls);
-    4. functions still without a convention are classified from their instructions."""
+    4. functions still without a convention are classified from their instructions;
+    5. Delphi string literals typed as strings and the integer parameters that receive them retyped as
+       string pointers, so the decompiler prints ``L"text"`` (``delphistr``; nothing on other programs)."""
+    from . import delphistr
     out: dict[str, Any] = {"call_fixups": apply_call_fixups(program)}
     out["unknown_before"] = round(unknown_share(program), 3)
     if parameter_id and out["unknown_before"] > PARAM_ID_MIN_UNKNOWN \
@@ -360,4 +363,6 @@ def apply_all(program: Any, monitor: Any = None, parameter_id: bool = True) -> d
     if not (monitor is not None and monitor.isCancelled()):
         out["conventions"] = apply_conventions(program, monitor, relabel_fastcall=True)
     out["unknown_after"] = round(unknown_share(program), 3)
+    if not (monitor is not None and monitor.isCancelled()):
+        out["delphi_strings"] = delphistr.apply_delphi_strings(program, monitor)
     return out

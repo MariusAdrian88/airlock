@@ -999,7 +999,8 @@ no Ghidra) when a Delphi binary becomes ready and on open for older projects. Pu
 methods and event handlers that Ghidra has no function for are created through `fnfix` (the same
 `create_functions` op as for MFC handlers). Nothing is renamed in Ghidra: `function` shows hints
 (`TMainForm.Button1Click (published)`, `handler OnClick of Button1 (TButton "Run") in form TMainForm`,
-`TFoo::vslot 3`). The project map gets a `UI:` line, handlers seed the `ui-menu` / `ui-dialog`
+`TFoo::vslot 3`). The Delphi tools on a project without Delphi binaries answer with what it has:
+`error not_delphi: no Delphi binaries; frameworks: qt (app.exe)`. The project map gets a `UI:` line, handlers seed the `ui-menu` / `ui-dialog`
 features, and methods of classes from runtime units (`System`, `Vcl.*`, `Classes`...) plus `@`-prefixed
 helper names count as runtime (`runtime: Delphi`).
 
@@ -1763,13 +1764,14 @@ prefix that are no longer final are withdrawn (file and entry removed).
     assignments or calls, braces blocks, `begin`/`end` blocks),
   - Ghidra artefacts (`FUN_`, `DAT_`, `undefined4`, `param_1`, `local_`),
   - hex addresses in the image range of any binary in the project,
-  - more than N consecutive hex bytes.
+  - more than N consecutive hex bytes (a comma-separated list of plain decimal numbers, such as column widths, is not a byte run).
   The rejection names the offending line so the agent rewrites it as prose or
   as a data-layout table. This filter is a heuristic aid, not a guarantee; the
   reviewer remains responsible.
+- A clean session never shows the dirty folder's path (`project_open` names only the clean and specs folders; the clean map scrubs it from the purpose text).
 - Data layouts in specs use a neutral table form (field, offset, size,
   meaning), which describes the format without copying code.
-- `spec_write` requires `sources`, stored in `spec_provenance` (dirty only).
+- `spec_write` requires `sources`, stored in `spec_provenance` (dirty only). A line of `sources` that is not a valid form and holds spaces is prose: it is stored whole (commas kept) as an `observation` with its text, and the reply says so; other bad items list the accepted forms.
   `sources` is a list (newline, `;` or `,`) of `[method:]binary!function-or-address` items
   or bare method words (`decompile`, `file_diff`, `resources`, `observation`). Targets
   resolve with the §7.3 rules; a non-decompile method with an unresolvable target keeps
@@ -2194,6 +2196,29 @@ classes with `DECLARE_EVENTSINK_MAP` (dialogs hosting ActiveX controls).
 - Join: the handler name is looked up (case-insensitive) in the published method table of the owner
   class and its ancestors. The owner is the form class (the root component's class), or the class of the
   nearest `inline` ancestor (a frame). A form whose class is not linked into the binary stays unresolved.
+- Handler header: every DFM binding of a handler is listed. Components of one class that share the
+  handler (one `OnExecute` for six actions) form one hint, `handler OnExecute of 6 TAction: actA "A",
+  actB "B", ... in form TMainForm`, with up to 24 names per group. A limit of 4 bindings used to drop the
+  fifth and sixth action, and agents named the wrong one.
+- String literals (`worker/ghidra_ops/delphistr.py`, a step of the post-analysis fixups,
+  `COLLECTOR_VERSION` 4). A Delphi 2009+ `UnicodeString` / `AnsiString` literal is a constant header
+  (`u16 codePage` 1200 for UTF-16, `u16 elemSize` 2 or 1, `i32 refCnt` -1, `i32 length`; on x64 a `u32`
+  padding comes first) followed by the characters and a zero; code passes the address of the characters.
+  The step finds the headers in the initialized blocks, types the characters as `unicode` / `string` data
+  where only undefined bytes are, follows each instruction reference to the call it feeds (`LEA RDX,[lit]`
+  ... `CALL f`, no other write to the register in between, at most 8 instructions) and retypes that
+  register parameter of `f` from an integer or undefined type to `wchar_t *` / `char *`. Signatures the
+  user or agent set and pointer parameters are kept. **[verified]** (Ghidra 12.1.4, a Delphi 12 x64
+  program) the decompiler prints a constant as a string only for a pointer or undefined parameter;
+  Parameter ID had typed the RTL string assignment's source as `longlong`, so literals showed as
+  `0x124ab50`. After the step: `FUN_00412a40(local_28, L"TABLES WITH READ LOCK")`; 24896 literals,
+  176 parameters retyped, 4.8 s on a 25 MB program. ShortString literals (length byte, then text) are
+  found through data references from code and typed as `PascalString255`; the decompiler then shows the
+  label (`p_Segoe_UI_0051e150`). Identifiers are not taken as ShortStrings: code also points at RTTI
+  names and at type info records (kind byte, then the name), which read as a ShortString **[verified]**.
+  On a 32-bit Delphi program the step found 5811 literals and retyped 76 parameters in 1.7 s; the
+  sampled routine showed its literal before already. A literal pushed for a variadic routine (`UStrCatN`)
+  stays missing from the C there, because the decompiler does not show that stack argument.
 
 ### .NET
 

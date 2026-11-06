@@ -34,13 +34,38 @@ def _scope(ctx: ServerContext, binary: str, ident: str = "") -> tuple[list[Bound
         return got
     bounds = [bd for bd in got[0] if delphi.is_delphi(bd.binary)]
     if not bounds:
-        what = f"'{got[0][0].binary.name}' is a {got[0][0].binary.toolchain or 'native'} binary" if binary \
-            else "the project has no ready Delphi binary"
-        return f"error not_delphi: {what}."
+        what = f"'{got[0][0].binary.name}' is not a Delphi binary" if binary else "no Delphi binaries"
+        return f"error not_delphi: {what}; frameworks: {_frameworks(got[0])}."
     for bd in bounds:
         art = ctx.indexer.paths(bd.project).artifacts / bd.binary.sha256
         delphi.ensure(bd.store, bd.binary, art)
     return bounds, len(bounds) > 1, ident
+
+
+# framework -> table whose rows for a binary mean the framework was found in it
+_FW_TABLES = (("qt", "qt_class"), ("mfc", "msgmap_entry"), (".net", "dn_type"), ("c++ rtti", "rtti_class"))
+
+
+def _frameworks(bounds: list[Bound]) -> str:
+    """`qt (a.exe, b.dll), mfc (c.exe)`: what the binaries have, as data, for a Delphi tool called on a
+    project without Delphi; a binary with none of them is listed under its toolchain."""
+    by: dict[str, list[str]] = {}
+    for bd in bounds:
+        hit = False
+        for fw, table in _FW_TABLES:
+            try:
+                n = bd.store.db.execute(f"SELECT 1 FROM {table} WHERE binary_id=? LIMIT 1",
+                                        (bd.binary.id,)).fetchone()
+            except Exception:  # noqa: BLE001  table missing in an older index
+                n = None
+            if n:
+                by.setdefault(fw, []).append(bd.binary.name)
+                hit = True
+                break       # the first (most specific) framework names the binary
+        if not hit:
+            by.setdefault(f"none ({bd.binary.toolchain or 'native'})", []).append(bd.binary.name)
+    return ", ".join(f"{fw} ({', '.join(names)})" if not fw.startswith("none") else
+                     f"{fw[:-1]}: {', '.join(names)})" for fw, names in by.items())
 
 
 def _page(lines: list[str], bud: int, name: str, args: dict, cursor: str) -> str:

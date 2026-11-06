@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from airlock.index.store import Binary, Function, Store
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
+from airlock.server.registry import add_note
 from airlock.server.selectors import MAX_CANDIDATES, fmt_addr, resolve_function, split_binary_suffix, split_binary_target
 
 
@@ -24,6 +27,50 @@ class Bound:
         return fmt_addr(value, self.psize, space)
 
 
+def _guess_binary(proj: str, ref: str, every: list[Binary]) -> Binary | None:
+    """The binary a wrong ``binary=`` means: the project's only binary (this covers the project
+    name), or the one binary whose name without the extension equals ``ref``."""
+    if len(every) == 1:
+        return every[0]
+    r = ref.strip().lower()
+    stems = [b for b in every if b.name.rsplit(".", 1)[0].lower() == r]
+    if len(stems) == 1:
+        return stems[0]
+    return None
+
+
+def normalize_kind(kind: str, allowed: Iterable[str]) -> tuple[str, str | None]:
+    """``(value, note)``: ``kind`` as one of ``allowed`` when only its case, a plural/singular
+    form or ``-``/``_``/space/``/`` differ (note says what was used); ``("", None)`` when no
+    allowed value fits. An exact value gives no note."""
+    opts = list(allowed)
+    k = kind.strip()
+    if k in opts:
+        return k, None
+
+    def squash(x: str) -> str:
+        return re.sub(r"[\s_/\-]+", "", x.lower())
+
+    def forms(x: str) -> set[str]:
+        x = squash(x)
+        out = {x, x + "s", x + "es"}
+        if x.endswith("ies"):
+            out.add(x[:-3] + "y")
+        if x.endswith("es"):
+            out.add(x[:-2])
+        if x.endswith("s"):
+            out.add(x[:-1])
+        if x.endswith("y"):
+            out.add(x[:-1] + "ies")
+        return out
+
+    mine = forms(k)
+    hit = [o for o in opts if squash(o) in mine]
+    if len(hit) == 1:
+        return hit[0], f"(kind: {k} read as {hit[0]})"
+    return "", None
+
+
 def bind_binary(ctx: ServerContext, binary: str = "", *, require_ready: bool = True,
                 project: str | None = None) -> Bound | str:
     """Resolve the project and binary; returns Bound or a one-line error string.
@@ -38,8 +85,13 @@ def bind_binary(ctx: ServerContext, binary: str = "", *, require_ready: bool = T
     if binary:
         found = st.find_binaries(binary)
         if not found:
-            names = ", ".join(b.name for b in st.list_binaries()) or "none"
-            return f"error not_found: no binary '{binary}' in project '{proj}' (have: {names})."
+            every = st.list_binaries()
+            guess = _guess_binary(proj, binary, every)
+            if guess is None:
+                names = ", ".join(b.name for b in every) or "none"
+                return f"error not_found: no binary '{binary}' in project '{proj}' (have: {names})."
+            add_note(f"(binary: {guess.name})")
+            found = [guess]
         if len(found) > 1:
             return (f"error ambiguous_binary: '{binary}' matches {len(found)} binaries: "
                     f"{', '.join(f'{x.name} ({x.sha256[:12]})' for x in found[:MAX_CANDIDATES])}.")

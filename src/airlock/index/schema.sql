@@ -171,7 +171,7 @@ CREATE TABLE spec_provenance (
   binary_id     INTEGER REFERENCES binary(id),
   function_id   INTEGER REFERENCES function(id),
   address       INTEGER,
-  method        TEXT            -- decompile | file_diff | resources | observation
+  method        TEXT            -- decompile | file_diff | resources | observation[: prose given as a source]
 );
 CREATE INDEX spec_provenance_by_spec ON spec_provenance(spec_id);
 -- Append-only log of spec writes and publishes (profile = session role).

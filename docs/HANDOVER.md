@@ -15,7 +15,7 @@ fixture only (gitignored via a generic `tests/fixtures/` rule plus the exact
 path in `.git/info/exclude`). Never name it or quote anything from it in
 tracked files or commit messages; results live in local memory notes only.
 
-Tests: `pytest -q` → 1090 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
+Tests: `pytest -q` → 1135 passed, 47 skipped (~1-3 min; pytest-xdist, at most 8 workers by default; Ghidra runs with `--binary`/`--xbin` are serial). Ghidra suites:
 `pytest -q -m ghidra --binary=<exe>` (notepad copy) and
 `--xbin=<folder>` (an exe + a DLL it imports, from System32).
 
@@ -490,6 +490,18 @@ Failure patterns (round 4):
   (`actFlushTableswithreadlock` and `actFlushStatus` are missing), so both models call the read-lock branch
   `actFlushTables`. Unicode string literals passed as `0x124ab50` stay numbers in the C, so the exact SQL suffix and
   the portable-file delimiter `<|||>` were not read (Haiku then guessed JSON for the settings file).
+  Fixed after round 4: the header query had `LIMIT 4`; it now lists every binding and groups components
+  of one class (`handler OnExecute of 6 TAction: ...`). The strings: Parameter ID had typed the
+  source parameter of the RTL string assignment as `longlong`, and the decompiler turns a constant into
+  a string only for a pointer or undefined parameter. A new fixup step (`delphistr`, DESIGN §11
+  "Delphi", `COLLECTOR_VERSION` 4, so old projects are refreshed on open) types the literals and
+  retypes such parameters; the C now reads `FUN_00412a40(local_28, L"TABLES WITH READ LOCK")` and
+  `FUN_00d48cc0(L"<|||>", ...)`. `delphi_*` on a project without Delphi answers
+  `error not_delphi: no Delphi binaries; frameworks: qt (rpi-imager.exe)`.
+  Rerun r6 (transcripts `r6_*`, a refreshed copy of the project, same prompts): t13 Sonnet v 7 calls,
+  Haiku v 6 (r5_b 11); both name `actFlushTableswithreadlock` and quote the SQL. t14 Sonnet v 11 calls
+  (1 `bad_cursor`), Haiku v 22 (r5_b ~ 17); both read the `<|||>` line format and the `<{{{>` / `<}}}>`
+  escapes from the C.
 - Binary named by project name: Haiku passed `binary=ohm` (4 errors in t7/t8); the error lists the one binary, but
   with a single binary the tool could just use it.
 - Other errors are wrong tool choices: `delphi_classes` on a Qt project, `dotnet_types kind=methods`,

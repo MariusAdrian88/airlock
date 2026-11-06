@@ -436,6 +436,14 @@ def scrub_clean(text: str, names: list[str]) -> str:
     return text
 
 
+def scrub_dirty_path(text: str, pp: ProjectPaths) -> str:
+    """Remove the dirty folder's path (either slash style) from a free text going into the clean map."""
+    d = str(pp.dirty)
+    for form in {d, d.replace("\\", "/")}:
+        text = re.sub(re.escape(form) + r"[\\/]?", "[path removed]", text, flags=re.I)
+    return text
+
+
 def render_clean(pp: ProjectPaths, store: Store | None, man: dict[str, Any] | None = None) -> list[str]:
     names: list[str] = []
     purpose = ""
@@ -446,7 +454,7 @@ def render_clean(pp: ProjectPaths, store: Store | None, man: dict[str, Any] | No
     names += [PurePosixPath(str(f.get("path", "")).replace("\\", "/")).name
               for f in man.get("files") or [] if isinstance(f, dict)]
     out = [f"# {pp.name} (clean map)", "## Purpose",
-           scrub_clean(purpose, names) if purpose else "(not set yet)", "## Specs"]
+           scrub_clean(scrub_dirty_path(purpose, pp), names) if purpose else "(not set yet)", "## Specs"]
     specs = published_specs(pp)
     if not specs:
         out.append("(no published specs yet)")

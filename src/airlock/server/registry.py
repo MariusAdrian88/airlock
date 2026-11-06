@@ -11,6 +11,7 @@ Descriptions stay to one sentence: they are part of every session's context.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import inspect
 import typing
@@ -35,12 +36,43 @@ class ToolImpl:
 IMPLEMENTED: dict[str, ToolImpl] = {}
 
 
+_NOTES: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("airlock_notes", default=None)
+
+
+NL = chr(10)
+
+
+def add_note(text: str) -> None:
+    """A one-line fact about how the call's arguments were read (``(binary: X)``); the outermost
+    tool call puts the notes above a successful result. Does nothing outside a tool call."""
+    notes = _NOTES.get()
+    if notes is not None and text not in notes:
+        notes.append(text)
+
+
+def _noting(fn: Impl) -> Impl:
+    @functools.wraps(fn)
+    def run(*args: Any, **kwargs: Any) -> str:
+        if _NOTES.get() is not None:        # nested tool call: the outer call owns the notes
+            return fn(*args, **kwargs)
+        notes: list[str] = []
+        token = _NOTES.set(notes)
+        try:
+            out = fn(*args, **kwargs)
+        finally:
+            _NOTES.reset(token)
+        if notes and isinstance(out, str) and not out.startswith("error "):
+            return NL.join(notes) + NL + out
+        return out
+    return run
+
+
 def tool(name: str, description: str) -> Callable[[Impl], Impl]:
     if name not in CATALOG:
         raise ValueError(f"tool '{name}' is not in the catalog")
 
     def deco(fn: Impl) -> Impl:
-        IMPLEMENTED[name] = ToolImpl(name, description, fn)
+        IMPLEMENTED[name] = ToolImpl(name, description, _noting(fn))
         return fn
     return deco
 

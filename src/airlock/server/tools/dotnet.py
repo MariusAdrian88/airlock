@@ -15,8 +15,8 @@ from airlock.server import dotnet as dn
 from airlock.server.budget import CursorError, fit_lines, resume_lines
 from airlock.server.context import ServerContext
 from airlock.server.indexer import IndexerError
-from airlock.server.registry import tool
-from airlock.server.tools.common import Bound, bind_binary, budget_for
+from airlock.server.registry import add_note, tool
+from airlock.server.tools.common import Bound, bind_binary, budget_for, normalize_kind
 
 
 def _page(ctx: ServerContext, lines: list[str], name: str, args: dict, cursor: str, budget: int,
@@ -70,7 +70,12 @@ def dotnet_types(ctx: ServerContext, query: str = "", limit: int = 50, binary: s
         return _page(ctx, [], "dotnet_types", args, cursor, budget)
     k = kind.strip().lower()
     if k and k not in dn.KINDS:
-        return f"error bad_args: kind '{kind}' is not one of {', '.join(dn.KINDS)}."
+        k, note = normalize_kind(kind, dn.KINDS)
+        if not k:
+            return f"error bad_args: kind '{kind}' is not one of {', '.join(dn.KINDS)}."
+        if note:
+            add_note(note)
+    args["kind"] = k
     bounds = _scope(ctx, binary)
     if isinstance(bounds, str):
         return bounds

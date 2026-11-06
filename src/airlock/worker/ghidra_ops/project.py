@@ -16,7 +16,7 @@ from . import fixups
 from . import session as S
 from .session import ANALYSING, LOADED, READY, SESSION, Entry, guarded
 
-COLLECTOR_VERSION = 3  # bump when extract/decompile row semantics or post-analysis fixups change
+COLLECTOR_VERSION = 4  # 4: Delphi string literals (delphistr); bump when extract/decompile row semantics or post-analysis fixups change
 PROGRESS_INTERVAL_S = 1.0
 
 

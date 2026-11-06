@@ -127,7 +127,7 @@ def test_project_open_clean_and_redaction(tmp_path):
     server, ctx, pp = _server(tmp_path)
     out = _call(server, "project_open", {"name": "demo", "role": "clean"})
     assert out.splitlines()[0] == (f"session clean for demo: write the implementation under {pp.clean}; "
-                                   f"never read {pp.dirty}. Specs: 1 published in {pp.specs}")
+                                   f"Specs: 1 published in {pp.specs}")
     assert "# demo (clean map)" in out and "one" in out and "app.exe" not in out
     assert _call(server, "projects") == "demo | specs 1"
     info = _call(server, "project_info")
@@ -138,6 +138,31 @@ def test_project_open_clean_and_redaction(tmp_path):
     assert _call(server, "function", {"query": "x"}).startswith("error wrong_role:")
     assert _call(server, "project_open", {"name": "demo", "role": "dirty"}).startswith(
         "error role_locked:")
+
+
+def test_clean_tools_show_no_dirty_path(tmp_path):
+    server, ctx, pp = _server(tmp_path)
+    (pp.dirty / "notes.txt").write_text("secret")
+    pp.specs.joinpath("specs.json").write_text(
+        '{"specs":[{"topic":"one","title":"One","version":1,"status":"final","file":"one.md"}]}')
+    pp.specs.joinpath("one.md").write_text("---\ntopic: one\n---\nbody text\n")
+    leaks = [str(pp.dirty), str(pp.dirty).replace("\\", "/"), "dirty\\", "dirty/", "app.exe", "a.dll"]
+    outs = [_call(server, "project_open", {"name": "demo", "role": "clean"}), _call(server, "projects"),
+            _call(server, "project_info"), _call(server, "spec_list"), _call(server, "spec_read", {"topic": "one"}),
+            _call(server, "spec_read", {"topic": "nope"}), _call(server, "spec_read"),
+            _call(server, "spec_export")]
+    for out in outs:
+        for leak in leaks:
+            assert leak not in out, (leak, out)
+    assert str(pp.clean) in outs[0]
+
+
+def test_clean_map_scrubs_the_dirty_path(tmp_path):
+    from airlock.server import projectmap
+    _, _, pp = _server(tmp_path)
+    text = f"notes live in {pp.dirty}\\x and {str(pp.dirty).replace(chr(92), '/')}/y"
+    out = projectmap.scrub_dirty_path(text, pp)
+    assert "dirty" not in out.replace("[path removed]", "") and "[path removed]" in out
 
 
 def test_project_open_errors(tmp_path):

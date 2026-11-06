@@ -102,6 +102,48 @@ def test_write_validation(dctx):
     assert _w(dctx, topic="fmt/two", sources="file_diff, app.exe!0x401100").startswith("spec ")
 
 
+def test_prose_sources_become_an_observation(dctx):
+    prose = "read from the saved file, then compared with the header"
+    out = _w(dctx, sources=prose)
+    assert out.startswith("spec ") and f'(stored as observation: "{prose}")' in out
+    prov = dctx.indexer.store("proj").db.execute(
+        "SELECT * FROM spec_provenance").fetchall()
+    assert len(prov) == 1 and prov[0]["method"] == f"observation: {prose}" and prov[0]["function_id"] is None
+    # real items next to prose lines keep their meaning; commas inside a prose line are not split
+    out = _w(dctx, topic="fmt/mix", sources="app.exe!main, app.exe!0x401100\nsaw it, twice in the UI")
+    assert out.startswith("spec ") and 'observation: "saw it, twice in the UI"' in out
+    rows = dctx.indexer.store("proj").db.execute(
+        "SELECT method FROM spec_provenance ORDER BY rowid DESC LIMIT 3").fetchall()
+    assert sorted(r["method"] for r in rows).count("decompile") == 2
+
+
+def test_bad_single_word_source_lists_the_forms(dctx):
+    out = _w(dctx, sources="app.exe!nosuchfn")
+    assert out.startswith("error bad_source:") and "binary!function, binary!0xADDRESS" in out
+    assert "observation" in out
+
+
+@pytest.mark.parametrize("line", [
+    "| 64, 64, 48, 73, 90, 12, 45, 33, 21 |",
+    "the column widths are 64, 64, 48, 73, 90, 12, 45, 33 pixels",
+])
+def test_filter_accepts_decimal_lists(line):
+    assert specfilter.check(line) is None
+
+
+@pytest.mark.parametrize("line", [
+    "50 4B 03 04 14 00 06 00 08 00 00 00",
+    "00, 00, 00, 00, 00, 00, 00, 00, 00",
+    "64, 4A, 48, 73, 90, 12, 45, 33",
+    "0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x06, 0x00",
+    "4d5a90000300000004000000ffff0000",
+    "64 64 48 73 90 12 45 33 21",
+])
+def test_filter_still_rejects_byte_dumps(line):
+    out = specfilter.check(line)
+    assert out is not None and out.startswith("error spec_has_bytes:"), out
+
+
 def test_write_filters_the_title_too(dctx):
     assert _w(dctx, title="FUN_00401000 handler").startswith("error spec_has_ghidra_names:")
 

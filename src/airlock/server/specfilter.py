@@ -31,6 +31,7 @@ _HEX_LIT = re.compile(r"(?<![\w$])(?:0[xX]|\$)([0-9A-Fa-f]{1,16})\b|\b([0-9A-Fa-
                       r"(?<![\w.])([0-9A-Fa-f]{6,16})(?![\w.])")
 _BYTE = r"(?:0[xX])?[0-9A-Fa-f]{2}"
 _BYTE_RUN = re.compile(rf"(?<![\w])(?:{_BYTE}(?:[ ,:\-]+|(?=[ ,]|$))){{{MAX_HEX_BYTES - 1},}}{_BYTE}(?![\w])")
+_DECIMAL_LIST = re.compile(r"[1-9]\d?(?:\s*,\s*[1-9]\d?)+")
 _LONG_HEX = re.compile(r"(?<![\w])(?:[0-9A-Fa-f]{2}){8,}(?![\w])")
 _POINTER_LIT = re.compile(r"(?<![\w$])0[xX][0-9A-Fa-f]{8,16}\b")
 
@@ -42,6 +43,15 @@ def _preview(line: str) -> str:
 
 def _err(code: str, n: int, line: str, what: str, how: str) -> str:
     return f"error {code}: line {n} {what} ('{_preview(line)}'). {how}."
+
+
+def _is_byte_dump(s: str) -> bool:
+    """A hex-byte run, unless it is only a comma-separated list of plain decimal numbers (column widths,
+    counts): digits only, no leading zero, no 0x. Letters, zero padding or space-only separators stay bytes."""
+    for m in _BYTE_RUN.finditer(s):
+        if not _DECIMAL_LIST.fullmatch(m.group(0).strip()):
+            return True
+    return False
 
 
 def image_ranges(bases: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -74,7 +84,7 @@ def check(text: str, ranges: list[tuple[int, int]] | None = None) -> str | None:
             if pat.match(s):
                 return _err("spec_has_code", n, line, what,
                             "allowed: prose and field/offset/size/meaning tables")
-        if _BYTE_RUN.search(s) or _LONG_HEX.search(s):
+        if _is_byte_dump(s) or _LONG_HEX.search(s):
             return _err("spec_has_bytes", n, line,
                         f"carries a run of {MAX_HEX_BYTES} or more hex bytes",
                         "allowed: the byte layout as fields, not dumped bytes")

@@ -54,40 +54,66 @@ class Source:
     function_id: int | None
     address: int | None
     method: str
+    note: str = ""          # prose given as a source: kept with the observation
+
+
+FORMS = ("accepted sources: binary!function, binary!0xADDRESS, [decompile|file_diff|resources|observation:]"
+         "binary!function, or a method word alone such as 'observation'; separate items with commas")
+MAX_NOTE = 300
+
+
+def _parse_item(st: Store, item: str) -> Source | str | None:
+    """One source item: a Source, an error line, or None when it is not a source form at all (prose)."""
+    method, rest = "", item
+    head, sep, tail = item.partition(":")
+    if sep and head.strip().lower() in METHODS:
+        method, rest = head.strip().lower(), tail.strip()
+    elif item.lower() in METHODS:
+        method, rest = item.lower(), ""
+    if not rest:
+        return Source(None, None, None, method)
+    bname, bare = split_binary_target(st, rest)
+    bins = st.find_binaries(bname) if bname else st.list_binaries()
+    if len(bins) != 1:
+        return None if " " in item else err("bad_source", f"source '{item}' does not name one binary", FORMS)
+    res = resolve_function(st, bins[0].id, bare)
+    if not res.ok:
+        if method and method != "decompile":
+            return Source(None, None, None, method)
+        if " " in item:
+            return None
+        why = (res.error or "").partition(": ")[2].rstrip(".")
+        return err("bad_source", f"source '{item}': {why}", FORMS)
+    fn = res.function
+    return Source(bins[0].id, fn.id, fn.entry, method or "decompile")
 
 
 def parse_sources(st: Store, text: str) -> list[Source] | str:
-    """``[method:]binary!function-or-address`` items, or a bare method word; or an error line."""
-    items = [x.strip() for x in re.split(r"[\n;,]+", text or "") if x.strip()]
-    if not items:
-        return err("sources_required", "spec_write needs sources",
-                   "sources: binary!function, binary!0xADDRESS or a method word such as 'observation'")
+    """``[method:]binary!function-or-address`` items, or a bare method word; or an error line.
+
+    Items split on newlines, ``;`` and ``,``. A line that is not a source form and holds spaces is prose:
+    the whole line (commas kept) is stored as an ``observation`` carrying its text."""
+    lines = [x.strip() for x in re.split(r"[\n;]+", text or "") if x.strip()]
+    if not lines:
+        return err("sources_required", "spec_write needs sources", FORMS)
     out: list[Source] = []
-    for item in items:
-        method, rest = "", item
-        head, sep, tail = item.partition(":")
-        if sep and head.strip().lower() in METHODS:
-            method, rest = head.strip().lower(), tail.strip()
-        elif item.lower() in METHODS:
-            method, rest = item.lower(), ""
-        if not rest:
-            out.append(Source(None, None, None, method))
-            continue
-        bname, bare = split_binary_target(st, rest)
-        bins = st.find_binaries(bname) if bname else st.list_binaries()
-        if len(bins) != 1:
-            return err("bad_source", f"source '{item}' does not name one binary",
-                       "the forms are binary!function or binary!0xADDRESS")
-        res = resolve_function(st, bins[0].id, bare)
-        if not res.ok:
-            if method and method != "decompile":
-                out.append(Source(None, None, None, method))
-                continue
-            why = (res.error or "").partition(": ")[2].rstrip(".")
-            return err("bad_source", f"source '{item}': {why}",
-                       "method words such as 'observation' count too")
-        fn = res.function
-        out.append(Source(bins[0].id, fn.id, fn.entry, method or "decompile"))
+    for line in lines:
+        got: list[Source] = []
+        prose = False
+        for frag in (x.strip() for x in line.split(",") if x.strip()):
+            r = _parse_item(st, frag)
+            if isinstance(r, str):
+                return r
+            if r is None:
+                prose = True
+                break
+            got.append(r)
+        if prose:
+            out.append(Source(None, None, None, "observation", " ".join(line.split())[:MAX_NOTE]))
+        else:
+            out += got
+    if not out:
+        return err("sources_required", "spec_write needs sources", FORMS)
     return list(dict.fromkeys(out))
 
 
@@ -128,7 +154,8 @@ def write_spec(st: Store, role: str, topic: str, title: str, body: str, status: 
         sid = cur.lastrowid
         st.db.executemany("INSERT INTO spec_provenance(spec_id, binary_id, function_id, address, method) "
                           "VALUES (?,?,?,?,?)",
-                          [(sid, s.binary_id, s.function_id, s.address, s.method) for s in sources])
+                          [(sid, s.binary_id, s.function_id, s.address,
+                           f"{s.method}: {s.note}" if s.note else s.method) for s in sources])
         audit(st, role, "spec_write", f"{topic}\n{body}", "ok", f"{topic} v{ver} {status}")
         return sid, ver, True
 

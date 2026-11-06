@@ -10,6 +10,8 @@ from airlock.index.store import Function, Store
 _SPACE_ADDR = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(?:0[xX])?([0-9a-fA-F]+)$")
 _BARE_HEX = re.compile(r"^[0-9a-fA-F]+$")
 MAX_CANDIDATES = 20
+# Ghidra default names carry the address: DAT_14026ebc8, PTR_FUN_00401000, LAB_0040102c, UNK_..., s_Hello_00402000
+_DEFAULT_NAME = re.compile(r"^(?:DAT|PTR|LAB|UNK|FUN|SUB|EXT|BYTE|WORD|DWORD|QWORD|s|u)_(?:.*_)?([0-9a-fA-F]{4,16})$")
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,13 @@ def parse_address(target: str) -> tuple[str, int] | None:
             space = "ram"
         return space, int(m.group(2), 16)
     return None
+
+
+def default_name_address(text: str) -> int | None:
+    """The address in a Ghidra default data or label name (``DAT_14026ebc8``, ``s_text_00402000``),
+    else None. The hex part is the last ``_`` segment (32-bit names have 8 digits, 64-bit 8 to 16)."""
+    m = _DEFAULT_NAME.match(text.strip())
+    return int(m.group(1), 16) if m else None
 
 
 def split_binary_target(store: Store, target: str) -> tuple[str, str]:

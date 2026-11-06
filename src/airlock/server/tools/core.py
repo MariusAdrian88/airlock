@@ -24,12 +24,12 @@ from airlock.server.cview import (
     OUTLINE_DEFAULT_DEPTH, OUTLINE_MAX_DEPTH, block_listing, format_asm, outline_lines, reduce_c,
 )
 from airlock.server.indexer import IndexerError, worker_error
-from airlock.server.registry import call as call_tool, tool
+from airlock.server.registry import add_note, call as call_tool, tool
 from airlock.server.selectors import fmt_addr
 from airlock.server import cpp, delphi, dotnet, notes, qt, uijoin
 from airlock.server import targets as tg
 from airlock.server.tools.common import (
-    Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, preview,
+    Bound, bind_binary, bind_many, bound_of, budget_for, fn_desc, normalize_kind, preview,
 )
 from airlock.worker.protocol import WorkerError
 
@@ -167,6 +167,11 @@ def search(ctx: ServerContext, query: str = "", binary: str = "", kind: str = "a
         return _cursor_page(cursor, "search", bud)
     if not query.strip():
         return "error bad_args: query is empty."
+    fixed, note = normalize_kind(kind, (*_SEARCH_KINDS, *_UNINDEXED_KINDS))
+    if fixed:
+        kind = fixed
+        if note:
+            add_note(note)
     if kind in _UNINDEXED_KINDS:      # not in the full-text index: the tool that has them answers
         name, param = _FORWARD_KINDS[kind]
         if name not in ctx.config.tools:
@@ -781,7 +786,10 @@ def xrefs(ctx: ServerContext, target: str = "", binary: str = "", direction: str
         return "error bad_args: direction must be to or from."
     kinds = None
     if kind:
-        kinds = _KIND_MAP.get(kind)
+        fixed, note = normalize_kind(kind, _KIND_MAP)
+        if note:
+            add_note(note)
+        kinds = _KIND_MAP.get(fixed)
         if kinds is None:
             return (f"error bad_args: unknown kind '{kind}' "
                     "(kinds: call, jump, read, write, data, import, dynamic, table).")

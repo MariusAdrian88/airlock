@@ -18,7 +18,7 @@ from typing import Iterable
 from airlock.index.store import CODE_EDGES, Function, StringHit, Xref
 from airlock.server.context import ServerContext
 from airlock.server.graph import dll_stem, norm_import
-from airlock.server.selectors import (MAX_CANDIDATES, MAX_CLOSE, close_functions, close_text,
+from airlock.server.selectors import (default_name_address, MAX_CANDIDATES, MAX_CLOSE, close_functions, close_text,
                                       parse_address, resolve_function)
 from airlock.server.tools.common import Bound, Scope, bind_scope
 
@@ -428,6 +428,9 @@ def _resolve(ctx: ServerContext, binary: str, target: str, kinds: Iterable[str],
             return ClusterTarget(c.id, c)
     if _HEX.match(t):
         return _by_address(sc, t, ks)
+    da = default_name_address(t)
+    if da is not None:     # a name the decompiler prints for data or a label: the address is in it
+        return _by_address(sc, f"0x{da:x}", ks)
     if FEATURE in ks:
         try:
             feat = sc.store.get_feature(t.lower())

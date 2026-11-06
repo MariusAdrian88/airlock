@@ -908,14 +908,10 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
         if (r[1], r[2]) not in seen:
             seen.add((r[1], r[2]))
             out.append(f"rtti: {r[0] + '.' if r[0] else ''}{r[1]}.{r[2]}")
-    ev = q("SELECT e.prop, c.name, c.class, c.caption, f.class FROM dl_event e JOIN dl_form f ON "
-           "f.binary_id=e.binary_id AND f.res_name=e.form JOIN dl_component c ON c.binary_id=e.binary_id AND "
-           "c.form=e.form AND c.seq=e.seq WHERE e.binary_id=? AND e.addr=? ORDER BY e.form, e.seq LIMIT 4",
-           (binary_id, entry)).fetchall()
-    for r in ev:
-        cap = f' "{_short(r[3])}"' if r[3] else ""
-        who = f"{r[1]} ({r[2]}{cap})" if r[1] else f"form ({r[2]})"
-        out.append(f"handler {r[0]} of {who} in form {r[4]}")
+    out.extend(_event_hints(q("SELECT e.prop, c.name, c.class, c.caption, f.class FROM dl_event e JOIN dl_form f ON "
+                              "f.binary_id=e.binary_id AND f.res_name=e.form JOIN dl_component c ON "
+                              "c.binary_id=e.binary_id AND c.form=e.form AND c.seq=e.seq WHERE e.binary_id=? "
+                              "AND e.addr=? ORDER BY e.form, e.seq", (binary_id, entry)).fetchall()))
     props = q("SELECT c.unit, c.name, m.kind, m.name FROM dl_method m JOIN dl_class c ON c.binary_id=m.binary_id AND "
               "c.vmt=m.vmt WHERE m.binary_id=? AND m.addr=? AND m.kind IN ('prop-get','prop-set') "
               "ORDER BY c.vmt, m.name LIMIT 3", (binary_id, entry)).fetchall()
@@ -934,6 +930,31 @@ def hints_for(store: Store, binary_id: int, entry: int) -> list[str]:
         out.append(f"{names[0]}::vslot {slot}{extra}")
     from airlock.server import idr
     out.extend(idr.hint_for(store, binary_id, entry))
+    return out
+
+
+_EVENT_SHOWN = 24      # bindings named per (event, class, form) group; the rest are counted
+
+
+def _event_hints(rows) -> list[str]:
+    """DFM bindings of one handler, every one of them: a single binding as ``handler OnClick of Button1
+    (TButton "OK") in form TMainForm``, several components of one class sharing the handler (one
+    ``actFlushExecute`` for six actions) as ``handler OnExecute of 6 TAction: actA "A", actB "B" in form
+    TMainForm`` so that no binding is dropped."""
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        groups.setdefault((r[0], r[2], r[4], bool(r[1])), []).append(r)
+    out: list[str] = []
+    for (prop, cls, form, named), rs in groups.items():
+        if len(rs) == 1 or not named:
+            for r in rs:
+                cap = f' "{_short(r[3])}"' if r[3] else ""
+                who = f"{r[1]} ({r[2]}{cap})" if r[1] else f"form ({r[2]})"
+                out.append(f"handler {prop} of {who} in form {form}")
+            continue
+        items = [f'{r[1]} "{_short(r[3])}"' if r[3] else r[1] for r in rs[:_EVENT_SHOWN]]
+        more = f", +{len(rs) - _EVENT_SHOWN} more" if len(rs) > _EVENT_SHOWN else ""
+        out.append(f"handler {prop} of {len(rs)} {cls}: {', '.join(items)}{more} in form {form}")
     return out
 
 

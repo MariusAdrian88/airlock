@@ -45,7 +45,7 @@ def clean_open_text(ctx: ServerContext, pp: ProjectPaths) -> str:
 
 def clean_line(pp: ProjectPaths) -> str:
     return (f"session clean for {pp.name}: write the implementation under {pp.clean}; "
-            f"never read {pp.dirty}. Specs: {count_specs(pp)} published in {pp.specs}")
+            f"Specs: {count_specs(pp)} published in {pp.specs}")
 
 
 @tool("projects", "List the projects with their state; call it first to choose one for "
