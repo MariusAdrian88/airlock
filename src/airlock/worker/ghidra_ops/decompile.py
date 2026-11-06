@@ -154,7 +154,8 @@ def _resolve_function(program: Any, entry: Any) -> Any:
 
 def _unstub_calls(program: Any, rows: list[list[Any]], c_text: str) -> str:
     """A call to an airlock stub becomes a call of the routine the stub stands for: the row target is
-    the routine's entry and the C text names the routine, not the stub (``Name_3`` -> ``Name``). Returns
+    the routine's entry and the C text names the routine, not the stub (``Name_3`` -> ``Name``); the target of
+    a stub of an indirect call (``vmt_64_ad_0``) is dropped, so no stub address is printed. Returns
     the new C text; the offsets of all rows move with it."""
     rng = stubs.stub_range(program)
     if rng is None:
@@ -167,6 +168,8 @@ def _unstub_calls(program: Any, rows: list[list[Any]], c_text: str) -> str:
             continue
         tag = stubs.real_target(program, r[4])
         if tag is None:
+            if stubs.is_vcall_stub(program, r[4]):
+                r[4] = None     # a stub of an indirect call has no routine: no address note after its name
             continue
         entry, n = tag
         old = c_text[r[1]:r[2]]

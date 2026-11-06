@@ -255,6 +255,21 @@ def test_decompile_text_names_the_real_routine():
     assert "_3" not in out and hex(LO) not in out
 
 
+def test_decompile_vcall_stub_has_no_target_address():
+    p = Program()
+    p.fns.append(Fn(LO + 32, "vmt_64_ad_0", f"{stubs.STUB_TAG}vcall 64.ad.0"))
+    assert stubs.is_vcall_stub(p, LO + 32) and not stubs.is_vcall_stub(p, LO) and not stubs.is_vcall_stub(p, 0x401000)
+    assert stubs.real_target(p, LO + 32) is None
+    text = "x = vmt_64_ad_0(self,&y); z = RealConcat_3(a);"
+    s1 = text.index("vmt_64_ad_0")
+    s2 = text.index("RealConcat_3")
+    rows = [["call", s1, s1 + 11, 0x402010, LO + 32, "vmt_64_ad_0"], ["call", s2, s2 + 12, 0x402020, LO, "RealConcat_3"]]
+    out = decompile._unstub_calls(p, rows, text)
+    assert out == "x = vmt_64_ad_0(self,&y); z = RealConcat(a);"
+    assert [r[4] for r in rows] == [None, 0x401000]         # no target: the server prints no /*0x...*/ note
+    assert out[rows[0][1]:rows[0][2]] == "vmt_64_ad_0" and out[rows[1][1]:rows[1][2]] == "RealConcat"
+
+
 def test_rename_follows_the_routine(monkeypatch):
     _fake_symbol_module(monkeypatch)
     p = Program()

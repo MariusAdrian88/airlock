@@ -75,6 +75,17 @@ def real_target(program: Any, off: int) -> tuple[int, int] | None:
     return parse_tag(fn.getComment()) if fn is not None else None
 
 
+def is_vcall_stub(program: Any, off: int) -> bool:
+    """True when ``off`` is the entry of a stub of an indirect call (tag ``airlock:concat vcall <key>``): it
+    stands for no routine, so a decompiled call to it has no target address."""
+    rng = stub_range(program)
+    if not in_range(rng, off):
+        return False
+    fn = program.getFunctionManager().getFunctionAt(
+        program.getAddressFactory().getDefaultAddressSpace().getAddress(off))
+    return fn is not None and str(fn.getComment() or "").startswith(STUB_TAG + "vcall ")
+
+
 def real_callee(program: Any, off: int) -> int:
     """The routine a stub at offset ``off`` stands for; ``off`` itself when it is no stub."""
     tag = real_target(program, off)

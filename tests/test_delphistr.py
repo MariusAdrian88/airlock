@@ -213,3 +213,95 @@ def test_vcall_args_push_of_an_outer_call_is_not_counted():
     selfload = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}))
     assert D.vcall_args(_vc("ECX"), [selfload, lea, store, push]) == (("EAX", "EDX"), 0)
     assert D.vcall_args(_vc("ECX"), [selfload, push, lea]) == (("EAX", "EDX"), 1)   # a push inside the setup counts
+
+
+def test_vcall_args_delphi_vmt_load_into_another_register():
+    # lea ecx,[ebp-4]; mov edx,esi; mov eax,ebx; mov esi,[eax]; call [esi]  (nearest first)
+    vmt = D.Ins("MOV", dst="ESI", writes=frozenset({"ESI"}))
+    eax = D.Ins("MOV", dst="EAX", src="EBX", writes=frozenset({"EAX"}))
+    edx = D.Ins("MOV", dst="EDX", src="ESI", writes=frozenset({"EDX"}))
+    lea = D.Ins("LEA", dst="ECX", writes=frozenset({"ECX"}))
+    assert D.vcall_args(_vc("ESI"), [vmt, eax, edx, lea]) == (("EAX", "EDX", "ECX"), 0)
+    # the write of the call's base register is skipped once (a vmt load, or a copy of Self: MOV EBX, EAX)
+    copy = D.Ins("MOV", dst="ESI", src="EAX", writes=frozenset({"ESI"}))
+    assert D.vcall_args(_vc("ESI"), [eax, copy, edx]) == (("EAX", "EDX"), 0)
+    assert D.vcall_args(_vc("ESI"), [copy, copy, edx]) == (("EAX",), 0)      # only the first write is skipped
+    assert D.vcall_args(_vc("EBX"), [vmt, edx]) == (("EAX",), 0)             # the load writes ESI, not the call's base
+    # Delphi: two pushes, then the register arguments, then the vmt load
+    push = D.Ins("PUSH", src="EAX", writes=frozenset({"ESP"}))
+    ecx = D.Ins("MOV", dst="ECX", writes=frozenset({"ECX"}))
+    assert D.vcall_args(_vc("ESI"), [vmt, eax, edx, ecx, push, eax, push]) == (("EAX", "EDX", "ECX"), 2)
+
+
+def test_vcall_is_stack_convention():
+    assert D.vcall_is_stack(("EAX",), 3)                    # safecall / stdcall: Self and the arguments pushed
+    assert D.vcall_is_stack(("EAX", "EDX"), 1)
+    assert not D.vcall_is_stack(("EAX", "EDX", "ECX"), 2)   # register convention with two stack arguments
+    assert not D.vcall_is_stack(("EAX", "EDX"), 0)
+    assert not D.vcall_is_stack(("EAX",), 0)
+
+
+def test_vcall_args_byte_load_is_a_narrow_register():
+    byte = D.Ins("MOV", dst="EDX", imm=1, writes=frozenset({"EDX"}), bits=8)
+    word = D.Ins("MOV", dst="EDX", imm=-4, writes=frozenset({"EDX"}), bits=16)
+    full = D.Ins("XOR", dst="EDX", writes=frozenset({"EDX"}))
+    vmt = D.Ins("MOV", dst="ECX", writes=frozenset({"ECX"}))
+    assert D.vcall_args(_vc("ECX"), [vmt, byte]) == (("EAX", "DL"), 0)                  # mov dl,1: a Boolean
+    assert D.vcall_args(_vc("ECX"), [vmt, word]) == (("EAX", "DX"), 0)
+    assert D.vcall_args(_vc("ECX"), [vmt, byte, full]) == (("EAX", "DL"), 0)            # the nearest load decides
+    assert D.vcall_args(_vc("ECX"), [vmt, full, byte]) == (("EAX", "EDX"), 0)
+    cl = D.Ins("MOV", dst="ECX", imm=2, writes=frozenset({"ECX"}), bits=8)
+    assert D.vcall_args(_vc("ESI"), [byte, cl]) == (("EAX", "DL", "CL"), 0)
+    assert D.vcall_key(0x8, ("EAX", "DL"), 0) == "8.ADb.0" and D.vcall_name("8.ADb.0") == "vmt_8_adb_0"
+    assert D.vcall_key(0x8, ("EAX", "EDX", "CX"), 1) == "8.ADCw.1"
+    assert not D.vcall_is_stack(("EAX", "EDX", "CL"), 1)
+
+
+def test_vcall_args_prologue_pushes_are_no_arguments():
+    # push ebp; mov ebp,esp; push ebx; (loads of EAX, EDX, ECX); mov ebx,[eax]; call [ebx+0xc]
+    vmt = D.Ins("MOV", dst="EBX", writes=frozenset({"EBX"}))
+    eax = D.Ins("MOV", dst="EAX", src="ECX", writes=frozenset({"EAX"}))
+    edx = D.Ins("MOV", dst="EDX", src="EAX", writes=frozenset({"EDX"}))
+    ecx = D.Ins("MOV", dst="ECX", writes=frozenset({"ECX"}))
+    save = D.Ins("PUSH", src="EBX", writes=frozenset({"ESP"}))
+    frame = D.Ins("MOV", dst="EBP", src="ESP", writes=frozenset({"EBP"}))
+    assert D.vcall_args(_vc("EBX"), [vmt, eax, edx, ecx, save, frame]) == (("EAX", "EDX", "ECX"), 0)
+    # frameless: the function starts with the push, a RET of the previous function before it
+    ret = D.Ins("RET", jump=True)
+    assert D.vcall_args(_vc("EBX"), [vmt, eax, edx, ecx, save, ret]) == (("EAX", "EDX", "ECX"), 0)
+    # a real stack argument next to the saved register: only the oldest push of a saved register goes
+    arg = D.Ins("PUSH", src="EAX", writes=frozenset({"ESP"}))
+    assert D.vcall_args(_vc("EBX"), [vmt, eax, edx, ecx, arg, save, frame]) == (("EAX", "EDX", "ECX"), 1)
+    assert D.vcall_args(_vc("EBX"), [vmt, eax, edx, ecx, save, arg, frame]) == (("EAX", "EDX", "ECX"), 2)
+    # no frame or branch at the far end: the pushes stay arguments
+    assert D.vcall_args(_vc("EBX"), [vmt, eax, edx, ecx, save]) == (("EAX", "EDX", "ECX"), 1)
+
+
+def test_vcall_key_without_registers_is_a_stack_call():
+    assert D.vcall_key(0x1C, (), 3) == "1c.S.3" and D.vcall_name("1c.S.3") == "vmt_1c_s_3"
+
+
+def test_vcall_scan_stack_call_needs_the_vmt_load():
+    # push [ebp-8]; push eax (Self); mov eax,[eax]; call [eax+0x1c]   (stdcall / safecall interface method)
+    vmt = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}), ld=("EAX", 0))
+    self_ = D.Ins("PUSH", src="EAX", writes=frozenset({"ESP"}))
+    arg = D.Ins("PUSH", mem=None, writes=frozenset({"ESP"}))
+    assert D.vcall_scan(_vc("EAX"), [vmt, self_, arg]) == (("EAX",), 2, True)
+    # push eax; call [eax+0x1c]: EAX saved around a register call
+    assert D.vcall_scan(_vc("EAX"), [self_]) == (("EAX",), 1, False)
+    # mov eax,[ebp-4] is no vmt load; mov eax,[eax+4] neither
+    local = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}), ld=("EBP", -4))
+    field = D.Ins("MOV", dst="EAX", writes=frozenset({"EAX"}), ld=("EAX", 4))
+    assert D.vcall_scan(_vc("EAX"), [local, self_])[2] is False and D.vcall_scan(_vc("EAX"), [field, self_])[2] is False
+    # the base register is another one: its load decides
+    esi = D.Ins("MOV", dst="ESI", writes=frozenset({"ESI"}), ld=("EAX", 0))
+    assert D.vcall_scan(_vc("ESI"), [esi, self_, arg]) == (("EAX",), 2, True)
+    esi4 = D.Ins("MOV", dst="ESI", writes=frozenset({"ESI"}), ld=("EAX", 0x2C))
+    assert D.vcall_scan(_vc("ESI"), [esi4, self_, arg])[2] is False
+    assert D.vcall_is_stack(("EAX",), 2)
+
+
+def test_vcall_args_push_of_ebp_is_never_an_argument():
+    push_ebp = D.Ins("PUSH", src="EBP", writes=frozenset({"ESP"}))
+    ecx = D.Ins("MOV", dst="ECX", src="EBX", writes=frozenset({"ECX"}))
+    assert D.vcall_args(_vc("ESI"), [ecx, push_ebp]) == (("EAX", "EDX", "ECX"), 0)

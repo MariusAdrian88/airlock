@@ -49,11 +49,13 @@ MIN_LITERALS = 16        # fewer header matches: not a Delphi program, nothing i
 CONCAT_WINDOW = 48       # instructions searched backwards for the pushed pieces of a concatenation
 CONCAT_MARK = "concat "  # PRE comments the pass writes start with this; it replaces only its own
 STUB_STRIDE = 16
-STUB_SLOTS = 1024         # stubs per program: one per (routine, piece count)
+STUB_SLOTS = 1024         # stubs a new block holds: one per (routine, piece count)
+GROW_SLOTS = 2048         # slots a full block grows by (joined to the block's end)
+MAX_SLOTS = 8192          # stubs per program, all kinds
 MAX_STUB_PIECES = 255     # the count of a concatenation call is a byte
-MAX_VCALL_STUBS = 512     # stubs for indirect calls of Free Pascal x86 (virtual and interface methods)
+MAX_VCALL_STUBS = 4096    # stubs for indirect calls of x86 Pascal code (virtual and interface methods)
 VCALL_WINDOW = 12         # instructions searched backwards for the register arguments of such a call
-VERSION = 5              # of the pass; stored in the program (options "airlock", delphi_strings)
+VERSION = 6              # of the pass; stored in the program (options "airlock", delphi_strings)
 
 # codePage(2) elemSize(2)=1|2 refCnt(4)=-1: the 8 bytes that end 4 bytes before the characters
 _STRREC = re.compile(rb"(?s)..[\x01\x02]\x00\xff\xff\xff\xff")
@@ -204,6 +206,8 @@ class Ins:
     call: bool = False
     jump: bool = False
     pops: int = 0        # x86 call: stack argument slots the callee takes
+    bits: int = 32       # width of the destination register (``MOV DL, 1`` writes 8 bits of EDX)
+    ld: tuple[str, int] | None = None   # ``MOV reg, [base + disp]``: the memory source
 
 
 def literal_use(seq: list[Ins], ptr: int) -> tuple[str, Any, int] | None:
@@ -306,38 +310,74 @@ def fpc_marker(buf: bytes) -> bool:
     return _FPC_MARK.search(buf) is not None
 
 
-def vcall_args(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int]:
-    """(register arguments, stack arguments) of an indirect call ``CALL [reg + disp]`` of Free Pascal x86, whose
-    ``register`` convention passes ``Self`` in EAX, the next arguments in EDX and ECX (a hidden result pointer
-    of a string result comes first, as ``LEA EDX, [local]``) and the rest on the stack. ``before`` holds the
-    instructions before the call, nearest first; the search ends at the previous call or branch, or at the first
-    instruction that is neither a push nor a load of EAX, EDX or ECX (a push further back belongs to an outer
-    call, as the code page of a string concatenation that the call sits in). A register
-    that the call's own address uses (``MOV ECX, [ECX]`` for the vmt) is not an argument. EAX is always one."""
+_SAVED = ("EBX", "ESI", "EDI", "EBP")      # registers a prologue pushes to keep them
+_NARROW = {("EDX", 8): "DL", ("EDX", 16): "DX", ("ECX", 8): "CL", ("ECX", 16): "CX"}
+
+
+def vcall_scan(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int, bool]:
+    """(register arguments, stack arguments, vmt loaded) of an indirect call ``CALL [reg + disp]`` of Free Pascal
+    or Delphi x86, whose ``register`` convention passes ``Self`` in EAX, the next arguments in EDX and ECX (a
+    hidden result pointer of a string result comes first in Free Pascal, as ``LEA EDX, [local]``, and last in
+    Delphi) and the rest on the stack. ``before`` holds the instructions before the call, nearest first; the
+    search ends at the previous call or branch, or at the first instruction that is neither a push nor a load
+    of EAX, EDX or ECX (a push further back belongs to an outer call, as the code page of a string
+    concatenation that the call sits in). A register that the call's own address uses (``MOV ECX, [ECX]`` for
+    the vmt) is not an argument; the first write of another base register (Delphi: ``MOV ESI, [EAX]``, then
+    ``CALL [ESI + 8]``; or ``MOV EBX, EAX``) is skipped. A register whose nearest load is a byte or word load
+    (``MOV DL, 1``) is named ``DL`` / ``DX`` (``CL`` / ``CX``). A push of EBP is never an argument (EBP is the
+    frame pointer, or a variable that a frameless function saves), nor are the pushes of EBX, ESI, EDI at the
+    far end when the search stops at the frame set-up or a branch (the prologue saves them). The last value
+    tells whether the vmt pointer was loaded just before (``MOV reg, [reg]`` into the base register); EAX is
+    always an argument."""
     base = call.mem[0] if call.mem else ""
     wrote: set[str] = set()
-    pushes = 0
+    width: dict[str, int] = {}
+    pushed: list[str | None] = []
+    vmt_seen = False
+    vmt_load = False
+    stopped = False             # the search ended at a branch or the frame set-up, not at the window or odd code
     for x in before[:VCALL_WINDOW]:
         if x.jump or x.call:
+            stopped = x.jump
             break
         if x.mn == "PUSH":
-            pushes += 1
+            if x.src != "EBP":
+                pushed.append(x.src)
+        elif not vmt_seen and base not in ("EAX", "EDX", "ECX") and x.mn == "MOV" and x.dst == base                 and x.mem is None:
+            vmt_seen = True     # the vmt load (or a copy of Self): no argument, the search goes on
+            vmt_load = x.ld is not None and x.ld[1] == 0
         elif x.mem is None and x.writes & {"EAX", "EDX", "ECX"}:
-            wrote |= {"EDX", "ECX"} & x.writes
+            if x.mn == "MOV" and x.dst == base and x.ld == (base, 0):
+                vmt_load = True         # MOV EAX, [EAX]
+            for r in {"EDX", "ECX"} & x.writes:
+                wrote.add(r)
+                width.setdefault(r, x.bits if x.dst == r else 32)       # the nearest load decides
         else:
+            stopped = x.mn in ("MOV", "ADD", "SUB") and x.dst in ("EBP", "ESP")
             break               # a store or another register: what is further back belongs to other code
+    if stopped:
+        while pushed and pushed[-1] in _SAVED:
+            pushed.pop()        # the oldest pushes of saved registers belong to the prologue
     wrote.discard(base)
     regs = ["EAX"]
     if wrote:
         regs.append("EDX")      # a later register argument needs the earlier ones
         if "ECX" in wrote and base != "EDX":
             regs.append("ECX")
-    return tuple(regs), pushes
+    out = [_NARROW.get((r, width.get(r, 32)), r) for r in regs]
+    return tuple(out), len(pushed), vmt_load
+
+
+def vcall_args(call: Ins, before: list[Ins]) -> tuple[tuple[str, ...], int]:
+    """(register arguments, stack arguments) of an indirect call; see ``vcall_scan``."""
+    regs, pushes, _vmt = vcall_scan(call, before)
+    return regs, pushes
 
 
 def vcall_key(disp: int, regs: tuple[str, ...], pushes: int) -> str:
     """Identity of a stub for an indirect call; also its tag text."""
-    return f"{disp & 0xFFFFFFFF:x}.{''.join(r[1] for r in regs)}.{pushes}"
+    letters = "".join(r[1] if r[0] == "E" else r[0] + ("b" if r[1] == "L" else "w") for r in regs) or "S"
+    return f"{disp & 0xFFFFFFFF:x}.{letters}.{pushes}"
 
 
 def vcall_name(key: str) -> str:
@@ -461,7 +501,8 @@ def _view(ins: Any, ptr: int, fm: Any = None) -> Ins:
     writes = frozenset(base(o) for o in ins.getResultObjects() if isinstance(o, Register))
     if mn in ("PUSH", "POP", "CALL", "RET"):
         writes = writes | {"RSP" if ptr == 8 else "ESP"}
-    dst = mem = src = imm = None
+    dst = mem = src = imm = ld = None
+    bits = 32
     n = int(ins.getNumOperands())
     if n >= 1:
         t0 = int(ins.getOperandType(0))
@@ -471,6 +512,7 @@ def _view(ins: Any, ptr: int, fm: Any = None) -> Ins:
                 src = base(objs[0])
             else:
                 dst = base(objs[0])
+                bits = int(objs[0].getBitLength())
         elif OperandType.isDynamic(t0):
             regs = [o for o in objs if isinstance(o, Register)]
             disp = sum(int(o.getSignedValue()) for o in objs if isinstance(o, Scalar))
@@ -484,12 +526,16 @@ def _view(ins: Any, ptr: int, fm: Any = None) -> Ins:
             src = base(objs[0])
         elif OperandType.isScalar(t1) and not OperandType.isDynamic(t1) and objs:
             imm = int(objs[0].getUnsignedValue())
+        elif mn == "MOV" and OperandType.isDynamic(t1):
+            regs1 = [o for o in objs if isinstance(o, Register)]
+            if len(regs1) == 1:
+                ld = (base(regs1[0]), sum(int(o.getSignedValue()) for o in objs if isinstance(o, Scalar)))
     pops = 0
     if fm is not None and ptr == 4 and ft.isCall():
         f = _callee(ins, fm)
         if f is not None:
             pops = sum(1 for p in f.getParameters() if p.isStackVariable())
-    return Ins(mn, dst, mem, src, imm, writes, bool(ft.isCall()), bool(ft.isJump() or ft.isTerminal()), pops)
+    return Ins(mn, dst, mem, src, imm, writes, bool(ft.isCall()), bool(ft.isJump() or ft.isTerminal()), pops, bits, ld)
 
 
 def _callee(call: Any, fm: Any) -> Any:
@@ -618,23 +664,53 @@ class _Stubs:
         self.block = blk
         return True
 
+    def _grow(self) -> bool:
+        """Add ``GROW_SLOTS`` slots behind the block and join them to it (a program of an older run has a block of
+        ``STUB_SLOTS``; one stub per (vmt offset, arguments) of a large program needs more)."""
+        import jpype
+        from ghidra.util.task import TaskMonitor  # type: ignore
+        if self.block is None or (int(self.block.getSize()) // STUB_STRIDE) + GROW_SLOTS > MAX_SLOTS:
+            return False
+        mem = self.program.getMemory()
+        old = self.block
+        try:
+            ext = mem.createInitializedBlock(STUB_BLOCK + "_ext", old.getEnd().add(1), GROW_SLOTS * STUB_STRIDE,
+                                             jpype.JByte(-61), TaskMonitor.DUMMY, False)
+            ext.setRead(True)
+            ext.setWrite(False)
+            ext.setExecute(True)
+            mem.join(old, ext)
+        except Exception:  # noqa: BLE001  something in the way: the stubs stay as they are
+            return False
+        self.block = mem.getBlock(STUB_BLOCK)
+        return self.block is not None
+
+    def _room(self) -> bool:
+        """True when the block has a free slot (it is made or grown as needed)."""
+        if self.block is None and not self._make_block():
+            self.failed = True
+            return False
+        if self.next_slot >= MAX_SLOTS:
+            return False
+        if (self.next_slot + 1) * STUB_STRIDE > int(self.block.getSize()) and not self._grow():
+            return False
+        return True
+
     def get_vcall(self, key: str, regs: tuple[str, ...], pushes: int) -> Any:
-        """Entry of the stub of an indirect call of Free Pascal x86: ``Self`` and the register arguments in
+        """Entry of the stub of an indirect call of x86 Pascal code: ``Self`` and the register arguments in
         EAX, EDX, ECX, then ``pushes`` stack arguments (the first one pushed is the deepest), result in EAX,
-        the callee pops the stack arguments. None when none can be made."""
+        the callee pops the stack arguments. Without ``regs`` (Delphi ``stdcall`` and ``safecall``) all
+        arguments are on the stack, pushed right to left, so ``Self`` is the top one. None when none can be
+        made."""
         from ghidra.program.model.address import AddressSet  # type: ignore
-        from ghidra.program.model.data import PointerDataType, Undefined4DataType, VoidDataType  # type: ignore
+        from ghidra.program.model.data import (PointerDataType, Undefined1DataType, Undefined2DataType,  # type: ignore
+                                               Undefined4DataType, VoidDataType)
         from ghidra.program.model.listing import Function, ParameterImpl, VariableStorage  # type: ignore
         from ghidra.program.model.symbol import SourceType  # type: ignore
         from java.util import ArrayList  # type: ignore
         if key in self.by_vcall:
             return self.by_vcall[key]
-        if self.failed or len(self.by_vcall) >= MAX_VCALL_STUBS:
-            return None
-        if self.block is None and not self._make_block():
-            self.failed = True
-            return None
-        if self.next_slot >= STUB_SLOTS or (self.next_slot + 1) * STUB_STRIDE > int(self.block.getSize()):
+        if self.failed or len(self.by_vcall) >= MAX_VCALL_STUBS or not self._room():
             return None
         prog = self.program
         at = self.block.getStart().add(self.next_slot * STUB_STRIDE)
@@ -646,12 +722,15 @@ class _Stubs:
                                                           SourceType.USER_DEFINED)
             params = ArrayList()
             for i, r in enumerate(regs):
-                typ = PointerDataType(VoidDataType.dataType, 4) if i == 0 else word
+                typ = PointerDataType(VoidDataType.dataType, 4) if i == 0 else (
+                    word if r[0] == "E" else Undefined1DataType.dataType if r[1] == "L" else Undefined2DataType.dataType)
                 params.add(ParameterImpl("self" if i == 0 else f"a{i}", typ,
                                          VariableStorage(prog, [lang.getRegister(r)]), prog))
             for i in range(pushes):
-                params.add(ParameterImpl(f"s{i}", word,
-                                         VariableStorage(prog, stack.getAddress(4 + 4 * (pushes - 1 - i)), 4), prog))
+                at_sp = 4 * i if not regs else 4 * (pushes - 1 - i)
+                typ = PointerDataType(VoidDataType.dataType, 4) if not regs and i == 0 else word
+                params.add(ParameterImpl("self" if not regs and i == 0 else f"s{i}", typ,
+                                         VariableStorage(prog, stack.getAddress(4 + at_sp), 4), prog))
             fn.replaceParameters(params, Function.FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
             fn.setReturnType(word, SourceType.USER_DEFINED)
             fn.setStackPurgeSize(4 * pushes)
@@ -674,12 +753,7 @@ class _Stubs:
         key = (entry, n)
         if key in self.by_key:
             return self.by_key[key]
-        if self.failed or n > MAX_STUB_PIECES:
-            return None
-        if self.block is None and not self._make_block():
-            self.failed = True
-            return None
-        if self.next_slot >= STUB_SLOTS or (self.next_slot + 1) * STUB_STRIDE > int(self.block.getSize()):
+        if self.failed or n > MAX_STUB_PIECES or not self._room():
             return None
         prog = self.program
         at = self.block.getStart().add(self.next_slot * STUB_STRIDE)
@@ -804,11 +878,22 @@ def _comment_concat(program: Any, f: Any, lits: dict[int, tuple[str, int, int]],
         out["comments"] += 1
 
 
-def _override_vcalls(program: Any, stubs: _Stubs, out: dict[str, int]) -> None:
-    """Free Pascal x86: point each ``CALL [reg + disp]`` (virtual and interface methods) at a stub with the
-    registers and stack slots of the ``register`` convention. Without it the decompiler knows no register
-    argument of such a call: a hidden result pointer (``LEA EDX, [local]``) is lost and the local reads as
-    the value stored before the call (``x = 0``)."""
+def vcall_is_stack(regs: tuple[str, ...], pushes: int) -> bool:
+    """True when a Delphi call that pushes arguments loaded no ECX: the ``register`` convention fills EAX, EDX
+    and ECX before it pushes, so this is ``stdcall`` or ``safecall`` (all arguments on the stack, ``Self`` last
+    pushed), or a register call whose push saves a register (``PUSH EAX`` / ``CALL [EAX + n]``). The stub of
+    a stack call has no register parameter, and only a call with the vmt load just before it
+    (``MOV EAX, [EAX]``) gets one."""
+    return pushes > 0 and not any(r[:2] in ("EC", "CL", "CX") for r in regs)
+
+
+def _override_vcalls(program: Any, stubs: _Stubs, out: dict[str, int], delphi: bool = False) -> None:
+    """x86: point each ``CALL [reg + disp]`` (virtual and interface methods) at a stub with the registers and
+    stack slots of the ``register`` convention (Free Pascal and Delphi). Without it the decompiler knows no
+    register argument of such a call: a hidden result pointer (``LEA EDX, [local]``) is lost and the local
+    reads as the value stored before the call (``x = 0``). With ``delphi`` a call of the stack conventions
+    (``vcall_is_stack``) gets a stub with stack parameters only, unless the caller pops them (``cdecl``:
+    ``ADD ESP, n`` after the call), which gets none."""
     from ghidra.program.model.symbol import RefType, SourceType  # type: ignore
     listing = program.getListing()
     refman = program.getReferenceManager()
@@ -820,15 +905,24 @@ def _override_vcalls(program: Any, stubs: _Stubs, out: dict[str, int]) -> None:
         if v.mem is None or v.mem[0] in ("?", "ESP", "EBP"):
             continue
         views, _raw = _before(call, 4, None)
-        regs, pushes = vcall_args(v, views)
-        key = vcall_key(v.mem[1], regs, pushes)
-        at = stubs.get_vcall(key, regs, pushes)
-        if at is None:
-            continue
+        regs, pushes, vmt_load = vcall_scan(v, views)
+        at = None
+        if delphi and vcall_is_stack(regs, pushes):
+            regs = ()
+            nxt = call.getNext()
+            if not vmt_load or (nxt is not None and (nv := _view(nxt, 4)).mn == "ADD" and nv.dst == "ESP"):
+                pushes = -1     # no vmt load before the pushes (a register call that saves a register) or cdecl
+        if pushes >= 0:
+            key = vcall_key(v.mem[1], regs, pushes)
+            at = stubs.get_vcall(key, regs, pushes)
         mine = {str(a) for a in stubs.by_vcall.values()}
         old = [x for x in call.getReferencesFrom() if x.getReferenceType() == RefType.CALL_OVERRIDE_UNCONDITIONAL]
         if old and not all(str(x.getToAddress()) in mine for x in old):
             continue            # somebody else's override
+        if at is None:
+            for x in old:       # a stub of an earlier run that this call no longer gets
+                refman.delete(x)
+            continue
         if old and all(str(x.getToAddress()) == str(at) for x in old):
             continue            # up to date
         for x in old:           # a stub of an earlier run with other arguments
@@ -990,8 +1084,9 @@ def apply_delphi_strings(program: Any, monitor: Any = None) -> dict[str, int]:
             out["stack_params"] += bool(p.isStackVariable())
         except Exception:  # noqa: BLE001  one odd signature must not stop the pass
             continue
-    if ptr_size == 4 and any(fpc_marker(_block_bytes(b)) for b in mem.getBlocks()
-                             if b.isInitialized() and not b.isOverlay() and str(b.getName()) != STUB_BLOCK):
-        _override_vcalls(program, stubs, out)
+    if ptr_size == 4:       # Free Pascal or Delphi: the pass got here only for a program with Pascal strings
+        fpc = any(fpc_marker(_block_bytes(b)) for b in mem.getBlocks()
+                  if b.isInitialized() and not b.isOverlay() and str(b.getName()) != STUB_BLOCK)
+        _override_vcalls(program, stubs, out, delphi=not fpc)
     program.getOptions("airlock").setInt("delphi_strings", VERSION)
     return out
